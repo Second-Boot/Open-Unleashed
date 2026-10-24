@@ -430,8 +430,8 @@ fn dealer_flag_admitted(flag: u16, game_type: u8) -> bool {
 }
 
 /// `GenericCar.Car`'s own list, `[0x6919EC]` — kind-0 records the current `Game.GameType` admits
-/// ([`dealer_flag_admitted`]), 0x4F0F50-sorted. Shared by [`Menu::set_cars`] and the initial
-/// `Menu` construction, which needs the filtered/sorted vector before a `Menu` exists yet (to
+/// ([`dealer_flag_admitted`]), 0x4F0F50-sorted. Shared by [`FeCatalogues::set_cars`] and the initial
+/// `FeCatalogues` construction, which needs the filtered/sorted vector before a `FeCatalogues` exists yet (to
 /// resolve `NFS_FE_CAR`'s starting index).
 pub(crate) fn generic_car_list(catalog: &[nfs_formats::fedata::CarCatalogEntry], game_type: u8) -> Vec<nfs_formats::fedata::CarCatalogEntry> {
     let mut v: Vec<_> = catalog.iter().filter(|c| c.kind == 0 && dealer_flag_admitted(c.dealer_flag_204, game_type)).cloned().collect();

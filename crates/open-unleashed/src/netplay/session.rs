@@ -26,7 +26,7 @@ impl NetPlay {
                 // **TEST GLUE** (not in the original): `NFS_NET_LIMIT=n` sets the player limit
                 // (`session+0x84`, 8 in the game: 0x509B49), so a "game full" refusal (`-2`, 0x588F3D)
                 // can be reached with two instances instead of eight
-                let limit = std::env::var("NFS_NET_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(nfs_net::session::DEFAULT_LIMIT);
+                let limit = nfs_game::config::cfg().nfs_net_limit.as_str().and_then(|v| v.parse().ok()).unwrap_or(nfs_net::session::DEFAULT_LIMIT);
                 let mut n = with_probe(Net::host(sock, name, key(), limit));
                 n.advertise = advertised_record();
                 n.my_name = name16(who);
@@ -89,6 +89,8 @@ impl NetPlay {
             pictures: HashMap::new(),
             next_seat: 0,
             lagged: VecDeque::new(),
+            lockstep: VecDeque::new(),
+            lockstep_seen: None,
             start_due: false,
             join: if mode == "host" { JoinState::Hosting } else { JoinState::Pending(Instant::now()) },
             join_wait: join_target.map(|h| (h, who.to_string(), Instant::now())),
@@ -110,6 +112,7 @@ impl NetPlay {
             exch: Default::default(),
             server: Default::default(),
             exchange: false,
+            clocked: false,
             timer_anchor: None,
             timer_done: 0,
             commands: [0; 8],
@@ -547,7 +550,14 @@ impl NetPlay {
                     // a slow link (`network.md` 8.4)
                     match lag_glue() {
                         Some(ms) => self.lagged.push_back((Instant::now() + Duration::from_millis(ms), bytes)),
-                        None => self.car_state_in(&bytes, tick, &mut log),
+                        None => match (lockstep_glue(), CarState::from_packet(&bytes, self.id)) {
+                            // **TEST GLUE** `NFS_NET_LOCKSTEP=<D>`: held until this machine's tick reaches the sender's tick + D
+                            (Some(_), Some((_, st))) => {
+                                self.lockstep_seen = self.lockstep_seen.max(Some(st.tick));
+                                self.lockstep.push_back((st.tick, bytes));
+                            }
+                            _ => self.car_state_in(&bytes, tick, &mut log),
+                        },
                     }
                 }
             }
@@ -555,6 +565,13 @@ impl NetPlay {
         while self.lagged.front().is_some_and(|(due, _)| *due <= Instant::now()) {
             if let Some((_, bytes)) = self.lagged.pop_front() {
                 self.car_state_in(&bytes, tick, &mut log);
+            }
+        }
+        if let Some(d) = lockstep_glue() {
+            while self.lockstep.front().is_some_and(|(s, _)| u64::from(*s) + d <= tick) {
+                if let Some((_, bytes)) = self.lockstep.pop_front() {
+                    self.car_state_in(&bytes, tick, &mut log);
+                }
             }
         }
         // 0x587CE0 can drop a peer whose countdown ran out, and that has to be reported too
@@ -612,6 +629,35 @@ impl NetPlay {
         log
     }
 
+    /// **TEST GLUE** (scripted network race, before the tick `tick` runs).
+    ///
+    /// * Always, at tick 0: wait (at most 30 s) until the session is established, i.e. a joiner has been admitted (`0xC6 (14)`).
+    /// * With `NFS_NET_LOCKSTEP=<D>`: wait (at most 30 s) until a car-state packet sent at a tick above `tick - D` has come in,
+    ///   so [`Self::poll`] has every packet that falls due by `tick`; not before tick D, or the two machines would wait for each
+    ///   other's first packet, and the host also at tick 0, until the joiner's first packet shows it is racing (it hears nothing
+    ///   sent before it started). With the packets released by *sender tick + D* the remote car's blocks reach `store` (0x4A0DF0)
+    ///   at the same receiver ticks in every run, whatever the wall-clock offset between the two machines.
+    pub fn lockstep_wait(&mut self, tick: u64) {
+        let t0 = Instant::now();
+        // a `--net` run has no lobby: the race starts at once, but the original's joiner races only once the host has admitted it
+        // (`0xC6 (14)`, `comm_state::CONNECTED`, 0x48F357 `[net+0xBE] = 1`). Until the admission arrives (wall-clock timed) the link
+        // classification 0x490140 answers 3 / 4, which retires the racers and stops the remote car's apply (0x49B9C8) for a while
+        while tick == 0 && !self.established() && t0.elapsed() < Duration::from_secs(30) {
+            for line in self.poll(tick) {
+                tracing::info!(target: "netplay", "{line}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let Some(d) = lockstep_glue() else { return };
+        let first = self.is_host() && tick == 0;
+        while (tick >= d || first) && self.lockstep_seen.is_none_or(|s| u64::from(s) + d <= tick) && t0.elapsed() < Duration::from_secs(30) {
+            for line in self.poll(tick) {
+                tracing::info!(target: "netplay", "{line}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// **0x48F5E8** for one `0xBE` datagram: our own id comes back on a relayed packet and is dropped;
     /// the sender's car is found (or given the next reserved seat) and 0x4A0DF0 stores the block.
     fn car_state_in(&mut self, bytes: &[u8], tick: u64, log: &mut Vec<String>) {
@@ -653,6 +699,14 @@ impl NetPlay {
                 r.stale,
                 r.got,
                 st.encode().chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]]))).collect::<Vec<_>>().join(" ")
+            )
+        });
+        // the store's `SN` (`edx` = the receiver's tick) and `SO` (the lag book it leaves: `+0x3C`, `+0x5C…+0x70`, `+0xDA8`, `+0xDAC`) in the original's trace format
+        super::remote::remote_dump(|| format!("SN {tick} car=00000000 now={tick}"));
+        super::remote::remote_dump(|| {
+            format!(
+                "SO {tick} car=00000000 {:08x} lag {:08x} {:08x} {:08x} {:08x} 00000000 {:08x} da {:08x} {:08x}",
+                r.state.tick, r.lag_avg, r.fresh, r.late, r.lag, u32::from(r.stale), u32::from(r.held), u32::from(r.got)
             )
         });
     }

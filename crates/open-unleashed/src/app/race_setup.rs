@@ -34,7 +34,7 @@ impl PlayerLook {
     /// or the menu's custom colour (`App::menu_custom_paint`), which is then the paint the race
     /// compares against too. No race number. The text menu's and the layout front end's single
     /// race and the text menu's knockout round all took this.
-    pub(crate) fn from_menu(m: &Menu, car: &nfs_formats::fedata::CarCatalogEntry) -> Self {
+    pub(crate) fn from_menu(m: &FeCatalogues, car: &nfs_formats::fedata::CarCatalogEntry) -> Self {
         let mut look = Self::plain(car.paint_sets.get(m.paint_idx % car.paint_sets.len().max(1)).map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10]));
         if let Some(p) = App::menu_custom_paint(m, car) {
             (look.paint, look.owned_paint) = (p.exterior, Some(p));
@@ -180,7 +180,7 @@ impl RaceSetup {
     /// cops' worth of slots, no career opponents and no grid override. The caller fills what its
     /// arm decides (`opponents`, `laps`, `quick_knockout`, `cops_race`, `cops_enabled`, `look`)
     /// with `..RaceSetup::menu(m, kept)`; anything it does not name is the race's as it stood.
-    pub(crate) fn menu(m: &Menu, kept: RaceSetup) -> Self {
+    pub(crate) fn menu(m: &FeCatalogues, kept: RaceSetup) -> Self {
         Self {
             backwards: m.backwards,
             mirror: m.mirror,
@@ -405,8 +405,8 @@ mod parity {
         }
     }
 
-    fn menu() -> Menu {
-        Menu {
+    fn menu() -> FeCatalogues {
+        FeCatalogues {
             mode: 0,
             tracks: vec!["alps".into(), "coastal".into()],
             looped: vec!["monaco1".into()],
@@ -434,8 +434,7 @@ mod parity {
             mirror: false,
             circuits: vec!["coastal".into()],
             looped_idx: 0,
-            knockout_line: String::new(),
-            row: 0,
+            debug: DebugMenuState { knockout_line: String::new(), row: 0 },
             font: None,
         }
     }
@@ -561,7 +560,7 @@ mod parity {
     }
 
     /// `start_from_layout`'s arm for game types 0 / 1, the old way, onto `o`
-    fn old_layout_arm(o: &mut Old, m: &Menu, quick: bool) {
+    fn old_layout_arm(o: &mut Old, m: &FeCatalogues, quick: bool) {
         o.player_grid_override = None;
         o.career_opponents = None;
         o.backwards = m.backwards;
@@ -589,7 +588,7 @@ mod parity {
     #[test]
     fn layout_arms() {
         for (quick, cheat, cops) in [(false, 0, false), (false, CHEAT_COPS, false), (false, 0, true), (true, CHEAT_COPS, true)] {
-            let m = Menu { cops, ..menu() };
+            let m = FeCatalogues { cops, ..menu() };
             let mut o = Old { cheat_bits: cheat, ..kept() };
             // the new arm, as `start_from_layout` builds it
             let new = if quick {
@@ -614,7 +613,7 @@ mod parity {
     fn text_menu_enter() {
         let entry = car(4, &[[1, 1, 1], [2, 2, 2]]);
         for (mode, cheat, cops, custom) in [(0, CHEAT_COPS, false, None), (0, 0, true, Some(0x00AABBCC)), (4, CHEAT_COPS, true, None)] {
-            let m = Menu { mode, cops, paint_custom: custom, ..menu() };
+            let m = FeCatalogues { mode, cops, paint_custom: custom, ..menu() };
             let mut o = Old { cheat_bits: cheat, ..kept() };
             // the new `Enter` arm (`player_grid_override` cleared at its top, as before)
             o.player_grid_override = None;

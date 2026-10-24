@@ -177,6 +177,8 @@ pub struct Wheel {
     /// on the FPU stack gets (0x499F7A…0x499F9B). *(Corrected 2026-09-25: the port stored the
     /// clamped value.)*
     pub height_d: f32,
+    /// `wheel+0x5C`, the `y` of the suspension vector `Susp_update` leaves (0x49A1DA…): what the pitch / roll rates are made of
+    pub susp_y: f32,
     pub airborne: bool,
     pub compression: f32,
     /// `wheel+0x70`, the render angle in radians that slot 9 copies into channels 1...4's `.z`
@@ -517,6 +519,12 @@ pub struct Vehicle {
     /// follows a re-orthonormalisation the probes sit where the raw rows put them. `None`: the rows
     /// are the current ones (every other step, and the racers, whose steps refresh them anyway).
     pub point_rows: Option<Mat3>,
+    /// The world collision points `car+0x1DC + 12i` of a **network car** as 0x49AE30 left them at the end of its last apply
+    /// (0x4A0DB3, and again at 0x49B9FC): the position and the rows they were built from. The next tick's apply moves the
+    /// body (the 64 Hz integration, the blend) before its `Susp_update` reads them (0x499AD4…0x499B13), so the wheels
+    /// probe where the car stood one tick earlier — 0.3 m behind at 20 m/s (`net_reseat`; RE/notes/REFERENCE-2026-10-24-PA-DEADRECK2.md).
+    /// `None` until the first apply: the current pose.
+    pub net_points: Option<(Vec3, Mat3)>,
 }
 
 impl Vehicle {
@@ -631,6 +639,7 @@ impl Vehicle {
             net_car: false,
             orient_countdown: 0,
             point_rows: None,
+            net_points: None,
         }
     }
 
@@ -842,6 +851,11 @@ impl Vehicle {
             let (x, z) = (u, v);
             u = x * cs - z * sn;
             v = x * sn + z * cs;
+            // The rotation is **in place** (0x4A2159…0x4A219x store back into `wheel+0x9C` / `+0xA4`): a steered
+            // wheel keeps the slip velocity in the steered frame until the next `Car_physicsStep` recomputes it
+            // (PA-TRACE item 7; the original's `su` / `sv` columns of the front wheels in s3).
+            w.slip_vel[0] = u;
+            w.slip_vel[2] = v;
         }
         w.slip = 0.0;
         w.locked = false;
@@ -1076,10 +1090,11 @@ impl Vehicle {
         let a_drive = self.engine_update(specs, rear_contact);
         if !front_contact && !rear_contact {
             self.accel_local = Vec3::ZERO;
+            // 0x49F70D…0x49F73F: only `car+0xD4C…+0xD54` and the four `wheel+0xB8` are zeroed; the wheels'
+            // `+0x90` / `+0x98` keep what the last contact tick left (PA-TRACE item 7; nothing reads them
+            // before the next contact tick's 0x49F85B…0x49F88E clears them).
             for w in &mut self.wheels {
                 w.slip = 0.0;
-                w.lateral = 0.0;
-                w.longitudinal = 0.0;
             }
         } else {
             self.wheel_demands(specs, vl, a_drive);
@@ -1569,7 +1584,11 @@ impl Vehicle {
         // port kept the frame built at 0x49B22F.)* The vectors are the slice the caller placed on;
         // 0x49AF70's 0x474440 re-finds the tracker's slice at the final position, which differs only
         // when the offset crosses a slice boundary — APPROXIMATION, not traced.
-        if self.tracker.track(grid, self.position) {
+        // 0x49AF70 (the only caller of that 0x499520 here) returns at once while `car+0x7F` is clear (0x49AF75…0x49AF7A):
+        // a car parked from purgatory at the race start keeps the orthonormal frame 0x49B22F built; and the raw vectors
+        // are those of the slice the tracker ends on (`Tracker::update` 0x474440 at the final position — slice 0 for the
+        // purgatory park at a retire, live alps tick 1260: forward `(0.0848, 0.0091, −0.9964)`, the slice-0 record's, not slice 1's).
+        if in_world && self.tracker.track(grid, self.position) {
             let [rl, ru, rf] = slice_raw;
             self.orientation = Mat3::from_cols(rl * s, ru, rf * s).transpose();
             self.frame = self.orientation;

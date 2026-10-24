@@ -167,6 +167,25 @@ impl App {
                 }
             }
         }
+        // **TEST GLUE** (not in the original): `NFS_NET_TELEPORT=<tick>:<slices>[,<tick>:<slices>…]` moves the human car forward along the
+        // road by that many slices (6 m each) on that tick, so the remote machine's dead reckoning sees the block jump (the snap arm of 0x4A04A0,
+        // `d > 20`). A network race only; the car keeps its velocity and orientation, the tracker finds its patch on the next tick.
+        if let Some(spec) = nfs_game::config::cfg().nfs_net_teleport.as_str()
+            && self.net.session.is_some()
+            && let (Some(v), Some(t), Some(r)) = (self.vehicle.as_mut(), self.slices.as_ref(), self.race.as_ref())
+        {
+            for hop in spec.split(',') {
+                if let Some((at, n)) = hop.split_once(':')
+                    && at.trim().parse::<u64>().ok() == Some(self.tick)
+                    && let Some(n) = n.trim().parse::<i32>().ok()
+                {
+                    let (a, b) = (&t.slices[r.slice], &t.slices[t.add(r.slice, n)]);
+                    let lateral = (v.position - a.centre).dot(a.lateral);
+                    v.position = b.centre + b.lateral * lateral + Vec3::Y * (v.position.y - a.centre.y);
+                    tracing::info!(tick = self.tick, slices = n, pos = ?v.position, "NFS_NET_TELEPORT: the human car moved ahead");
+                }
+            }
+        }
         // 0x417010, the first call of `GameTick`'s odd-tick group (0x4150D5 `test al, 1` → 0x4150D9).
         // What it reads — the finish state and `+0xB14` — only the even tick's progress update
         // changes, so testing it here, before this odd tick's work, is the same test
@@ -273,8 +292,6 @@ impl App {
         // outside an exchange race, where `reg_of` is the identity.
         let exch_order: Vec<HumanCar> = exchange_in.as_ref().map(|x| x.humans(self.road.opponents.len())).unwrap_or_default();
         let n_seat_cars = self.road.opponents.len();
-        // the same list from the session, for the odd tick's audio update (no latched samples then)
-        let exch_humans_now: Vec<HumanCar> = self.exch_human_order();
         // a **positional** race's human cars in registration order, for the traffic's lists only
         let pos_order: Vec<HumanCar> = if exchange_in.is_none() { self.positional_human_order() } else { Vec::new() };
         // the seats' horns (`car+0xD86`) of a positional race: the block's bit 1, the local pad's before the
@@ -296,7 +313,7 @@ impl App {
         let ff_replay = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
         // what the sections of the 32 Hz block read of the above (`TickCtx`)
         let ctx = TickCtx { rally_on, heavy_on, derby_on, ff_replay, view, replay_camera, net_seats, exchange_in, exch_order, n_seat_cars, pos_order, pos_seat_horns };
-        let (net_seats, exchange_in) = (&ctx.net_seats, &ctx.exchange_in);
+        let exchange_in = &ctx.exchange_in;
         // …and what one section hands on to a later one (`TickState`)
         let mut st = TickState::default();
         // the test glue: scripted placements of the cars (it borrows the car and the world itself)
@@ -304,7 +321,8 @@ impl App {
         if self.tick % 2 == 0 {
             // the non-player cars' collision events of this tick, in the order they happen, for
             // their sound queues (`car+0x1110`, 0x40F740) — committed after the collision pass
-            let mut ai_hits: Vec<(AudioCar, nfs_audio::sfx::QueuedSfx)> = Vec::new();
+            // (`App::ai_hits_buf`: the buffer is drained whole by `tick_ai_sound_queues`, so a tick starts with it empty)
+            let mut ai_hits = std::mem::take(&mut self.ai_hits_buf);
             self.tick_controls(&ctx, &mut st);
             // **The even tick, in the original's order** (`GameTick` 0x414FF0, `traffic.md` §17.5d):
             // `0x416140`, `Collide_beginTick` 0x498220, then **the AI pass `0x406720`** (0x4150A9),
@@ -354,19 +372,65 @@ impl App {
             self.tick_collide_smackables(&ctx, &ci, &mut ai_hits, &mut ground_event);
             self.tick_player_contact(&ctx, ground_event);
             self.tick_ai_sound_queues(&mut ai_hits);
+            self.ai_hits_buf = ai_hits;
             self.tick_ai_sparks();
             self.tick_player_reset(&ctx, &mut st);
             self.tick_opponent_resets(&ctx, &st);
             self.tick_traffic_post_impact(&ctx);
+            // `0x417800` runs after the whole Sc32 list of an even tick (the drive and `Car_simulate` at 0x1E, the collision
+            // pass 0x28, the post-impact pass 0x32), so `car+0xED0` / `car+0xEC0` are measured with the position and velocity
+            // THOSE left, against the frame block and slice the priority-6 tracker had (`HumanEd`, refreshed before the step).
+            // Live, alps cop + traffic trace (PA-COPS 2026-10-24): taking both from the start of the tick left the tracker's
+            // lateral difference 5e-4 off from tick 1042 (an airborne human, ed0 12 mm off at 1020) and the speed one pair
+            // stale (a wall hit at 1256 reached the original's `car+0xEC0` in the same tick); after this the cop follows the
+            // original within 6e-5 m/s over 30 s and `[0x5E6674]` matches on every tick
+            if self.tick % 2 == 0
+                && let (Some(_), Some(v)) = (self.road.human_ed.values, self.vehicle.as_ref())
+            {
+                let h = &self.road.human_ed;
+                self.road.human_ed.values = Some(((v.position - h.centre).dot(h.frame[0]), v.velocity.dot(h.frame[2])));
+            }
             self.tick_race_order(&ctx);
             self.tick_quick_knockout(&st);
             self.tick_derby_outcomes(&ctx);
             self.tick_race_progress(&ctx);
             self.tick_camera_key(&ctx);
         }
-        if self.world.is_none() {
+        if self.world.is_none() || self.vehicle.is_none() {
             return;
         }
+        self.tick_integrate64(&ctx, fx_marks);
+        self.tick_pose_and_camera_history();
+        self.tick_net_dump();
+        // **The audio update `0x4A8120` runs on the odd tick only** — `GameTick` 0x414FF0 calls it
+        // at 0x4150E3 behind `test byte [gGameTick], 1 ; je` (0x4150D5), after the even tick's
+        // physics and AI (`timing.md` §7): 32 Hz. Everything below is that update — the slot table
+        // 0x4A7DC0, the slot cars 0x4A7080 (engines, honk timers, sirens, queue drains), the
+        // player 0x4A7660 (engine, horn, loops, the one-shot gate's decay 0x4AA056, the ambience
+        // 0x4AEF30 its `(tick >> 1) & 3` quarter assumes) — so its per-update counters (the ±8
+        // layer slew, the gate, the reverb's 100 → 68 → 36 → 8 fade, the honk timers) run at the
+        // original's rate. *(Until 2026-09-26 the port ran it on every 64 Hz tick: twice as fast.)*
+        if self.tick % 2 == 0 {
+            self.replay_tick();
+            return;
+        }
+        // the listener is the camera slot as this tick's `Sc64` step left it (0x463C30 before 0x4A8120, 0x4150C8 / 0x4150E3)
+        let render_camera = self.camera;
+        if let Some((eye, target)) = self.audio_listener_pass() {
+            self.camera.position = eye;
+            self.camera.target = target;
+        }
+        // the same list from the session, for the odd tick's audio update (no latched samples then). Taken here, where it is
+        // used: it reads only the room's player list, `launch_index` / `in_race` and the opponent count, which nothing between
+        // the top of the tick and here writes on an odd tick (the receive runs in `net_step`; `NetPlay::apply` writes the seat arms)
+        let exch_humans_now: Vec<HumanCar> = self.exch_human_order();
+        self.simulate_audio(view, exch_humans_now);
+        self.camera = render_camera;
+        self.replay_tick();
+    }
+
+    /// **The 64 Hz tail's integrators** (see [`Self::simulate`]): the cops and the traffic, the player's and the opponents' `step64`, the skid marks, the smackables. Moved out of `game_tick` unchanged.
+    fn tick_integrate64(&mut self, ctx: &TickCtx, fx_marks: bool) {
         let Some(v) = self.vehicle.as_mut() else {
             return;
         };
@@ -411,15 +475,17 @@ impl App {
             // **0x49B8E0's network hook** (0x49B9AB…0x49B9EC), after the orientation step: a remote
             // car of a positional race, whose class 0x490140 is at most 2 (a player who has left keeps
             // its car where it stopped) — `NetPlay::apply` holds the other gates (`car+0xDAC`, `+0x70`)
-            if net_seats.contains(&oi)
+            if ctx.net_seats.contains(&oi)
                 && !exchanging
                 && let (Some(n), Some(w)) = (self.net.session.as_mut(), self.world.as_ref())
                 && !n.seat_race_index(oi).is_some_and(|i| n.link_quality(i, self.tick as u32).gone())
             {
                 // the retrack's walk goes toward the car's slice centre (the tracker's slice, `slice + 4`)
                 let centre = self.slices.as_ref().and_then(|t| t.slices.get(o.progress.slice)).map(|sl| sl.centre);
-                n.apply(oi, &mut o.vehicle, &o.specs, &w.collision, centre, self.tick);
+                n.apply(oi, &mut o.vehicle, netplay::SeatApply { specs: &o.specs, grid: &w.collision, centre, slice: o.progress.slice, tick: self.tick });
                 remote_dump(self.tick, oi, &o.vehicle, n);
+                // 0x49B9FC: the tail of 0x49B8E0 rebuilds the stored world points whether the apply ran or not
+                o.vehicle.refresh_net_points();
             }
             // the re-orthonormalisation is the car's own countdown `car+0x80` in its 64 Hz step
             // (0x49BA01…0x49BA1D, `Vehicle::integrate64`) — *(corrected 2026-10-22 by the live trace: the
@@ -483,6 +549,13 @@ impl App {
             }
         }
         self.smackables.integrate();
+    }
+
+    /// **The player's draw pose and the camera history** (`Sc64`, 0x463C30) of this tick. Moved out of `game_tick` unchanged.
+    fn tick_pose_and_camera_history(&mut self) {
+        let Some(v) = self.vehicle.as_ref() else {
+            return;
+        };
         // (the player's re-orthonormalisation: its own `car+0x80` countdown in `integrate64`)
         self.car_pos = v.draw_origin();
         self.car_rot = Quat::from_mat3(&v.orientation.transpose()).normalize();
@@ -520,7 +593,21 @@ impl App {
                 velocity: v.velocity,
                 cos_tilt: v.cos_tilt,
             });
+            // the audio update's copy of the slot steps against the same ticks (`audio_listener_pass`)
+            if let (Some(s), Some(h)) = (self.audio_cam.as_mut(), self.cam_hist.back().copied()) {
+                s.cam_hist.push_back(h);
+                while s.cam_hist.len() > 64 {
+                    s.cam_hist.pop_front();
+                }
+            }
         }
+    }
+
+    /// **TEST GLUE** `NFS_NET_DUMP`: the rows of the tick (see [`Self::net_dump_tick`]). Moved out of `game_tick` unchanged.
+    fn tick_net_dump(&mut self) {
+        let Some(v) = self.vehicle.as_ref() else {
+            return;
+        };
         // (a network race played back from a file dumps the same rows, its lanes' race indices standing for
         // the session's: `NFS_NET_DUMP` proves the playback against the live race)
         if self.net_dump.is_none()
@@ -597,20 +684,6 @@ impl App {
                 let _ = writeln!(out, "{},900,{:08x},0", self.tick, nfs_game::rng::state());
             }
         }
-        // **The audio update `0x4A8120` runs on the odd tick only** — `GameTick` 0x414FF0 calls it
-        // at 0x4150E3 behind `test byte [gGameTick], 1 ; je` (0x4150D5), after the even tick's
-        // physics and AI (`timing.md` §7): 32 Hz. Everything below is that update — the slot table
-        // 0x4A7DC0, the slot cars 0x4A7080 (engines, honk timers, sirens, queue drains), the
-        // player 0x4A7660 (engine, horn, loops, the one-shot gate's decay 0x4AA056, the ambience
-        // 0x4AEF30 its `(tick >> 1) & 3` quarter assumes) — so its per-update counters (the ±8
-        // layer slew, the gate, the reverb's 100 → 68 → 36 → 8 fade, the honk timers) run at the
-        // original's rate. *(Until 2026-09-26 the port ran it on every 64 Hz tick: twice as fast.)*
-        if self.tick % 2 == 0 {
-            self.replay_tick();
-            return;
-        }
-        self.simulate_audio(view, exch_humans_now);
-        self.replay_tick();
     }
 
     /// **TEST GLUE** `NFS_AUTOPILOT=ai`: an opponent's driver for the player's car — its `.ais`, its `.sim` tail and
@@ -1208,20 +1281,22 @@ impl App {
                     lateral: lat,
                     lane: lane_of(sl, lat),
                     speed: vl,
-                    // `car+0x3A8` / `car+0x3B0`, the windows the §27.8 sector tests use
-                    half_width: self.car_half_width,
+                    // `car+0x3A8` / `car+0x3B0`, the windows the §27.8 sector tests use: the model's LOD-5 box
+                    // (0x445090), [`Vehicle::half_extents`] — live, the 993: 0.90996 (the body's span / 2, 0.938, is not it:
+                    // the lateral error −0.9203 at tick 1114 is outside −0.90996, which keeps MODE −2 off, but inside −0.938)
+                    half_width: v.half_extents.x,
                     half_length: v.half_extents.z,
                     finished: self.race.as_ref().map(|r| r.finished).unwrap_or(false),
                 };
                 let mut others = vec![LaneCar {
                     slice,
                     lane: target.lane,
-                    lane_mask: lane_span(sl, lat, self.car_half_width),
+                    lane_mask: lane_span(sl, lat, v.half_extents.x),
                     speed: vl,
                     speed_est: v.speed(),
                     half_len: v.half_extents.z,
                     lateral: lat,
-                    half_span: self.car_half_width,
+                    half_span: v.half_extents.x,
                     is_human: true,
                     is_racer: true,
                 }];
@@ -1276,6 +1351,7 @@ impl App {
                         h.frame = [sl.lateral, sl.up, sl.forward];
                     }
                     h.values = Some(((v.position - sl.centre).dot(h.frame[0]), v.velocity.dot(h.frame[2])));
+                    h.centre = sl.centre;
                 }
             }
         }
@@ -1336,11 +1412,9 @@ impl App {
                             let s = r.map_or(slice, |r| r.slice);
                             let vl = v.v_long();
                             ExchHuman {
-                                car: h,
                                 position: v.position,
                                 slice: s,
                                 laps: r.map_or(0, |r| r.laps),
-                                progress: r.map_or(0.0, |r| r.progress),
                                 vl,
                                 dir: exch_dir(t, vl, v.forward(), s),
                                 speed: v.speed(),
@@ -1354,11 +1428,9 @@ impl App {
                             let s = o.progress.slice;
                             let vl = o.vehicle.v_long();
                             ExchHuman {
-                                car: h,
                                 position: o.vehicle.position,
                                 slice: s,
                                 laps: o.progress.laps,
-                                progress: o.progress.progress,
                                 vl,
                                 dir: exch_dir(t, vl, o.vehicle.forward(), s),
                                 speed: o.vehicle.speed(),
@@ -1598,7 +1670,7 @@ impl App {
         if let Some(x) = exchange_in.as_ref() {
             let mut lower: Vec<(usize, u32, Controls)> = x.seats.iter().filter(|e| e.1 < x.local_index).copied().collect();
             lower.sort_by_key(|e| e.1);
-            Self::exchange_seats_step(&mut self.road.opponents, &lower, v.position, self.tick, (rally_on, derby_on), &|p| autobahn && w.overhead_flags(p) == 0, &w.collision);
+            Self::exchange_seats_step(&mut self.road.opponents, SeatStep { seats: &lower, local: v.position, tick: self.tick, flags: (rally_on, derby_on), wet: &|p| autobahn && w.overhead_flags(p) == 0, grid: &w.collision });
         }
         // **A positional race: the same slot order** — the remote cars' `Car_simulate` is the
         // human's 0x49FD30 on the Sc32 list, inserted car by car in `Cars_create`'s order
@@ -1612,7 +1684,7 @@ impl App {
         early.sort_by_key(|e| e.1);
         late.sort_by_key(|e| e.1);
         if !early.is_empty() {
-            Self::exchange_seats_step(&mut self.road.opponents, &early, v.position, self.tick, (rally_on, derby_on), &|p| autobahn && w.overhead_flags(p) == 0, &w.collision);
+            Self::exchange_seats_step(&mut self.road.opponents, SeatStep { seats: &early, local: v.position, tick: self.tick, flags: (rally_on, derby_on), wet: &|p| autobahn && w.overhead_flags(p) == 0, grid: &w.collision });
         }
         // `DraftFactor` 0x49D9B0: the racer array only — traffic and police do not draft
         let racers: Vec<Vec3> = self.road.opponents.iter().map(|o| o.vehicle.position).collect();
@@ -1623,18 +1695,18 @@ impl App {
         v.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0;
         // 0x4123E0, the force-feedback driver: Sc32 priority 10, before the car's step (priority
         // 0x1E) — it reads what the last tick left
-        super::force_feedback::ff_drive(&mut self.ff, &mut self.gamepads, self.ff_levels, ff_replay, self.tick, &nfs_physics::force_feedback::FfCar::from_vehicle(v, &self.specs));
+        super::force_feedback::ff_drive(&mut self.ff, &mut self.gamepads, super::force_feedback::FfTick { levels: self.ff_levels, replay: ff_replay, tick: self.tick }, &nfs_physics::force_feedback::FfCar::from_vehicle(v, &self.specs));
         v.step32(&controls, &self.specs, &w.collision);
         // the remote cars' `Car_simulate` (a positional race) with an index above this machine's
         // own, after the player's, in race-index order (above)
         if !late.is_empty() {
-            Self::exchange_seats_step(&mut self.road.opponents, &late, v.position, self.tick, (rally_on, derby_on), &|p| autobahn && w.overhead_flags(p) == 0, &w.collision);
+            Self::exchange_seats_step(&mut self.road.opponents, SeatStep { seats: &late, local: v.position, tick: self.tick, flags: (rally_on, derby_on), wet: &|p| autobahn && w.overhead_flags(p) == 0, grid: &w.collision });
         }
         // …and the seats after it
         if let Some(x) = exchange_in.as_ref() {
             let mut higher: Vec<(usize, u32, Controls)> = x.seats.iter().filter(|e| e.1 > x.local_index).copied().collect();
             higher.sort_by_key(|e| e.1);
-            Self::exchange_seats_step(&mut self.road.opponents, &higher, v.position, self.tick, (rally_on, derby_on), &|p| autobahn && w.overhead_flags(p) == 0, &w.collision);
+            Self::exchange_seats_step(&mut self.road.opponents, SeatStep { seats: &higher, local: v.position, tick: self.tick, flags: (rally_on, derby_on), wet: &|p| autobahn && w.overhead_flags(p) == 0, grid: &w.collision });
         }
         if let Some(rec) = self.record.as_mut() {
             use std::io::Write;
@@ -2352,7 +2424,13 @@ impl App {
         // `R·(point − position)`, 0x4122A8…0x4122CB)
         if contact_mag > 0.0 {
             let body_point = v.orientation * (v.last_contact - v.position);
-            super::force_feedback::ff_collision(&mut self.ff, &mut self.gamepads, self.ff_levels, ff_replay, self.tick, &nfs_physics::force_feedback::FfCar::from_vehicle(v, &self.specs), contact_kind.word(), body_point, contact_mag);
+            super::force_feedback::ff_collision(
+                &mut self.ff,
+                &mut self.gamepads,
+                super::force_feedback::FfTick { levels: self.ff_levels, replay: ff_replay, tick: self.tick },
+                &nfs_physics::force_feedback::FfCar::from_vehicle(v, &self.specs),
+                super::force_feedback::FfContact { kind: contact_kind.word(), body_point, magnitude: contact_mag },
+            );
         }
         if matches!(contact_kind, ContactKind::Ground | ContactKind::Wall)
             && contact_mag > 1.5
@@ -2469,8 +2547,8 @@ impl App {
     /// `0x40F540` for the human car: the free slice from `r.slice` (or, for mode 3 — `behind`, a
     /// point-to-point car below its start bound — from the start slice `car+0xAFC`), then
     /// `Car_placeAtSlice` and the reset's clears.
-    #[allow(clippy::too_many_arguments)]
-    fn place_player_on_reset(v: &mut Vehicle, specs: &CarSpecs, w: &TrackWorld, t: &SliceTable, r: &nfs_game::race::RaceProgress, road: &RoadCars, smackables: &nfs_game::smackables::RaceSmackables, behind: bool) {
+    fn place_player_on_reset(v: &mut Vehicle, world: ResetWorld, behind: bool) {
+        let ResetWorld { specs, w, t, r, road, smackables } = world;
         let occupied: Vec<usize> = road
             .opponents
             .iter()
@@ -2556,7 +2634,7 @@ impl App {
             && !exempt
             && let (Some(t), Some(r)) = (&self.slices, &self.race)
         {
-            Self::place_player_on_reset(v, &self.specs, w, t, r, &self.road, &self.smackables, behind);
+            Self::place_player_on_reset(v, ResetWorld { specs: &self.specs, w, t, r, road: &self.road, smackables: &self.smackables }, behind);
             self.resets += 1;
         }
         if let (Some(t), Some(r)) = (&self.slices, &self.race) {
@@ -2986,7 +3064,7 @@ impl App {
                 && !exempt
                 && let Some(w) = self.world.as_ref()
             {
-                Self::place_player_on_reset(v, &self.specs, w, t, r, &self.road, &self.smackables, true);
+                Self::place_player_on_reset(v, ResetWorld { specs: &self.specs, w, t, r, road: &self.road, smackables: &self.smackables }, true);
                 self.resets += 1;
             }
             let n_cars = self.road.opponents.len() + 1;
@@ -3191,6 +3269,12 @@ impl App {
         if let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech) {
             sp.set_level(self.snd.audio_settings.speech_level);
             sp.update(a, double);
+        }
+        // the speech service 0x4B0A20 is also the pump of the streamed-patch loads: it installs one finished bank and
+        // issues the queued reads (`Ambience::bank_pump`), so a bank the ambience requested at update `u` can play from
+        // update `u + 2` on
+        if let Some(amb) = self.snd.ambience.as_mut() {
+            amb.bank_pump();
         }
         // the thunder's countdown 0x4A8380 is the update's second call (0x4A813F): a strike's call
         // 0x4A8340 (the sky's `ThunderCall`, drawn in the strike) sets it going, and at the end of
@@ -3939,16 +4023,20 @@ struct TickState {
 /// The human's lateral `car+0xED0` and speed `car+0xEC0` as the original keeps them: `0x417800` (after the Sc32 list of an
 /// even tick, before the Sc64 integrators) measures them against the human's frame block `car+0x3B8…` (the slice vectors of
 /// the last patch-zone change, 0x499520) and the AI pass of the next even tick reads that value — two ticks stale. This
-/// keeps the frame with a shadow tracker run at the same position the human's own tracker 0x49AF70 sees.
+/// keeps the frame with a shadow tracker run at the same position the human's own tracker 0x49AF70 sees (priority 6,
+/// before the step); the values themselves are measured after the tick's Sc32 list, with the position and velocity it left
+/// (`centre` is the tracker's slice of the refresh).
 pub(crate) struct HumanEd {
     pub(crate) tracker: nfs_physics::collision::PatchTracker,
     pub(crate) frame: [Vec3; 3],
     pub(crate) values: Option<(f32, f32)>,
+    /// the centre of the tracker's slice (`car+8`) of the last refresh
+    pub(crate) centre: Vec3,
 }
 
 impl Default for HumanEd {
     fn default() -> Self {
-        Self { tracker: nfs_physics::collision::PatchTracker::new(Vec3::ZERO), frame: [Vec3::ZERO; 3], values: None }
+        Self { tracker: nfs_physics::collision::PatchTracker::new(Vec3::ZERO), frame: [Vec3::ZERO; 3], values: None, centre: Vec3::ZERO }
     }
 }
 

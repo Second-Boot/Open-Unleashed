@@ -6,6 +6,7 @@
 //! whole and the alpha of what it pushed is then scaled by `fade / 255`, the same thing to within
 //! a rounding of the original's per-colour blend.
 
+use super::text_draw::TextBox;
 use super::{argb, tint, FeRect, LayoutScreen, DIALOG_BUTTON_FONT, DIALOG_TEXT_FONT};
 use crate::dialog::Dialog;
 use nfs_formats::locale::Strings;
@@ -70,7 +71,7 @@ impl LayoutScreen {
         }
         // 0x512B65: the text, black, centred in its 300-wide block at (x+10, y+10)
         if let Some(f) = self.fonts.get(DIALOG_TEXT_FONT) {
-            self.wrapped_text(&mut out, aspect, f, &d.text, x + 10.0, y + 10.0, 300.0, 1, [0.0, 0.0, 0.0, 1.0], None);
+            self.wrapped_text(&mut out, aspect, f, &d.text, TextBox { x: x + 10.0, y: y + 10.0, w: 300.0, align: 1, color: [0.0, 0.0, 0.0, 1.0] }, None);
         }
         // the four bevel bands 0x4D98D0, each `(UL, UR, BL, BR)` with its colour
         let bands: [([[f32; 2]; 4], [u32; 4]); 4] = [

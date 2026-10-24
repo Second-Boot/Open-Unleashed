@@ -19,8 +19,11 @@ fn header_colours() {
     assert!((l.ambient[0] - 0.304636).abs() < 1e-4, "{:?}", l.ambient);
     assert_eq!(l.ambient[0], l.ambient[2]);
     assert!((l.tint[0] - 1.801324).abs() < 1e-4);
-    // `interiordiffuse` is in no shipped file, so it keeps the loader's 0.3 default
-    assert_eq!(l.interior_diffuse, [0.3; 3]);
+    // `interiordiffuse` is in no shipped file, so it keeps the loader's default: 1 (the constant 0x440CCD…
+    // that precedes its lookup; the running original's slot 5 is `g · 1`, `RE/notes/lighting.md` §6a)
+    assert_eq!(l.interior_diffuse, [1.0; 3]);
+    let d = MapLight::default();
+    assert_eq!((d.tint, d.ambient, d.interior, d.light_decal), ([1.0; 3], [0.3; 3], [1.0; 3], [1.0; 3]));
 }
 
 #[test]

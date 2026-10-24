@@ -393,7 +393,9 @@ fn the_callback_does_not_free_the_last_owner_of_a_clip() {
         .1
     };
     out.set_audio_quality(2);
-    run(&mut core); // the quality change itself (a one-time cost on the callback, as before)
+    // the quality change itself and the very first run — whose `publish` was the
+    // first lock of the snapshot's mutex, which allocated its pthread mutex on macOS — allocate nothing
+    assert_eq!(run(&mut core), 0, "the first run with the quality change");
     assert_eq!(run(&mut core), 0);
     // a one-shot the mixer owns alone, stopped by the game
     let clip = Arc::new(Clip { samples: vec![100; 60_000], ..(*clips()[1]).clone() });

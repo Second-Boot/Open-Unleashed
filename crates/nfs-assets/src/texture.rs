@@ -80,6 +80,49 @@ pub fn cache_4444_from_8888(rgba: &mut [u8]) {
     }
 }
 
+/// What the same 16-bit cache does to a **565** source — `RE/notes/thrash.md` §6d.9 / `REFERENCE-2026-10-24-PA-TEX1555.md`.
+/// The opaque list 0x5CE48C (installed by 0x44D7E0 through 0x554950(4, list), [`cache_4444_from_8888`]) starts with 1555
+/// (type 3), so a 565 entry (type 4) is converted by `0x5350E0`: its table 0x5DE2FC at `[src * 8 + dst]` (types mapped
+/// through 0x5DE574: 565 -> 3, 1555 -> 2) holds **0x5702A0**, a single hop (the hop table 0x5DE4FC names the target).
+/// 0x5702A0 reads the texel word `p` and, **`p == 0` kept as 0** (`test ax, ax` / `je`, 0x5702A6...0x5702BA), writes
+/// `(p & 0x1F) | ((p >> 1) & 0xFFE0) | 0x8000`: red and blue keep their 5 bits, the green's lowest bit is dropped
+/// (truncation, no rounding), alpha becomes 1 - and the one colour the word 0 stays a transparent black. Read live on the
+/// original (gdb at 0x5702A0 and the call 0x555708, `nfs5-second`, dx7): `common.fsh` `HEAD`, `particle.fsh` `SPRK`
+/// and the 27 `bpp = 565` pages of the front end's room models (`FEData/Models/*.tpg`).
+/// `rgba` holds the decoded 565 texels (`r5 << 3 | r5 >> 2`, `g6 << 2 | g6 >> 4`, ...), from which the word is rebuilt.
+pub fn cache_1555_from_565(rgba: &mut [u8]) {
+    for t in rgba.chunks_exact_mut(4) {
+        let p = ((t[0] >> 3) as u16) << 11 | ((t[1] >> 2) as u16) << 5 | (t[2] >> 3) as u16;
+        if p == 0 {
+            t.copy_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        let q = (p & 0x1F) | ((p >> 1) & 0xFFE0) | 0x8000;
+        let (r, g, b) = (((q >> 10) & 0x1F) as u8, ((q >> 5) & 0x1F) as u8, (q & 0x1F) as u8);
+        t.copy_from_slice(&[r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2, 255]);
+    }
+}
+
+impl TextureImage {
+    /// The entry's texels as the original's 16-bit texture cache holds them, for a pack the cache is told to keep in 16
+    /// bits (descriptor depth 0x10 of 0x44DFE0: keys 2, 3, 4 and 5 at every `TEXTUREDETAIL`; the front end builds
+    /// everything as key 5): an 8888 entry (code `0x7D`) becomes 4444 ([`cache_4444_from_8888`]), a 565 entry (`0x78`) 1555
+    /// ([`cache_1555_from_565`]), every other format stays as decoded. The sky (key 1) and the track (key 0) are depth
+    /// 0x20 at `TEXTUREDETAIL` 3, the tier the port runs, and are not touched by this.
+    ///
+    /// PORT-DEVIATION D42: the port always runs that tier (the original's 32-bit screen); at a 16-bit screen the original
+    /// drops to tier 2 and keeps the track and sky 16-bit too (`RE/notes/PORT-DEVIATIONS.md`).
+    pub fn cache_mips(&self) -> Vec<Vec<u8>> {
+        let mut mips = self.mips.clone();
+        match self.code {
+            0x7D => mips.iter_mut().for_each(|m| cache_4444_from_8888(m)),
+            0x78 => mips.iter_mut().for_each(|m| cache_1555_from_565(m)),
+            _ => {}
+        }
+        mips
+    }
+}
+
 /// Decode every entry of a SHPI pack, **the base level only**. `path` is used for diagnostics only.
 ///
 /// The original samples every texture but a track's with the mip filter `NONE`, i.e. its top level
@@ -150,4 +193,38 @@ fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32 +
         }
         Ok(out)
     })
+}
+
+#[cfg(test)]
+mod cache_565_tests {
+    use super::*;
+
+    /// 0x5702A0: blue and red keep 5 bits, green drops its low bit, alpha 1; the word 0 stays 0.
+    #[test]
+    fn a_565_texel_becomes_1555_by_0x5702a0() {
+        let mut t = [255u8, 255, 255, 255, 0, 0, 0, 255, 0x08, 0x04, 0x08, 255];
+        cache_1555_from_565(&mut t);
+        assert_eq!(&t[..4], [255, 255, 255, 255]);
+        // the word 0 is kept as 0: alpha 0
+        assert_eq!(&t[4..8], [0, 0, 0, 0]);
+        // r5 = 1, g6 = 1 (low bit dropped -> g5 = 0), b5 = 1
+        assert_eq!(&t[8..], [1 << 3 | 1 >> 2, 0, 1 << 3 | 1 >> 2, 255]);
+    }
+
+    /// Every 565 word goes through the routine's formula.
+    #[test]
+    fn every_word_matches_the_routine() {
+        for p in 0..=0xFFFFu32 {
+            let (r, g, b) = ((p >> 11) as u8, ((p >> 5) & 0x3F) as u8, (p & 0x1F) as u8);
+            let mut t = [r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2, 255];
+            cache_1555_from_565(&mut t);
+            if p == 0 {
+                assert_eq!(t, [0; 4]);
+                continue;
+            }
+            let q = (p & 0x1F) | ((p >> 1) & 0xFFE0) | 0x8000;
+            let (r5, g5, b5) = (((q >> 10) & 0x1F) as u8, ((q >> 5) & 0x1F) as u8, (q & 0x1F) as u8);
+            assert_eq!(t, [r5 << 3 | r5 >> 2, g5 << 3 | g5 >> 2, b5 << 3 | b5 >> 2, 255], "p = {p:#06x}");
+        }
+    }
 }

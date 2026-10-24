@@ -8,6 +8,7 @@
 //! `out` parameter, which is already a `&mut Vec<Sprite>`. The
 //! comment block that stood above the arm stands above the method. Every move is checked against
 //! 97 golden screenshots of the shipped layouts, byte for byte.
+use super::text_draw::TextBox;
 use super::*;
 
 /// Everything one widget's draw reads from the loop in `sprites_reporting`: which widget, where
@@ -458,7 +459,7 @@ impl LayoutScreen {
     /// so the inset highlight is not drawn.
     fn combo_value(&self, d: WidgetDraw<'_>, state: &str, out: &mut Vec<Sprite>, arrow_at: usize) -> bool {
         let WidgetDraw { i, e, x, y, w, aspect, strings, selected, hovered, accessor, .. } = d;
-        if e.class == "NFS5.ColorBox" && self.attr_num(e, "nolabel") != Some(1.0) {
+        if self.classes[i] == WidgetClass::ColorBox && self.attr_num(e, "nolabel") != Some(1.0) {
             if let Some(c) = self.swatches.get(&i) {
                 let (sx, sy, sw, sh) = (x + w - 40.0, y + 4.0, 20.0, 10.0);
                 let black = tint([0, 0, 0, 0xff]);
@@ -727,7 +728,7 @@ impl LayoutScreen {
     pub(super) fn draw_bar_or_graphic_tab(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, aspect, strings, selected, hovered, .. } = d;
         let state = self.state_for(e, i, selected, hovered);
-        let frame = (e.class == "NFS5.BOTTOMBARBUTTON").then(|| self.bar_button_frame(e, hovered == Some(i), self.pressed_on(i, hovered))).flatten();
+        let frame = (self.classes[i] == WidgetClass::BottomBarButton).then(|| self.bar_button_frame(e, hovered == Some(i), self.pressed_on(i, hovered))).flatten();
         let first = out.len();
         self.template_widget_at(out, aspect, e, state, x, y, strings, frame);
         if e.class != "NFS5.BOTTOMBARBUTTON" {
@@ -787,7 +788,7 @@ impl LayoutScreen {
         // `shapeIndex=data.picturenum`, and it is in none of the six state lists — so
         // the part walk never reaches it and only this arm can. `cameras.lay`'s four
         // widgets carry `picturenum` 1…4. §4.129.
-        if e.class == "NFS5.CAMERAPICTURE"
+        if self.classes[i] == WidgetClass::CameraPicture
             && let Some(n) = self.attr_num(e, "picturenum")
             && let Some(&(tex, aw, ah)) = self.shapes.get(&(CAMERA_PICTURES.to_string(), n.max(0.0) as usize))
         {
@@ -795,7 +796,7 @@ impl LayoutScreen {
             out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
         }
         self.template_widget(out, aspect, e, state, x, y, strings);
-        if e.class == "NFS5.TABBUTTON" {
+        if self.classes[i] == WidgetClass::TabButton {
             self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
         }
         // The tab buttons' draw 0x4D0350 draws the parts first (0x4D036D) and then,
@@ -819,7 +820,7 @@ impl LayoutScreen {
         // pressed, enabled tab gets the bevel at 0x4D0440; every other tab gets
         // 0x520F00 with (4, 4) at 0x4D044A. `Tab Button.ctr` carries
         // `dropshadow.value=1 HIDDEN|READONLY`, so all 11 have one.
-        if e.class == "NFS5.TABBUTTON"
+        if self.classes[i] == WidgetClass::TabButton
             && self.attr_num(e, "dropshadow").is_some_and(|v| v != 0.0)
             && !self.pressed_on(i, hovered)
         {
@@ -957,7 +958,7 @@ impl LayoutScreen {
         // would double it, per this pass's fix.
         let WidgetDraw { i, e, x, y, w, h, aspect, hovered, .. } = d;
         let Some(key) = self.logos.get(&i) else { return };
-        if e.class == "NFS5.ChroniclePicture" {
+        if self.classes[i] == WidgetClass::ChroniclePicture {
             let Some(&(tex, _, _)) = self.shapes.get(key) else { return };
             let Some((px, py, pw, ph)) = self.chronicle_pan(i) else { return };
             // the picture moves with the transition (0x4C8760 on the position, 0x50834A), the
@@ -1005,7 +1006,7 @@ impl LayoutScreen {
         // state mask, **hover** (§4.109). Entry 1 is therefore the hovered frame, not
         // "the entry the reader is on"; the host binds entry 0 and the next one is
         // taken here, exactly as `NFS5.CarLogo`'s pair is.
-        let key = &if e.class == "NFS5.ChroniclePictureIcon" && hovered == Some(i) && self.shapes.contains_key(&(key.0.clone(), key.1 + 1)) {
+        let key = &if self.classes[i] == WidgetClass::ChroniclePictureIcon && hovered == Some(i) && self.shapes.contains_key(&(key.0.clone(), key.1 + 1)) {
             (key.0.clone(), key.1 + 1)
         } else {
             key.clone()
@@ -1031,7 +1032,7 @@ impl LayoutScreen {
         // — and when it is *not* pressed, the **drop shadow** instead: 0x508931's arm
         // puts 0x520F00 at (4, 4) over that same art-sized box (0x508954), which is
         // the other half of a tail §4.23 read only the first half of. §4.78.
-        if e.class == "NFS5.ChroniclePictureIcon" {
+        if self.classes[i] == WidgetClass::ChroniclePictureIcon {
             if self.pressed_on(i, hovered) {
                 self.bevel(out, aspect, FeRect::new(x, y, aw, ah), 3.0);
             } else {
@@ -1333,7 +1334,7 @@ impl LayoutScreen {
         // — only at rest, the fade 0 (0x4CB01C) — 0x4DAAC0 (0x4CB024) and the glint, which lands
         // **on the letters alone**; 0x4DAB00 (0x4CB0B4 / 0x4CB0F9). Off rest the draw leaves by
         // 0x4DA9D0 without the second half (0x4CB0FE), the depth stepped all the same.
-        let header = (e.class == "NFS5.HEADER").then(super::fe_depth::mask_begin);
+        let header = (self.classes[i] == WidgetClass::Header).then(super::fe_depth::mask_begin);
         self.template_widget(out, aspect, e, state, x, y, strings);
         // The header's glint, **0x4CB024…0x4CB0F6** — its colour is 0x4D87D0 of
         // the fade, so white at full (§4.25).
@@ -1347,7 +1348,7 @@ impl LayoutScreen {
         // (§4.28, §4.29). The long axis is the one the sweep runs along: `x` when
         // `data.horizontal` is set — the class's own test is `!= 0`, so its 2 counts
         // as set — and `y` when it is not.
-        if e.class == "NFS5.GLINTYLINE" {
+        if self.classes[i] == WidgetClass::GlintyLine {
             // The sweep's own timer and draws (`glints::Line`, 0x51FB0A…0x51FC24): a run of
             // `rand() % 3 + 3` pixels a tick in a coin's direction, from one width outside one end
             // to one width past the other, then `rand() % 128` ticks of rest.
@@ -1382,7 +1383,7 @@ impl LayoutScreen {
         // bevel 0x521050 with a thickness of **3** (0x520EBD), over the widget's box
         // (0x4C8670) in its fade colour. So it is its amber fill and black frame with
         // a sunken bevel inside them, not the fill alone.
-        if e.class == "NFS5.BEVELEDOPTIONBOX" {
+        if self.classes[i] == WidgetClass::BeveledOptionBox {
             self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
         }
         // Erased, not undrawn, in two cases the original agrees with:
@@ -1488,7 +1489,7 @@ impl LayoutScreen {
         // `NFS5.HUD`'s pieces, 0x4CBC27…0x4CC312: each one `0x4D9E70(piece, ox + fx·240, oy + fy·180,
         // piece.w · 640/W, piece.h · 480/H)` on the schematic's origin, in the order the draw tests
         // the options (the application hands them over in that order)
-        if e.class == "NFS5.HUD" {
+        if self.classes[i] == WidgetClass::Hud {
             let (pieces, kx, ky) = &self.hud_preview;
             for &(entry, fx, fy) in pieces {
                 let Some(&(t, pw, ph)) = self.shapes.get(&("hud.fsh".to_string(), entry)) else { continue };
@@ -1540,7 +1541,7 @@ impl LayoutScreen {
         // at 0.99998 over a depth cleared to 1.0 (0x4DA890), both behind the mask — the port's
         // plain sprites write no depth, which leaves the 1.0 and gives the same test.
         // `NFS5.MOVIEBOX` has no parts and no mask.
-        let circle = e.class == "NFS5.MOVIECIRCLE";
+        let circle = self.classes[i] == WidgetClass::MovieCircle;
         // the kit's depth stepped for this mask from where the frame's earlier masks left it, and
         // the device's alpha test as it stands (`layout::fe_depth`: 10 as the frame's room left it,
         // 1 after a list box — the credits' first port took the device's initial 0)
@@ -2077,7 +2078,7 @@ impl LayoutScreen {
         // so the rows are **black** at the widget's fade, `spacing` apart. They are the
         // chat's lines, `[0x65B6A8]` (0x4C2FD1), which `set_chat_lines` puts here — not
         // `Comms.PlayerList`, which the box only asks for names. §4.131, §4.151.
-        if e.class == "NFS5.CHATDISPLAYBOX"
+        if self.classes[i] == WidgetClass::ChatDisplayBox
             && let Some(cf) = self.fonts.get("univers8b.ffn").or_else(|| self.font_for(e))
             && let Some((rows, cur)) = self.lists.get(&i)
         {
@@ -2131,7 +2132,7 @@ impl LayoutScreen {
         // the box with a thickness of 3 (0x4C34F8), and anything else gets nothing —
         // no shadow and no highlight. This port has no focus in the front end, so
         // only the pressed half of that test is here.
-        if e.class == "NFS5.CHATINPUTBOX" {
+        if self.classes[i] == WidgetClass::ChatInputBox {
             // 0x4C34A0…0x4C34F8: **focused or pressed** takes the bevel, and nothing
             // else takes anything. Focus is a runtime flag now (§4.109), so the
             // first half of that test is drawn as well.
@@ -2165,7 +2166,7 @@ impl LayoutScreen {
         // The gate is **focused or pressed**, and not disabled — 0x51CABC asks
         // 0x4C7DD0 first and only falls to 0x4C7CB0 when that says no (0x51CAC5),
         // and 0x51CAD2 sends a disabled row to the highlight arm too. §4.117.
-        if e.class == "NFS5.CONTROLLERSETUP" {
+        if self.classes[i] == WidgetClass::ControllerSetup {
             // the text and the arc come first (0x51C9A9…0x51CAB2), the box over them
             self.controller_setup_row(out, aspect, e, state, x, y, w, talpha, strings, accessor);
             let lit = (state == "focused" || self.pressed_on(i, hovered)) && state != "disabled";
@@ -2179,7 +2180,7 @@ impl LayoutScreen {
         }
         // `NFS5.CHATDISPLAYBOX`'s draw 0x4C2F50 is the chat's rows and its scrollbar, above, and
         // nothing else — its `data.accessor` (`Comms.PlayerList`) only names players. (history: `game-history.md` §22.7)
-        if e.class == "NFS5.CHATDISPLAYBOX" {
+        if self.classes[i] == WidgetClass::ChatDisplayBox {
             return;
         }
         let Some(f) = self.font_for(e) else { return };
@@ -2853,12 +2854,12 @@ impl LayoutScreen {
             let mut color = color;
             color[3] *= w.fade(now);
             if budget.is_none_or(|(n, _)| n != 0) {
-                self.wrapped_text(out, aspect, f, &w.text, x, y, box_w, e.int("align").unwrap_or(0), color, budget);
+                self.wrapped_text(out, aspect, f, &w.text, TextBox { x, y, w: box_w, align: e.int("align").unwrap_or(0), color }, budget);
             }
         } else if e.class.to_ascii_lowercase().contains("wordwrap") {
             let budget = self.typewriter(i, e, None);
             if budget.is_none_or(|(n, _)| n != 0) {
-                self.wrapped_text(out, aspect, f, &text, x, y, box_w, e.int("align").unwrap_or(0), color, budget);
+                self.wrapped_text(out, aspect, f, &text, TextBox { x, y, w: box_w, align: e.int("align").unwrap_or(0), color }, budget);
             }
         } else {
             self.text(out, aspect, f, &text, x, y, box_w, e.int("align").unwrap_or(0), color);

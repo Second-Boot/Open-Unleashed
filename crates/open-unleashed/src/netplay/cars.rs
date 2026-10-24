@@ -52,15 +52,8 @@ impl NetPlay {
     /// came) and `car+0x70` clear (else `+0xDA8 = 1` and nothing moves). The class test 0x490140 ≤ 2 is the
     /// caller's (`NetPlay::link_quality`). `centre` is the seat's slice centre (the retrack's walk).
     /// Answers whether the seat is a remote car with a block.
-    pub fn apply(
-        &mut self,
-        seat: usize,
-        v: &mut Vehicle,
-        specs: &nfs_physics::specs::CarSpecs,
-        grid: &nfs_physics::collision::TriangleGrid,
-        centre: Option<Vec3>,
-        tick: u64,
-    ) -> bool {
+    pub fn apply(&mut self, seat: usize, v: &mut Vehicle, with: SeatApply) -> bool {
+        let SeatApply { specs, grid, centre, slice, tick } = with;
         let Some(r) = self.remotes.values_mut().find(|r| r.seat == seat) else {
             return false;
         };
@@ -72,9 +65,10 @@ impl NetPlay {
         } else {
             r.held = false;
             let blk = r.block();
-            super::remote::remote_dump(|| format!("AI {tick} seat={seat} {}", super::remote::car_words(v)));
+            super::remote::remote_dump(|| super::remote::ai_line("AI", tick, seat, v, &r.state, slice));
+            super::remote::remote_dump(|| super::remote::sb_line(tick, v, specs));
             let stale = v.net_dead_reckon(&blk, tick as i32, grid, specs, centre);
-            super::remote::remote_dump(|| format!("AO {tick} seat={seat} {}", super::remote::car_words(v)));
+            super::remote::remote_dump(|| super::remote::ai_line("AO", tick, seat, v, &r.state, slice));
             if stale {
                 // 0x4A0DC3: `|age| > 0x100` — the next ticks leave the car alone until the lag recovers
                 r.stale = true;

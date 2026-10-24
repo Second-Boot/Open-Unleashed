@@ -897,7 +897,7 @@ impl App {
             self.fe_sound(9);
         }
         self.hud_hover = hover;
-        let (view, slot_near) = self.camera_pass(car_pos, car_rot, rear_view);
+        let (view, slot_near) = self.camera_pass(car_pos, car_rot, rear_view, false);
         // draw distance from `<track>_{forward,backwards}.key` for the camera's slice, scaled by the
         // detail setting (0x44F1A0: `value × {0.5, 0.67, 0.83, 1.0}`, at least 50 m). The sky is drawn
         // around the camera, so distant terrain simply stops at this range as in the original.
@@ -1240,7 +1240,7 @@ impl App {
     /// The camera slot's per-frame work (`RE/notes/camera*.md`): the view's update(s) since the last
     /// game tick, the car-relative eye, the mirror's eye, the beacon and the headlight frames.
     /// Returns the view id and the slot's near plane.
-    fn camera_pass(&mut self, car_pos: Vec3, car_rot: Quat, rear_view: bool) -> (u16, f32) {
+    fn camera_pass(&mut self, car_pos: Vec3, car_rot: Quat, rear_view: bool, audio: bool) -> (u16, f32) {
         // every view is slot 0's half-angle, 37.5° by default, across (`camera::fov_y`); only a
         // trackside camera element brings its own (`+0x9C` when `+0x98` is set)
         // the TV modes take the view the last trackside camera set (`TvSlot::view`): the sweep
@@ -1298,7 +1298,7 @@ impl App {
         let ws = self.widescreen();
         // the dll's SetMode cells (`camera::set_mode`) for the window as it is now — the
         // default half-angle `[0x10006080]` SetSlotView stores (0x46584F) and the aspect 0x466F30 takes
-        if let Some(r) = self.renderer.as_ref() {
+        if !audio && let Some(r) = self.renderer.as_ref() {
             let (w, h) = r.size();
             nfs_game::camera::set_mode(w, h);
         }
@@ -2010,7 +2010,10 @@ impl App {
                 self.replay_wander = (nfs_game::camera::ReplayWander::default(), key);
             }
             let plays = self.replay.stream.as_ref().is_some_and(|r| r.mode == nfs_game::replay::Mode::Playing);
+            // (the audio slot's pass leaves the wander out: it draws on the particles' RNG, which the render's
+            // pass alone may advance, and the listener's position, which the audio reads, does not move with it)
             if aimed
+                && !audio
                 && plays
                 && nfs_game::camera::ReplayWander::applies(word)
                 && let (Some(p), Some(v)) = (self.track_particles.as_mut(), self.vehicle.as_ref())
@@ -2058,7 +2061,8 @@ impl App {
         // **turns** (`[0x5B3714]`, through 0x5564A0 whose sine takes turns, `[0x5BB2C0]` = 2π), and
         // 0x539CD0 stores world → that frame in `[0x61E184]`. The 128 Hz TIMER is two of this
         // port's 64 Hz game ticks.
-        self.scene.beacon = self.track.is_night().then(|| {
+        // (the render's pass alone sets the scene's beacon)
+        let beacon = self.track.is_night().then(|| {
             let cam = self.camera.position;
             // diagnostic: `NFS_BEACON_VIEW=1` spins the beacon on the player's own car, the only
             // way to watch the sweep without a pursuit
@@ -2082,7 +2086,90 @@ impl App {
             let rot = Quat::from_mat3(&car.orientation) * Quat::from_rotation_y(turns * std::f32::consts::TAU);
             Some(Mat4::from_rotation_translation(rot, car.position).inverse())
         }).flatten();
+        if !audio {
+            self.scene.beacon = beacon;
+        }
         (view, slot_near)
+    }
+
+    /// The camera slot's state as it is now (the render's, the `App`'s own fields).
+    fn cam_slot_state(&self) -> CamSlotState {
+        CamSlotState {
+            camera: self.camera,
+            anim_cam: self.anim_cam,
+            anim_cam_counter: self.anim_cam_counter,
+            chase_offset: self.chase_offset,
+            chase_settle: self.chase_settle,
+            slot_view: self.slot_view,
+            slot_seen: self.slot_seen,
+            look_yaw: self.look_yaw,
+            look_held: self.look_held,
+            orbit: self.orbit,
+            camera_tick: self.camera_tick,
+            cam_hist: self.cam_hist.clone(),
+            flip_side: self.flip_side,
+            slot_eye: self.slot_eye,
+            replay_wander: self.replay_wander,
+            circle: self.circle,
+            tv: self.track_cameras.as_ref().map(|t| t.tv),
+        }
+    }
+
+    /// Exchanges the slot state the `App` holds with `s` (a pass runs on whichever is in the fields).
+    fn swap_cam_slot(&mut self, s: &mut CamSlotState) {
+        use std::mem::swap;
+        swap(&mut self.camera, &mut s.camera);
+        swap(&mut self.anim_cam, &mut s.anim_cam);
+        swap(&mut self.anim_cam_counter, &mut s.anim_cam_counter);
+        swap(&mut self.chase_offset, &mut s.chase_offset);
+        swap(&mut self.chase_settle, &mut s.chase_settle);
+        swap(&mut self.slot_view, &mut s.slot_view);
+        swap(&mut self.slot_seen, &mut s.slot_seen);
+        swap(&mut self.look_yaw, &mut s.look_yaw);
+        swap(&mut self.look_held, &mut s.look_held);
+        swap(&mut self.orbit, &mut s.orbit);
+        swap(&mut self.camera_tick, &mut s.camera_tick);
+        swap(&mut self.cam_hist, &mut s.cam_hist);
+        swap(&mut self.flip_side, &mut s.flip_side);
+        swap(&mut self.slot_eye, &mut s.slot_eye);
+        swap(&mut self.replay_wander, &mut s.replay_wander);
+        swap(&mut self.circle, &mut s.circle);
+        if let Some(tc) = self.track_cameras.as_mut() {
+            let theirs = s.tv.unwrap_or(tc.tv);
+            s.tv = Some(tc.tv);
+            tc.tv = theirs;
+        }
+    }
+
+    /// **The listener at the audio update's tick.** The original steps the camera slot in the `Sc64` table
+    /// (0x463C30, `GameTick` 0x4150C8) on every tick, and the odd tick's audio update 0x4A8120 (0x4150E3)
+    /// comes after it in the same tick: its 0x4654A0 (0x4A8150) copies the slot's eye `+0x24` (0x627EA4) into
+    /// the listener `[0x655E50]`, so the listener is the slot as that tick's step left it, and the car it
+    /// follows is that tick's. The port steps the render's slot once per drawn frame, the frames' ticks one
+    /// after the other (`camera_pass`); the audio read the last drawn frame's camera, a frame or more behind.
+    /// This runs the same pass on a second copy of the slot ([`App::audio_cam`]), once per audio update, over
+    /// the ticks since the last one (the history it keeps, `CamSlotState::cam_hist`, is pushed by `simulate`),
+    /// at the tick's own pose (alpha 1, no frame interpolation: the original draws that pose, PORT-DEVIATION
+    /// D8) and with no side effect on the render's slot, the scene or the particles' RNG. Returns the listener's
+    /// eye and aim point; the render's camera is unchanged. Called inside `simulate`, before the tick count.
+    pub(crate) fn audio_listener_pass(&mut self) -> Option<(Vec3, Vec3)> {
+        // the pose of the tick just simulated (`simulate` tags it with the count after the tick)
+        let h = *self.cam_hist.back().filter(|h| h.tick == self.tick + 1)?;
+        self.vehicle.as_ref()?;
+        let mut slot = match self.audio_cam.take() {
+            Some(s) => s,
+            None => Box::new(self.cam_slot_state()),
+        };
+        let rear_view = (self.input.held(Action::RearView) || nfs_game::config::cfg().nfs_lookback.as_str().is_some()) && self.vehicle.is_some();
+        self.swap_cam_slot(&mut slot);
+        // `camera_pass` counts the ticks done: the update of this tick is the one that brings the count to `tick + 1`
+        self.tick += 1;
+        self.camera_pass(h.pos, h.rot, rear_view, true);
+        self.tick -= 1;
+        let out = (self.camera.position, self.camera.target);
+        self.swap_cam_slot(&mut slot);
+        self.audio_cam = Some(slot);
+        Some(out)
     }
 }
 

@@ -203,7 +203,7 @@ impl LayoutScreen {
     /// so, unlike 0x4CCDB5's commit, the box **keeps its focus** and the line is taken whatever it
     /// holds, an empty one included. Answers the text when `index` is a chat input box.
     pub fn take_chat(&mut self, index: usize) -> Option<String> {
-        (self.layout.elements.get(index)?.class == "NFS5.CHATINPUTBOX").then_some(())?;
+        (*self.classes.get(index)? == WidgetClass::ChatInputBox).then_some(())?;
         Some(self.edits.remove(&index).unwrap_or_default())
     }
 
@@ -241,7 +241,7 @@ impl LayoutScreen {
     pub fn focused_binding_row(&self) -> Option<(usize, String)> {
         for &i in &self.focused {
             if let Some(e) = self.layout.elements.get(i)
-                && e.class == "NFS5.CONTROLLERSETUP"
+                && self.classes[i] == WidgetClass::ControllerSetup
             {
                 return Some((i, e.get("accessor").unwrap_or_default().to_string()));
             }

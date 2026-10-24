@@ -1,13 +1,23 @@
-//! The race-set-up state (`Menu`, `fe.menu`) the front end's game-setup screens and the
+//! The race-set-up state (`FeCatalogues`, `fe.menu`) the front end's game-setup screens and the
 //! developer text menu (`debug_menu.rs`) share.
 
 use crate::*;
 
+/// The developer text menu's own state (`--debug-menu`, `debug_menu.rs`): the cursor row and the knockout series status line.
+/// Nothing else reads them; they ride in [`FeCatalogues`] because the text menu draws and edits that one value, and
+/// [`FeCatalogues::race_template`] carries them over to the copy kept aside during a race.
+#[derive(Clone)]
+pub(crate) struct DebugMenuState {
+    /// knockout series status line
+    pub(crate) knockout_line: String,
+    pub(crate) row: u8,
+}
+
 /// The front end's race set-up: the catalogue lists the layout screens' accessors index (`tracks`,
 /// `looped`, `cars`, `cars2`, the knockout table) and the selections and options on them, which a
 /// launch reads (`race_setup.rs`). Its name is the M7 text menu's, which still draws and edits it
-/// behind `--debug-menu` (`debug_menu.rs`, with `row`, `mode` and `knockout_line`).
-pub(crate) struct Menu {
+/// behind `--debug-menu` (`debug_menu.rs`: `debug`, and `mode`, also `NFS_MENU_MODE`, which the launches read too).
+pub(crate) struct FeCatalogues {
     /// 0 = quick race, 1 = evolution (career)
     pub(crate) mode: u8,
     /// `[0x691D04]`, the list every `Track<n>.Track` indexes — built by 0x4FBC10
@@ -106,20 +116,19 @@ pub(crate) struct Menu {
     pub(crate) mirror: bool,
     /// circuit tracks (`nfs5.trk +0x6E`), the only ones a Quick Knockout may use (`LoopedTrack`)
     pub(crate) circuits: Vec<String>,
-    /// `LoopedTrack.Track`'s own selection, an index into [`Menu::looped_tracks`]
+    /// `LoopedTrack.Track`'s own selection, an index into [`FeCatalogues::looped_tracks`]
     pub(crate) looped_idx: usize,
-    /// knockout series status line
-    pub(crate) knockout_line: String,
-    pub(crate) row: u8,
+    /// the developer text menu's own state (`--debug-menu`): its cursor row and status line
+    pub(crate) debug: DebugMenuState,
     pub(crate) font: Option<BitmapFont>,
 }
 
-impl Menu {
+impl FeCatalogues {
     /// The text menu's copy of itself, kept aside while its race runs (`fe.menu_template`, handed
     /// back by `leave_race`): every field cloned, the font **moved** out of this one.
-    pub(crate) fn race_template(&mut self) -> Menu {
+    pub(crate) fn race_template(&mut self) -> FeCatalogues {
         let m = self;
-        Menu {
+        FeCatalogues {
             mode: m.mode,
             tracks: m.tracks.clone(),
             looped: m.looped.clone(),
@@ -147,8 +156,7 @@ impl Menu {
             mirror: m.mirror,
             circuits: m.circuits.clone(),
             looped_idx: m.looped_idx,
-            knockout_line: m.knockout_line.clone(),
-            row: m.row,
+            debug: m.debug.clone(),
             font: m.font.take(),
         }
     }
@@ -185,7 +193,7 @@ impl Menu {
 
     /// Rebuild `cars` (`[0x6919EC]`, see the field doc and [`generic_car_list`]) from the full
     /// `catalog` for the current `game_type`. Out-of-range `car_idx`/`car_garage` selections are
-    /// left to [`Menu::car`]'s own clamp (0x4F3070…0x4F308B, matched) — the same shape as
+    /// left to [`FeCatalogues::car`]'s own clamp (0x4F3070…0x4F308B, matched) — the same shape as
     /// `set_cars2` below.
     pub(crate) fn set_cars(&mut self, catalog: &[nfs_formats::fedata::CarCatalogEntry], game_type: u8) {
         self.cars = generic_car_list(catalog, game_type);

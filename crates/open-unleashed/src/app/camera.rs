@@ -199,6 +199,7 @@ impl App {
         self.look_yaw = None;
         self.orbit = Orbit::default();
         self.camera_tick = 0;
+        self.audio_cam = None;
         self.cam_hist.clear();
         self.flip_side = None;
         self.slot_eye = None;
@@ -207,6 +208,30 @@ impl App {
         self.circle = (nfs_game::camera::CircleCam::default(), 0xFFFF, 0);
         self.cam_slice = None;
     }
+}
+
+/// Everything one pass of the camera slot (`App::camera_pass`) reads from the last and leaves for the
+/// next: the state of one slot. The render's slot is the `App`'s own fields; the audio update's copy
+/// ([`App::audio_cam`]) is swapped in for its pass ([`App::swap_cam_slot`]).
+#[derive(Debug, Clone)]
+pub(crate) struct CamSlotState {
+    pub(crate) camera: Camera,
+    pub(crate) anim_cam: AnimCamSlot,
+    pub(crate) anim_cam_counter: u32,
+    pub(crate) chase_offset: Option<(Vec3, u16)>,
+    pub(crate) chase_settle: u8,
+    pub(crate) slot_view: Option<u16>,
+    pub(crate) slot_seen: (u32, u32),
+    pub(crate) look_yaw: Option<(i16, u16, bool)>,
+    pub(crate) look_held: [bool; 3],
+    pub(crate) orbit: Orbit,
+    pub(crate) camera_tick: u64,
+    pub(crate) cam_hist: std::collections::VecDeque<CamTick>,
+    pub(crate) flip_side: Option<bool>,
+    pub(crate) slot_eye: Option<Vec3>,
+    pub(crate) replay_wander: (nfs_game::camera::ReplayWander, (u16, u16, u32)),
+    pub(crate) circle: (nfs_game::camera::CircleCam, u16, u32),
+    pub(crate) tv: Option<nfs_game::cameras::TvSlot>,
 }
 
 /// Slot 0's `AnimCam` state: the view `+0xA8` on 0x0E and the player in `+0x0C`.

@@ -103,3 +103,45 @@ fn physics_step_reads_the_kept_speed_estimate_not_the_velocity() {
         "must not match {wrong}, the value a recompute from velocity would give"
     );
 }
+
+/// PA-TRACE item 7 (2026-10-24). A tick with every wheel off the ground leaves the wheels' `+0x90` / `+0x98`
+/// as they were (0x49F70D…0x49F73F zero only `car+0xD4C…`, the `+0xB8` slips and `+0x870…`; the clear of
+/// the forces, 0x49F85B…0x49F88E, sits on the contact path) — the original's s1 trace at tick 1026.
+#[test]
+fn a_fully_airborne_tick_keeps_the_wheel_forces() {
+    let specs = super::tests::specs_993();
+    let mut v = Vehicle::bare(Vec3::ZERO, Mat3::IDENTITY, specs.wheelbase, 1300.0, 0.8, 0.3);
+    v.body_height = 1.0;
+    for w in &mut v.wheels {
+        w.airborne = true;
+        w.lateral = -0.25;
+        w.longitudinal = 2.5;
+        w.slip = 0.7;
+    }
+    v.physics_step(&specs);
+    for w in &v.wheels {
+        assert_eq!((w.lateral, w.longitudinal), (-0.25, 2.5));
+        assert_eq!(w.slip, 0.0);
+    }
+}
+
+/// PA-TRACE item 7: `Tyre` rotates a steered wheel's slip velocity `+0x9C` / `+0xA4` into the wheel frame **in place**
+/// (0x4A2159…), so the stored pair is the rotated one afterwards.
+#[test]
+fn a_steered_wheel_keeps_its_slip_velocity_rotated() {
+    let specs = super::tests::specs_993();
+    let mut v = Vehicle::bare(Vec3::ZERO, Mat3::IDENTITY, specs.wheelbase, 1300.0, 0.8, 0.3);
+    v.wheels[0].steer = 3.0;
+    v.wheels[0].slip_vel = [1.0, 0.0, -10.0];
+    v.wheels[0].limit = 8.0;
+    v.tyre(0, &specs, 0.0);
+    let a = steer_angle_256(specs.max_steer, 3.0) / 256.0 * std::f32::consts::TAU;
+    let (s, c) = (a.sin(), a.cos());
+    assert!((v.wheels[0].slip_vel[0] - (1.0 * c - -10.0 * s)).abs() < 1e-4, "{:?}", v.wheels[0].slip_vel);
+    assert!((v.wheels[0].slip_vel[2] - (1.0 * s + -10.0 * c)).abs() < 1e-4);
+    // a rear wheel has no steering: untouched
+    v.wheels[2].slip_vel = [1.0, 0.0, -10.0];
+    v.wheels[2].limit = 8.0;
+    v.tyre(2, &specs, 0.0);
+    assert_eq!((v.wheels[2].slip_vel[0], v.wheels[2].slip_vel[2]), (1.0, -10.0));
+}

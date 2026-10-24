@@ -2,6 +2,19 @@
 
 use crate::*;
 
+/// What [`App::load_assets`] loads: the track (`derby`: through [`App::derby_track`], which the cheat can turn into the skid pad), the
+/// car's model with its body style (`variant`, `cabrio`, the parts' style overlay — `None`: the model as it comes) and the `.sim`
+/// (`sim_default`: the empty name loads `"default"`); `failed` is the log text when one of the three is missing.
+pub(crate) struct AssetRequest<'a> {
+    pub(crate) track: &'a str,
+    pub(crate) derby: bool,
+    pub(crate) model: &'a str,
+    pub(crate) style: Option<(i16, bool, Vec<[i16; 3]>)>,
+    pub(crate) sim: &'a str,
+    pub(crate) sim_default: bool,
+    pub(crate) failed: &'static str,
+}
+
 impl App {
     /// Start the race the front end's own settings describe (the same path the text menu takes).
     /// The "evenstvn" name-box code, cheat bit 3: the launch's per-car routine 0x4EEDA0 sends every
@@ -31,6 +44,38 @@ impl App {
         }
         self.quick_knockout = true;
         "skidpad".to_string()
+    }
+
+    /// **The track, the car and its `.sim`, loaded in the order every launch path loads them** (the track through
+    /// [`App::derby_track`] when `derby`, then the car's model with its body style, then the `.sim`), logging
+    /// the three results under `failed` when any of them is missing: `None` then. `derby_track` is the only
+    /// write to `self`.
+    pub(crate) fn load_assets(&mut self, req: AssetRequest<'_>) -> Option<(TrackAssets, CarAssets, nfs_formats::sim::CarSim)> {
+        let track = if req.derby { let derby = self.derby_track(req.track); TrackAssets::load(&self.paths, &derby) } else { TrackAssets::load(&self.paths, req.track) };
+        let car = CarAssets::load(&self.paths, req.model).map(|c| match req.style {
+            Some((variant, cabrio, overlay)) => c.with_style(variant).with_cabrio(cabrio).with_style_overlay(overlay),
+            None => c,
+        });
+        let sim = CarAssets::load_sim(&self.paths, if req.sim_default && req.sim.is_empty() { "default" } else { req.sim });
+        match (track, car, sim) {
+            (Ok(t), Ok(c), Ok(sim)) => Some((t, c, sim)),
+            (t, c, s) => {
+                tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "{}", req.failed);
+                None
+            }
+        }
+    }
+
+    /// The tail every launch path ends on: the renderer and the window go to [`App::start_race`] (the clock at 0). The
+    /// launch is called from the event loop with both in `self`; without them (a bug elsewhere) it logs and stops
+    /// where it used to panic on an `unwrap`.
+    pub(crate) fn hand_over_to_race(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else {
+            tracing::error!("race launch without a renderer / window");
+            return;
+        };
+        self.tick = 0;
+        self.start_race(renderer, window, event_loop);
     }
 
     /// A test drive, `Game.GameType` 6 / 7 / 8. The car is 0x4EB710's per type — 6 a new
@@ -133,53 +178,44 @@ impl App {
         // 0x4D52EA: the launch saves the profile once the start check said yes
         self.launch_save();
         tracing::info!(track = track_name, car = car.model, game_type, "front end: test drive");
-        match (
-            { let derby = self.derby_track(&track_name); TrackAssets::load(&self.paths, &derby) },
-            CarAssets::load(&self.paths, &car.model).map(|c| c.with_style(car.variant).with_cabrio(car.cabrio).with_style_overlay(swaps.clone())),
-            CarAssets::load_sim(&self.paths, if car.sim.is_empty() { "default" } else { &car.sim }),
-        ) {
-            (Ok(t), Ok(c), Ok(sim)) => {
-                self.track = t;
-                self.car = c;
-                let race_class = car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
-                self.specs = CarSpecs::from_sim(&sim, race_class);
-                // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
-                if self.cheat_bits & CHEAT_TINY != 0 {
-                    self.specs.apply_tinycar();
-                }
-                // a record car brings its parts, their wear and its setup, as a career race does
-                if let (Some(o), Some(cu)) = (owned.as_ref(), self.career.as_ref()) {
-                    let parts: Vec<&nfs_formats::career::Part> = o.parts.iter().filter_map(|id| cu.tables.parts.iter().find(|p| p.id == *id)).collect();
-                    self.specs.apply_parts(&parts, &car.sim_family);
-                    self.specs.parts = nfs_game::career::installed_parts(&parts, Some(o));
-                    self.specs.apply_setup(&o.setup, self.player_automatic());
-                } else {
-                    // no owned/career state: a freshly built catalogue car — its stock parts
-                    // (0x4EE9A0) and the constructor's neutral sliders (0x4EED2D) through 0x49CB50
-                    let table = self.fe_parts_table();
-                    let automatic = self.player_automatic();
-                    nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
-                }
-                self.snd.sound_set = car.sound_set.clone();
-                self.sim_name = car.sim.clone();
-                self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
-                self.fe.test_drive = Some((game_type, owned));
-                // `prerace`'s 0x5060D0 and `VictoryRoom`'s 0x506C70 write `Game.GameType` (5, 11);
-                // 6…8 are the override `[0x5DC1C0]` the launch reads (0x50C110) — whether the
-                // front end's own value keeps them afterwards is not read, so it is left alone
-                if matches!(game_type, game_type::TOURNAMENT_TEST_DRIVE | game_type::FINALE_TEST_DRIVE) {
-                    self.fe.game_type = game_type;
-                }
-                self.fe.race_game_type = Some(game_type);
-                self.fe.menu_template = self.fe.menu.take();
-                self.fe.layout_preview = None;
-                self.fe.layout_name = None;
-                let (renderer, window) = (self.renderer.take().unwrap(), self.window.take().unwrap());
-                self.tick = 0;
-                self.start_race(renderer, window, event_loop);
-            }
-            (t, c, s) => tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "test drive load failed"),
+        let req = AssetRequest { track: &track_name, derby: true, model: &car.model, style: Some((car.variant, car.cabrio, swaps.clone())), sim: &car.sim, sim_default: true, failed: "test drive load failed" };
+        let Some((t, c, sim)) = self.load_assets(req) else { return };
+        self.track = t;
+        self.car = c;
+        let race_class = car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
+        self.specs = CarSpecs::from_sim(&sim, race_class);
+        // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
+        if self.cheat_bits & CHEAT_TINY != 0 {
+            self.specs.apply_tinycar();
         }
+        // a record car brings its parts, their wear and its setup, as a career race does
+        if let (Some(o), Some(cu)) = (owned.as_ref(), self.career.as_ref()) {
+            let parts: Vec<&nfs_formats::career::Part> = o.parts.iter().filter_map(|id| cu.tables.parts.iter().find(|p| p.id == *id)).collect();
+            self.specs.apply_parts(&parts, &car.sim_family);
+            self.specs.parts = nfs_game::career::installed_parts(&parts, Some(o));
+            self.specs.apply_setup(&o.setup, self.player_automatic());
+        } else {
+            // no owned/career state: a freshly built catalogue car — its stock parts
+            // (0x4EE9A0) and the constructor's neutral sliders (0x4EED2D) through 0x49CB50
+            let table = self.fe_parts_table();
+            let automatic = self.player_automatic();
+            nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
+        }
+        self.snd.sound_set = car.sound_set.clone();
+        self.sim_name = car.sim.clone();
+        self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
+        self.fe.test_drive = Some((game_type, owned));
+        // `prerace`'s 0x5060D0 and `VictoryRoom`'s 0x506C70 write `Game.GameType` (5, 11);
+        // 6…8 are the override `[0x5DC1C0]` the launch reads (0x50C110) — whether the
+        // front end's own value keeps them afterwards is not read, so it is left alone
+        if matches!(game_type, game_type::TOURNAMENT_TEST_DRIVE | game_type::FINALE_TEST_DRIVE) {
+            self.fe.game_type = game_type;
+        }
+        self.fe.race_game_type = Some(game_type);
+        self.fe.menu_template = self.fe.menu.take();
+        self.fe.layout_preview = None;
+        self.fe.layout_name = None;
+        self.hand_over_to_race(event_loop);
     }
 
     /// The player's car-info record as the launch left it (`.TYPE`, the paint, the installed parts and their wear, the
@@ -218,87 +254,76 @@ impl App {
         let car = self.cheat_993(req.car.clone());
         self.mission = req.mission.clone().map(cone_limit_diagnostic);
         self.skill = None;
-        match (
-            { let derby = self.derby_track(&req.track_file); TrackAssets::load(&self.paths, &derby) },
-            CarAssets::load(&self.paths, &car.model).map(|c| {
-                c.with_style(car.variant)
-                    .with_cabrio(car.cabrio)
-                    .with_style_overlay(req.parts.iter().flat_map(|p| p.geometry_swaps.iter().copied()).collect())
-            }),
-            CarAssets::load_sim(&self.paths, &car.sim),
-        ) {
-            (Ok(mut t), Ok(c), Ok(sim)) => {
-                if let Some(ms) = &req.mission
-                    && let Some(suffix) = &ms.scene_suffix
-                {
-                    match t.load_scene(suffix) {
-                        Ok(Some(scene)) => {
-                            self.skill = Some(SkillTest::from_scene(&scene, &t.name));
-                            t.extra_scenes.push(scene);
-                        }
-                        other => {
-                            tracing::error!(suffix, result = ?other.err(), "skill-test scene missing")
-                        }
-                    }
-                }
-                self.track = t;
-                self.car = c;
-                let race_class =
-                    car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
-                self.specs = CarSpecs::from_sim(&sim, race_class);
-                // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
-                if self.cheat_bits & CHEAT_TINY != 0 {
-                    self.specs.apply_tinycar();
-                }
-                // the purchased parts, then the setup sliders — the order 0x49CB50 runs
-                // them in, and both of them before anything reads the block
-                // A car with no garage record behind it and no parts of its own (the era finale's
-                // loaned prize car) is a freshly built `FECar`: its stock parts (0x4EE9A0) and the
-                // neutral sliders (0x4EED2D) go through 0x49CB50 — `fold_fresh_car`.
-                let fresh_stock = req.parts.is_empty()
-                    && self.career.as_ref().is_some_and(|cu| cu.pending.as_ref().is_none_or(|p| p.garage_idx.is_none()));
-                let grip_ratio = if fresh_stock {
-                    0.0
-                } else {
-                    self.specs.apply_parts(&req.parts.iter().collect::<Vec<_>>(), &car.sim_family)
-                };
-                tracing::debug!(parts = req.parts.len(), grip_ratio, "parts applied");
-                if fresh_stock {
-                    let table = self.fe_parts_table();
-                    let automatic = self.player_automatic();
-                    nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
-                } else if let Some(cu) = &self.career {
-                    // the installed-part list `car+0x768` the damage getters walk, each part
-                    // with its own zone mask and the damage it carries from earlier races
-                    let owned = cu
-                        .pending
-                        .as_ref()
-                        .and_then(|p| p.garage_idx)
-                        .and_then(|i| cu.career.garage.get(i));
-                    self.specs.parts = nfs_game::career::installed_parts(
-                        &req.parts.iter().collect::<Vec<_>>(),
-                        owned,
-                    );
-                    // …and the car-setup screen's seventeen sliders reach the block
-                    // here, as 0x49D290 folds them in out of the per-player record — the owned
-                    // car's own, else the constructor's neutral ones (a mission's car is a fresh
-                    // `FECar`, 0x4EED2D). `automatic` is `carinfo+0xC`, the manual ×1.05 of 0x49D733
-                    self.specs.apply_setup(owned.map_or(&nfs_game::career::CAR_SETUP_DEFAULT, |o| &o.setup), self.player_automatic());
-                }
-                self.snd.sound_set = car.sound_set.clone();
-                self.sim_name = car.sim.clone();
-                self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
-                true
+        let overlay = req.parts.iter().flat_map(|p| p.geometry_swaps.iter().copied()).collect();
+        let asset_req = AssetRequest { track: &req.track_file, derby: true, model: &car.model, style: Some((car.variant, car.cabrio, overlay)), sim: &car.sim, sim_default: false, failed: "career event load failed" };
+        let Some((mut t, c, sim)) = self.load_assets(asset_req) else {
+            if let Some(cu) = self.career.as_mut() {
+                cu.pending = None;
             }
-            (t, c, s) => {
-                tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "career event load failed");
-                if let Some(cu) = self.career.as_mut() {
-                    cu.pending = None;
+            self.career_opponents = None;
+            return false;
+        };
+        if let Some(ms) = &req.mission
+            && let Some(suffix) = &ms.scene_suffix
+        {
+            match t.load_scene(suffix) {
+                Ok(Some(scene)) => {
+                    self.skill = Some(SkillTest::from_scene(&scene, &t.name));
+                    t.extra_scenes.push(scene);
                 }
-                self.career_opponents = None;
-                false
+                other => {
+                    tracing::error!(suffix, result = ?other.err(), "skill-test scene missing")
+                }
             }
         }
+        self.track = t;
+        self.car = c;
+        let race_class =
+            car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
+        self.specs = CarSpecs::from_sim(&sim, race_class);
+        // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
+        if self.cheat_bits & CHEAT_TINY != 0 {
+            self.specs.apply_tinycar();
+        }
+        // the purchased parts, then the setup sliders — the order 0x49CB50 runs
+        // them in, and both of them before anything reads the block
+        // A car with no garage record behind it and no parts of its own (the era finale's
+        // loaned prize car) is a freshly built `FECar`: its stock parts (0x4EE9A0) and the
+        // neutral sliders (0x4EED2D) go through 0x49CB50 — `fold_fresh_car`.
+        let fresh_stock = req.parts.is_empty()
+            && self.career.as_ref().is_some_and(|cu| cu.pending.as_ref().is_none_or(|p| p.garage_idx.is_none()));
+        let grip_ratio = if fresh_stock {
+            0.0
+        } else {
+            self.specs.apply_parts(&req.parts.iter().collect::<Vec<_>>(), &car.sim_family)
+        };
+        tracing::debug!(parts = req.parts.len(), grip_ratio, "parts applied");
+        if fresh_stock {
+            let table = self.fe_parts_table();
+            let automatic = self.player_automatic();
+            nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
+        } else if let Some(cu) = &self.career {
+            // the installed-part list `car+0x768` the damage getters walk, each part
+            // with its own zone mask and the damage it carries from earlier races
+            let owned = cu
+                .pending
+                .as_ref()
+                .and_then(|p| p.garage_idx)
+                .and_then(|i| cu.career.garage.get(i));
+            self.specs.parts = nfs_game::career::installed_parts(
+                &req.parts.iter().collect::<Vec<_>>(),
+                owned,
+            );
+            // …and the car-setup screen's seventeen sliders reach the block
+            // here, as 0x49D290 folds them in out of the per-player record — the owned
+            // car's own, else the constructor's neutral ones (a mission's car is a fresh
+            // `FECar`, 0x4EED2D). `automatic` is `carinfo+0xC`, the manual ×1.05 of 0x49D733
+            self.specs.apply_setup(owned.map_or(&nfs_game::career::CAR_SETUP_DEFAULT, |o| &o.setup), self.player_automatic());
+        }
+        self.snd.sound_set = car.sound_set.clone();
+        self.sim_name = car.sim.clone();
+        self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
+        true
     }
 
     /// **`PLAYGAME` for `Game.GameType` 4 on the layout front end** (`prerace.lay`,
@@ -582,126 +607,107 @@ impl App {
         .filter(|(parts, _)| !parts.is_empty());
         let swaps: Vec<[i16; 3]> = garage.iter().flat_map(|(parts, _)| parts.iter().flat_map(|p| p.geometry_swaps.iter().copied())).collect();
         tracing::info!(track = track_name, car = car.model, "front end: start race");
-        match (
-            { let derby = self.derby_track(&track_name); TrackAssets::load(&self.paths, &derby) },
-            CarAssets::load(&self.paths, &car.model).map(|c| c.with_style(car.variant).with_cabrio(car.cabrio).with_style_overlay(swaps.clone())),
-            CarAssets::load_sim(
-                &self.paths,
-                if car.sim.is_empty() {
-                    "default"
-                } else {
-                    &car.sim
-                },
-            ),
-        ) {
-            (Ok(t), Ok(c), Ok(sim)) => {
-                self.track = t;
-                self.car = c;
-                let race_class =
-                    car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
-                self.specs = CarSpecs::from_sim(&sim, race_class);
-                // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
-                if self.cheat_bits & CHEAT_TINY != 0 {
-                    self.specs.apply_tinycar();
-                }
-                // the garage car's parts, then its sliders — 0x49CB50's order (`loaders.md` §1.3,
-                // `physics.md` §3a), both before anything reads the block
-                if let Some((parts, setup)) = &garage {
-                    let refs: Vec<&nfs_formats::career::Part> = parts.iter().collect();
-                    let before = (self.specs.top_speed, self.specs.final_drive, self.specs.grip, self.specs.gear_ratio[2]);
-                    let grip_ratio = self.specs.apply_parts(&refs, &car.sim_family);
-                    self.specs.parts = nfs_game::career::layout_race_parts(&refs);
-                    self.specs.apply_setup(setup, self.player_automatic());
-                    tracing::info!(
-                        parts = ?parts.iter().map(|p| p.id).collect::<Vec<_>>(), grip_ratio,
-                        setup = ?setup.map(|v| (v * 100.0).round() / 100.0),
-                        top_speed_before = before.0, final_drive_before = before.1, grip_before = before.2, first_gear_before = before.3,
-                        top_speed = self.specs.top_speed, final_drive = self.specs.final_drive, grip = self.specs.grip,
-                        first_gear = self.specs.gear_ratio[2],
-                        "layout race: the garage car's installed parts and set-up applied (0x4EEDA0 kind 1, 0x49CB50)"
-                    );
-                }
-                // **A network race's own catalogue car goes through the fold every other machine puts its
-                // copy through.** 0x49CB50 folds the car's parts and its `carinfo` set-up into the block for
-                // every car of the race, the player's included; the seat build in `start_race` does it from the
-                // record the owner sent, and this is that build for the owner's own copy — from the record it
-                // sent (`launch.cars` at its own index). Two machines then race one set of numbers per car,
-                // which the input exchange needs (`network.md` §11.17). A single-player race's catalogue car takes
-                // the same fold from the neutral record (the `else if` below, §11.12c); a garage car took its own above.
-                if garage.is_none()
-                    && let Some(n) = self.net.session.as_ref()
-                    && n.in_race != 0
-                    && let Some(idx) = n.local_race_index()
-                    && let Some(rec) = n.launch.cars.get(&idx).cloned()
-                {
-                    use nfs_net::launchcar::id as cid;
-                    let parts_table = self.fe_parts_table();
-                    let before = (self.specs.grip, self.specs.transfer_div, self.specs.roll_gain);
-                    // the same single fold the seat build makes of a record (`start_race`'s `fold_list`): the
-                    // record's `.PARTINDEX` when it is not the car's stock list, else the stock list itself
-                    let ids: Vec<i16> = rec.parts().into_iter().map(|p| p as i16).collect();
-                    if !ids.is_empty() && ids != car.stock_parts {
-                        let owned: Vec<&nfs_formats::career::Part> = ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect();
-                        self.specs.apply_parts(&owned, &car.sim_family);
-                        self.specs.parts = nfs_game::career::installed_parts(&owned, None);
-                    } else {
-                        let stock: Vec<&nfs_formats::career::Part> = car.stock_parts.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect();
-                        self.specs.apply_parts(&stock, &car.sim_family);
-                        self.specs.parts = nfs_physics::specs::stock_parts(&car.stock_parts, &parts_table);
-                    }
-                    let automatic = rec.num(cid::TRANSMISSION).is_none_or(|v| v == 1);
-                    if let Some(setup) = rec.setup() {
-                        self.specs.apply_setup(&setup, automatic);
-                    }
-                    tracing::info!(
-                        target: "netplay", grip_before = before.0, grip = self.specs.grip, transfer_div_before = before.1, transfer_div = self.specs.transfer_div,
-                        roll_gain_before = before.2, roll_gain = self.specs.roll_gain,
-                        "network race: the player's own car folded from its own record, as its copies on the other machines are (0x49CB50)"
-                    );
-                } else if garage.is_none() {
-                    // **A single-player layout race's catalogue car** (QuickRace, Knockout, a series'
-                    // round): 0x4EB710's default arm builds a fresh `FECar` from the record (0x4EE3B0),
-                    // so it carries the stock parts (0x4EE9A0) and the neutral sliders (0x4EED2D),
-                    // and 0x49CB50 folds both — `network.md` §11.12b.
-                    let table = self.fe_parts_table();
-                    let before = (self.specs.grip, self.specs.transfer_div, self.specs.roll_gain);
-                    let automatic = self.player_automatic();
-                    nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
-                    tracing::info!(
-                        grip_before = before.0, grip = self.specs.grip, transfer_div_before = before.1, transfer_div = self.specs.transfer_div,
-                        roll_gain_before = before.2, roll_gain = self.specs.roll_gain,
-                        "layout race: the catalogue car's stock parts and neutral set-up folded (0x4EE9A0, 0x4EED2D, 0x49CB50)"
-                    );
-                }
-                self.snd.sound_set = car.sound_set.clone();
-                self.sim_name = car.sim.clone();
-                self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
-                // the join screen's destructor 0x50A260 runs as the race takes over
-                if self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("joingame")) {
-                    self.net_join_screen_gone();
-                }
-                self.fe.layout_preview = None;
-                self.fe.layout_name = None;
-                // kept for the way back, as the other launches keep it: without it neither the
-                // pause menu's quit (`leave_race`) nor the last results page had a front end to
-                // return to, and the quit closed the program
-                self.fe.menu_template = self.fe.menu.take();
-                // the race's `FEGAME_TYPE [0x6573E8]` is `Game.GameType`, which the `SETTYPE*` button
-                // wrote on the way in (0 quick race, 1 quick knockout, 2 knockout, 3 multiplayer …);
-                // a direct `--fe=peertopeerip` / `--fe=udpip` entry never passed that button (test glue),
-                // so a race with an established link says 3 itself. *(The 2026-09-30 change wrote
-                // 3 for every layout race — a quick race's P then took the network rule 0x415110 and left.)*
-                let net_link = self.net.session.as_ref().is_some_and(|n| n.established());
-                self.fe.race_game_type = Some(if net_link { game_type::NETWORK } else { self.fe.game_type });
-                let (renderer, window) =
-                    (self.renderer.take().unwrap(), self.window.take().unwrap());
-                self.tick = 0;
-                self.start_race(renderer, window, event_loop);
-            }
-            (t, c, s) => {
-                tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "load failed")
-            }
+        let req = AssetRequest { track: &track_name, derby: true, model: &car.model, style: Some((car.variant, car.cabrio, swaps.clone())), sim: &car.sim, sim_default: true, failed: "load failed" };
+        let Some((t, c, sim)) = self.load_assets(req) else { return };
+        self.track = t;
+        self.car = c;
+        let race_class =
+            car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
+        self.specs = CarSpecs::from_sim(&sim, race_class);
+        // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
+        if self.cheat_bits & CHEAT_TINY != 0 {
+            self.specs.apply_tinycar();
         }
+        // the garage car's parts, then its sliders — 0x49CB50's order (`loaders.md` §1.3,
+        // `physics.md` §3a), both before anything reads the block
+        if let Some((parts, setup)) = &garage {
+            let refs: Vec<&nfs_formats::career::Part> = parts.iter().collect();
+            let before = (self.specs.top_speed, self.specs.final_drive, self.specs.grip, self.specs.gear_ratio[2]);
+            let grip_ratio = self.specs.apply_parts(&refs, &car.sim_family);
+            self.specs.parts = nfs_game::career::layout_race_parts(&refs);
+            self.specs.apply_setup(setup, self.player_automatic());
+            tracing::info!(
+                parts = ?parts.iter().map(|p| p.id).collect::<Vec<_>>(), grip_ratio,
+                setup = ?setup.map(|v| (v * 100.0).round() / 100.0),
+                top_speed_before = before.0, final_drive_before = before.1, grip_before = before.2, first_gear_before = before.3,
+                top_speed = self.specs.top_speed, final_drive = self.specs.final_drive, grip = self.specs.grip,
+                first_gear = self.specs.gear_ratio[2],
+                "layout race: the garage car's installed parts and set-up applied (0x4EEDA0 kind 1, 0x49CB50)"
+            );
+        }
+        // **A network race's own catalogue car goes through the fold every other machine puts its
+        // copy through.** 0x49CB50 folds the car's parts and its `carinfo` set-up into the block for
+        // every car of the race, the player's included; the seat build in `start_race` does it from the
+        // record the owner sent, and this is that build for the owner's own copy — from the record it
+        // sent (`launch.cars` at its own index). Two machines then race one set of numbers per car,
+        // which the input exchange needs (`network.md` §11.17). A single-player race's catalogue car takes
+        // the same fold from the neutral record (the `else if` below, §11.12c); a garage car took its own above.
+        if garage.is_none()
+            && let Some(n) = self.net.session.as_ref()
+            && n.in_race != 0
+            && let Some(idx) = n.local_race_index()
+            && let Some(rec) = n.launch.cars.get(&idx).cloned()
+        {
+            use nfs_net::launchcar::id as cid;
+            let parts_table = self.fe_parts_table();
+            let before = (self.specs.grip, self.specs.transfer_div, self.specs.roll_gain);
+            // the same single fold the seat build makes of a record (`start_race`'s `fold_list`): the
+            // record's `.PARTINDEX` when it is not the car's stock list, else the stock list itself
+            let ids: Vec<i16> = rec.parts().into_iter().map(|p| p as i16).collect();
+            if !ids.is_empty() && ids != car.stock_parts {
+                let owned: Vec<&nfs_formats::career::Part> = ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect();
+                self.specs.apply_parts(&owned, &car.sim_family);
+                self.specs.parts = nfs_game::career::installed_parts(&owned, None);
+            } else {
+                let stock: Vec<&nfs_formats::career::Part> = car.stock_parts.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect();
+                self.specs.apply_parts(&stock, &car.sim_family);
+                self.specs.parts = nfs_physics::specs::stock_parts(&car.stock_parts, &parts_table);
+            }
+            let automatic = rec.num(cid::TRANSMISSION).is_none_or(|v| v == 1);
+            if let Some(setup) = rec.setup() {
+                self.specs.apply_setup(&setup, automatic);
+            }
+            tracing::info!(
+                target: "netplay", grip_before = before.0, grip = self.specs.grip, transfer_div_before = before.1, transfer_div = self.specs.transfer_div,
+                roll_gain_before = before.2, roll_gain = self.specs.roll_gain,
+                "network race: the player's own car folded from its own record, as its copies on the other machines are (0x49CB50)"
+            );
+        } else if garage.is_none() {
+            // **A single-player layout race's catalogue car** (QuickRace, Knockout, a series'
+            // round): 0x4EB710's default arm builds a fresh `FECar` from the record (0x4EE3B0),
+            // so it carries the stock parts (0x4EE9A0) and the neutral sliders (0x4EED2D),
+            // and 0x49CB50 folds both — `network.md` §11.12b.
+            let table = self.fe_parts_table();
+            let before = (self.specs.grip, self.specs.transfer_div, self.specs.roll_gain);
+            let automatic = self.player_automatic();
+            nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
+            tracing::info!(
+                grip_before = before.0, grip = self.specs.grip, transfer_div_before = before.1, transfer_div = self.specs.transfer_div,
+                roll_gain_before = before.2, roll_gain = self.specs.roll_gain,
+                "layout race: the catalogue car's stock parts and neutral set-up folded (0x4EE9A0, 0x4EED2D, 0x49CB50)"
+            );
+        }
+        self.snd.sound_set = car.sound_set.clone();
+        self.sim_name = car.sim.clone();
+        self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
+        // the join screen's destructor 0x50A260 runs as the race takes over
+        if self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("joingame")) {
+            self.net_join_screen_gone();
+        }
+        self.fe.layout_preview = None;
+        self.fe.layout_name = None;
+        // kept for the way back, as the other launches keep it: without it neither the
+        // pause menu's quit (`leave_race`) nor the last results page had a front end to
+        // return to, and the quit closed the program
+        self.fe.menu_template = self.fe.menu.take();
+        // the race's `FEGAME_TYPE [0x6573E8]` is `Game.GameType`, which the `SETTYPE*` button
+        // wrote on the way in (0 quick race, 1 quick knockout, 2 knockout, 3 multiplayer …);
+        // a direct `--fe=peertopeerip` / `--fe=udpip` entry never passed that button (test glue),
+        // so a race with an established link says 3 itself. *(The 2026-09-30 change wrote
+        // 3 for every layout race — a quick race's P then took the network rule 0x415110 and left.)*
+        let net_link = self.net.session.as_ref().is_some_and(|n| n.established());
+        self.fe.race_game_type = Some(if net_link { game_type::NETWORK } else { self.fe.game_type });
+        self.hand_over_to_race(event_loop);
     }
 
     pub(crate) fn start_race(
@@ -733,6 +739,11 @@ impl App {
         } else {
             self.career.as_ref().map(|c| c.profile.name.clone())
         };
+        // A launch with no front end (`fe = 0`) never runs the per-car set-up 0x4EEDA0 (the only writer
+        // of `.DRIVERNAME` 0x13B at 0x4EEDF1 and `.LICENSE` 0x13C at 0x4EEE7E, both from its one name
+        // argument), so the registry's own `car[0].drivername` / `car[0].license` stand: the shipped
+        // fe.txt's `driver` and `I8A4RE` (`hud.md` §5, "fe = 0 identity")
+        let name = if self.fe0 { self.registry.get("car[0].drivername").map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).or(name) } else { name };
         if let Some(name) = name {
             let automatic = self.player_automatic();
             self.specs.apply_driver_name(&name, automatic);
@@ -980,7 +991,10 @@ impl App {
         if self.fe0 && self.registry.get("car[0].colorconfig").is_some() && player_paint.exterior != self.paint {
             self.paint = player_paint.exterior;
         }
-        let mut text = self.page_text(0, &self.player_name, None);
+        // the plate is `.LICENSE` (0x13C): in a `fe = 0` launch the registry's `car[0].license`, in a
+        // front-end launch the name argument 0x4EEDA0 sends to both (0x4EEDF1 / 0x4EEE7E)
+        let plate = if self.fe0 { self.registry.get("car[0].license").map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) } else { None };
+        let mut text = self.page_text(0, plate.as_deref().unwrap_or(&self.player_name), None);
         // a garage car brings its own race number (the front end's 0x4D1800 from `DecalNum`)
         if let (Some(n), true) = (self.owned_decal, self.owned_paint.is_some_and(|p| p.exterior == self.paint)) {
             text.race_number = n as i32;
@@ -1134,6 +1148,11 @@ impl App {
         }
         self.prev_car_pos = self.car_pos;
         self.slices = table;
+        // "Loading track sounds..." 0x4AF5C0 (after `AudioLoadTrack` 0x4A88A0) warms the track-bank registry with the audio
+        // elements near slice 0's centre, before the first tick
+        if let (Some(amb), Some(s0)) = (self.snd.ambience.as_mut(), self.slices.as_ref().and_then(|t| t.slices.first())) {
+            amb.preload([s0.centre.x, s0.centre.z]);
+        }
         self.car_half_width = (car.bbox_max.x - car.bbox_min.x).abs() * 0.5;
         let mut vehicle = Vehicle::new(
             self.car_pos,

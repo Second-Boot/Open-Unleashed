@@ -514,7 +514,7 @@ impl App {
         }
     }
 
-    /// **`zMergedList.Car` at its initial index 0** (`Menu::merged_at_zero`): 0x4F4DF0's `cur < n`
+    /// **`zMergedList.Car` at its initial index 0** (`FeCatalogues::merged_at_zero`): 0x4F4DF0's `cur < n`
     /// with `cur = 0` is true exactly when list A (`OwnedCars.Car`'s list, 0x4F4DF9 `slot9`) is not
     /// empty, so with a garage the merged list is on the owned car (`гараж...`, no colour row) and
     /// without one on catalogue row 0. Re-evaluated every frame like the original's test (the

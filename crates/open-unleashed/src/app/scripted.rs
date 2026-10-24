@@ -819,10 +819,14 @@ impl App {
         // the game's own 64 Hz, so the two machines' tick counters stay comparable — the link
         // classification (0x490140) measures a packet's age against the game tick, and an unpaced
         // headless run lets one machine's tick run far ahead of the other's
-        let exchange_run = self.net.session.as_ref().is_some_and(|n| n.exchanging());
+        let exchange_run = self.net.session.as_ref().is_some_and(|n| n.clocked());
         let pace = (nfs_game::config::cfg().nfs_net_pace.is_set() && self.net.session.is_some() && !exchange_run).then(Instant::now);
         for t in 0..ticks {
             self.net_race_notice();
+            // **TEST GLUE** `NFS_NET_LOCKSTEP=<D>`: the remote cars' blocks arrive at fixed receiver ticks (`NetPlay::lockstep_wait`)
+            if let Some(n) = self.net.session.as_mut() {
+                n.lockstep_wait(self.tick);
+            }
             // an input-exchange race runs a tick when the frames and the host's clock allow it
             if exchange_run && !self.net_exchange_wait() {
                 tracing::warn!(target: "open_unleashed::app::race_start", tick = self.tick, "the input exchange stopped: the scripted run ends");

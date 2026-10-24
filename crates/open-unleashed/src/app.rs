@@ -512,6 +512,8 @@ pub(crate) struct App {
     pub(crate) blended_dyn_items: Vec<(u32, nfs_renderer::DrawItem)>,
     /// the scene build's reusable buffers (`scratch.rs`)
     pub(crate) scratch: scratch::SceneScratch,
+    /// the even tick's non-player collision events (`simulate::tick_collide_*`), kept between ticks for its capacity; empty outside the tick
+    pub(crate) ai_hits_buf: Vec<(AudioCar, nfs_audio::sfx::QueuedSfx)>,
     /// `live_order`'s last answer under the `(progress, tick)` pairs it was ranked from, and the
     /// buffer the next key is built in (`race_end.rs`)
     pub(crate) order_cache: std::cell::RefCell<Option<(Vec<u64>, Vec<usize>)>>,
@@ -624,6 +626,9 @@ pub(crate) struct App {
     /// look-around yaw, BlimpCam, CircleCam, SplineCam, 0x462B80's zoom) step once per game tick,
     /// not once per drawn frame: a frame applies `tick − camera_tick` updates.
     pub(crate) camera_tick: u64,
+    /// The camera slot as the audio update reads it: a second copy of the slot's state that
+    /// steps once per game tick up to the odd tick's audio update (`App::audio_listener_pass`).
+    pub(crate) audio_cam: Option<Box<CamSlotState>>,
     /// `[+0x18]` of the four `OwnedCar.*` colour accessors (`owned_colour_slot`), the list row each
     /// keeps beside its colour `[+0x2C]`. Built once at 0x4F1EE0 with the index 0
     /// (0x4B91F0 → 0x4BC240(0)), written only by slot 11 (0x4B92B0 → 0x4BC240) and reset to 0 when
@@ -673,7 +678,7 @@ pub(crate) struct App {
     pub(crate) snd: AudioState,
     /// `.sim` name — also the name of the car's `.spl` engine-audio parameters
     pub(crate) sim_name: String,
-    /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a command-line race, `Game.Difficutly` (`Menu::difficulty`) for a layout launch (0x4EB470), the event's in career
+    /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a command-line race, `Game.Difficutly` (`FeCatalogues::difficulty`) for a layout launch (0x4EB470), the event's in career
     pub(crate) race_skill: u8,
     pub(crate) last_frame: Instant,
     /// what the window last showed, for the front end's idle redraw (`idle.rs`)
@@ -697,9 +702,9 @@ pub(crate) struct App {
 /// the fields kept their names apart from dropping a redundant `fe_` (`fe_room` is `room`),
 /// so `self.x` became `self.fe.x`.
 pub(crate) struct FrontEnd {
-    pub(crate) menu: Option<Menu>,
+    pub(crate) menu: Option<FeCatalogues>,
     /// menu kept for returning after a race
-    pub(crate) menu_template: Option<Menu>,
+    pub(crate) menu_template: Option<FeCatalogues>,
     /// `Factory.ProfileNum` — which of the six factory-team profiles `teamprofile.lay` shows. The
     /// accessor is a counted list (0x4BC1F0 at 0x5196D0: `[+0x14]` = 6 rows, the index `[+0x18]`
     /// starting at 0), stepped by the screen's `PROFILEINC` / `PROFILEDEC` (0x519A10 / 0x519A40:
@@ -880,7 +885,7 @@ pub(crate) struct FrontEnd {
     pub(crate) picker_prev: Option<Result<usize, u32>>,
     /// `GenericCar.Colour`'s `[+0x18]` while its `[+0x2C]` is a saved custom colour: the colour
     /// and the row slot 11 (0x4B92B0 → 0x4BC240) was given for it. Read only while
-    /// `Menu::paint_custom` is still that colour, so every reset of the menu's colour (a changed
+    /// `FeCatalogues::paint_custom` is still that colour, so every reset of the menu's colour (a changed
     /// car row, 0x4F3060) retires it without touching the reset sites.
     pub(crate) generic_colour_row: Option<(u32, usize)>,
     /// `[FEUsedCarsScreen + 0x290]` — whether `usedcars.lay` is on the parts panel rather than

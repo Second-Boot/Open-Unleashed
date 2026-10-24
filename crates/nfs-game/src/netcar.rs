@@ -92,7 +92,7 @@ pub fn stale_place(table: &SliceTable, b: &NetBlock, now: i32, car_slice: usize,
     let along = dir_b.dot(b.velocity);
     // the x87 chain runs in extended precision; `f64` for the arithmetic and `f32` where the code stores
     let lap_m = table.lap_len as f64 * 6.0;
-    let err = ((table.frac(sb) as f64 + (along as f64 * 0.015625 * age as f64) / lap_m) - progress as f64) * lap_m;
+    let err = ((table.frac_exact(sb) + (along as f64 * 0.015625 * age as f64) / lap_m) - progress as f64) * lap_m;
     if err.abs() > PUT_ON_ROAD_METRES {
         // `fmul [0x5B49D4]`, `fstp` to `f32`, `fistp` (round to nearest even)
         let d = ((err * f32::from_bits(0x3E2A_AAAB) as f64) as f32).round_ties_even() as i32;

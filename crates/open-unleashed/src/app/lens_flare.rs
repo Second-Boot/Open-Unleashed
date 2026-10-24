@@ -146,7 +146,7 @@ impl App {
         if let Ok(d) = std::fs::read(self.paths.render_dir().join("flarepos.dat")) {
             positions = [0.0; 14];
             for (p, c) in positions.iter_mut().zip(d.chunks_exact(4)) {
-                *p = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                *p = nfs_formats::bytes::read_f32(c, 0);
             }
         }
         self.lens = LensState { enabled, positions, ..Default::default() };

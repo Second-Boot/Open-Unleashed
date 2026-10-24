@@ -174,7 +174,7 @@ impl App {
     /// `tournament.lay` (until 2026-09-24 the port asked for `prerace` alone).
     pub(crate) fn fe_offer_check(&mut self) {
         // the tick of `[fe+0xE0]`, the bottom layer's list
-        let tourny_screen = self.fe_list_now() == "ID_TOURNYSCREEN";
+        let tourny_screen = self.fe_list_is("ID_TOURNYSCREEN");
         let on_career = tourny_screen || self.fe.menu.as_ref().is_some_and(|m| (1..=3).contains(&m.mode));
         if !on_career || self.fe.dialog.is_some() {
             return;
@@ -394,7 +394,7 @@ impl App {
     /// their names (0x5135B0, 0x4F03CC).
     pub(crate) fn fe_carsetup_blocked(&mut self) -> bool {
         // the callback list `[fe+0xE0]` is the bottom layer's
-        let on_carsetup = self.fe_list_now() == "ID_CARSETUP";
+        let on_carsetup = self.fe_list_is("ID_CARSETUP");
         if !on_carsetup {
             return false;
         }
@@ -641,6 +641,11 @@ impl App {
 
 /// A screen's `data.callbacklist`, upper-cased, "" read as `ID_NONE` (0x4E0B30) — the id that
 /// picks the class of the current screen `[fe+0xE0]`.
+/// `callback_list_of(l) == list` for an upper-case `list`, without building the `String`.
+pub(crate) fn callback_list_is(l: &nfs_game::layout::LayoutScreen, list: &str) -> bool {
+    l.layout.elements.first().and_then(|e| e.get("callbacklist")).filter(|c| !c.is_empty()).unwrap_or("ID_NONE").eq_ignore_ascii_case(list)
+}
+
 pub(crate) fn callback_list_of(l: &nfs_game::layout::LayoutScreen) -> String {
     l.layout.elements.first().and_then(|e| e.get("callbacklist")).filter(|c| !c.is_empty()).unwrap_or("ID_NONE").to_ascii_uppercase()
 }

@@ -159,16 +159,8 @@ impl App {
     /// in `seats` (race-index order) is a human car — the same step the player's car takes, from the
     /// controller sample the room's frame gave it. `local` is the player's car, which the draft sees
     /// with the other seats (live); `wet` is `LoadTransfer`'s wet test (0x4A191D…0x4A194D).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn exchange_seats_step(
-        opponents: &mut [RaceCar],
-        seats: &[(usize, u32, Controls)],
-        local: Vec3,
-        tick: u64,
-        flags: (bool, bool),
-        wet: &dyn Fn(Vec3) -> bool,
-        grid: &nfs_physics::collision::TriangleGrid,
-    ) {
+    pub(crate) fn exchange_seats_step(opponents: &mut [RaceCar], step: SeatStep) {
+        let SeatStep { seats, local, tick, flags, wet, grid } = step;
         for &(oi, _, c) in seats {
             let others: Vec<Vec3> = std::iter::once(local)
                 .chain(opponents.iter().enumerate().filter(|(k, _)| *k != oi).map(|(_, q)| q.vehicle.position))
@@ -258,6 +250,8 @@ impl App {
     pub(crate) fn net_exchange_gate(&mut self) -> bool {
         let paused = self.paused;
         let samples = self.net.session.as_mut().map_or(0, |n| n.exchange_pump(paused));
+        // (the 32 Hz samples are the input exchange's; a positional race's callbacks only count the clock)
+        let samples = if self.net.session.as_ref().is_some_and(|n| n.exchanging()) { samples } else { 0 };
         for _ in 0..samples {
             if let Some(s) = self.exchange_sample_bytes()
                 && let Some(n) = self.net.session.as_mut()
@@ -284,7 +278,9 @@ impl App {
             // (the frames drawn while the game waits: `HInfo`'s tick, 0x427C70)
             self.net_race_notice();
             let Some(n) = self.net.session.as_ref() else { return true };
-            if !n.established() || n.exch.stopped || Instant::now() > end {
+            // (a positional race goes on without its peers: only the clock gates it, as in the original, whose positional
+            // target `[0x6559F8] − 1` has no frames to wait for)
+            if (n.exchanging() && (!n.established() || n.exch.stopped)) || Instant::now() > end {
                 return false;
             }
             std::thread::sleep(Duration::from_micros(500));
@@ -1368,16 +1364,34 @@ pub(crate) struct ExchangeIn {
     pub(crate) seat_raw: Vec<nfs_net::exchange::Sample>,
 }
 
+/// What [`App::exchange_seats_step`] steps the seats with: the seats (race-index order), the player's car position, the tick, the
+/// `(rally, derby)` flags, `LoadTransfer`'s wet test and the collision grid.
+pub(crate) struct SeatStep<'a> {
+    pub(crate) seats: &'a [(usize, u32, Controls)],
+    pub(crate) local: Vec3,
+    pub(crate) tick: u64,
+    pub(crate) flags: (bool, bool),
+    pub(crate) wet: &'a dyn Fn(Vec3) -> bool,
+    pub(crate) grid: &'a nfs_physics::collision::TriangleGrid,
+}
+
+/// What [`App::place_player_on_reset`] reads of the world: the player's `.sim`, the track, the slice table, the race progress, the other
+/// cars and the smackables (the free-slice search's blockers).
+pub(crate) struct ResetWorld<'a> {
+    pub(crate) specs: &'a CarSpecs,
+    pub(crate) w: &'a TrackWorld,
+    pub(crate) t: &'a SliceTable,
+    pub(crate) r: &'a nfs_game::race::RaceProgress,
+    pub(crate) road: &'a RoadCars,
+    pub(crate) smackables: &'a nfs_game::smackables::RaceSmackables,
+}
+
 /// What the simulation reads of a human car in an input-exchange race, taken the same way for the local car
 /// and for a seat (`network.md` §11.18).
 pub(crate) struct ExchHuman {
-    #[allow(dead_code)]
-    pub(crate) car: HumanCar,
     pub(crate) position: Vec3,
     pub(crate) slice: usize,
     pub(crate) laps: u32,
-    #[allow(dead_code)]
-    pub(crate) progress: f32,
     /// `car+0xEC0`: the speed along the car's own heading
     pub(crate) vl: f32,
     /// `car+0xEB0`

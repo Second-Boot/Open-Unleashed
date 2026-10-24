@@ -338,10 +338,10 @@ impl App {
 
     /// **0x4FBC10**: rebuild `[0x691D04]` / `[0x691D08]` for the chronicle year and
     /// `Game.GameType` ([`nfs_game::track_list`]). The selections stay the indices they were; a
-    /// read past a shorter list's end takes row 0 ([`Menu::track`], 0x4FA690).
+    /// read past a shorter list's end takes row 0 ([`FeCatalogues::track`], 0x4FA690).
     ///
-    /// **Also rebuilds `cars` and `cars2`** (`GenericCar.Car`'s `[0x6919EC]`/`Menu::set_cars` and
-    /// `GenericCar2.Car`'s `[0x6919F4]`/`Menu::set_cars2`) — the original's 0x4F3E40 is one
+    /// **Also rebuilds `cars` and `cars2`** (`GenericCar.Car`'s `[0x6919EC]`/`FeCatalogues::set_cars` and
+    /// `GenericCar2.Car`'s `[0x6919F4]`/`FeCatalogues::set_cars2`) — the original's 0x4F3E40 is one
     /// function that rebuilds both the track lists (via its own 0x4FBC10 call, 0x4F3EA8) and all
     /// six car lists for the same chronicle year and `Game.GameType` in one pass, so this port
     /// hook, already every one of 0x4F3E40's own triggers by proxy (`modes.md`'s "0x4F3E40's

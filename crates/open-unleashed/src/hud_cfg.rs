@@ -109,7 +109,7 @@ impl HudCfg {
 
     fn word(&self, i: usize, off: usize) -> u32 {
         let o = i * CFG2_REC + off;
-        u32::from_le_bytes([self.cfg2[o], self.cfg2[o + 1], self.cfg2[o + 2], self.cfg2[o + 3]])
+        nfs_formats::bytes::read_u32(&self.cfg2, o)
     }
 
     /// 0x41F7A0's search: the first record named `layout`'s whose resolution is `(w, h)`.
@@ -160,7 +160,7 @@ impl HudCfg {
     pub fn stored_positions(&self, i: usize) -> [(f32, f32); 13] {
         let f1 = |off: usize| {
             let o = i * CFG1_REC + off;
-            let g = |k: usize| f32::from_le_bytes([self.cfg1[o + k], self.cfg1[o + k + 1], self.cfg1[o + k + 2], self.cfg1[o + k + 3]]);
+            let g = |k: usize| nfs_formats::bytes::read_f32(&self.cfg1, o + k);
             (g(0), g(4))
         };
         let f2 = |off: usize| (f32::from_bits(self.word(i, off)), f32::from_bits(self.word(i, off + 4)));

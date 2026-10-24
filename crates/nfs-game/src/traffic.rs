@@ -1925,7 +1925,7 @@ impl TrafficSet {
         let in_world = self.cars[i].active;
         Self::sync_in_one(&self.cars[i], &mut self.bodies[i]);
         let b = &mut self.bodies[i];
-        b.place_at_slice_from(g, specs, s1.centre, s0.centre, s1.forward.normalize_or_zero(), [s1.lateral, s1.up, s1.forward], Vec3::new(0.0, slot * 10.0, 0.0), false, false, in_world);
+        b.place_at_slice_from(g, specs, s1.centre, s0.centre, s1.forward.normalize_or_zero(), [s0.lateral, s0.up, s0.forward], Vec3::new(0.0, slot * 10.0, 0.0), false, false, in_world);
         Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
     }
 
@@ -2031,8 +2031,11 @@ impl TrafficSet {
         c.lateral_rate = 0.0;
         c.target_speed = target * dir;
         c.speed = target * dir; // `car+0xEC0 = car+0xEB8` — a traffic car spawns already at speed
-        c.accel_local = Vec3::ZERO;
-        c.accel_world = Vec3::ZERO;
+        // `car+0xD4C…` / `car+0xD40…` (the AI's force and its world image) are NOT cleared here: the spawn's pose
+        // 0x407690 calls 0x49E220 (the only zeroing of them) only for `car+0x52C & 4`, which a traffic car does
+        // not carry, so the previous life's values reach the placement's two `Susp_update`s, whose roll / dive
+        // filters `car+0xDC8` / `+0xDC4` take `accel_local` (live, PA-VYBLIP: tick 1292, `-4.371` against 0 here;
+        // `RE/notes/REFERENCE-2026-10-24-PA-VYBLIP.md`)
         match (grid, self.car_specs.get(i).or(self.specs.as_ref())) {
             (Some(g), Some(specs)) if i < self.bodies.len() => {
                 // 0x407690 (§9.6): `Car_placeAtSlice` 0x49B090 (car, slice, {car+0xEB4, 1.0, 0},

@@ -491,7 +491,7 @@ fn run() -> Result<()> {
         // them; `Game.GameType` is 0 (QuickRace) at start-up, `controls.md`:9519.)*
         let cars = generic_car_list(&catalog, 0);
         // `GenericCar2.Car`'s own list `[0x6919F4]` is a **separate** rebuild, not `cars` again —
-        // see `Menu::cars2`'s field doc and `Menu::set_cars2`. Built here for the same chronicle
+        // see `FeCatalogues::cars2`'s field doc and `FeCatalogues::set_cars2`. Built here for the same chronicle
         // year `tracks_year` below starts at (`nfs_game::track_list::START_YEAR`).
         let mut cars2: Vec<_> = catalog.iter().filter(|c| c.kind == 0 && c.year as i32 <= nfs_game::track_list::START_YEAR).cloned().collect();
         era_class_year_sort(&mut cars2, era_class_year_key);
@@ -499,7 +499,7 @@ fn run() -> Result<()> {
         // among the seven `Track<i>` rows, `Knockout.TrackNumber` and `LoopedTrack.Track` it also
         // resets — and `modes.md` §2 confirms it runs **both** at accessor registration (i.e. from
         // the very first frame, before any profile) and again on every `SETTYPEQUICKRACE`/
-        // `SETTYPEKNOCKOUT`/`SETTYPEQUICKKNOCKOUT` (`Menu::reset_track_rows`, ported). So the
+        // `SETTYPEKNOCKOUT`/`SETTYPEQUICKKNOCKOUT` (`FeCatalogues::reset_track_rows`, ported). So the
         // catalogue always starts on row 0 — the (flag-filtered, sorted) list's first entry —
         // unless the player has picked something else. `NFS_FE_CAR=<display name substring>` still
         // overrides it, for stills of the showroom (the same kind of diagnostic as `NFS_MENU_MODE`).
@@ -522,7 +522,7 @@ fn run() -> Result<()> {
         // `nfs5.car`'s own **record 0** once, at registration, and the row shown for the actual
         // default car is whichever of *its* rows carries that fixed colour.
         let default_paint_idx = cars.get(car_idx).map_or(0, |c| default_paint_row(default_paint_colour(&catalog), &c.paint_sets));
-        let mut menu0 = Menu {
+        let mut menu0 = FeCatalogues {
             mode: std::env::var("NFS_MENU_MODE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -563,8 +563,7 @@ fn run() -> Result<()> {
             mirror: false,
             circuits: records.circuits(),
             looped_idx: 0,
-            knockout_line: "KNOCKOUT   ENTER STARTS A SERIES".into(),
-            row: 0,
+            debug: DebugMenuState { knockout_line: "KNOCKOUT   ENTER STARTS A SERIES".into(), row: 0 },
             font: None,
         };
         menu0.fit_ko();

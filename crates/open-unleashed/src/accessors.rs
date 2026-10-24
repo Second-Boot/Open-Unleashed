@@ -354,7 +354,7 @@ impl App {
                 if row >= m.ko_opponents as usize {
                     return None;
                 }
-                // row 0 is `Track1` (`Menu::ko_row`)
+                // row 0 is `Track1` (`FeCatalogues::ko_row`)
                 let slot = m.ko_row(row);
                 let name = m.ko_track(row).to_string();
                 let rec = self.fe.track_tables.tracks.iter().find(|r| r.file.eq_ignore_ascii_case(&name));
@@ -625,7 +625,7 @@ impl App {
             }
             // the compare screen's right-hand car, the one `GenericCar2.Car` steps with `car2_idx`
             // over its own list `cars2` — `[0x6919F4]`, separate from `GenericCar.Car`'s `cars`
-            // (`Menu::cars2`'s field doc)
+            // (`FeCatalogues::cars2`'s field doc)
             "GenericCar2.Car" => match menu {
                 _ if !matches!(modifier, "" | "SHORT") => return None,
                 Some(m) if modifier == "SHORT" => m.cars2.get(m.car2_idx)?.family.to_string(),

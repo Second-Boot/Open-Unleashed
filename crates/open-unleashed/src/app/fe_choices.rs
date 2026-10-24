@@ -337,7 +337,7 @@ impl App {
                 Some((rows, Some(m.car_idx)))
             }
             // `GenericCar2.Car`'s own list `cars2` — `[0x6919F4]`, separate from `cars` above
-            // (`Menu::cars2`'s field doc) — same class, same grouping as `GenericCar.Car`.
+            // (`FeCatalogues::cars2`'s field doc) — same class, same grouping as `GenericCar.Car`.
             "GenericCar2.Car" => Some(self.catalog_rows(m.cars2.iter(), modifier == "SHORT", Some(m.car2_idx))),
             // `LoopedTrack.Track` is its own accessor over the circuits `[0x691D08]`, and
             // `Knockout.Track` forwards to the selected row's `Track<n>.Track` (0x4B8580)
@@ -385,7 +385,7 @@ impl App {
             }
             // the direction's rows are `DIRECTION_OPTIONS`' four (`FEDirectionAccessor`'s fixed
             // table), the selection `REVERSE + 2·MIRROR`; the traffic's `TRAFFIC_OPTIONS`' four.
-            // The `Knockout.*` ones are the selected row's (row 0 is `Track1`, `Menu::ko_row`).
+            // The `Knockout.*` ones are the selected row's (row 0 is `Track1`, `FeCatalogues::ko_row`).
             "Track1.Direction" | "Knockout.Direction" => {
                 let row = if base == "Knockout.Direction" { m.ko_row(m.ko_sel) } else { m.ko_row(0) };
                 let rows = DIRECTION_OPTIONS.iter().map(|id| ListRow::Text(self.fe.strings.get(*id).unwrap_or_default().to_string())).collect();
@@ -1010,7 +1010,7 @@ pub(crate) const POSITIONAL_OPTIONS: [u32; 2] = [281, 282];
 /// `Game.Difficutly`'s three rows, in index order — the option list **0x5D9F08** = `0x1C2, 0x1C3,
 /// 0x1C4, 0` that 0x4E560A hands 0x4BB680 with the name: `FEStrings` 450 "beginner", 451
 /// "advanced", 452 "expert", the same three `Track1.Track(DIFFICULTY)` indexes with `0x1C2 + n`.
-/// (0x4E561B then calls the setter, slot 11, with **1** — `Menu::difficulty`.)
+/// (0x4E561B then calls the setter, slot 11, with **1** — `FeCatalogues::difficulty`.)
 pub(crate) const DIFFICULTY_OPTIONS: [u32; 3] = [450, 451, 452];
 
 /// The accessor names the port's own code asks [`App::choice_index`] for (each is a

@@ -225,7 +225,7 @@ impl LayoutScreen {
                 g.load_hud_preview_art(r, paths);
             }
         }
-        if self.layout.elements.iter().any(|e| e.class == "NFS5.HUD") {
+        if self.classes.contains(&WidgetClass::Hud) {
             for entry in 1..=14 {
                 self.load_pack_entry(r, paths, "Art", "hud.fsh", entry);
             }

@@ -1378,7 +1378,11 @@ impl LayoutScreen {
             // `Graphic Tab Button.ctr` centres its caption over `selectedbg.size.width`, which
             // only `[state.selected]` lists, so without the art of every state the four unopened
             // tabs could not place their own captions
-            for p in c.parts.values() {
+            // (in the parts' name order: `parts` is a `HashMap`, whose order changes from run to run, and with it the
+            // `TextureId`s the uploads hand out — `NFS_WIDGET_DUMP` compares of two runs differed on them)
+            let mut parts: Vec<(&String, &nfs_formats::ctr::Part)> = c.parts.iter().collect();
+            parts.sort_by(|a, b| a.0.cmp(b.0));
+            for (_, p) in parts {
                 if p.kind() != nfs_formats::ctr::PartKind::Shape {
                     continue;
                 }
@@ -2675,8 +2679,7 @@ impl LayoutScreen {
             // `1111`, which is why only the first row is matched by name. The widget on both
             // `chroniclepicture.lay` and `chroniclemedia.lay` is `size=458,286`, which is the
             // picture in 140 of the 183 packs; the other 43 are bigger — `MA601a.fsh` is **five**
-            // rows, 4 × (128+128+128+74) by (148+138+148+138+78) = 458×650 (this said 458×286
-            // until 2026-09-26, counting only its first two rows) — and the draw shows a
+            // rows, 4 × (128+128+128+74) by (148+138+148+138+78) = 458×650 (history: `game-history.md` §34.1) — and the draw shows a
             // box-sized window of them that the player drags (`chronicle_pan`).
             //
             // The measure's own row height is the height of entry `2 + r·cols + 1` for r ≥ 1 (the
@@ -3928,8 +3931,7 @@ impl LayoutScreen {
             // sets through 0x4C7E80): slot 13 (0x4C86F0) writes four zeros for it, and 0x525A90 fails on
             // an empty box (`left == right`, 0x525AAF). So the garage button `ID_MERGEDLISTCARSETUP`
             // hidden under the paint box `ID_MERGEDLISTCOLOR` (same `pos`, and the earlier section, so
-            // the first the hit test tries) takes no pointer — until 2026-09-30 a click on the colour box
-            // fell through to it and opened `garage`.
+            // the first the hit test tries) takes no pointer. (history: `game-history.md` §34.2)
             if self.hidden_flags.contains(&i) {
                 continue;
             }

@@ -157,6 +157,7 @@ impl Renderer {
             .name("nfs-render".into())
             .spawn(move || {
                 while let Ok(Job { mut core, mut list, scene, camera }) = jobs.recv() {
+                    core.frame_begin();
                     core.apply(&mut list);
                     let result = core.render(&scene, &camera);
                     let lens = core.take_lens();
@@ -202,6 +203,7 @@ impl Renderer {
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
         if self.worker.is_none() {
             let core = self.core.as_mut().expect("core home");
+            core.frame_begin();
             core.apply(&mut self.list);
             self.list.barrier = 0;
             return core.render(scene, camera);

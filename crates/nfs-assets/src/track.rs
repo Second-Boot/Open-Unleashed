@@ -8,15 +8,13 @@ use nfs_formats::bytes::{get_u32, read_i32, read_u32};
 use nfs_formats::{crp::{layer_class, tags, Crp, Material}, edg::EdgeFile, ini::Ini, scn::Scene};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ArticleMeshes {
     pub name: String,
-    /// The lowest LOD's meshes, one per `pr` part in the file's order ([`crate::mesh::article_parts`]).
-    pub meshes: Vec<MaterialMesh>,
     /// Every LOD the article carries, ascending by its number (`pr.lod`, `RE/notes/crp-geometry.md`
     /// §2.1), each with its per-part meshes — the drawer's LOD pick (`Base+100`'s records,
     /// 0x450DE0) chooses one of these per frame. The first is [`Self::meshes`]. *(Until 2026-09-26
-    /// merged per material.)*
+    /// merged per material.)* One vector per LOD: the lowest LOD's is not kept a second time.
     pub lods: Vec<(u8, Vec<MaterialMesh>)>,
     /// World transform (from the `tr` part, row-major; identity when absent).
     pub transform: glam::Mat4,
@@ -35,6 +33,31 @@ pub struct ArticleMeshes {
     /// (0x48916D), so they contribute **no** collision patch and no `kCylinder`/`kBox` object
     /// (`RE/notes/COVERAGE-2026-09-26.md` §14.80).
     pub collides: bool,
+}
+
+/// Prints the fields as the derive did when `meshes` was a field of its own (the lowest LOD's
+/// vector, now [`ArticleMeshes::meshes`]), so the `build_geometry` golden hash still covers it.
+impl std::fmt::Debug for ArticleMeshes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArticleMeshes")
+            .field("name", &self.name)
+            .field("meshes", &self.meshes())
+            .field("lods", &self.lods)
+            .field("transform", &self.transform)
+            .field("tag", &self.tag)
+            .field("animation", &self.animation)
+            .field("index", &self.index)
+            .field("collides", &self.collides)
+            .finish()
+    }
+}
+
+impl ArticleMeshes {
+    /// The lowest LOD's meshes, one per `pr` part in the file's order ([`crate::mesh::article_parts`]);
+    /// empty for an article with no LOD.
+    pub fn meshes(&self) -> &[MaterialMesh] {
+        self.lods.first().map_or(&[], |l| &l.1)
+    }
 }
 
 /// One placement of a library article requested by a `.scn` GEOM element.
@@ -199,7 +222,7 @@ impl TrackGeometry {
         use nfs_physics::collision::{PatchSource, Triangle, TriangleGrid};
         let mut tris = Vec::new();
         let mut push = |art: &ArticleMeshes, m: glam::Mat4| {
-            for mm in &art.meshes {
+            for mm in art.meshes() {
                 let v = &mm.mesh.vertices;
                 let surface = (surface_of(mm.material) & 0xFFFF) | ((mm.material as u32) << 16);
                 // Primitive identity (quadtree prerequisite 1, `RE/RENDERING.md` "What the tree
@@ -210,8 +233,11 @@ impl TrackGeometry {
                 for idx in mm.mesh.indices.chunks_exact(3) {
                     let p = |i: u32| m.transform_point3(glam::Vec3::from(v[i as usize].position));
                     // the vertex colours ride along: the original lights a car from the patch it
-                    // stands on (0x474700, `RE/notes/lighting.md`)
-                    let c = |i: u32| v[i as usize].color.map(|x| (x.clamp(0.0, 1.0) * 255.0) as u8);
+                    // stands on (0x474700, `RE/notes/lighting.md`). The patch keeps each vertex's colour as a
+                    // 16-bit word of 5-bit channels and 0x474700 widens it with `<< 3` (0x474857…0x4748F0,
+                    // no replication: 248 / 255 at most), so the 8-bit channel loses its low three bits
+                    // (`RE/notes/lighting.md` §6a). The alpha is not read (the result's alpha is 1).
+                    let c = |i: u32| v[i as usize].color.map(|x| ((x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8) & 0xF8);
                     tris.push(Triangle { a: p(idx[0]), b: p(idx[1]), c: p(idx[2]), surface, colors: [c(idx[0]), c(idx[1]), c(idx[2])], source });
                 }
             }
@@ -548,12 +574,11 @@ impl TrackAssets {
                 }
                 lods.push((lod, meshes));
             }
-            let meshes = lods[0].1.clone();
             let transform = g.transform.as_ref().map(tr_to_mat4).unwrap_or(glam::Mat4::IDENTITY);
             let (is_lib, tag) = g.base.as_ref().map(|b| (b.is_library(), b.tag_u32())).unwrap_or((false, 0));
             let animation = self.crp.article_animation(&self.crp_data, a);
             let collides = !matches!(self.crp.bundle_of(&self.crp_data, a), Ok(nfs_formats::crp::BundleKind::Anim | nfs_formats::crp::BundleKind::MidGround));
-            let item = ArticleMeshes { name: g.name.clone(), meshes, lods, transform, tag, animation, index, collides };
+            let item = ArticleMeshes { name: g.name.clone(), lods, transform, tag, animation, index, collides };
             if is_lib { library.push(item) } else { world.push(item) }
         }
         let mut instances = Vec::new();
@@ -760,7 +785,7 @@ mod quad_identity_tests {
         assert_eq!(meshes[1].patch_kind, nfs_physics::collision::PatchKind::Triangle);
         assert_eq!(meshes[1].prim_index, 1);
 
-        let article = ArticleMeshes { name: "test".into(), meshes, lods: vec![], transform: glam::Mat4::IDENTITY, tag: 0, animation: None, index: 5, collides: true };
+        let article = ArticleMeshes { name: "test".into(), lods: vec![(1, meshes)], transform: glam::Mat4::IDENTITY, tag: 0, animation: None, index: 5, collides: true };
         let geometry = TrackGeometry { world: vec![article], library: vec![], instances: vec![], skipped_primitives: 0 };
         let grid = geometry.collision_grid(20.0, &|_| 1);
         let patches = grid.patches();

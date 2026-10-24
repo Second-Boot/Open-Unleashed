@@ -747,8 +747,7 @@ pub struct CopCar {
     pub boost_budget: i32,
     /// `chase+0x8C`. The original's only writer besides the ctor is the state-4 head 0x404571,
     /// which blacks the rubber band out for 15 s when *some* human has been faster than 20 m/s
-    /// while un-pursued for over 25 s (`perpAI+0xAC > 0x320`, in `[0x5E6654]` units of 1/32 s —
-    /// 12.5 s until 2026-09-25, read as 64 Hz ticks). That counter is reset the instant
+    /// while un-pursued for over 25 s (`perpAI+0xAC > 0x320`, in `[0x5E6654]` units of 1/32 s; history: `game-history.md` §34.3). That counter is reset the instant
     /// a chaser is claimed and the player's AI runs before any cop's, so with one human the rule
     /// can never fire (`traffic.md` §17.5) — hence no writer here either.
     pub blackout_until: u64,
@@ -1227,7 +1226,7 @@ impl Police {
             let slot = (self.slot_base + i) as f32;
             let c = &mut self.cars[i];
             c.sync_body_in();
-            c.body.place_at_slice_from(g, &c.specs, s1.centre, s0.centre, s1.forward.normalize_or_zero(), [s1.lateral, s1.up, s1.forward], Vec3::new(0.0, slot * 10.0, 0.0), false, false, false);
+            c.body.place_at_slice_from(g, &c.specs, s1.centre, s0.centre, s1.forward.normalize_or_zero(), [s0.lateral, s0.up, s0.forward], Vec3::new(0.0, slot * 10.0, 0.0), false, false, false);
             c.sync_body_out();
         }
         // (the table's entry only scales the draw: `1 + (rand16 * table[n]) >> 16`)
@@ -1740,9 +1739,7 @@ impl Police {
             // `AIState_GotoSlice(car, [[car+0xED4]+8], 0)` — the **reference car's** slice — deletes
             // the chase through `[vt+4]`, and sets state 9. The rest of the state-4 arm then runs on
             // (its give-up tests are the ones above) and 0x405092 drives the GotoSlice this very
-            // tick. The port retired the cop here until 2026-09-25 and then restarted the chase in
-            // place, without the GotoSlice and Normal ticks in between, and until 2026-09-25 (later)
-            // aimed the GotoSlice at the cop's own slice, reading `car+0xED4` as the cop itself.
+            // tick. (history: `game-history.md` §34.4)
             // (0x404551… keeps using `ebx`, the chase it has just freed — 0x40CCA0 / 0x40CD50 write
             // into freed memory; nothing reads it again, so there is nothing to port.)
             if self.cars[i].stuck_ticks > STUCK_LIMIT {
@@ -2013,7 +2010,7 @@ impl Police {
                 let y = base + if m != 0 { dir * (hw + 6.0) } else { dir * offset[0] };
                 // 0x40D5CF…0x40D638: clamped to `[−rec+0x48·rec+0x38, rec+0x4C·rec+0x3C]`
                 // of the cop's slice — lane width × lane count on each side, not the road
-                // half-widths `rec+0x40` / `+0x44` the port used until 2026-09-26
+                // half-widths `rec+0x40` / `+0x44` (history: `game-history.md` §34.5)
                 let sl = &table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
                 (y.max(-(sl.lane_width_a * sl.lanes_a as f32)).min(sl.lane_width_b * sl.lanes_b as f32), 15.0)
             };
@@ -2484,8 +2481,7 @@ impl Police {
     /// The 64 Hz half — the two shared Sc64 integrators every car record runs (`car+0xE24` /
     /// `+0xE28`): `0x49B7A0` `pos += vel · 1/64` and `0x49B8E0`'s rotation by the **whole** `ω/64`
     /// ([`nfs_physics::vehicle::orientation_step`]: the pitch and roll rates `Susp_update` wrote
-    /// into `car+0x388` turn the body, as for a racer; until 2026-09-26 the port turned a cop
-    /// about its up axis only and stood it on the contact plane instead) — then the route frame:
+    /// into `car+0x388` turn the body, as for a racer; history: `game-history.md` §34.6) — then the route frame:
     /// the slice, the lateral offset `car+0xED0` and the route speed `car+0xEC0`, exactly as
     /// traffic does. The ground contact is [`Police::ground`], on the 32 Hz list; without a grid
     /// (the unit tests' [`Police::integrate`] alone) a cop keeps the slice's height (port

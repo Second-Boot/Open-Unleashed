@@ -81,9 +81,9 @@ impl LayoutScreen {
         }
         let text_c = self.attr(e, "textcolor").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
         // the same foot-of-loop test as the list box's (0x4C6915): the last row is drawn and the
-        // mask cuts it at the panel's foot (it "overhangs" until 2026-09-27); the
-        // first row drawn is the scrollbar's position `[+0x1BC]->slot10()` (0x4C66F8, §4.44) —
-        // *until 2026-09-27 the port drew from row 0 whatever the bar said*
+        // mask cuts it at the panel's foot; the
+        // first row drawn is the scrollbar's position `[+0x1BC]->slot10()` (0x4C66F8, §4.44).
+        // (history: `game-history.md` §34.7)
         // `FEOpponentCarAccessor`'s own row draw, `0x4F58A0` (vtable `0x5B77D8` slot 15 —
         // `controls.md` §4.140; it shares the row-draw shape and call site (`0x4C68F5`)
         // `FEColourAccessor`'s `0x4B9390` does, confirmed by both taking the exact same
@@ -120,8 +120,7 @@ impl LayoutScreen {
             // (0x4C4CF0) sets to 1 only for `NFS5.ListBox` (0x4CCE5A) and to 0 for
             // `NFS5.ComboBoxSlider` (0x4C4CA7) and `NFS5.ColorBox` (0x4C38A3) — the only widgets
             // whose open list comes through here (`draw_combo`). A list box's own selected row
-            // is `draw_list_box`'s. COVERAGE §14.34 (until 2026-09-30 the port drew the combo's
-            // current row black with white text).
+            // is `draw_list_box`'s. COVERAGE §14.34 (history: `game-history.md` §34.8).
             let fg = tint(text_c);
             match row {
                 ListRow::Text(t) => self.text(out, aspect, f, t, px + 3.0, ry + 2.0, 0.0, 0, fg),

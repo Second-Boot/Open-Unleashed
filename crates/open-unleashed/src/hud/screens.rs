@@ -94,20 +94,8 @@ impl Hud {
     /// `"--------------"` rather than a dash. `title` is the billboard's, by game type: 18130
     /// `Race Summary`, 18129 `Single Race`, 18169 `Knockout`, 18175 `Quick Knockout`
     /// (`RE/notes/hud.md` §5). The box's own geometry is still this port's — see the same section.
-    #[allow(clippy::too_many_arguments)]
-    pub fn results_sprites(
-        &self,
-        out: &mut Vec<Sprite>,
-        aspect: f32,
-        rows: &[SummaryRow],
-        player: usize,
-        bb: &Billboard,
-        head: &[String],
-        widths: &[f32],
-        best_lap: bool,
-        points: bool,
-        ord: &[String],
-    ) {
+    pub fn results_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, t: ResultsTable) {
+        let ResultsTable { rows, player, head, widths, best_lap, points, ord } = t;
         if self.font.is_none() {
             return;
         }
@@ -252,8 +240,8 @@ impl Hud {
     /// (54×64, 0x428A19) with the name 18176 + CHARACTER under it (`0x4700 +`, 0x428BBE, 66 px
     /// below, 0x428C1B), the result lines typed out from `(W/2 − w/4, H/2 − h/4)`, and the "race
     /// again" button (18109, `+0x124`). The box is the dialogs' shared 500 × 325.
-    #[allow(clippy::too_many_arguments)]
-    pub fn mission_summary_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, narrator: Option<usize>, name: &str, lines: &[String], race_again: &str, typed: Option<usize>, button: (bool, bool)) {
+    pub fn mission_summary_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, m: MissionSummary) {
+        let MissionSummary { narrator, name, lines, race_again, typed, button } = m;
         if self.font.is_none() {
             return;
         }
@@ -518,8 +506,8 @@ impl Hud {
     /// shown and hidden every time `[0x606AC8]` has run 16 past the last flip (0x430D8C…0x430DB1,
     /// shown first, `+0x154 = 1` 0x430C74). The draw order is the box, the field, the two buttons,
     /// then the label (0x42E2A3…0x42E305), all once the box is open.
-    #[allow(clippy::too_many_arguments)]
-    pub fn replay_save_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, label: &str, name: &str, caret: bool, buttons: [&str; 2], hover: Option<usize>, pressed: bool) {
+    pub fn replay_save_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, d: ReplaySaveDialog) {
+        let ReplaySaveDialog { label, name, caret, buttons, hover, pressed } = d;
         if !self.billboard(out, aspect, bb) {
             return;
         }
@@ -580,8 +568,8 @@ impl Hud {
     /// (`[0x5B2404]` = 4.0): two text lines (`+0x120`, `+0x124`, `UniversC12b` in **0xC0000000**)
     /// and then the 18141 "yes" / 18142 "no" buttons, each `ftol` one step below the last —
     /// 186 / 212 / 238 / 264 (0x437482…0x43760E). The question is 18171 on the first line.
-    #[allow(clippy::too_many_arguments)]
-    pub fn yes_no_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, lines: [&str; 2], buttons: [&str; 2], sel: usize, pressed: bool) {
+    pub fn yes_no_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, d: YesNoDialog) {
+        let YesNoDialog { lines, buttons, sel, pressed } = d;
         if !self.billboard(out, aspect, bb) {
             return;
         }
@@ -621,18 +609,8 @@ impl Hud {
     /// The tournament standings (`HTournamentStandings` 0x431860, rows 0x431D33…0x431E46): ordinal,
     /// driver name, points or total time, winnings; the player's row selected (0x431E1A). Same box
     /// as the summary — `BILLBOARD`, 500 × 325 centred (0x431897 → 0x41A510, 0x41B100).
-    pub fn standings_sprites(
-        &self,
-        out: &mut Vec<Sprite>,
-        aspect: f32,
-        rows: &[(String, String, String)],
-        player: Option<usize>,
-        bb: &Billboard,
-        head: &[String; 3],
-        timed: bool,
-        ord: &[String],
-        winnings: Option<(&nfs_game::career::Winnings, [String; 4], Option<(f32, f32)>)>,
-    ) {
+    pub fn standings_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, t: StandingsTable) {
+        let StandingsTable { rows, player, head, timed, ord, winnings } = t;
         if self.font.is_none() {
             return;
         }

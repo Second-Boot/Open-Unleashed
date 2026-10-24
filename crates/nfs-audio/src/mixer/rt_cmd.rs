@@ -319,6 +319,10 @@ impl Tx {
         let (prod, rx) = rt::channel::<Cmd>(QUEUE);
         let (gc_tx, gc) = rt::channel::<Gc>(GC_QUEUE);
         let snap = Arc::new(Mutex::new(Snapshot { applied: 0, voices: Vec::with_capacity(RT_VOICES), streams: Vec::with_capacity(32) }));
+        // std's pthread `Mutex` (macOS) makes its `pthread_mutex_t` on the FIRST lock. The
+        // callback's `publish` is `snap`'s try_lock; if it ran before any status call of the game thread
+        // had locked it, that first lock allocated in the callback. Locked once here, off the callback.
+        drop(snap.lock().unwrap());
         let lat = Arc::new(Latency { epoch: std::time::Instant::now(), frames: AtomicU64::new(0), at: AtomicU64::new(0) });
         let mut shared = Shared::default();
         shared.reserve_rt();

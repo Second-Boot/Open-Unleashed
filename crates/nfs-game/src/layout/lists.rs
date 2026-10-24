@@ -12,7 +12,7 @@ impl LayoutScreen {
             .enumerate()
             // `NFS5.CHATDISPLAYBOX` is not one: its rows are the chat's, and its accessor only
             // names the players (see `chat_boxes`). *(It was bound here until 2026-09-25.)*
-            .filter(|(_, e)| e.class == "NFS5.ListBox")
+            .filter(|(i, _)| self.classes[*i] == WidgetClass::ListBox)
             .map(|(index, e)| ListBoxWidget { index, accessor: self.attr(e, "accessor").map(str::to_string) })
             .collect();
         // …and the ones inside the panels this screen holds, in the flattened index space, as
@@ -38,7 +38,7 @@ impl LayoutScreen {
     /// scrollbar moves. The rows the draw 0x4C2F50 walks are the vector `[0x65B6A8]` of chat
     /// lines (0x4C2FD1), filled by 0x4C24F0 as lines arrive. (history: `game-history.md` §24.1)
     pub fn chat_boxes(&self) -> Vec<usize> {
-        self.layout.elements.iter().enumerate().filter(|(_, e)| e.class == "NFS5.CHATDISPLAYBOX").map(|(i, _)| i).collect()
+        self.layout.elements.iter().enumerate().filter(|(i, _)| self.classes[*i] == WidgetClass::ChatDisplayBox).map(|(i, _)| i).collect()
     }
 
     /// Fill a chat box with its lines — what **0x4C24F0** does with each one after formatting it:
@@ -82,7 +82,7 @@ impl LayoutScreen {
             .elements
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.class == "NFS5.ComboBoxSlider" || e.class == "NFS5.ColorBox")
+            .filter(|(i, _)| matches!(self.classes[*i], WidgetClass::ComboBoxSlider | WidgetClass::ColorBox))
             .map(|(index, e)| ListBoxWidget { index, accessor: self.attr(e, "accessor").map(str::to_string) })
             .collect();
         let mut keys: Vec<usize> = self.groups.keys().copied().collect();
@@ -135,7 +135,7 @@ impl LayoutScreen {
         // `data.allowcustom` through 0x4B9590: clear, the list is the car's colours alone —
         // no custom row and no saved colours (0x4B9262, 0x4B9374). §4.171.
         let mut rows = rows;
-        if self.layout.elements.get(index).is_some_and(|e| e.class == "NFS5.ColorBox" && self.attr_num(e, "allowcustom").unwrap_or(0.0) == 0.0)
+        if self.layout.elements.get(index).is_some_and(|e| self.classes[index] == WidgetClass::ColorBox && self.attr_num(e, "allowcustom").unwrap_or(0.0) == 0.0)
             && let Some(n) = rows.iter().position(|r| matches!(r, ListRow::CustomColour(_)))
         {
             rows.truncate(n);
@@ -172,8 +172,9 @@ impl LayoutScreen {
         self.layout
             .elements
             .iter()
-            .find(|e| e.class == "NFS5.ColorBox" && self.attr(e, "accessor").is_some_and(|a| a.eq_ignore_ascii_case(accessor)))
-            .is_none_or(|e| self.attr_num(e, "allowcustom").unwrap_or(0.0) != 0.0)
+            .enumerate()
+            .find(|(i, e)| self.classes[*i] == WidgetClass::ColorBox && self.attr(e, "accessor").is_some_and(|a| a.eq_ignore_ascii_case(accessor)))
+            .is_none_or(|(_, e)| self.attr_num(e, "allowcustom").unwrap_or(0.0) != 0.0)
     }
 
     /// Whether the widget has an **integer** attribute `data.<key>` — what 0x5258C0 (the
@@ -413,7 +414,7 @@ impl LayoutScreen {
             .elements
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.class == "NFS5.3DCAR")
+            .filter(|(i, _)| self.classes[*i] == WidgetClass::Car3d)
             .map(|(index, e)| Car3dWidget {
                 index,
                 accessor: self.attr(e, "accessor").map(str::to_string),
@@ -432,7 +433,7 @@ impl LayoutScreen {
             .elements
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.class == "NFS5.CarLogo")
+            .filter(|(i, _)| self.classes[*i] == WidgetClass::CarLogo)
             .map(|(index, e)| CarLogoWidget {
                 index,
                 accessor: e.get("accessor").filter(|a| !a.is_empty()).map(str::to_string),

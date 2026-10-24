@@ -16,7 +16,7 @@ fn main() {
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
     // the same meshes `TrackGeometry::collision_grid` takes from the world articles
     for art in &g.world {
-        for mm in &art.meshes {
+        for mm in art.meshes() {
             if flags.get(mm.material as usize).copied().unwrap_or(0) & 0xF == 0 {
                 continue;
             }

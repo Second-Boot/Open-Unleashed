@@ -66,6 +66,22 @@ impl App {
     }
 }
 
+/// What the force-feedback driver reads of the tick besides the car: the five levels, whether a replay is
+/// playing, and the game tick (the effects' 128 Hz counter, [`ff_clock`]).
+#[derive(Clone, Copy)]
+pub(crate) struct FfTick {
+    pub(crate) levels: FfLevels,
+    pub(crate) replay: bool,
+    pub(crate) tick: u64,
+}
+
+/// The tick's contact for [`ff_collision`]: the contact word, the body point and the magnitude.
+pub(crate) struct FfContact {
+    pub(crate) kind: u32,
+    pub(crate) body_point: Vec3,
+    pub(crate) magnitude: f32,
+}
+
 /// The 128 Hz counter the port feeds the effects (A3).
 pub(crate) fn ff_clock(tick: u64) -> i32 {
     (tick as i32).wrapping_mul(2)
@@ -89,7 +105,8 @@ pub(crate) fn ff_output(pads: &mut nfs_input::gamepad::Gamepads, cmds: &[FfComma
 
 /// The driver 0x4123E0, once per Sc32 tick, before the player's physics step (priority 10 against
 /// the car's 0x1E): reads the car as the previous tick left it.
-pub(crate) fn ff_drive(ff: &mut Option<ForceFeedback>, pads: &mut nfs_input::gamepad::Gamepads, levels: FfLevels, replay: bool, tick: u64, car: &FfCar) {
+pub(crate) fn ff_drive(ff: &mut Option<ForceFeedback>, pads: &mut nfs_input::gamepad::Gamepads, t: FfTick, car: &FfCar) {
+    let FfTick { levels, replay, tick } = t;
     let Some(ff) = ff.as_mut() else { return };
     if !ff.enabled {
         return;
@@ -99,18 +116,9 @@ pub(crate) fn ff_drive(ff: &mut Option<ForceFeedback>, pads: &mut nfs_input::gam
 }
 
 /// 0x40F740 → 0x412230, for the player's car, after the tick's contact words are final.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ff_collision(
-    ff: &mut Option<ForceFeedback>,
-    pads: &mut nfs_input::gamepad::Gamepads,
-    levels: FfLevels,
-    replay: bool,
-    tick: u64,
-    car: &FfCar,
-    kind: u32,
-    body_point: Vec3,
-    magnitude: f32,
-) {
+pub(crate) fn ff_collision(ff: &mut Option<ForceFeedback>, pads: &mut nfs_input::gamepad::Gamepads, t: FfTick, car: &FfCar, contact: FfContact) {
+    let FfTick { levels, replay, tick } = t;
+    let FfContact { kind, body_point, magnitude } = contact;
     let Some(ff) = ff.as_mut() else { return };
     if !ff.enabled {
         return;

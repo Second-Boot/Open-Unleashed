@@ -347,6 +347,16 @@ impl App {
                 // the plate, `.RACENUMBER` the number, `.DRIVER` the driver; a seat whose owner sent
                 // no car (or one this install lacks) keeps the seat's own.
                 let mut plan = plan;
+                // A launch with no front end (`fe = 0`) never runs 0x4EEDA0, so each opponent's `.DRIVERNAME`
+                // (0x13B) is the registry's `car[k].drivername` (devon / sheila / mark in the shipped fe.txt)
+                // instead of the `nfs5.per` driver the front end's quick race draws (0x4E3160, `hud.md` §5)
+                if self.fe0 && rec_plan.is_none() && self.net.session.is_none() && self.replay_net.is_none() {
+                    for (k, p) in plan.iter_mut().enumerate() {
+                        if let Some(n) = self.registry.get(&format!("car[{}].drivername", k + 1)).map(str::trim).filter(|n| !n.is_empty()) {
+                            p.2 = n.to_string();
+                        }
+                    }
+                }
                 let mut seat_recs: Vec<Option<nfs_net::launchcar::CarSlot>> = vec![None; plan.len()];
                 // (a network race played back from a file has no session: the names come from the file)
                 let net_names: Option<Vec<String>> = match (self.net.session.as_ref(), self.replay_net.as_ref()) {
@@ -466,7 +476,10 @@ impl App {
                         paint = Paint { exterior: rgb(cc[0]), stripe1: rgb(cc[1]), stripe2: rgb(cc[2]), interior: rgb(cc[3]), package: rec.num(nfs_net::launchcar::id::STRIPEPACKAGE).unwrap_or(0) };
                     }
                     let mut assets = assets;
-                    assets.page_text = Some(self.page_text(slot + 1, name, Some(*decal)));
+                    // the plate is `.LICENSE` (0x13C, 0x4EEE7E); a `fe = 0` launch has the registry's
+                    // `car[k].license` (none in the shipped fe.txt: the empty `.bss` string), not the name
+                    let plate = if self.fe0 && seat_rec.is_none() && rec_plan.is_none() { self.registry.get(&format!("car[{}].license", slot + 1)).map_or("", str::trim) } else { name.as_str() };
+                    assets.page_text = Some(self.page_text(slot + 1, plate, Some(*decal)));
                     // the draw stays (the seat order of the shared generator is the same), a remote
                     // player's own `.DRIVER` (its profile picture, 0x4EEDBD) replaces the value
                     let drawn = (driver_rand.next() & 7) as u32;
@@ -1107,7 +1120,7 @@ impl App {
                 .iter()
                 .find(|t| t.name.trim() == name)
                 .or_else(|| images.iter().find(|t| t.name.trim().eq_ignore_ascii_case(name)))?;
-            let tex = renderer.upload_texture_mips(img.width, img.height, &img.mips);
+            let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
             let mesh = renderer.upload_mesh(quad);
             let material = renderer.create_material(nfs_renderer::MaterialDesc {
                 alpha_blend: true,
@@ -1196,7 +1209,7 @@ impl App {
                     tracing::debug!(name, "flare texture not in common.fsh");
                     continue;
                 };
-                let tex = renderer.upload_texture_mips(img.width, img.height, &img.mips);
+                let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
                 let mesh = renderer.upload_mesh(&quad);
                 // the flares' state object `[0x61BCB4]` is set to blend 1, additive, at 0x4514E7
                 let material = renderer.create_material(nfs_renderer::MaterialDesc {
@@ -1231,7 +1244,7 @@ impl App {
         if let Some(images) = common.as_ref()
             && let Some(img) = images.iter().find(|t| t.name.trim() == "HEAD")
         {
-            let tex = renderer.upload_texture_mips(img.width, img.height, &img.mips);
+            let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
             renderer.set_headlight_texture(Some(tex));
         }
         // the windscreen drops (0x4577A0 from 0x458FF5): `SPLT` (0x544C5053) of the shared bundle
@@ -1242,7 +1255,7 @@ impl App {
         if let Some(images) = common.as_ref()
             && let Some(img) = images.iter().find(|t| t.name.trim() == "SPLT")
         {
-            let tex = renderer.upload_texture_mips(img.width, img.height, &img.mips);
+            let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
             let material = renderer.create_material(nfs_renderer::MaterialDesc {
                 alpha_blend: true,
                 cull_back: false,
@@ -1298,7 +1311,7 @@ impl App {
                 // `GRSS`, ...) sit in the original's texture cache as 4444, `>> 4` per byte
                 // (`cache_4444_from_8888`, `thrash.md` §6d.9 — PA-SMOKE: the bytes found by a gdb search of
                 // the running original)
-                let tex = *textures.entry(name.clone()).or_insert_with(|| renderer.upload_texture_mips(img.width, img.height, &particle_mips(img)));
+                let tex = *textures.entry(name.clone()).or_insert_with(|| renderer.upload_texture_mips(img.width, img.height, &img.cache_mips()));
                 let mesh = renderer.upload_mesh(&quad);
                 let material = renderer.create_material(nfs_renderer::MaterialDesc {
                     alpha_blend: true,
@@ -1318,7 +1331,7 @@ impl App {
             for (k, params) in [nfs_game::weather::Params::snow(0.0), nfs_game::weather::Params::rain(0.0)].iter().enumerate() {
                 let img = params.texture_names(level).iter().find_map(|n| images.iter().find(|t| t.name.trim() == n.as_str()));
                 self.weather_draws[k] = img.map(|img| {
-                    let tex = renderer.upload_texture_mips(img.width, img.height, &particle_mips(img));
+                    let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
                     let material = renderer.create_material(nfs_renderer::MaterialDesc {
                         alpha_blend: true,
                         cull_back: false,
@@ -1340,14 +1353,4 @@ impl App {
         self.car_effect_defs = car_defs;
         self.car_effects = None;
     }
-}
-
-/// A `particle.fsh` entry's texels as the original's texture cache keeps them: 4444 for an 8888 entry
-/// (code `0x7D`), the rest as decoded (`PA-SMOKE`, `thrash.md` §6d.9).
-fn particle_mips(img: &nfs_assets::texture::TextureImage) -> Vec<Vec<u8>> {
-    let mut mips = img.mips.clone();
-    if img.code == 0x7D {
-        mips.iter_mut().for_each(|m| nfs_assets::texture::cache_4444_from_8888(m));
-    }
-    mips
 }

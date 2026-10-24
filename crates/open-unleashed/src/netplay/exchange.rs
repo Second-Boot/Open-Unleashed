@@ -9,6 +9,14 @@ impl NetPlay {
         self.exchange && !self.positional
     }
 
+    /// Whether the race's ticks follow the room's clock — every network race that went through the race frame's `0xC5` round
+    /// ([`NetPlay::exchange_race_frame`]), positional or by input exchange: **0x4A45D0**'s network arm (`[0x6573E8] == 3`) counts
+    /// `[0x6559F8]` against the host's synchronised clock for both, and the frame driver's positional target is
+    /// `[0x6559F8] − 1` (0x415455…0x415495; `network.md` §11.44).
+    pub fn clocked(&self) -> bool {
+        self.clocked
+    }
+
     /// **0x48B6B0**, for as long as the room is started (see [`nfs_net::exchange::Server::tick`]):
     /// the `0xC4` heartbeat to everyone, each player's next frame (reliably in the original), and the
     /// `0xC6 (4)` that drops a player 128 frames behind.
@@ -99,6 +107,7 @@ impl NetPlay {
         self.timer_done = 0;
         self.commands = [0; 8];
         self.exchange = !self.positional;
+        self.clocked = true;
         // The original's first tick, `t = 0`, latches entry 0 — the zero sample 0x415E00 preloaded —
         // and frees it (0x415EF0). The port's ticks count from 1 (its `simulate` increments first), so
         // that latch is made here: without it entry 0 would stay full and the 128th write would find it so.
@@ -130,8 +139,12 @@ impl NetPlay {
     /// One turn of what runs beside the game loop in the original: the events, the room's tick and the
     /// 128 Hz timer's callbacks ([`NetPlay::exchange_callbacks`]). Answers how many 32 Hz samples are due.
     pub fn exchange_pump(&mut self, paused: bool) -> u32 {
-        let _ = self.poll_lobby();
-        if !self.exchanging() {
+        // a positional race's datagrams are drained by the tick's own poll (`NetPlay::poll(tick)`, the stores read `gGameTick`
+        // from it): a pump with tick 0 here would store every block against tick 0
+        if !self.positional || !self.clocked {
+            let _ = self.poll_lobby();
+        }
+        if !self.clocked {
             return 0;
         }
         self.exchange_callbacks(Instant::now(), paused)
@@ -183,6 +196,10 @@ impl NetPlay {
     /// stay at or below `min(0x6559F8, 2·F0 + 1) − 1`; without a connection (0x4154A4) the target is
     /// the input-frame counter's, `2·[0x5CC818]`. Answers how many ticks in all may have run.
     pub fn exchange_ticks_allowed(&self) -> u64 {
+        // positional (`[0x657408] != 0`): the target is `[0x6559F8] − 1` alone — no frames to wait for (0x415455…0x415495)
+        if self.positional {
+            return u64::from(self.exch.timer.wall);
+        }
         if self.established() && !self.exch.stopped {
             u64::from(self.exch.allowed_ticks())
         } else {
@@ -194,5 +211,6 @@ impl NetPlay {
     /// 0x48DAD0's `0xB7`s, [`NetPlay::leave_race`], sent by the front end's return.)
     pub fn exchange_leave(&mut self) {
         self.exchange = false;
+        self.clocked = false;
     }
 }

@@ -41,7 +41,7 @@ impl NetPlay {
         // first barrier (so the host's wait can be shown to end on ESC)
         static STALLED: std::sync::Once = std::sync::Once::new();
         if !self.is_host()
-            && let Some(ms) = std::env::var("NFS_NET_STALL_MS").ok().and_then(|v| v.parse::<u64>().ok())
+            && let Some(ms) = nfs_game::config::cfg().nfs_net_stall_ms.as_str().and_then(|v| v.parse::<u64>().ok())
         {
             STALLED.call_once(|| std::thread::sleep(Duration::from_millis(ms)));
         }

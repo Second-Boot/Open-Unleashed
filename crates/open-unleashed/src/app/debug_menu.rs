@@ -1,6 +1,6 @@
 //! The port's own developer text menu (`--debug-menu`): its keys and its sprites. **TEST GLUE /
 //! a developer tool**, no counterpart in the original — the layout front end does not use it. It
-//! draws and edits the same [`Menu`] the layout screens' accessors read (the catalogue lists and
+//! draws and edits the same [`FeCatalogues`] the layout screens' accessors read (the catalogue lists and
 //! the race set-up); the fields it drives are `row`, `mode` (also `NFS_MENU_MODE`) and `knockout_line`. Moved out of
 //! `input.rs` and `menu.rs` unchanged.
 
@@ -25,26 +25,26 @@ impl App {
         let rows = m.rows();
         match key {
             MenuKey::Up => {
-                m.row = (m.row + rows - 1) % rows;
+                m.debug.row = (m.debug.row + rows - 1) % rows;
                 if (1..=3).contains(&m.mode)
-                    && m.row > 0
+                    && m.debug.row > 0
                     && let Some(c) = self.career.as_mut()
                 {
-                    c.row = m.row - 1;
+                    c.row = m.debug.row - 1;
                 }
             }
             MenuKey::Down => {
-                m.row = (m.row + 1) % rows;
+                m.debug.row = (m.debug.row + 1) % rows;
                 if (1..=3).contains(&m.mode)
-                    && m.row > 0
+                    && m.debug.row > 0
                     && let Some(c) = self.career.as_mut()
                 {
-                    c.row = m.row - 1;
+                    c.row = m.debug.row - 1;
                 }
             }
             MenuKey::Left | MenuKey::Right => {
                 let delta: i32 = if key == MenuKey::Left { -1 } else { 1 };
-                if m.row == 0 {
+                if m.debug.row == 0 {
                     m.mode = if self.career.is_some() {
                         ((m.mode as i32 + delta).rem_euclid(6)) as u8
                     } else {
@@ -73,14 +73,14 @@ impl App {
                     }
                 } else if (1..=3).contains(&m.mode) {
                     if let Some(c) = self.career.as_mut() {
-                        c.row = m.row - 1;
+                        c.row = m.debug.row - 1;
                         c.move_col(delta);
                     }
                 } else {
                     let step = |i: usize, n: usize| {
                         ((i as i32 + delta).rem_euclid(n.max(1) as i32)) as usize
                     };
-                    match m.row {
+                    match m.debug.row {
                         1 => {
                             m.track_idx = step(m.track_idx, m.tracks.len());
                             if m.mode == 4 {
@@ -164,10 +164,7 @@ impl App {
                     return;
                 }
                 self.fe.menu = None;
-                let (renderer, window) =
-                    (self.renderer.take().unwrap(), self.window.take().unwrap());
-                self.tick = 0;
-                self.start_race(renderer, window, event_loop);
+                self.hand_over_to_race(event_loop);
             }
             MenuKey::Enter if m.mode == 5 => {
                 let Some(car) = m.car().cloned() else { return };
@@ -216,10 +213,7 @@ impl App {
                         self.sim_name = car.sim.clone();
                         self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
                         self.fe.menu = None;
-                        let (renderer, window) =
-                            (self.renderer.take().unwrap(), self.window.take().unwrap());
-                        self.tick = 0;
-                        self.start_race(renderer, window, event_loop);
+                        self.hand_over_to_race(event_loop);
                     }
                     (t, c, s) => {
                         tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "load failed")
@@ -291,10 +285,7 @@ impl App {
                         self.sim_name = car.sim.clone();
                         self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
                         self.fe.menu = None;
-                        let (renderer, window) =
-                            (self.renderer.take().unwrap(), self.window.take().unwrap());
-                        self.tick = 0;
-                        self.start_race(renderer, window, event_loop);
+                        self.hand_over_to_race(event_loop);
                     }
                     (t, c, s) => {
                         tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "load failed")
@@ -305,7 +296,7 @@ impl App {
     }
 }
 
-impl Menu {
+impl FeCatalogues {
     pub(crate) fn rows(&self) -> u8 {
         match self.mode {
             0 | 4 | 5 => 10,
@@ -325,7 +316,7 @@ impl Menu {
             [1.0, 1.0, 1.0, 1.0],
         );
         let sel = |r: u8| {
-            if self.row == r {
+            if self.debug.row == r {
                 [1.0, 0.75, 0.1, 1.0]
             } else {
                 [0.85, 0.85, 0.85, 1.0]
@@ -350,7 +341,7 @@ impl Menu {
         if (1..=3).contains(&self.mode) {
             match career {
                 // career rows share the cursor: menu row 1 = tournament, row 2 = car
-                Some(c) => out.extend(c.sprites(f, (self.row > 0).then(|| self.row - 1))),
+                Some(c) => out.extend(c.sprites(f, (self.debug.row > 0).then(|| self.debug.row - 1))),
                 None => out.extend(f.sprites(
                     "CAREER TABLES UNAVAILABLE",
                     [0.08, 0.30],
@@ -367,7 +358,7 @@ impl Menu {
             return out;
         }
         if self.mode == 5 {
-            out.extend(f.sprites(&self.knockout_line, [0.08, 0.30], 0.045, sel(1)));
+            out.extend(f.sprites(&self.debug.knockout_line, [0.08, 0.30], 0.045, sel(1)));
         } else {
             out.extend(f.sprites(
                 &format!("TRACK   < {} >", self.track().to_string()),

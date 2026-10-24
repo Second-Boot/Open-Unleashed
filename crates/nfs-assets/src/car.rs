@@ -4,6 +4,7 @@ use crate::{fmt_err, read, read_pack, texture::{decode_pack, TextureImage}, Asse
 use nfs_formats::bytes::get_u32;
 use nfs_formats::{crp::Crp, fsh::Fsh, ini::Ini, refpack, sim::CarSim};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The values of a `.tpg` `[tpageN.details] bpp` key — the surface format 0x535950 makes the page in
 /// (`TexturePage::bpp`); 1555 is the default (0x613 at 0x442F5F).
@@ -69,16 +70,24 @@ pub struct TexturePage {
 }
 
 impl TexturePage {
-    /// The texels as the original's texture cache holds them: a **32-bit** page (the `.tpg` `bpp = 32` ones — 901's
+    /// The texels as the original's texture cache holds them: a **32-bit** page (the `.tpg` `bpp = 32` ones - 901's
     /// pages 4, 5 and 8) becomes 4444 on its way to the device, 0x570540's `>> 4` per byte
-    /// ([`crate::texture::cache_4444_from_8888`]); a 1555, 4444 or 565 page is already what it will be.
+    /// ([`crate::texture::cache_4444_from_8888`]), and a **565** page (the front end's room models', 27 in
+    /// `FEData/Models/*.tpg`) becomes 1555 through 0x5702A0 ([`crate::texture::cache_1555_from_565`]); a 1555 or 4444 page
+    /// is already what it will be.
     pub fn cache_rgba(&self) -> std::borrow::Cow<'_, [u8]> {
-        if self.bpp == page_bpp::ARGB8888 {
-            let mut v = self.rgba.clone();
-            crate::texture::cache_4444_from_8888(&mut v);
-            std::borrow::Cow::Owned(v)
-        } else {
-            std::borrow::Cow::Borrowed(&self.rgba)
+        match self.bpp {
+            page_bpp::ARGB8888 => {
+                let mut v = self.rgba.clone();
+                crate::texture::cache_4444_from_8888(&mut v);
+                std::borrow::Cow::Owned(v)
+            }
+            page_bpp::RGB565 => {
+                let mut v = self.rgba.clone();
+                crate::texture::cache_1555_from_565(&mut v);
+                std::borrow::Cow::Owned(v)
+            }
+            _ => std::borrow::Cow::Borrowed(&self.rgba),
         }
     }
 }
@@ -438,8 +447,9 @@ pub struct CarAssets {
     pub model: String,
     pub crp_data: Vec<u8>,
     pub crp: Crp,
-    pub textures_day: Vec<TextureImage>,
-    pub textures_night: Vec<TextureImage>,
+    /// Shared (`Arc`): a model with one pack only uses it for both, and clones of the assets do not copy the pixels.
+    pub textures_day: Arc<[TextureImage]>,
+    pub textures_night: Arc<[TextureImage]>,
     pub tpg: Ini,
     /// Which **body style** of this model the car is, **0-based** — `nfs5.car +0x1C0`
     /// (`fedata::CarCatalogEntry::variant`). `Car_init` copies it out of the car-info record at
@@ -517,11 +527,17 @@ impl CarAssets {
         // `eas3D.fsh`), so each set falls back to the other rather than failing the whole car.
         let (day, night) = (pack("D.fsh"), pack("L.fsh"));
         let (textures_day, textures_night) = match (day, night) {
-            (Ok(d), Ok(n)) => (d, n),
-            (Ok(d), Err(_)) => (d.clone(), d),
-            (Err(_), Ok(n)) => (n.clone(), n),
+            (Ok(d), Ok(n)) => (Arc::from(d), Arc::from(n)),
+            (Ok(d), Err(_)) => {
+                let d: Arc<[TextureImage]> = Arc::from(d);
+                (d.clone(), d)
+            }
+            (Err(_), Ok(n)) => {
+                let n: Arc<[TextureImage]> = Arc::from(n);
+                (n.clone(), n)
+            }
             // a model whose textures are all embedded in the `.crp` has neither pack
-            (Err(_), Err(_)) => (Vec::new(), Vec::new()),
+            (Err(_), Err(_)) => (Arc::from(Vec::new()), Arc::from(Vec::new())),
         };
         Ok(Self {
             model: model.to_string(),
@@ -1340,10 +1356,14 @@ mod cache_page_tests {
     fn a_32_bit_page_reaches_the_device_as_4444() {
         let mut p = TexturePage { width: 1, height: 1, rgba: vec![0x77, 0x6F, 0x10, 0x2C], is_window: false, is_alpha: true, bpp: page_bpp::ARGB8888 };
         assert_eq!(p.cache_rgba().as_ref(), [0x77, 0x66, 0x11, 0x22]);
-        for bpp in [page_bpp::ARGB1555, page_bpp::ARGB4444, page_bpp::RGB565] {
+        for bpp in [page_bpp::ARGB1555, page_bpp::ARGB4444] {
             p.bpp = bpp;
             assert_eq!(p.cache_rgba().as_ref(), [0x77, 0x6F, 0x10, 0x2C], "bpp {bpp}");
         }
+        // a 565 page: 0x5702A0's 1555 (green low bit dropped, alpha 1)
+        p.bpp = page_bpp::RGB565;
+        p.rgba = vec![0x73, 0x6D, 0x10, 255];
+        assert_eq!(p.cache_rgba().as_ref(), [0x73, 0x6B, 0x10, 255]);
     }
 }
 

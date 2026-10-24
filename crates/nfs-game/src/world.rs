@@ -1423,10 +1423,14 @@ impl MapSection {
 }
 
 /// The five colours in a track's `.map` `[header]` (0x4409D0 parses them into the environment-map
-/// object at `+0x00`, `+0x10`, `+0x20`, `+0x30`, `+0x40`, defaulting to 1 or 0.3).
+/// object at `+0x00`, `+0x10`, `+0x20`, `+0x30`, `+0x40`). Each key's lookup is preceded by the
+/// default it falls back to (0x440B1C…, 0x440B9F…, 0x440C41…, 0x440CCD…, 0x440D5C…): 1 for `tint`,
+/// `interior`, `interiordiffuse` and `lightdecal`, 0.3 for `ambient` only (`RE/notes/lighting.md` §6a —
+/// every shipped file lacks `interiordiffuse`, so the cockpit's directional slot is `g · 1`, which the
+/// running original shows).
 ///
 /// They are the multipliers of the **car** light block: 0x43A8A6 samples the colour of the ground
-/// patch under the car (0x4746A0 → 0x474700, a bilinear blend of the patch's four vertex colours)
+/// patch under the car (0x4746A0 → 0x474700, a blend of the patch's vertex colours, each a 5-bit-per-channel word)
 /// and multiplies one slot of the car's light block by each of them (`RE/notes/lighting.md`).
 /// Every shipped file has r = g = b, so each is really a scalar; `tint` runs 0.25…1.80 and
 /// `ambient` 0.29…1.23.
@@ -1441,7 +1445,7 @@ pub struct MapLight {
 
 impl Default for MapLight {
     fn default() -> Self {
-        Self { tint: [1.0; 3], ambient: [0.3; 3], interior: [0.3; 3], interior_diffuse: [0.3; 3], light_decal: [0.3; 3] }
+        Self { tint: [1.0; 3], ambient: [0.3; 3], interior: [1.0; 3], interior_diffuse: [1.0; 3], light_decal: [1.0; 3] }
     }
 }
 
@@ -1521,11 +1525,7 @@ pub fn car_specular_maps(r: &mut Renderer, paths: &nfs_assets::GamePaths, front_
             .map(|t| {
                 // 8888 in the file, 4444 in the original's key-3 cache (0x44DFE0 → 0x44D7E0 → 0x5350E0 → 0x570540,
                 // `nfs_assets::texture::cache_4444_from_8888`)
-                let mut mips = t.mips.clone();
-                if t.code == 0x7D {
-                    mips.iter_mut().for_each(|m| nfs_assets::texture::cache_4444_from_8888(m));
-                }
-                r.upload_texture_mips(t.width, t.height, &mips)
+                r.upload_texture_mips(t.width, t.height, &t.cache_mips())
             })
     })
 }
@@ -2088,7 +2088,10 @@ impl TrackWorld {
     fn upload_env_textures(r: &mut Renderer, track: &TrackAssets) -> (HashMap<u32, nfs_renderer::TextureId>, Option<nfs_renderer::TextureId>) {
         // every `.env` entry, keyed by its SHPI name as the `.map` sections spell it
         let mut env_by_id = HashMap::new();
-        let env_items: Vec<(u32, u32, &[Vec<u8>])> = track.env_textures.iter().map(|t| (t.width, t.height, t.mips.as_slice())).collect();
+        // key 2 (the track's `.env` / `.map`, 0x440A4F): the 16-bit cache of 0x44D7E0 keeps its 8888 entries as 4444
+        // (`Y2T1`, `Y2T2`, `YT1`, `YT2` of coastal, read live: type 6 -> 7, thrash.md §6d.9) and a 565 one as 1555
+        let env_mips: Vec<Vec<Vec<u8>>> = track.env_textures.iter().map(|t| t.cache_mips()).collect();
+        let env_items: Vec<(u32, u32, &[Vec<u8>])> = track.env_textures.iter().zip(&env_mips).map(|(t, m)| (t.width, t.height, m.as_slice())).collect();
         let env_ids = r.upload_textures(&env_items);
         for (t, id) in track.env_textures.iter().zip(env_ids) {
             let mut name = [b' '; 4];
@@ -2473,7 +2476,7 @@ impl TrackWorld {
         let mut upload = |r: &mut Renderer, material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId, k: usize| -> Vec<(MeshId, MaterialId)> {
             uploaded
                 .entry(k)
-                .or_insert_with(|| by_index.get(&k).map(|a| a.meshes.iter().map(|mm| (r.upload_mesh(&mm.mesh), material_for(r, mm.material))).collect()).unwrap_or_default())
+                .or_insert_with(|| by_index.get(&k).map(|a| a.meshes().iter().map(|mm| (r.upload_mesh(&mm.mesh), material_for(r, mm.material))).collect()).unwrap_or_default())
                 .clone()
         };
         let mut out = Vec::new();
@@ -2651,7 +2654,7 @@ pub fn smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::ArticleMesh
     // matches one of the 70 shared library articles), same as the other two.
     let def = track.animdefs.lookup(art.tag).filter(|d| d.collide_type == "kSmackable")?;
     let local = Mat4::from_scale(inst.scale);
-    let verts: Vec<Vec3> = art.meshes.iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| local.transform_point3(Vec3::from(v.position)))).collect();
+    let verts: Vec<Vec3> = art.meshes().iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| local.transform_point3(Vec3::from(v.position)))).collect();
     let (_, rot, pos) = inst.transform.to_scale_rotation_translation();
     // 0x483360: the record's points are centred and its position moves by the centre
     let mut points = nfs_physics::smackable::point_cloud(&verts);
@@ -2679,7 +2682,7 @@ pub fn track_smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::Artic
     let tr = art.transform;
     let rows = [tr.x_axis.truncate(), tr.y_axis.truncate(), tr.z_axis.truncate()];
     let lengths = Vec3::new(rows[0].length(), rows[1].length(), rows[2].length());
-    let verts: Vec<Vec3> = art.meshes.iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| Vec3::from(v.position))).collect();
+    let verts: Vec<Vec3> = art.meshes().iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| Vec3::from(v.position))).collect();
     let mut points = if def.tag.eq_ignore_ascii_case("SIGN") { nfs_physics::smackable::sign_point_cloud(&verts, lengths) } else { nfs_physics::smackable::point_cloud(&verts) };
     // 0x483360: the record's points are centred and its position moves by the centre
     let position = nfs_physics::smackable::centre_record(&mut points, tr.w_axis.truncate());

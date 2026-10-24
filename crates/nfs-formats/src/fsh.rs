@@ -82,6 +82,9 @@ pub mod block_code {
     pub const PALETTE_RGB565: u8 = 0x29;
     /// 16-bit ARGB1555 palette
     pub const PALETTE_ARGB1555: u8 = 0x2D;
+    /// 24-bit palette, three bytes a colour (`R G B`), count = the block's width word; converted by
+    /// 0x571160 (dispatcher 0x5346D0). Shipped in three entries only: `eas8` `hood` / `grad`, `gt3` `det2`.
+    pub const PALETTE_RGB888: u8 = 0x24;
     /// text comment
     pub const TEXT: u8 = 0x6F;
     /// hot-spot table
@@ -332,15 +335,21 @@ impl Fsh {
         let mut rgba = vec![0u8; npix * 4];
         match fmt {
             PixelFormat::Indexed8 => {
-                let pal = e.blocks.iter().find(|b| matches!(b.code, block_code::PALETTE_ARGB8888 | block_code::PALETTE_RGB565 | block_code::PALETTE_ARGB1555)).ok_or(FormatError::UnexpectedValue {
+                let pal = e.blocks.iter().find(|b| matches!(b.code, block_code::PALETTE_ARGB8888 | block_code::PALETTE_RGB565 | block_code::PALETTE_ARGB1555 | block_code::PALETTE_RGB888)).ok_or(FormatError::UnexpectedValue {
                     what: "SHPI indexed image",
                     offset: img.offset,
-                    expected: "a 0x2A/0x29/0x2D palette block".into(),
+                    expected: "a 0x2A/0x29/0x2D/0x24 palette block".into(),
                     found: format!("blocks {:?}", e.blocks.iter().map(|b| b.code).collect::<Vec<_>>()),
                 })?;
-                let ncol = pal.width as usize * pal.height.max(1) as usize;
+                // 0x24: 0x5346D0 calls the converter 0x571160 with count = `movsx word [block+4]`,
+                // the width word alone (the other codes keep width * height).
+                let ncol = if pal.code == block_code::PALETTE_RGB888 { pal.width as usize } else { pal.width as usize * pal.height.max(1) as usize };
                 let pal_off = pal.offset + 16;
-                let entry_size = if pal.code == block_code::PALETTE_ARGB8888 { 4 } else { 2 };
+                let entry_size = match pal.code {
+                    block_code::PALETTE_ARGB8888 => 4,
+                    block_code::PALETTE_RGB888 => 3,
+                    _ => 2,
+                };
                 let pal_bytes = data.get(pal_off..pal_off + ncol * entry_size).ok_or(FormatError::Truncated {
                     what: "SHPI palette",
                     offset: pal_off,
@@ -355,6 +364,22 @@ impl Fsh {
                     });
                 }
                 let lookup = |ix: u8| -> [u8; 4] {
+                    if pal.code == block_code::PALETTE_RGB888 {
+                        // 0x571160, dword k = bytes [src[3k+2], src[3k+1], src[3k], A] (memory
+                        // order B G R A, so R = src[3k]), A = 0xFF except k == 255 -> 0
+                        // (0x57117A…0x571189: `sub edx,0xFF / neg edx / sbb dl,dl`). Only k < count
+                        // is written (0x571168 `test edi,edi / jle`, 0x5711A7 `cmp esi,edi`); an
+                        // index >= count reads what the scratch 0x6B4B20 held before, which is not
+                        // traced. APPROXIMATION: a zero dword there (every shipped 0x24 block has
+                        // width 256, so no shipped texel can reach it).
+                        let k = ix as usize;
+                        return if k >= ncol {
+                            [0; 4]
+                        } else {
+                            let c = &pal_bytes[k * 3..][..3];
+                            [c[0], c[1], c[2], if k == 255 { 0 } else { 255 }]
+                        };
+                    }
                     let c = &pal_bytes[(ix as usize).min(ncol - 1) * entry_size..][..entry_size];
                     match pal.code {
                         // Stored as B,G,R,A (little-endian ARGB). CONFIRMED visually on car textures.
@@ -516,12 +541,55 @@ mod tests {
         d
     }
 
+    /// A 4x1 `0x7B` image over a `0x24` palette (0x571160): `width` colours of `R G B`.
+    fn synthetic_indexed_24(width: u16, ixs: [u8; 4]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(b"SHPI");
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(b"GIMX");
+        d.extend_from_slice(b"test");
+        d.extend_from_slice(&24u32.to_le_bytes());
+        d.push(0x7B);
+        d.extend_from_slice(&20u32.to_le_bytes()[..3]);
+        d.extend_from_slice(&4u16.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&[0u8; 8]);
+        d.extend_from_slice(&ixs);
+        d.push(0x24);
+        d.extend_from_slice(&[0u8; 3]);
+        d.extend_from_slice(&width.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&[0u8; 8]);
+        for k in 0..width as usize {
+            d.extend_from_slice(&[k as u8, (k as u8).wrapping_mul(3), 0xA0 ^ k as u8]);
+        }
+        d
+    }
+
+    #[test]
+    fn palette_0x24_matches_the_converter_0x571160() {
+        let d = synthetic_indexed_24(256, [0, 1, 254, 255]);
+        let f = Fsh::parse(&d).unwrap();
+        let img = f.decode(&d, 0).unwrap();
+        // colour k = (src[3k], src[3k+1], src[3k+2]) as R, G, B; alpha 0xFF except index 255
+        assert_eq!(&img.rgba[0..4], &[0, 0, 0xA0, 255]);
+        assert_eq!(&img.rgba[4..8], &[1, 3, 0xA1, 255]);
+        assert_eq!(&img.rgba[8..12], &[254, 254u8.wrapping_mul(3), 0xA0 ^ 254, 255]);
+        assert_eq!(&img.rgba[12..16], &[255, 255u8.wrapping_mul(3), 0xA0 ^ 255, 0]);
+        // count is the width word: with 2 colours, an index past it is the APPROXIMATION zero dword
+        let d = synthetic_indexed_24(2, [0, 1, 2, 255]);
+        let img = Fsh::parse(&d).unwrap().decode(&d, 0).unwrap();
+        assert_eq!(&img.rgba[4..8], &[1, 3, 0xA1, 255]);
+        assert_eq!(&img.rgba[8..16], &[0; 8]);
+    }
+
     #[test]
     fn block_codes_keep_their_literal_values() {
         use block_code::*;
         assert_eq!(MAGIC, b"SHPI");
         assert_eq!([INDEXED8, ARGB8888, RGB565, ARGB1555, ARGB4444, BGR888], [0x7B, 0x7D, 0x78, 0x7E, 0x6D, 0x7F]);
-        assert_eq!([PALETTE_ARGB8888, PALETTE_RGB565, PALETTE_ARGB1555, TEXT, HOT_SPOTS], [0x2A, 0x29, 0x2D, 0x6F, 0x7C]);
+        assert_eq!([PALETTE_ARGB8888, PALETTE_RGB565, PALETTE_ARGB1555, PALETTE_RGB888, TEXT, HOT_SPOTS], [0x2A, 0x29, 0x2D, 0x24, 0x6F, 0x7C]);
         assert_eq!([COMPRESSED_BIT, FORMAT_MASK, NOT_COMPRESSED], [0x80, 0x7F, 0xFF]);
         // every format code round-trips through PixelFormat, with and without the compressed bit
         for c in [INDEXED8, ARGB8888, RGB565, ARGB1555, ARGB4444, BGR888] {

@@ -127,7 +127,7 @@ impl App {
                 .iter()
                 .find(|t| t.name.trim() == name)
                 .or_else(|| images.iter().find(|t| t.name.trim().eq_ignore_ascii_case(name)))?;
-            let tex = renderer.upload_texture_mips(img.width, img.height, &img.mips);
+            let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
             let mesh = renderer.upload_mesh(&quad);
             let material = renderer.create_material(nfs_renderer::MaterialDesc {
                 alpha_blend: true,

@@ -308,7 +308,7 @@ impl App {
             // combo boxes are link accessors (0x4B8580, vtable 0x5B4BE4) whose every slot jumps
             // through `[this+0x24]` to `Track<n>.*` of the selected row (0x4B85B0 / 0x4B85C0 /
             // 0x4B85D0 …), so they step exactly as the single race's do, and row 0 **is** `Track1`
-            // (`Menu::ko_row`). *(Until 2026-09-26 the knockout traffic wrapped where `Track1`'s
+            // (`FeCatalogues::ko_row`). *(Until 2026-09-26 the knockout traffic wrapped where `Track1`'s
             // clamps and its direction toggled between two rows.)*
             "Knockout.Track" | "Knockout.Laps" | "Knockout.Traffic" | "Knockout.Direction" | "Track1.Laps" | "Track1.Traffic" | "Track1.Direction" => {
                 let (row, field) = match base.split_once('.') {
@@ -326,7 +326,7 @@ impl App {
                 }
                 m.set_ko_row(row, k);
             }
-            // `LoopedTrack.Track` has its own selection over the circuits (`Menu::looped_tracks`)
+            // `LoopedTrack.Track` has its own selection over the circuits (`FeCatalogues::looped_tracks`)
             "LoopedTrack.Track" => m.looped_idx = step(m.looped_idx.min(m.looped_tracks().len().saturating_sub(1)), m.looped_tracks().len()),
             "Track1.Track" => {
                 m.track_idx = step(m.track_idx, m.tracks.len())
@@ -588,6 +588,17 @@ impl App {
     /// `data.callbacklist` (0x4D1BD0 / 0x4D2570, [`Self::fe_base_layout`]), `ID_NONE` for none.
     pub(crate) fn fe_list_now(&self) -> String {
         self.fe_base_layout().map(callback_list_of).unwrap_or_else(|| "ID_NONE".into())
+    }
+
+    /// [`Self::fe_list_now`]` == list` without the `String`: `list` is an upper-case list name (`"ID_MAINSCREEN"`), the
+    /// layout's `callbacklist=` compares ignoring ASCII case because [`callback_list_of`] upper-cases it. Called once per
+    /// frame by `fe_offer_check`, which a race runs too.
+    pub(crate) fn fe_list_is(&self, list: &str) -> bool {
+        debug_assert!(list.bytes().all(|b| !b.is_ascii_lowercase()), "{list}");
+        match self.fe_base_layout() {
+            Some(l) => callback_list_is(l, list),
+            None => list == "ID_NONE",
+        }
     }
 
     /// **0x4D5BA0** (`true`) / **0x4D5BC0** (`false`): the back lock `[fe+0x17C]` and the bottom

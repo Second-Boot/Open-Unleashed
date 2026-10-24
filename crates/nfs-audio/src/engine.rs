@@ -214,6 +214,16 @@ pub enum LayerStep {
     Stop,
 }
 
+/// Whether the layer's second voice is handled on the same pass as the first one's `step`.
+/// 0x4AC290 reaches the second voice's code (0x4AC61F…0x4AC70C) only from the first voice's
+/// update arm (0x4AC5BB…0x4AC61B, which falls into it) or its stop (0x4AC73F); the first voice's **start**
+/// arm ends in `jmp 0x4AC592` (0x4AC58E…0x4AC592, the next layer), so the second voice of a
+/// layer that has just risen from 0 starts on the next pass — one ring record, two ticks, later
+/// (PA-AUDIO-RMS-O1, seen live: layer 18/19 first voice 703, second 710 under the hooks).
+pub fn second_voice_runs(first: LayerStep) -> bool {
+    first != LayerStep::Start
+}
+
 /// **A stolen or refused voice stays in its layer until the level falls to 0.** 0x4AC290 tests
 /// the handle it keeps (`[esi+4]`, the second voice's `[esi+0x184]`) only against −1
 /// (0x4AC537, 0x4AC645): it stores whatever `Voice_start` answered, −9 for a refusal (0x589BE9)
@@ -580,7 +590,8 @@ impl EngineSound {
             for (k, slot, wanted, pan_x, lvl_x) in [(0, &mut self.voices[i], lvl > 0, pan_a, lvl_a), (1, &mut self.voices_b[i], lvl > 0 && stereo_pair, pan_b, lvl)] {
                 let vol = byte_gain(lvl_x);
                 tracing::trace!(tick = crate::trace_tick(), layer = i, k, level = lvl_x, pitch_word, pan = pan_x, "engine layer");
-                match (layer_step(wanted, *slot), *slot) {
+                let step = layer_step(wanted, *slot);
+                match (step, *slot) {
                     (LayerStep::Stop, Some(v)) => {
                         out.stop(v);
                         *slot = None;
@@ -599,6 +610,12 @@ impl EngineSound {
                             if k == 0 {
                                 self.kept[i] = (pan_x, lvl_x);
                             }
+                        }
+                        // 0x4AC572…0x4AC58E: the first voice's start ends the layer's pass (`jmp 0x4AC592`)
+                        // — the second voice, reached only from the first one's update arm
+                        // (0x4AC5BB…0x4AC61F), starts on the next pass, one ring record later
+                        if k == 0 && !second_voice_runs(step) {
+                            break;
                         }
                     }
                     _ => {}
@@ -747,6 +764,13 @@ mod tests {
         assert_eq!(layer_step(false, None), LayerStep::Idle);
         // ... and the next rise starts a new voice
         assert_eq!(layer_step(true, None), LayerStep::Start);
+    }
+
+    #[test]
+    fn the_second_voice_waits_one_pass_after_the_first_starts() {
+        assert!(!second_voice_runs(layer_step(true, None)));
+        assert!(second_voice_runs(layer_step(true, Some(VoiceId(7)))));
+        assert!(second_voice_runs(layer_step(false, None)));
     }
 
     #[test]

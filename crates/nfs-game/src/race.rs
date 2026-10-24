@@ -388,6 +388,29 @@ impl SliceTable {
         raw
     }
 
+    /// [`Self::frac`] as the x87 hands it to a caller that does not store it: 0x416290 leaves `st0` unrounded (53-bit mantissa, the race's
+    /// control word 0x27F, `REFERENCE-2026-10-22-PA-TRACE.md`) where [`Self::frac`] is the `f32` the progress words keep (`fstp dword`).
+    /// 0x4A0680's progress error `(frac + …) · 6N` multiplies it by `6N` ≈ 8400, so the last bit of the `f32` is 4e-5 m there.
+    pub fn frac_exact(&self, slice: usize) -> f64 {
+        let Some(seg) = self.junctions.segments.iter().find(|s| (s.first..=s.last).contains(&slice)) else { return f64::from(self.frac(slice)) };
+        let (Some(f0), Some(f1)) = (seg.entry_node.and_then(|n| self.junctions.nodes.get(n)), seg.exit_node.and_then(|n| self.junctions.nodes.get(n))) else {
+            return f64::from(self.frac(slice));
+        };
+        let f1 = if f1.lap_fraction <= 0.01 { 1.0 } else { f1.lap_fraction };
+        let len = (seg.last + 1 - seg.first) as f64;
+        // 0x4162C8…0x4162DE: `fild; fild; fdivp; fld f1; fsub f0; fmulp; fadd f0`
+        let raw = (slice - seg.first) as f64 / len * (f64::from(f1) - f64::from(f0.lap_fraction)) + f64::from(f0.lap_fraction);
+        if self.backwards {
+            // 0x4162E9: `fsubr 1.0`; on a circuit exactly 1.0 becomes 0.0 (0x4162F3…0x416302)
+            let f = 1.0 - raw;
+            if !self.linear && f == 1.0 {
+                return 0.0;
+            }
+            return f;
+        }
+        raw
+    }
+
     /// 0x481B70 + 0x416290 / 0x416A30 on the **raw** slice (the original never reverses its table):
     /// the segment holding the slice (the first of the split list with `first ≤ slice ≤ last`,
     /// 0x481B8B…0x481BA0), its entry node's `lapFraction` `f0` and its exit node's `f1` (`≤ 0.01`

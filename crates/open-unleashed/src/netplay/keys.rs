@@ -20,7 +20,7 @@ impl KeyRing {
 
     /// Whether the next key is ESC.
     pub fn esc(&self) -> bool {
-        if let Some(ms) = std::env::var("NFS_NET_ESC_MS").ok().and_then(|v| v.parse::<u64>().ok())
+        if let Some(ms) = nfs_game::config::cfg().nfs_net_esc_ms.as_str().and_then(|v| v.parse::<u64>().ok())
             && self.since.elapsed() >= Duration::from_millis(ms)
         {
             return true;

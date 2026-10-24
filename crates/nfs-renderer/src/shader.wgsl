@@ -202,7 +202,26 @@ struct VsOut {
     @location(6) head_uvw: vec3<f32>,
     /// the draw's object, `instance_index` (index into `objects`)
     @location(7) @interpolate(flat) obj: u32,
+    /// `R3DLightLayer`'s colour, made per vertex as the layer makes it (0x446530) and interpolated
+    @location(8) vlight: vec3<f32>,
+    /// `R3DSpecularTextureLayer`'s coordinates, per vertex (0x445520)
+    @location(9) env_uv: vec2<f32>,
 };
+
+// `R3DLightLayer` 0x446530, one vertex: `A = block[slot] · 255 · p0` and, where the normal faces the
+// light (`n · (−255 · L)` not negative, 0x446944), `A + D · d` with `D = block[slot + 4] ⊙ +0x74 · p1`;
+// each channel is rounded to nearest by the 1.5 · 2^23 trick (`[0x5CDE94]` / `[0x5CDE98]` added, the
+// low 22 bits kept: 0x446670…0x44669E, 0x4469A2…0x4469CD) and clamped to 255. The colour lands in the
+// vertex's diffuse dword, so the device interpolates it between vertices.
+fn layer_light(n: vec3<f32>) -> vec3<f32> {
+    // a zero direction normalises to NaN in the original (0x4E8791), whose sign bit sends every
+    // vertex to the ambient arm (0x446944) — so no directional term
+    var d = 0.0;
+    if length(object.lit_dir.xyz) > 0.0 {
+        d = max(dot(n, -normalize(object.lit_dir.xyz)), 0.0);
+    }
+    return min(floor(object.lit_a.rgb * 255.0 + object.lit_d.rgb * 255.0 * d + vec3<f32>(0.5)), vec3<f32>(255.0)) / 255.0;
+}
 
 @vertex
 fn vs_main(in: VsIn, @builtin(instance_index) inst: u32) -> VsOut {
@@ -258,6 +277,14 @@ fn vs_main(in: VsIn, @builtin(instance_index) inst: u32) -> VsOut {
         let p = (object.model * vec4<f32>(in.normal + 3.33 * in.position, 1.0)).xyz;
         out.sky_uv = vec2<f32>(dot(object.sky_u.xyz, p) + object.sky_u.w, dot(object.sky_v.xyz, p) + object.sky_v.w);
     }
+    // the light and the reflection's coordinates are made per vertex, the way the layers make them
+    out.vlight = vec3<f32>(1.0);
+    if object.lit_a.w > 0.5 {
+        out.vlight = layer_light(out.normal);
+    }
+    let vne = (globals.view * vec4<f32>(out.normal, 0.0)).xyz;
+    let vr = inverseSqrt(abs(vne.z) + 1.0) * 0.5;
+    out.env_uv = vec2<f32>(vne.x * vr + 0.5, vne.y * vr + 0.5);
     out.head_w = 0.0;
     out.head_uvw = vec3<f32>(0.0, 0.0, 1.0);
     if object.shadow_on.y > 0.5 && globals.headlight_on.x > 0.5 {
@@ -357,17 +384,10 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     // the per-object light multiplies the ambient term only: the original keeps one ambient slot
     // per `.map` header colour and lights the car from the ground patch it stands on
     var light = globals.ambient.x * object.light.rgb + vec3<f32>(1.0 - globals.ambient.x) * diffuse;
-    // `R3DLightLayer` (0x446530): the slot's colour, plus its partner along the reversed light
-    // direction where the normal faces it, clamped per channel. The original does this per
-    // vertex; here it is per pixel of the interpolated normal.
+    // `R3DLightLayer` (0x446530): made per vertex, rounded to 8 bits (`layer_light`, the vertex
+    // stage) and interpolated by the device, as the original does (`RE/notes/lighting.md` §6a)
     if object.lit_a.w > 0.5 {
-        // a zero direction normalises to NaN in the original (0x4E8791), whose sign bit sends every
-        // vertex to the ambient arm (0x446944) — so no directional term
-        var d = 0.0;
-        if length(object.lit_dir.xyz) > 0.0 {
-            d = max(dot(n, -normalize(object.lit_dir.xyz)), 0.0);
-        }
-        light = min(object.lit_a.rgb + object.lit_d.rgb * d, vec3<f32>(1.0));
+        light = in.vlight;
     }
     var base = tex * in.color;
     // `CarExtEnv`'s pass 1 (option mask 2): its `Rs` block is `{1, 2, 0, 1, 0, −1}` — gouraud,
@@ -393,9 +413,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         // — `LINEAR`, mip filter `NONE` (0x535BC0 → 0x5379D0, `thrash.md` §7) — except the address
         // modes, which the binder 0x440940 sets to 1, `WRAP` (0x537A70(1)): `s_env` at level 0.
         // *(Until 2026-09-26 this sampled `CLAMP`, the default block's.)*
-        let ne = (globals.view * vec4<f32>(n, 0.0)).xyz;
-        let r = inverseSqrt(abs(ne.z) + 1.0) * 0.5;
-        let env = textureSampleLevel(t_env, s_env, vec2<f32>(ne.x * r + 0.5, ne.y * r + 0.5), 0.0);
+        let env = textureSampleLevel(t_env, s_env, in.env_uv, 0.0);
         if env.a * 255.0 > 10.0 {
             env_over = env;
         }

@@ -109,7 +109,7 @@ impl Viewer {
             })
         };
         for art in &geometry.world {
-            for mm in &art.meshes {
+            for mm in art.meshes() {
                 let mat_id = material_for(r, mm.material);
                 let mesh = r.upload_mesh(&mm.mesh);
                 self.scene.items.push(DrawItem::new(mesh, mat_id, art.transform));
@@ -121,7 +121,7 @@ impl Viewer {
         for art in &geometry.library {
             let entry = lib_gpu.entry(art.tag).or_default();
             if !entry.is_empty() { continue; } // first article per tag wins (duplicates like "cone SMACKABLE"/"default cone" differ by tag anyway)
-            for mm in &art.meshes {
+            for mm in art.meshes() {
                 let mat_id = material_for(r, mm.material);
                 entry.push((r.upload_mesh(&mm.mesh), mat_id));
             }

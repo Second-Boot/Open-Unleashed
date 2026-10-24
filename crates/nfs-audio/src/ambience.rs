@@ -250,6 +250,90 @@ pub fn step(kind: i32, voice: VoiceState, repeats_left: i32, d: f32, range: f32,
     Step::Play { replay, consume: false }
 }
 
+/// The streamed-patch registry `SndBank_get` 0x4A8570 keeps for the track banks (class 0): 32 entries of 24 bytes at
+/// 0x656528 `{class, patch, handle, used}`, a request ring the audio update's pump 0x4B0A20 works off
+/// (`engine-audio.md` §7.2, "2026-10-24 — PA-AUDIOMIX-O1"). A bank the ambience asks for that is not in it is
+/// **requested** (0x4A8570 → 0x4B05A0, only while fewer than 6 are pending, 0x4B0CF0) and the call answers −1:
+/// `Voice_play` 0x4A9C10 / `Bank_playOneShot` 0x4A98E0 then start nothing (0x4A9BC7) and the element is tried again on
+/// its next visit. The pump (`GameTick`'s odd tick, 0x4A813A, before the ambience) installs **one** finished read
+/// (0x4AF970, the oldest, `[0x656AC8]`) and then issues the queued requests (0x4B0680, `[0x656AF4]`), so a request made
+/// in update `u` is issued by update `u + 1` and the k-th of a batch is installed by update `u + 1 + k`.
+///
+/// APPROXIMATION: a read is taken as finished by the pump after the one that issued it (the file read of
+/// 0x568B10 / 0x567AF0 is asynchronous in real time — a few ticks at the most for a small bank, measured only as
+/// "within 8 ticks" on the original); the ring's other users (speech phrases, the thunder's patch, other cars'
+/// engine banks) are not counted in the registry or the pending limit.
+#[derive(Debug, Clone, Default)]
+struct Banks {
+    /// the 32 entries; `None` = free (`class == −1`)
+    entries: Vec<Option<BankEntry>>,
+    /// requests the ring holds that no pump has issued yet (patch ids, in order)
+    queued: std::collections::VecDeque<u16>,
+    /// reads issued, not installed yet (0x656AC8 … 0x656AF4)
+    issued: std::collections::VecDeque<u16>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BankEntry {
+    patch: u16,
+    /// the entry's handle is valid (`+8` ≠ −1): the bank is in memory
+    loaded: bool,
+    /// `+0x0C`: the game tick of its last use
+    used: u64,
+}
+
+/// registry entries (0x656528 … 0x656828, 24 bytes each)
+const BANK_ENTRIES: usize = 32;
+/// 0x4A8570 refuses a request while `0x4B0CF0() > 5`
+const BANK_PENDING_MAX: usize = 6;
+
+impl Banks {
+    /// **0x4A8570**(0, `patch`, 0) at game tick `tick`: `true` when the bank is in memory (a handle), `false` for −1.
+    fn get(&mut self, patch: u16, tick: u64) -> bool {
+        if self.entries.is_empty() {
+            self.entries = vec![None; BANK_ENTRIES];
+        }
+        // 0x4A8570's first loop: a hit stamps `+0x0C` and answers `+8`
+        if let Some(e) = self.entries.iter_mut().flatten().find(|e| e.patch == patch) {
+            e.used = tick;
+            return e.loaded;
+        }
+        // the first free entry; none → 0x4A83E0 frees the one least recently used that has been idle for 16 ticks
+        let free = self.entries.iter().position(|e| e.is_none()).or_else(|| {
+            let mut best: Option<(usize, u64)> = None;
+            for (i, e) in self.entries.iter().enumerate() {
+                let Some(e) = e else { continue };
+                if e.used as i64 >= tick as i64 - 0x10 {
+                    continue;
+                }
+                if best.is_none_or(|(_, u)| e.used < u) {
+                    best = Some((i, e.used));
+                }
+            }
+            best.map(|(i, _)| i)
+        });
+        let Some(i) = free else { return false };
+        // 0x4A8570 → 0x4B05A0 only while fewer than six requests are waiting
+        if self.queued.len() + self.issued.len() >= BANK_PENDING_MAX {
+            return false;
+        }
+        self.queued.push_back(patch);
+        self.entries[i] = Some(BankEntry { patch, loaded: false, used: tick });
+        false
+    }
+
+    /// **0x4B0A20**'s share of a bank load, once per audio update: 0x4AF970 installs the oldest finished read,
+    /// then 0x4B0680 issues what was queued.
+    fn pump(&mut self) {
+        if let Some(patch) = self.issued.pop_front()
+            && let Some(e) = self.entries.iter_mut().flatten().find(|e| e.patch == patch)
+        {
+            e.loaded = true;
+        }
+        self.issued.append(&mut self.queued);
+    }
+}
+
 pub struct Ambience {
     /// What `Voice_play`'s update of a playing voice hands the strip hook this pass
     /// ([`crate::mixer::voice_play_filter`], 0x4A9FA8…0x4AA03B): set by the caller every audio update.
@@ -273,6 +357,10 @@ pub struct Ambience {
     game_trim: u32,
     /// the sky lightning's thunder ([`Thunder`])
     pub thunder: Thunder,
+    /// the streamed-patch registry ([`Banks`])
+    banks: Banks,
+    /// the game tick of the update in progress (`*0x606AC4`, what a registry hit stamps)
+    now: u64,
 }
 
 /// The thunder of the sky's lightning (`RE/RENDERING.md` "Lightning", `sfx.md` "The thunder"): three
@@ -353,7 +441,53 @@ impl Ambience {
             base += s.elements.len();
         }
         tracing::info!(elements = elements.len(), banks = index.len(), ambient_level, "ambience loaded");
-        Ok(Self { filter: None, elements, animated: Vec::new(), index, viv, clips: ClipCache::new(true), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim, thunder: Thunder::default() })
+        Ok(Self { filter: None, elements, animated: Vec::new(), index, viv, clips: ClipCache::new(true), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim, thunder: Thunder::default(), banks: Banks::default(), now: 0 })
+    }
+
+    /// **0x4AF5C0 "Loading track sounds..."**, at the race load (after `AudioLoadTrack` 0x4A88A0 emptied the registry):
+    /// every audio element whose octagonal distance to slice 0's centre `(x, z)` (`max + 0.25 · min` of the two
+    /// offsets) is below `Range + 100` and whose PatchID names a bank asks `SndBank_get(0, id, 0)`, the loop pumping
+    /// 0x4B0A20 between rounds until all answer (or 640 ms are out). The registry holds 32 banks and frees none at
+    /// tick 0 (0x4A83E0 wants an entry idle for 16 ticks), so the first 32 of them are in memory when the race starts and
+    /// the rest are requested by the ambience when its element is first visited.
+    pub fn preload(&mut self, slice0_xz: [f32; 2]) {
+        let wanted: Vec<u16> = self
+            .elements
+            .iter()
+            .filter(|e| {
+                let (dx, dz) = ((e.position[0] - slice0_xz[0]).abs(), (e.position[2] - slice0_xz[1]).abs());
+                let est = if dx <= dz { dx * 0.25 + dz } else { dz * 0.25 + dx };
+                est < e.range + 100.0 && e.patch >= 0 && self.index.get(&(e.patch as u16)).is_some_and(|&(_, l)| l > 0)
+            })
+            .map(|e| e.patch as u16)
+            .collect();
+        let mut stalled = 0;
+        while stalled < 3 {
+            let mut all = true;
+            let before = (self.banks.queued.len(), self.banks.issued.len());
+            for &p in &wanted {
+                all &= self.banks.get(p, 0);
+            }
+            if all {
+                break;
+            }
+            self.banks.pump();
+            // nothing in flight and nothing queued: the registry is full of banks it cannot free
+            stalled = if before == (0, 0) && self.banks.queued.is_empty() && self.banks.issued.is_empty() { stalled + 1 } else { 0 };
+        }
+        let loaded = self.banks.entries.iter().flatten().filter(|e| e.loaded).count();
+        tracing::info!(wanted = wanted.len(), loaded, "ambience: track banks preloaded (0x4AF5C0)");
+    }
+
+    /// The bank pump of the audio update (0x4B0A20, the update's first call, 0x4A813A): see [`Banks::pump`].
+    pub fn bank_pump(&mut self) {
+        self.banks.pump();
+    }
+
+    /// Is the PatchID's bank in memory — `SndBank_get(0, patch, 0)` 0x4A8570 as `Voice_play` 0x4A9C10 /
+    /// 0x4A98E0 (0x4A9D68, 0x4A9BAE) and the Type-1 prefetch (0x4AED81) ask it; a bank that is not is requested.
+    fn bank_ready(&mut self, patch: i16) -> bool {
+        patch >= 0 && self.banks.get(patch as u16, self.now)
     }
 
     fn rand(&mut self) -> i32 {
@@ -460,6 +594,7 @@ impl Ambience {
         if self.ambient_level == 0 || self.elements.is_empty() {
             return;
         }
+        self.now = tick;
         let n = self.elements.len();
         let q = n / 4 + 1;
         let phase = ((tick >> 1) & 3) as usize;
@@ -499,6 +634,7 @@ impl Ambience {
         if self.ambient_level == 0 {
             return;
         }
+        self.now = tick;
         let tick8 = ((tick % 100) >> 3) as i32;
         for i in 0..self.animated.len() {
             let slot = self.animated[i].slot;
@@ -585,7 +721,12 @@ impl Ambience {
                 self.release(out, list, i);
                 return;
             }
-            Step::Hold | Step::Prefetch => return,
+            Step::Hold => return,
+            Step::Prefetch => {
+                // 0x4AED7A…0x4AED8E: `SndBank_get(0, patch, 0)`, the answer dropped
+                self.bank_ready(e.patch);
+                return;
+            }
             Step::Play { replay, consume } => {
                 if replay {
                     self.pool[slot].repeats_left -= 1;
@@ -619,6 +760,13 @@ impl Ambience {
         // so this is a strict extension, not a behaviour change, for every element but an
         // animated-object one ([`Element::from_sound_def`]/[`Ambience::sync_animated`]).
         let pitch = doppler_pitch_word(rel, e.velocity);
+        // 0x4A9C10 asks the registry for the bank on every call (0x4A9D68 for a voice it already holds, 0x4A9BAE inside
+        // `Bank_playOneShot` for a start): a bank that is not in memory (yet) makes it forget the voice's handle — the
+        // sound already playing goes on unattended — and start nothing; the element is tried again on its next visit
+        if !self.bank_ready(e.patch) {
+            self.pool[slot].voice = None;
+            return;
+        }
         match self.pool[slot].voice {
             Some(v) if out.is_playing(v) => {
                 out.set_word(v, vol, pitch, BEND_ROOT);
@@ -878,6 +1026,47 @@ mod tests {
         assert_eq!(extreme, 0xA000);
     }
 
+    /// The streamed-patch registry (0x4A8570 / the pump 0x4B0A20): a miss answers −1 and requests; the pump issues the
+    /// queue and then installs one bank per update, oldest first — three requests of update 0 are in memory from update 4
+    /// (the ambience's tick 9), a seventh waits for the pending limit, and a full registry frees only an entry idle 16 ticks.
+    #[test]
+    fn the_bank_registry_loads_one_bank_a_pump_and_refuses_past_six_pending() {
+        let mut b = Banks::default();
+        for p in [10u16, 11, 12] {
+            assert!(!b.get(p, 1), "a miss answers -1");
+        }
+        assert!(!b.get(10, 1), "still not loaded; no second request");
+        assert_eq!(b.queued.len(), 3);
+        b.pump(); // issues
+        assert!(!b.get(10, 3));
+        b.pump(); // installs 10
+        assert!(b.get(10, 5) && !b.get(11, 5));
+        b.pump(); // installs 11
+        assert!(b.get(11, 7) && !b.get(12, 7));
+        b.pump(); // installs 12
+        assert!(b.get(12, 9));
+        // six pending at most
+        let mut b = Banks::default();
+        for p in 0..6u16 {
+            b.get(p, 0);
+        }
+        assert!(!b.get(6, 0));
+        assert!(b.entries.iter().flatten().all(|e| e.patch != 6), "refused: no entry reserved");
+        // a full registry: nothing is freed at tick 0, an entry idle for more than 16 ticks goes at tick 40
+        let mut b = Banks::default();
+        for p in 0..32u16 {
+            b.get(p, 0);
+            b.pump();
+            b.pump();
+        }
+        assert!(!b.get(100, 0) && b.entries.iter().flatten().all(|e| e.patch != 100));
+        b.get(5, 39); // refreshed
+        assert!(!b.get(100, 40));
+        assert!(b.entries.iter().flatten().any(|e| e.patch == 100));
+        assert!(b.entries.iter().flatten().all(|e| e.patch != 0), "the oldest idle entry (patch 0) was freed");
+        assert!(b.entries.iter().flatten().any(|e| e.patch == 5));
+    }
+
     /// The animated-object emitter path end to end: [`Ambience::add_animated`] registers a
     /// `SoundDef`, [`Ambience::sync_animated`] feeds it a moving path's `p1`/`p2` samples each
     /// frame (`AnimTrack::sample`'s job in `nfs-game`, stood in here by a straight-line stub so
@@ -899,6 +1088,8 @@ mod tests {
             ambient_level: 127,
             game_trim: 100,
             thunder: Thunder::default(),
+            banks: Banks::default(),
+            now: 0,
         };
         let idx = amb.add_animated(&def, "train1_833".to_string());
         assert_eq!(idx, 0);

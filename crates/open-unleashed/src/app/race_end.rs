@@ -81,7 +81,7 @@ impl App {
         let k = self.knockout.as_ref().filter(|k| k.state.active)?.state.clone();
         let m = self.fe.menu.as_ref()?;
         let row = m.ko_row(k.race_index.max(0) as usize);
-        // `FETrackAccessor`'s out-of-range rule: row 0 of the list (`Menu::track`)
+        // `FETrackAccessor`'s out-of-range rule: row 0 of the list (`FeCatalogues::track`)
         let track = m.tracks.get(row.track_idx).or(m.tracks.first())?.clone();
         let (laps, damage) = (fe_laps(&m.circuits, &track, row.laps), m.damage);
         let catalog = self.fe_car_catalog();
@@ -169,7 +169,7 @@ impl App {
         }
     }
 
-    pub(crate) fn knockout_race_end(&mut self, menu: &mut Menu) {
+    pub(crate) fn knockout_race_end(&mut self, menu: &mut FeCatalogues) {
         if !std::mem::take(&mut self.knockout_round) {
             return;
         }
@@ -197,7 +197,7 @@ impl App {
         } else {
             format!("RACE {} OF {}   (P{} LAST RACE)   ENTER", s.race_index + 1, s.opponents, pos[0])
         };
-        menu.knockout_line = k.message.clone();
+        menu.debug.knockout_line = k.message.clone();
     }
 
     /// **The race run to its end is left** (the last page's Space, or the automatic replay running

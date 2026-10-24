@@ -2,9 +2,25 @@
 
 use super::*;
 
+/// What [`NetPlay::apply`] reads of the seat's car and the tick besides the vehicle: its `.sim` block, the collision grid, the seat's slice
+/// centre (the retrack's walk), its slice and the game tick.
+pub struct SeatApply<'a> {
+    pub specs: &'a nfs_physics::specs::CarSpecs,
+    pub grid: &'a nfs_physics::collision::TriangleGrid,
+    pub centre: Option<Vec3>,
+    pub slice: usize,
+    pub tick: u64,
+}
+
 /// **TEST GLUE**: `NFS_NET_LAG_MS`, the artificial delay of every car-state packet.
 pub(super) fn lag_glue() -> Option<u64> {
-    std::env::var("NFS_NET_LAG_MS").ok().and_then(|v| v.parse().ok()).filter(|ms| *ms > 0)
+    nfs_game::config::cfg().nfs_net_lag_ms.as_str().and_then(|v| v.parse().ok()).filter(|ms| *ms > 0)
+}
+
+/// **TEST GLUE**: `NFS_NET_LOCKSTEP=<D>` (ticks), the deterministic arrival of the remote cars' blocks: each is stored at
+/// the receiver's tick *sender tick + D* ([`NetPlay::lockstep_wait`]).
+pub(super) fn lockstep_glue() -> Option<u64> {
+    nfs_game::config::cfg().nfs_net_lockstep.as_str().and_then(|v| v.parse().ok())
 }
 
 /// **TEST GLUE** (`NFS_NET_REMOTE_DUMP=<file>`): the remote cars' dead reckoning in the line format of the
@@ -15,7 +31,7 @@ pub(super) fn remote_dump(line: impl FnOnce() -> String) {
     use std::sync::{Mutex, OnceLock};
     static OUT: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
     let out = OUT.get_or_init(|| {
-        let path = std::env::var("NFS_NET_REMOTE_DUMP").ok()?;
+        let path = nfs_game::config::cfg().nfs_net_remote_dump.as_str()?;
         std::fs::File::create(path).ok().map(|f| Mutex::new(std::io::BufWriter::new(f)))
     });
     if let Some(m) = out
@@ -26,16 +42,69 @@ pub(super) fn remote_dump(line: impl FnOnce() -> String) {
     }
 }
 
-/// The car as `AI`/`AO` print it: position, velocity, the matrix rows, the spin (all `f32` bits).
-pub(super) fn car_words(v: &Vehicle) -> String {
-    let mut f: Vec<f32> = Vec::new();
-    f.extend(v.position.to_array());
-    f.extend(v.velocity.to_array());
-    for r in 0..3 {
-        f.extend(v.orientation.row(r).to_array());
+/// The seat's car as the original's `AI` line holds it (`drpy2.py`: `carstate`), for the harness of `deadreck_tests.rs` to run on the port's own receiving:
+/// position / velocity, the rows, the spin, the block, the tracker's slice, and the state `Susp_update` reads (`+0x35C`, `+0x3A0`, `+0xD40…`,
+/// the filters, the throttle byte, the plane). Every float as its bit pattern.
+pub(super) fn ai_line(tag: &str, tick: u64, seat: usize, v: &Vehicle, blk: &CarState, slice: usize) -> String {
+    let h = |f: &[f32]| f.iter().map(|x| format!("{:08x}", x.to_bits())).collect::<Vec<_>>().join(" ");
+    let rows: Vec<f32> = (0..3).flat_map(|r| v.orientation.row(r).to_array()).collect();
+    let blk_words = blk.encode().chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]]))).collect::<Vec<_>>().join(" ");
+    let (pn, pp) = (v.tracker.plane_normal, v.tracker.plane_point);
+    format!(
+        "{tag} {tick} car=00000000 idx={seat} pos/vel {} 00000000 | M {} | w {} | blk {blk_words} | trk {slice:08x} ffffffff | m {} 00000000 00000000 | x35c {} | x3a0 00000000 {} 00000000 | xd40 {} {} 00000000 00000000 00000000 00000000 00000000 00000000 | xdc4 {} | xd7c 00000000 {:08x} | xpl {} | xwh {}",
+        h(&[v.position.x, v.position.y, v.position.z, v.velocity.x, v.velocity.y, v.velocity.z]),
+        h(&rows),
+        h(&v.angular_velocity.to_array()),
+        h(&[v.ground_h]),
+        h(&[v.speed_est]),
+        h(&[v.cos_tilt]),
+        h(&v.accel_world.to_array()),
+        h(&v.accel_local.to_array()),
+        h(&[v.dive, v.roll_lp]),
+        u32::from(v.throttle_byte) << 24,
+        h(&[pn.x, pn.y, pn.z, 0.0, 0.0, 0.0, pp.x, pp.y, pp.z]),
+        v.wheels.iter().map(|w| format!("{} {:08x}", h(&[w.compression]), u32::from(w.airborne))).collect::<Vec<_>>().join(" "),
+    )
+}
+
+/// The `SB` line of the same trace — the wheels' blocks (`car+0x7B8 + 0xC4·i`: compression `+0x68`, roughness `+0x74…+0x7C`, airborne `+0x84`,
+/// rotation `+0x88`), the shared random word, the damage zones — and the stored world points' origin.
+pub(super) fn sb_line(tick: u64, v: &Vehicle, specs: &nfs_physics::specs::CarSpecs) -> String {
+    let h = |f: &[f32]| f.iter().map(|x| format!("{:08x}", x.to_bits())).collect::<Vec<_>>().join(" ");
+    let mut wh = vec![0u32; 196];
+    for (i, w) in v.wheels.iter().enumerate() {
+        let b = &mut wh[49 * i..49 * (i + 1)];
+        b[26] = w.compression.to_bits();
+        b[29] = w.rough_prev.to_bits();
+        b[30] = w.rough_target.to_bits();
+        b[31] = w.rough_phase.to_bits();
+        b[33] = u32::from(w.airborne);
+        b[34] = w.rotation.to_bits();
     }
-    f.extend(v.angular_velocity.to_array());
-    f.iter().map(|x| format!("{:08x}", x.to_bits())).collect::<Vec<_>>().join(" ")
+    // the body points `car+0x8C…`, the box `car+0x3A8…`, the stored world points `car+0x1DC…` as 0x49AE30 left them (`net_points`)
+    let (origin, rows) = v.net_points.unwrap_or((v.position, v.orientation));
+    let pts: Vec<f32> = v.body_points.iter().flat_map(|p| (origin + rows.transpose() * *p).to_array()).collect();
+    let body: Vec<f32> = v.body_points.iter().flat_map(|p| p.to_array()).collect();
+    // the spec words `Susp_update` reads (`[car+0x760]` +0x114, +0x118, +0x120, +0x124, +0x128, +0x12C, +0x134, +0x138) and the installed parts
+    let sp = [specs.pitch_ret, specs.roll_ret, specs.probe_offset, specs.bump_travel, specs.dive_gain, specs.roll_gain, specs.pitch_clamp, specs.roll_clamp];
+    let parts: Vec<String> = specs
+        .parts
+        .iter()
+        .map(|p| format!("{:x} {:08x} {:08x} {:x}", p.kind, p.scale.to_bits(), p.state.to_bits(), p.mask.iter().enumerate().fold(0u32, |m, (i, b)| m | (u32::from(*b) << i))))
+        .collect();
+    format!(
+        "SB {tick} car=00000000 | qn {} | qbody {} | q3a8 {} | qpts {} | qspecs {} | qparts {} | q330 {} | qwh {} | qrng {:08x} | qdmg {}",
+        v.body_points.len(),
+        h(&body),
+        h(&[v.half_extents.x, v.half_extents.y, v.half_extents.z, 0.0]),
+        h(&pts),
+        h(&sp),
+        parts.join(" "),
+        h(&[v.position.x, v.position.y, v.position.z, v.velocity.x, v.velocity.y, v.velocity.z, 0.0]),
+        wh.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" "),
+        nfs_physics::lcg::STATE.load(std::sync::atomic::Ordering::Relaxed),
+        h(&v.damage),
+    )
 }
 
 /// One remote player's car as the receiver keeps it — the block `car+0x38…+0x5B` and the lag book

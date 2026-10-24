@@ -146,32 +146,16 @@ impl Hud {
         }
     }
 
-    pub(crate) fn map_sprites(
-        &self,
-        out: &mut Vec<Sprite>,
-        aspect: f32,
-        // `HTrackMap`'s tray position (`layout.track_map` — `(0, 358)` in all four shipped
-        // 640×480 configs, so this never actually moves the map on screen today, but it is the
-        // same place 0x41FB40 writes and is wired through for correctness)
-        pos: (f32, f32),
-        // every blip, the player last (the loop runs from the last car down to car 0, so the
-        // player's is drawn on top): position, forward, half width / half length, colour
-        blips: &[(Vec3, Vec3, [f32; 2], [[f32; 4]; 4])],
-        // the footprint scale 0x4337D2…0x4337ED: 60 in the whole-track view (`+0x14A`, set by the
-        // camera 0x433498 when the zoom is 0x41EA40's 600), 20 otherwise, 1 in radar mode (0x41E7C0)
-        k: f32,
-        // the counter and its `hud.loc` 0x13 (FE 19 "lap") label, drawn on the map (0x432EB0…
-        // 0x43304C): `itoa(min(car+0xB20 + 1, laps))` + "/" (0x5CCDE0) in the display colour (`+0xD8`)
-        // right-aligned against `itoa(laps)` in grey (`+0xDC`), both in `UniversC12b`. Where they sit
-        // is the map's layout 0x432880: in the map's render target, which is the whole screen shown at
-        // 120 × 120 (`[0x60C900]` / `[0x60C81C]` over cfg+0xE4 / +0xE8, 0x420990), the label at
-        // `(cfg+0x34, H − (cfg+0x38 + h)/fy)` and the total's anchor at `W − cfg+0x34/fx` on the same
-        // line (0x43296C…0x432A44) — on the map, the bottom edge 2 px under the text and the count
-        // 5 px from the right; the label's x is not divided, so it lands at 5·120/W
-        lap: Option<(&str, String, String)>,
-        // the tray is mid-slide (0x42A410, state 1 or 2)
-        sliding: bool,
-    ) {
+    /// `HTrackMap`'s tray position `pos` is `layout.track_map` — `(0, 358)` in all four shipped 640×480 configs, so this never
+    /// actually moves the map on screen today, but it is the same place 0x41FB40 writes and is wired through for correctness.
+    /// The lap counter `view.lap` is drawn on the map (0x432EB0…0x43304C): `itoa(min(car+0xB20 + 1, laps))` + "/" (0x5CCDE0) in
+    /// the display colour (`+0xD8`) right-aligned against `itoa(laps)` in grey (`+0xDC`), both in `UniversC12b`. Where they sit
+    /// is the map's layout 0x432880: in the map's render target, which is the whole screen shown at 120 × 120 (`[0x60C900]` /
+    /// `[0x60C81C]` over cfg+0xE4 / +0xE8, 0x420990), the label at `(cfg+0x34, H − (cfg+0x38 + h)/fy)` and the total's anchor at
+    /// `W − cfg+0x34/fx` on the same line (0x43296C…0x432A44) — on the map, the bottom edge 2 px under the text and the count 5 px
+    /// from the right; the label's x is not divided, so it lands at 5·120/W.
+    pub(crate) fn map_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, pos: (f32, f32), view: MapView) {
+        let MapView { blips, k, lap, sliding } = view;
         let Some((tex, _)) = self.map else {
             return;
         };
@@ -532,17 +516,8 @@ impl Hud {
     /// (0x42B7AC…0x42B7D6, 0x42B964…0x42B9DA); the label sits at `x + 5`, `"%d/"` at `ftol(ftol(x + w
     /// − 5 − W("4/")) − W₉("4")) − 3` and the count at that `+ W("4/")` (0x42B90A…0x42B994) — widths of
     /// the stand-in strings "4/" (0x5CCDDC, C12b) and "4" (0x5CCC38, `unviers9b`), not of the texts.
-    pub(crate) fn opponent_list_sprites(
-        &self,
-        out: &mut Vec<Sprite>,
-        aspect: f32,
-        pos: (f32, f32),
-        rows: &[(usize, [f32; 4], String, String)],
-        links: &[Option<LinkBadge>],
-        place: usize,
-        label: &str,
-        derby: bool,
-    ) {
+    pub(crate) fn opponent_list_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, list: OpponentList) {
+        let OpponentList { pos, rows, links, place, label, derby } = list;
         let (x, y) = pos;
         let (w, rh) = (138.0, 15.0);
         let h = (rows.len() as f32 + 1.0) * rh + 4.0;

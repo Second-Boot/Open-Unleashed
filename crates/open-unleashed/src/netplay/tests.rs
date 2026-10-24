@@ -154,7 +154,7 @@ fn the_store_keeps_the_lag_book_the_original_keeps() {
     assert_eq!(r.lag, 1);
     assert!(r.store(block(200), 160), "a block from the future: |age| = 40");
     assert_eq!(r.lag, 40);
-    assert_eq!(r.lag_avg, (7 * 0 + 40) / 8);
+    assert_eq!(r.lag_avg, 40 / 8, "(7 · 0 + 40) / 8");
     assert!(r.store(block(300), 390));
     assert_eq!(r.lag_avg, (7 * 5 + 90) / 8);
 }
@@ -460,6 +460,71 @@ fn the_shipped_picture_survives_the_chunks_and_decodes_at_54_by_64() {
     let fsh = nfs_formats::fsh::Fsh::parse(&f.bytes).unwrap();
     let img = fsh.decode(&f.bytes, 0).unwrap();
     assert_eq!((img.width, img.height), (54, 64));
+}
+
+/// **A positional race's ticks follow the room's clock too** (0x4A45D0's network arm counts `[0x6559F8]` against the host's synchronised
+/// clock whether or not the race is an input exchange; the frame driver's positional target is `[0x6559F8] − 1`, 0x415455…0x415495;
+/// `network.md` §11.44): after the `0xC5` round both machines' allowed-tick counts advance at 64 Hz and agree to a few ticks, and a
+/// machine that stops pumping for a while finds the ticks it missed waiting (the original's thread went on counting), not lost.
+#[test]
+fn a_positional_races_ticks_follow_the_rooms_clock_through_a_stall() {
+    let mut host = NetPlay::start("host:0", "HOSTY").unwrap();
+    host.net.identity_gate = None;
+    let port = host.net.local_addr().unwrap().port();
+    let mut p = NetPlay::start(&format!("join:127.0.0.1:{port}"), "PLAYER").unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until && !(p.join == JoinState::Joined && p.established() && host.room_len() == 2 && p.room_len() == 2) {
+        host.poll_lobby();
+        p.poll_lobby();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(p.established() && host.room_len() == 2 && p.room_len() == 2);
+    assert!(host.positional && p.positional, "the default race is positional");
+    host.request_start();
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && !p.take_start() {
+        host.poll_lobby();
+        p.poll_lobby();
+    }
+    p.request_start();
+    for m in [&mut host, &mut p] {
+        m.note_race_indices(&[(0, 0), (1, 1)]);
+        m.exchange_race_frame();
+        assert!(m.clocked() && !m.exchanging(), "positional: clocked, not an exchange");
+        assert_eq!(m.exchange_ticks_allowed(), 0, "no tick before the room's go");
+    }
+    host.request_go();
+    p.request_go();
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && (host.exch.waiting || p.exch.waiting) {
+        host.poll_lobby();
+        p.poll_lobby();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!host.exch.waiting && !p.exch.waiting);
+    // half a second of play: both count 64 Hz from the room's clock
+    let end = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < end {
+        host.exchange_pump(false);
+        p.exchange_pump(false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (a, b) = (host.exchange_ticks_allowed(), p.exchange_ticks_allowed());
+    assert!((24..=40).contains(&a) && a.abs_diff(b) <= 6, "0.5 s of the room's clock = 32 ticks: {a} / {b}");
+    // the joiner stops pumping for 0.6 s; the host goes on
+    let end = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < end {
+        host.exchange_pump(false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    host.exchange_pump(false);
+    p.exchange_pump(false);
+    let (a2, b2) = (host.exchange_ticks_allowed(), p.exchange_ticks_allowed());
+    assert!(a2 >= a + 32, "the host went on: {a} -> {a2}");
+    assert!(a2.abs_diff(b2) <= 8, "the joiner's missed ticks are waiting, not lost: host {a2} / joiner {b2}");
+    // the race's end leaves the clock
+    p.exchange_leave();
+    assert!(!p.clocked());
 }
 
 /// **The input exchange end to end, over the loopback**: a host and a player, `Comms.Positional`

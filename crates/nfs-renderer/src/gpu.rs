@@ -74,6 +74,10 @@ struct GpuMesh {
     index_offset: u64,
     index_len: u64,
     index_count: u32,
+    /// The vertex and the index buffer's serial ([`Core::buffer_serial`]): the meshes of one arena
+    /// share theirs, so a draw that moves to another mesh of the same arena binds nothing
+    vb_serial: u32,
+    ib_serial: u32,
     /// How many vertex writes this mesh has had since its upload (every `write_mesh_vertices` /
     /// `update_mesh_vertices` that queued bytes): lets a caller that keeps the last vertices it
     /// wrote tell whether anyone else wrote the mesh since ([`Core::mesh_writes`]).
@@ -83,6 +87,8 @@ struct GpuMesh {
 /// The arena the static meshes are carved from: a vertex and an index buffer, filled front to back.
 // PORT-DEVIATION D6 (RE/notes/PORT-DEVIATIONS.md): static meshes in shared arenas and instanced draws from one object storage buffer; draw order and state as before, a polygon seam can land one pixel differently (not D3D7-exact, never was).
 struct MeshArena {
+    /// the two buffers' serial ([`GpuMesh::vb_serial`])
+    serial: u32,
     vertex_buf: wgpu::Buffer,
     vertex_used: u64,
     index_buf: wgpu::Buffer,
@@ -94,6 +100,10 @@ struct MeshArena {
 
 /// One arena's size for each of the two buffers; a larger mesh gets an arena of its own size.
 const ARENA_CHUNK: u64 = 4 << 20;
+
+/// [`Vertex`]'s size: the vertex buffer's stride
+const VERTEX_STRIDE: u64 = std::mem::size_of::<Vertex>() as u64;
+const _: () = assert!(VERTEX_STRIDE % 8 == 0, "a vertex range stays 8-byte aligned");
 
 struct GpuTexture {
     _texture: wgpu::Texture,
@@ -169,6 +179,12 @@ pub(crate) struct Core {
     /// `[0x6115CC]+0x190`: set while the view being drawn is the rear-view mirror's (type 1,
     /// 0x43AD39…0x43AD4E), when the specular and sky-map layers take no texture and skip their passes
     no_reflections: bool,
+    /// the adapter draws with a base vertex (`DownlevelFlags::BASE_VERTEX`; every Metal, Vulkan and
+    /// Direct3D 12 device, not every OpenGL one): the draws of one arena bind its buffers once and
+    /// address a mesh by `first_index` / `base_vertex` ([`Core::draw_run`])
+    base_vertex: bool,
+    /// the next serial for a vertex / index buffer pair ([`GpuMesh::vb_serial`])
+    buffer_serial: u32,
     /// the scene samplers by address mode and mip filter — index `clamp_u | clamp_v << 1 |
     /// point_mip << 2`
     samplers: [wgpu::Sampler; 8],
@@ -233,7 +249,23 @@ pub(crate) struct Core {
     lens_staged: Vec<(wgpu::Buffer, bool)>,
     /// `NFS_SPRITE_LOG`, read once
     sprite_log: bool,
+    /// the objects and the sprite vertices of the pass being encoded, built here and copied into
+    /// the belt (wgpu's mapped views are write-only), kept between frames
+    object_scratch: Vec<ObjectUniform>,
+    sprite_scratch: Vec<SpriteVertex>,
+    /// the last submission of each of the frames still in flight, oldest first, and the newest
+    /// submission of the frame being built ([`Self::frame_begin`])
+    frames_in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
+    last_submit: Option<wgpu::SubmissionIndex>,
 }
+
+/// At most this many frames are queued to the GPU ahead of the one being built (host pacing, no
+/// counterpart in the game's code: a driver's render-ahead). With vsync the swap chain's own
+/// three drawables already hold the loop there, so this never waits; it
+/// matters when presenting does not block (an occluded window on macOS hands out drawables without
+/// waiting), where wgpu-hal's Metal queue (4096 command buffers) would let thousands of frames —
+/// each holding its staging chunks — pile up (`RE/notes/PERF.md` PERF2).
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 /// One lens-flare read-back in flight: the 4 × 4 block copied into `buf` (rows `LENS_ROW` bytes
 /// apart), mapped once the copy has run.
@@ -267,13 +299,18 @@ struct PendingTextureWrite {
 /// What the render pass has bound, so a draw sets only what changed.
 struct DrawState {
     pipeline: usize,
-    material: u32,
+    /// what the bound material bind group holds ([`bind_key`]): two materials over the same
+    /// textures and sampler bind the same thing, so the second binds nothing
+    material: u64,
     sky: u32,
     mesh: u32,
+    /// the bound vertex / index buffer's serial (the base-vertex path)
+    vb: u32,
+    ib: u32,
 }
 
 impl DrawState {
-    const NONE: Self = Self { pipeline: usize::MAX, material: u32::MAX, sky: u32::MAX, mesh: u32::MAX };
+    const NONE: Self = Self { pipeline: usize::MAX, material: u64::MAX, sky: u32::MAX, mesh: u32::MAX, vb: u32::MAX, ib: u32::MAX };
 }
 
 /// A run of consecutive items drawn as one instanced draw: same mesh, pipeline and bind groups,
@@ -286,6 +323,14 @@ struct Run {
     material: u32,
     sky: u32,
     mesh: u32,
+}
+
+/// What a material's bind group (`point`: its point-filtered one) is made of — the diffuse texture,
+/// the sampler's address modes, the specular map and the filter — as one number. Every bind group of
+/// the frame is built under the same `trilinear` ([`Core::set_trilinear`] rebuilds them all), so
+/// two equal keys are two bind groups over the same views and the same sampler.
+fn bind_key(m: &GpuMaterial, point: bool) -> u64 {
+    m.texture.0 as u64 | (m.env.0 as u64) << 28 | (m.sampler as u64) << 56 | (point as u64) << 60
 }
 
 /// The section map an item's sky-map pass samples, by its material's bucket.
@@ -789,6 +834,8 @@ impl Core {
             sky_layout,
             sky_bgs: Vec::new(),
             no_reflections: false,
+            base_vertex: adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::BASE_VERTEX),
+            buffer_serial: 0,
             samplers,
             point_samplers,
             trilinear: false,
@@ -820,6 +867,10 @@ impl Core {
             lens_done: Vec::new(),
             lens_staged: Vec::new(),
             sprite_log: std::env::var("NFS_SPRITE_LOG").is_ok(),
+            object_scratch: Vec::new(),
+            sprite_scratch: Vec::new(),
+            frames_in_flight: std::collections::VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + 1),
+            last_submit: None,
         };
         let _ = &r.object_layout;
         r.white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
@@ -881,6 +932,19 @@ impl Core {
             }
         }
         bytes.clear();
+    }
+
+    /// The start of a frame, before its commands are applied: the previous frame's last
+    /// submission joins the frames in flight, and once more than [`MAX_FRAMES_IN_FLIGHT`] are
+    /// queued the oldest is waited for. Only the host's pacing: nothing drawn changes.
+    pub(crate) fn frame_begin(&mut self) {
+        if let Some(i) = self.last_submit.take() {
+            self.frames_in_flight.push_back(i);
+        }
+        while self.frames_in_flight.len() > MAX_FRAMES_IN_FLIGHT {
+            let oldest = self.frames_in_flight.pop_front().expect("non-empty");
+            let _ = self.device.poll(wgpu::PollType::Wait { submission_index: Some(oldest), timeout: Some(std::time::Duration::from_secs(1)) });
+        }
     }
 
     pub(crate) fn white(&self) -> TextureId {
@@ -1031,7 +1095,9 @@ impl Core {
             usage: wgpu::BufferUsages::INDEX,
         });
         let (vertex_len, index_len) = (vertex_buf.size(), index_buf.size());
-        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, writes: 0 });
+        let serial = self.buffer_serial;
+        self.buffer_serial += 1;
+        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0 });
         MeshId(self.meshes.len() as u32 - 1)
     }
 
@@ -1062,8 +1128,9 @@ impl Core {
         let ibytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
         let (vlen, ilen) = (vbytes.len() as u64, ibytes.len() as u64);
         // every range is rounded to 8 bytes (a mapped range starts on a multiple of 8, a slice on 4;
-        // and an empty one still reserves 8, so it can be sliced)
-        let (vreserve, ireserve) = (vlen.next_multiple_of(8).max(8), ilen.next_multiple_of(8).max(8));
+        // and an empty one still reserves 8, so it can be sliced), a vertex range to whole vertices
+        // too (48 bytes, a multiple of 8), so each mesh starts on a vertex: its `base_vertex`
+        let (vreserve, ireserve) = (vlen.next_multiple_of(VERTEX_STRIDE).max(VERTEX_STRIDE), ilen.next_multiple_of(8).max(8));
         let fits = self.arena.as_ref().is_some_and(|a| a.vertex_used + vreserve <= a.vertex_buf.size() && a.index_used + ireserve <= a.index_buf.size());
         if !fits {
             // a full arena goes to the queue now, so the host copies of a whole track's meshes do not pile up
@@ -1074,7 +1141,10 @@ impl Core {
             let make = |label: &'static str, usage: wgpu::BufferUsages, need: u64| {
                 self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: ARENA_CHUNK.max(need), usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: true })
             };
+            let serial = self.buffer_serial;
+            self.buffer_serial += 1;
             self.arena = Some(MeshArena {
+                serial,
                 vertex_buf: make("mesh arena vb", wgpu::BufferUsages::VERTEX, vreserve),
                 vertex_used: 0,
                 index_buf: make("mesh arena ib", wgpu::BufferUsages::INDEX, ireserve),
@@ -1101,7 +1171,7 @@ impl Core {
         }
         a.vertex_used += vreserve;
         a.index_used += ireserve;
-        self.meshes.push(GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, writes: 0 });
+        self.meshes.push(GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0 });
         MeshId(self.meshes.len() as u32 - 1)
     }
 
@@ -1208,6 +1278,24 @@ impl Core {
                 self.pending_texture_bytes[start + y * padded..start + y * padded + row].copy_from_slice(&data[y * row..(y + 1) * row]);
             }
         }
+    }
+
+    /// A frame that draws nothing (the window occluded, the surface lost) still carries out the
+    /// buffer and texture writes queued for it, as `write_buffer` / `write_texture` did at once:
+    /// left queued, the vertex writes of every skipped frame (a few hundred KB each, thousands of
+    /// frames a second while hidden) piled up to gigabytes and were all copied by the next drawn
+    /// frame (`RE/notes/PERF.md` PERF2).
+    fn flush_writes(&mut self) {
+        if self.pending_writes.is_empty() && self.pending_textures.is_empty() {
+            return;
+        }
+        self.seal_arena();
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("writes") });
+        self.flush_texture_writes(&mut encoder);
+        self.flush_mesh_writes(&mut encoder);
+        self.belt.finish();
+        self.last_submit = Some(self.queue.submit(Some(encoder.finish())));
+        self.belt.recall();
     }
 
     /// Record the queued texture writes into `encoder`, from the staging belt, in call order.
@@ -1439,10 +1527,14 @@ impl Core {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
+                self.flush_writes();
                 return Ok(());
             }
             // a timeout or an occluded window: skip the frame (wgpu 30)
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                self.flush_writes();
+                return Ok(());
+            }
             other => anyhow::bail!("surface texture: {other:?}"),
         };
         let view = frame.texture.create_view(&Default::default());
@@ -1642,17 +1734,34 @@ impl Core {
             pass.set_pipeline(&self.pipelines[r.pipeline]);
             st.pipeline = r.pipeline;
         }
-        if st.material != r.material {
-            let m = &self.materials[(r.material >> 1) as usize];
-            let bg = if r.material & 1 == 1 { m.bind_group_point.as_ref().unwrap_or(&m.bind_group) } else { &m.bind_group };
+        let m = &self.materials[(r.material >> 1) as usize];
+        let point = r.material & 1 == 1 && m.bind_group_point.is_some();
+        let key = bind_key(m, point);
+        if st.material != key {
+            let bg = if point { m.bind_group_point.as_ref().unwrap_or(&m.bind_group) } else { &m.bind_group };
             pass.set_bind_group(2, bg, &[]);
-            st.material = r.material;
+            st.material = key;
         }
         if st.sky != r.sky {
             pass.set_bind_group(3, self.sky_bgs[r.sky as usize].as_ref().expect("sky bind group made"), &[]);
             st.sky = r.sky;
         }
         let mesh = &self.meshes[r.mesh as usize];
+        if self.base_vertex {
+            // the whole buffer bound once per arena; the mesh is its range of indices and its first
+            // vertex — the same vertices and indices as a bind of its own slices
+            if st.vb != mesh.vb_serial {
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                st.vb = mesh.vb_serial;
+            }
+            if st.ib != mesh.ib_serial {
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                st.ib = mesh.ib_serial;
+            }
+            let first_index = (mesh.index_offset / 4) as u32;
+            pass.draw_indexed(first_index..first_index + mesh.index_count, (mesh.vertex_offset / VERTEX_STRIDE) as i32, r.first..r.first + r.count);
+            return;
+        }
         if st.mesh != r.mesh {
             pass.set_vertex_buffer(0, mesh.vertex_buf.slice(mesh.vertex_offset..mesh.vertex_offset + mesh.vertex_len.max(4)));
             pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
@@ -1718,7 +1827,10 @@ impl Core {
             let size = wgpu::BufferSize::new((n * std::mem::size_of::<ObjectUniform>()) as u64).expect("objects size");
             // built on the CPU and copied in once: wgpu 30's mapped views are write-only
             // (`WriteOnly`), not a `&mut [u8]` to cast in place
-            let mut objects: Vec<ObjectUniform> = vec![bytemuck::Zeroable::zeroed(); n];
+            // the frame's objects, in a buffer kept between frames
+            let mut objects = std::mem::take(&mut self.object_scratch);
+            objects.clear();
+            objects.resize(n, bytemuck::Zeroable::zeroed());
             let vp64 = glam::DMat4::from_cols_array(&vp.to_cols_array().map(f64::from));
             for (o, item) in objects.iter_mut().zip(scene.items.iter().take(n)) {
                 let mat = self.materials.get(item.material.0 as usize);
@@ -1766,6 +1878,7 @@ impl Core {
                 };
             }
             self.belt.write_buffer(&mut encoder, &self.object_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&objects));
+            self.object_scratch = objects;
         }
 
         // the 2D pass's vertices go into the belt before any pass opens (a copy cannot be
@@ -1777,7 +1890,9 @@ impl Core {
         }
         if n_sprites > 0 {
             let size = wgpu::BufferSize::new((n_sprites * 6 * std::mem::size_of::<SpriteVertex>()) as u64).expect("sprites size");
-            let mut verts: Vec<SpriteVertex> = vec![bytemuck::Zeroable::zeroed(); n_sprites * 6];
+            let mut verts = std::mem::take(&mut self.sprite_scratch);
+            verts.clear();
+            verts.resize(n_sprites * 6, bytemuck::Zeroable::zeroed());
             for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
                 verts[i * 6..i * 6 + 6].copy_from_slice(&sprite_quad(sp, aspect));
                 if self.sprite_log {
@@ -1787,6 +1902,7 @@ impl Core {
                 }
             }
             self.belt.write_buffer(&mut encoder, &self.sprite_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&verts));
+            self.sprite_scratch = verts;
         }
 
         let c = clear_color;
@@ -1938,7 +2054,7 @@ impl Core {
         }
         self.buckets = buckets;
         self.belt.finish();
-        self.queue.submit(Some(encoder.finish()));
+        self.last_submit = Some(self.queue.submit(Some(encoder.finish())));
         self.belt.recall();
         self.lens_map_staged();
     }

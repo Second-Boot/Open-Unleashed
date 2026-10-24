@@ -466,6 +466,12 @@ impl Vehicle {
         // body height above the contact plane: `BodyHeight` 0x49A900 on Susp_update's normal and
         // `Σc/4` (0x49A8CF…0x49A8DD), over the body points (`Self::body_height_on`)
         let centre = (contacts[0] + contacts[1] + contacts[2] + contacts[3]) * 0.25;
+        // 0x49A8CA…: `Susp_update` itself calls 0x49AE30 before `BodyHeight` — after the two-wheel shift — so a network car's stored
+        // points (read by its next apply's probes, `Vehicle::net_reseat`) are where this call left the body, whoever called it: the
+        // car's own `Car_ground` on the even tick as much as the apply (5 cm of probe offset on the even ticks, RE/notes/REFERENCE-2026-10-24-PA-DEADRECK2.md)
+        if self.net_car {
+            self.refresh_net_points();
+        }
         self.body_height_on(n, centre);
         self.height_marker = if self.body_height > 0.05 { self.body_height } else { 0.0 };
         h
@@ -589,6 +595,7 @@ impl Vehicle {
             susp_y = stiff * v_y + lat;
         }
         w.contact = !w.airborne;
+        w.susp_y = susp_y;
         WheelSample { height: h_i, contact, susp_y, hangs }
     }
 
@@ -650,7 +657,11 @@ impl Vehicle {
             let p = sign_clamp(p_in - self.dive, specs.pitch_clamp);
             let r_in = ((susp_y[1] + susp_y[3]) - (susp_y[0] + susp_y[2])) / div;
             // the cop's roll filter takes 0.15 (`[0x5B2638]`, 0x49A627…0x49A639), anyone else 0.25
-            self.roll_lp = if police {
+            // a network car (`car+0xDAC`, 0x49A608 `test edx, edx`; 0x49A612 `mov [esi+0xDC8], 0; jmp 0x49A671`) holds the roll filter
+            // at 0 as well — the dive's 0x49A4BE twin — and skips the filter
+            self.roll_lp = if self.net_car {
+                0.0
+            } else if police {
                 specs.roll_gain * self.accel_local.x * 0.15 + self.roll_lp * 0.8
             } else if self.tiny {
                 specs.roll_gain * self.accel_local.x

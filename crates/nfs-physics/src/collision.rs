@@ -150,6 +150,11 @@ impl PatchTracker {
         }
     }
 
+    /// TEST GLUE (`NFS_PA_TRACE`'s `.whl` file): the cached patch's corners and flags word.
+    pub fn patch_corners(&self) -> Option<(Vec3, Vec3, Vec3, u32)> {
+        self.patch
+    }
+
     /// The cached patch's plane height at `(x, z)` — `Tracker::point(0)` 0x4745F0 and
     /// `Tracker::normal()` 0x474420 into `p0.y − ((x − p0.x)·n.x + (z − p0.z)·n.z)/n.y`, the form
     /// 0x494480 and `Susp_update` (0x499C37…0x499C7B) evaluate. `None` with no patch.

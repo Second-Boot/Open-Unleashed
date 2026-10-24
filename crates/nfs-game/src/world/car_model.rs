@@ -924,6 +924,318 @@ pub const MODEL_TO_BODY: Mat4 = Mat4::from_cols(
     glam::Vec4::new(0.0, 0.0, 0.0, 1.0),
 );
 
+/// The materials one car upload creates, by the `.crp` material index: the renderer material each
+/// one becomes (rendering state from the material's `Rs` block, the page it names, the env passes
+/// its method has), with the layer-light and shadow-map sets collected on the way.
+struct MaterialCache<'a> {
+    car: &'a CarAssets,
+    env: CarEnv,
+    materials: Vec<nfs_formats::crp::Material>,
+    page_tex: &'a [(nfs_renderer::TextureId, bool)],
+    ids: HashMap<u16, MaterialId>,
+    light: MaterialMap<nfs_formats::crp::LayerLight>,
+    shadowed: MaterialSet,
+}
+
+impl MaterialCache<'_> {
+    fn get(&mut self, r: &mut Renderer, id: u16) -> MaterialId {
+        let Self { car, env, materials, page_tex, ids: mat_ids, light: material_light, shadowed } = self;
+
+        if let Some(m) = mat_ids.get(&id) {
+            return *m;
+        }
+        let m = materials.get(id as usize);
+        let page = m.map(|m| m.page_index() as usize).and_then(|p| page_tex.get(p));
+        let blend = m.map(|m| matches!(m.render_method.as_str(), "CarWindow" | "CarWheel")).unwrap_or(false) || page.map(|p| p.1).unwrap_or(false);
+        // the specular and sky-map passes belong to `CarExtEnv` and `CarExtEnvNS` (passes of
+        // option mask 2, built at CarChrome ≥ Medium) and to `CarWindow` (mask 0, always built)
+        // — `rmthpasses`, `lighting.md` §5.3. (history: `game-history.md` §10.4)
+        let reflective = m.is_some_and(|m| match m.render_method.as_str() {
+            "CarExtEnv" | "CarExtEnvNS" => env.chrome_passes,
+            "CarWindow" => true,
+            _ => false,
+        });
+        // `R3DSpecularTextureLayer` and `R3DSkyMapTextureLayer` bucket the material's own
+        // reflection strength to pick which of their three textures they take (0x44553F,
+        // 0x445B33; `lighting.md` §3.1, §3.2 — the four strength dwords at `mt+284…+296` are equal
+        // in every shipped material, so the one `reflection` stands for each layer's own). The
+        // passes' combine is their `Rs` block `{1, 2, 0, 1, 0, −1}` (`rmthpasses`): alpha-blended
+        // over the pixel by the texel's own alpha — `env_mix` is only the switch
+        let variant = nfs_formats::crp::env_variant(m.map(|m| m.reflection).unwrap_or(0.0));
+        // the specular texture is the car's own `SPC{bucket+1}` (0x441AB2), not a section map
+        let spec = if reflective { env.specular[variant] } else { None };
+        // the cull mode is the material's own `Rs` block, Thrash state 2 at `mt+272`: 1 the
+        // view's own (the back faces, `thrash.md` §6d.2), 0 none — the port had culled every opaque one and
+        // none of the blended, which with depth writes on let a wheel well's outer faces cover
+        // the wheel
+        let cull = m.and_then(|m| m.rs).map_or(!blend, |rs| rs[3] == 1);
+        // A front-end room is drawn by the car's own class (`nfs_assets::car::CarAssets::
+        // front_end_room`), so its `Rs` block is what `LayerState` hands the driver: Thrash
+        // 0x0A = 2 blends every one of its materials, and 0x38 picks the pair — 0 the plain
+        // alpha pair, **1 `SRCALPHA` / `ONE`** for the light pools and light cones on the 4444
+        // pages (`Lightcast*`, `SpotLight`, `GarageSpot`'s `ligh` / `spot`), which add their light
+        // to what is under them (`RE/notes/frontend-3d.md` §9). The cars keep the port's rule by
+        // method and page: every shipped car block is `{1, 2, 0, …}`, the plain pair.
+        let (blend, blend_pair) = match m.and_then(|m| m.rs) {
+            Some(rs) if car.front_end_room => (rs[1] == 2, rs[2].clamp(0, 3) as u8),
+            // The shipped car's own block says 0x0A = 2 on every material (`thrash.md` §6d.4): the
+            // draw is alpha-blended over the pixel by the texel's alpha, so the 1555 pages'
+            // edge texels (the door handle's and the badges' sprites, whose neighbours are alpha 0
+            // with coloured bits) fade out under the bilinear filter instead of leaving a light
+            // outline (PA-DETAIL). `device_states` already drops alpha ≤ 10.
+            Some(rs) => (blend || rs[1] == 2, 0),
+            _ => (blend, 0),
+        };
+        // Thrash 0x18 from the same block, `rs[4]` (`LayerState` 0x53F780 → 0x540660 hands the
+        // driver states 6, 0x0A, 0x38, 2 and 0x18, the last through 0x540500): over the shipped
+        // cars −10, −3, −2, −1, 0, 1, 3 and 5 (`nfs-formats/examples/rsblock.rs`) — `b · 2^-15`
+        // on the game's screen z `far/(far − near) · (1 − near / Z)` (0x540CE0, `RE/notes/
+        // thrash.md` §6d.3): ≈ `b · 2^-15 · Z² / near` of view depth, 0.05 mm a unit at 0.5 m in
+        // the driver view (near 0.15), 0.5 m at 50 m. (history: `game-history.md` §10.5)
+        let depth_bias = if env.rs_bias { m.and_then(|m| m.rs).map_or(0, |rs| rs[4]) } else { 0 };
+        let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: spec, env_mix: 1.0, env_variant: variant, sky_map: reflective, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias, false_sort: false });
+        if let Some(l) = m.and_then(|m| m.light) {
+            material_light.insert(mid, l);
+        }
+        // the methods with a pass of layer class **0x8102**, `R3DShadowMapTextureLayer` (the
+        // factory's 0x449FB4 arm → vtable 0x5B3964) that the option word builds (`rmthpasses`
+        // over every shipped car and room `.crp`, `lighting.md` §5.3): `CarExt` and `CarIntShd`
+        // (pass 1, mask 0), `CarWindow` (pass 3, mask 0) and `CarExtEnv` (pass 3, mask 2 — built
+        // at CarChrome ≥ Medium). `CarExtEnvNS` ("no shadow") lists it only in its dead mask-4
+        // passes, `CarInt` and `CarWheel` not at all. (history: `game-history.md` §10.6)
+        if m.is_some_and(|m| match m.render_method.as_str() {
+            "CarExt" | "CarIntShd" | "CarWindow" => true,
+            "CarExtEnv" => env.chrome_passes,
+            _ => false,
+        }) {
+            shadowed.insert(mid);
+        }
+        mat_ids.insert(id, mid);
+        mid
+    }
+}
+
+/// What the per-article loop of [`CarModel::upload_with_env`] collects.
+struct CarAccum {
+    lists: CarParts,
+    skipped: usize,
+    min: Vec3,
+    max: Vec3,
+    lights: Vec<CarLight>,
+    morph: [Vec<MorphPart>; ANIMS],
+    anim_length: [u32; ANIMS],
+    wheel_radius: f32,
+    half_track: f32,
+    deform: Vec<DeformPart>,
+    lod_lists: LodLists,
+}
+
+impl Default for CarAccum {
+    fn default() -> Self {
+        Self {
+            lists: CarParts::default(),
+            skipped: 0,
+            min: Vec3::splat(f32::MAX),
+            max: Vec3::splat(f32::MIN),
+            lights: Vec::new(),
+            morph: Default::default(),
+            anim_length: [0u32; ANIMS],
+            wheel_radius: 0.3,
+            half_track: 0.7,
+            deform: Vec::new(),
+            lod_lists: LodLists::default(),
+        }
+    }
+}
+
+/// One article's geometry, as [`CarAccum::add_article_lod`] reads it for each of its LODs.
+struct ArticleCtx<'a> {
+    ai: usize,
+    a: &'a nfs_formats::crp::Article,
+    g: nfs_formats::crp::ArticleGeometry,
+    ty: u8,
+    is_wheel: bool,
+    anim: usize,
+    frame_geometry: Vec<nfs_formats::crp::ArticleGeometry>,
+    damage_geometry: Option<nfs_formats::crp::ArticleGeometry>,
+}
+
+impl CarAccum {
+    /// One article of the `.crp`: the glare lamps, the style's gate, and the meshes of every LOD it
+    /// has primitives in.
+    fn add_article(&mut self, r: &mut Renderer, mats: &mut MaterialCache, car: &CarAssets, style: &nfs_assets::car::CarStyle, lod: u8, ai: usize, a: &nfs_formats::crp::Article) -> anyhow::Result<()> {
+        let Self { lights, lod_lists, .. } = self;
+        lod_lists.admit(car, style, ai, a);
+        // the glare articles hold no geometry, only an `ef` record (`particles.md` §4): its
+        // lamp, the slot `Base[0x50]` that switches it (0x43C427 / 0x43D8C0), and a mirrored copy
+        // across x with the slot `L+0x4E` (0x43DAC5…0x43DB32) when `L+0x48 & 8`. One `ef` per article in
+        // every shipped model (0x43DDA5…0x43DE48 would walk on through consecutive ones).
+        //
+        // The effect pass 0x43D800 walks the LOD's part list, which 0x43C1B0 builds from the
+        // articles the style admits (`carinfo[0x56C + 4·Base+68] == Base+69`, 0x43C2A1) that have
+        // a `Base` LOD record for this LOD — the first `k` in `[Base+8, Base+0xC)` whose `word
+        // Base+0x6C + 12k` is it (0x43C2AA…0x43C2C9); the part's `[article+0x48]` is that record
+        // (0x43C42A…0x43C431), and the pass skips the part when the record's **byte +1** is 0
+        // (0x43D863…0x43D872) before it looks for the `ef` (0x43D88B). Across every shipped
+        // model the byte is 1 on each LOD record of an article with an `ef` and 0 on every
+        // other, so it is the "has effects" flag; the style test is what drops lamps: glare
+        // articles carry types 0, 1, 4, 5, 7, 18, 19, 20 and 27 with their variants, and one
+        // of another variant was lit alongside the style's own.
+        let effect_part = effect_part(car, style, a, lod);
+        if !effect_part && a.parts.iter().any(|p| p.is_part(b"ef")) {
+            return Ok(());
+        }
+        if let Some(lamps) = glare_lamps(car, a, lod) {
+            lights.extend(lamps);
+            return Ok(());
+        }
+        let g = car.crp.article_geometry(&car.crp_data, a)?;
+        let (ty, variant) = g.base.as_ref().map(|b| (b.tag[0], b.tag[1])).unwrap_or((0, 0));
+        if !style.article_enabled(ty, variant) {
+            return Ok(());
+        }
+        let is_wheel = matches!(ty, 0x0D | 0x0E);
+        // an animated article's morph frames: each frame's geometry — 0x43C4FB probes `vt`
+        // part `frame·0x10 + index` until one is missing, and the count is the animation's
+        // length when it is the largest (0x43C54B…0x43C56F)
+        let anim = g.base.as_ref().map(|b| b.anim as usize).filter(|&n| n > 0 && n < ANIMS).unwrap_or(0);
+        let frame_geometry: Vec<nfs_formats::crp::ArticleGeometry> = if !is_wheel && anim != 0 {
+            (1u16..).map_while(|f| car.crp.article_geometry_frame(&car.crp_data, a, f).ok()).collect()
+        } else {
+            Vec::new()
+        };
+        // 0x43E390 crushes the parts whose `Base+78` has bit 3 (0x43E3D8) from their
+        // `vt#(0x8000|lod)` vectors by their `dz#lod` zones, into the buffer `*(part+0x40)`
+        // points at. *(Settled 2026-09-27: a part that also morphs (the convertibles' roof,
+        // `Base+77`) is not excluded there — 0x43E390 only gates on `Base+78 & 8` and a
+        // non-null `part+0x40` (0x43E3D8, 0x43E3EF) — so it IS crushed. The two writers of
+        // `*(part+0x40)`: the crush, 0x43E390, called from `R3DCar` slot 7's `0x438230(0)`
+        // (0x4383CC); the morph blend, 0x43E120 (its own destination load at 0x43E225,
+        // `ebp = *(part+0x40)`), called from the SAME slot's `0x438030` (0x4383D3) — right
+        // after 0x438230, in the same per-frame update. Both are edge-triggered (0x438230 on a
+        // changed zone value, 0x438030 on a queued, changed animation), so on a frame where
+        // both trigger the morph runs last and wins; the crush persists on a stationary part
+        // between hits and is erased the next time that part's animation changes. Ported: the
+        // article now goes in both `deform` and `morph`; `App::update_damage_decals` already
+        // calls `update_damage` before `update_animation` / `update_driver`
+        // (`CarModel::blend`'s own dedup on `(frame, next, frac)` gives the edge-triggering).)*
+        let damage_geometry = if g.base.as_ref().is_some_and(|b| b.draw_bytes[0] & 8 != 0) { car.crp.article_geometry_damage(&car.crp_data, a).ok() } else { None };
+        // Every LOD the article has primitives in: the car draw 0x444E00 takes each pass from
+        // its own LOD object (`CarPass`). (history: `game-history.md` §10.7)
+        let lods: std::collections::BTreeSet<u8> = g.primitives.iter().map(|p| p.lod).filter(|l| (1..=7).contains(l)).collect();
+        let ctx = ArticleCtx { ai, a, g, ty, is_wheel, anim, frame_geometry, damage_geometry };
+        for l in lods {
+            self.add_article_lod(r, mats, car, lod, &ctx, l);
+        }
+        Ok(())
+    }
+
+    /// One LOD of one article: its meshes uploaded, the morph / crush data, and the part filed as a
+    /// wheel or a body part.
+    fn add_article_lod(&mut self, r: &mut Renderer, mats: &mut MaterialCache, car: &CarAssets, lod: u8, c: &ArticleCtx, l: u8) {
+        let ArticleCtx { ai, a, g, ty, is_wheel, anim, frame_geometry, damage_geometry } = c;
+        let (ai, ty, is_wheel, anim) = (*ai, *ty, *is_wheel, *anim);
+        let Self { lists, skipped, min, max, morph, anim_length, wheel_radius, half_track, deform, .. } = self;
+
+        // 0x43C8F8: the part's `"tr"` + the LOD, **no fallback** — without one the part
+        // is drawn in the car's own frame and the whole matrix block, the translation and
+        // rotation channels with it, is skipped (0x43C902 → 0x43CAFA). Such parts are
+        // modelled in car space: the 356's `DoorWindow` at LOD 4 sits where LOD 1's does
+        // through its `tr` (`lodtris` example; 314 articles of the shipped cars, none at
+        // LOD 1).
+        let tr = g.transforms.iter().find(|(i, _)| *i == l).map(|t| Mat4::from_cols_array(&t.1));
+        let local = tr.unwrap_or(Mat4::IDENTITY);
+        let info = PartInfo {
+            lod: l,
+            mask: g.base.as_ref().map_or(0, |b| b.draw_bytes[0]),
+            inside: g.base.as_ref().is_some_and(|b| b.draw_bytes[3] != 0),
+            inside_only: g.base.as_ref().is_some_and(|b| b.draw_bytes[4] != 0),
+            move_channel: if tr.is_some() { g.base.as_ref().map_or(-1, |b| b.move_channel) } else { -1 },
+        };
+        let rot_channel = if tr.is_some() { g.base.as_ref().map_or(0, |b| b.rot_channel) } else { 0 };
+        let roof_frames: Vec<Vec<MeshData>> = frame_geometry
+            .iter()
+            .map(|gf| {
+                let mut sk = 0;
+                article_meshes(gf, l, &mut sk).into_iter().map(|m| m.mesh).collect()
+            })
+            .collect();
+        if !roof_frames.is_empty() {
+            anim_length[anim] = anim_length[anim].max(roof_frames.len() as u32 + 1);
+        }
+        // the crush vectors and zones laid out as the meshes are: the damage geometry, and
+        // the geometry with each vertex's position replaced by its zone (the `dz` lists
+        // index the whole `vt#lod`, a primitive's window starting at `vt_first`)
+        let crush = damage_geometry.as_ref().and_then(|dg| crush_meshes(car, a, &g, dg, l));
+        let mut parts = Vec::new();
+        let mut part_channels: Vec<u8> = Vec::new();
+        for (k, mm) in article_meshes(&g, l, skipped).into_iter().enumerate() {
+            let mut mesh = mm.mesh;
+            // the port's own measures (the model box, the tyre radius, the track) come
+            // from the reference LOD alone
+            if l == lod {
+                for v in &mut mesh.vertices {
+                    let p = (MODEL_TO_BODY * local).transform_point3(Vec3::from(v.position));
+                    if !is_wheel {
+                        *min = min.min(p);
+                        *max = max.max(p);
+                    } else {
+                        // the tyre's rolling radius is its extent about the hub, not the distance
+                        // to a corner of the wheel's quad: the 993's wheel mesh spans ±0.3148 in
+                        // both y and z, and the `.sim` tyre (16\" rim, 205/55) has a radius of
+                        // 16·12.7 + 205·0.55 = 315.95 mm
+                        let lp = Vec3::from(v.position);
+                        *wheel_radius = wheel_radius.max(lp.y.abs()).max(lp.z.abs());
+                    }
+                }
+            }
+            let material = mats.get(r, mm.material);
+            let id = r.upload_mesh(&mesh);
+            if !roof_frames.is_empty() {
+                let mut positions = vec![mm_positions(&mesh)];
+                for f in &roof_frames {
+                    match f.get(k) {
+                        Some(m) if m.vertices.len() == mesh.vertices.len() => positions.push(mm_positions(m)),
+                        _ => break,
+                    }
+                }
+                morph[anim].push(MorphPart { mesh: id, scratch: mesh.vertices.clone(), seen: 0, frames: positions });
+            }
+            if let Some((dm, zm)) = &crush
+                && let (Some(d), Some(z)) = (dm.get(k), zm.get(k))
+                && d.mesh.vertices.len() == mesh.vertices.len()
+                && z.mesh.vertices.len() == mesh.vertices.len()
+            {
+                deform.push(DeformPart {
+                    mesh: id,
+                    base: mesh.vertices.clone(),
+                    indices: mesh.indices.clone(),
+                    delta: d.mesh.vertices.iter().map(|v| v.position).collect(),
+                    zone: z.mesh.vertices.iter().map(|v| v.position[0] as u8).collect(),
+                });
+            }
+            parts.push((id, material, local));
+            part_channels.push(rot_channel);
+        }
+        if parts.is_empty() {
+            return;
+        }
+        if is_wheel && tr.is_some() {
+            let pivot = MODEL_TO_BODY.transform_point3(local.w_axis.truncate());
+            if l == lod {
+                *half_track = half_track.max(pivot.x.abs());
+            }
+            lists.wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel: rot_channel, order: u32::MAX, info, parts });
+            lists.wheel_art.push(ai);
+        } else {
+            lists.body_art.extend(std::iter::repeat_n(ai, parts.len()));
+            lists.body_info.extend(std::iter::repeat_n(info, parts.len()));
+            lists.body.extend(parts);
+            lists.body_channel.extend(part_channels);
+        }
+    }
+}
+
 impl CarModel {
     pub fn upload(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>) -> anyhow::Result<Self> {
         Self::upload_with_env(r, car, paths, lod, paint, CarUpload::default())
@@ -992,252 +1304,14 @@ impl CarModel {
         let damage_patches = nfs_assets::car::damage_patches(paths, &car.model, light_paint).unwrap_or_default();
         let page_textures: Vec<nfs_renderer::TextureId> = page_tex.iter().map(|p| p.0).collect();
         let materials = car.crp.materials(&car.crp_data)?;
-        let mut mat_ids: HashMap<u16, MaterialId> = HashMap::new();
-        let mut material_light: MaterialMap<nfs_formats::crp::LayerLight> = MaterialMap::default();
-        let mut shadowed = MaterialSet::default();
-        let mut material_for = |r: &mut Renderer, id: u16| {
-            if let Some(m) = mat_ids.get(&id) {
-                return *m;
-            }
-            let m = materials.get(id as usize);
-            let page = m.map(|m| m.page_index() as usize).and_then(|p| page_tex.get(p));
-            let blend = m.map(|m| matches!(m.render_method.as_str(), "CarWindow" | "CarWheel")).unwrap_or(false) || page.map(|p| p.1).unwrap_or(false);
-            // the specular and sky-map passes belong to `CarExtEnv` and `CarExtEnvNS` (passes of
-            // option mask 2, built at CarChrome ≥ Medium) and to `CarWindow` (mask 0, always built)
-            // — `rmthpasses`, `lighting.md` §5.3. (history: `game-history.md` §10.4)
-            let reflective = m.is_some_and(|m| match m.render_method.as_str() {
-                "CarExtEnv" | "CarExtEnvNS" => env.chrome_passes,
-                "CarWindow" => true,
-                _ => false,
-            });
-            // `R3DSpecularTextureLayer` and `R3DSkyMapTextureLayer` bucket the material's own
-            // reflection strength to pick which of their three textures they take (0x44553F,
-            // 0x445B33; `lighting.md` §3.1, §3.2 — the four strength dwords at `mt+284…+296` are equal
-            // in every shipped material, so the one `reflection` stands for each layer's own). The
-            // passes' combine is their `Rs` block `{1, 2, 0, 1, 0, −1}` (`rmthpasses`): alpha-blended
-            // over the pixel by the texel's own alpha — `env_mix` is only the switch
-            let variant = nfs_formats::crp::env_variant(m.map(|m| m.reflection).unwrap_or(0.0));
-            // the specular texture is the car's own `SPC{bucket+1}` (0x441AB2), not a section map
-            let spec = if reflective { env.specular[variant] } else { None };
-            // the cull mode is the material's own `Rs` block, Thrash state 2 at `mt+272`: 1 the
-            // view's own (the back faces, `thrash.md` §6d.2), 0 none — the port had culled every opaque one and
-            // none of the blended, which with depth writes on let a wheel well's outer faces cover
-            // the wheel
-            let cull = m.and_then(|m| m.rs).map_or(!blend, |rs| rs[3] == 1);
-            // A front-end room is drawn by the car's own class (`nfs_assets::car::CarAssets::
-            // front_end_room`), so its `Rs` block is what `LayerState` hands the driver: Thrash
-            // 0x0A = 2 blends every one of its materials, and 0x38 picks the pair — 0 the plain
-            // alpha pair, **1 `SRCALPHA` / `ONE`** for the light pools and light cones on the 4444
-            // pages (`Lightcast*`, `SpotLight`, `GarageSpot`'s `ligh` / `spot`), which add their light
-            // to what is under them (`RE/notes/frontend-3d.md` §9). The cars keep the port's rule by
-            // method and page: every shipped car block is `{1, 2, 0, …}`, the plain pair.
-            let (blend, blend_pair) = match m.and_then(|m| m.rs) {
-                Some(rs) if car.front_end_room => (rs[1] == 2, rs[2].clamp(0, 3) as u8),
-                // The shipped car's own block says 0x0A = 2 on every material (`thrash.md` §6d.4): the
-                // draw is alpha-blended over the pixel by the texel's alpha, so the 1555 pages'
-                // edge texels (the door handle's and the badges' sprites, whose neighbours are alpha 0
-                // with coloured bits) fade out under the bilinear filter instead of leaving a light
-                // outline (PA-DETAIL). `device_states` already drops alpha ≤ 10.
-                Some(rs) => (blend || rs[1] == 2, 0),
-                _ => (blend, 0),
-            };
-            // Thrash 0x18 from the same block, `rs[4]` (`LayerState` 0x53F780 → 0x540660 hands the
-            // driver states 6, 0x0A, 0x38, 2 and 0x18, the last through 0x540500): over the shipped
-            // cars −10, −3, −2, −1, 0, 1, 3 and 5 (`nfs-formats/examples/rsblock.rs`) — `b · 2^-15`
-            // on the game's screen z `far/(far − near) · (1 − near / Z)` (0x540CE0, `RE/notes/
-            // thrash.md` §6d.3): ≈ `b · 2^-15 · Z² / near` of view depth, 0.05 mm a unit at 0.5 m in
-            // the driver view (near 0.15), 0.5 m at 50 m. (history: `game-history.md` §10.5)
-            let depth_bias = if env.rs_bias { m.and_then(|m| m.rs).map_or(0, |rs| rs[4]) } else { 0 };
-            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: spec, env_mix: 1.0, env_variant: variant, sky_map: reflective, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias, false_sort: false });
-            if let Some(l) = m.and_then(|m| m.light) {
-                material_light.insert(mid, l);
-            }
-            // the methods with a pass of layer class **0x8102**, `R3DShadowMapTextureLayer` (the
-            // factory's 0x449FB4 arm → vtable 0x5B3964) that the option word builds (`rmthpasses`
-            // over every shipped car and room `.crp`, `lighting.md` §5.3): `CarExt` and `CarIntShd`
-            // (pass 1, mask 0), `CarWindow` (pass 3, mask 0) and `CarExtEnv` (pass 3, mask 2 — built
-            // at CarChrome ≥ Medium). `CarExtEnvNS` ("no shadow") lists it only in its dead mask-4
-            // passes, `CarInt` and `CarWheel` not at all. (history: `game-history.md` §10.6)
-            if m.is_some_and(|m| match m.render_method.as_str() {
-                "CarExt" | "CarIntShd" | "CarWindow" => true,
-                "CarExtEnv" => env.chrome_passes,
-                _ => false,
-            }) {
-                shadowed.insert(mid);
-            }
-            mat_ids.insert(id, mid);
-            mid
-        };
+        let mut mats = MaterialCache { car, env, materials, page_tex: &page_tex, ids: HashMap::new(), light: MaterialMap::default(), shadowed: MaterialSet::default() };
         let arts = car.crp.articles(&car.crp_data)?;
-        let mut lists = CarParts::default();
-        let mut skipped = 0;
-        let mut min = Vec3::splat(f32::MAX);
-        let mut max = Vec3::splat(f32::MIN);
-        let mut lights: Vec<CarLight> = Vec::new();
-        let mut morph: [Vec<MorphPart>; ANIMS] = Default::default();
-        let mut anim_length = [0u32; ANIMS];
-        let mut wheel_radius: f32 = 0.3;
-        let mut half_track: f32 = 0.7;
-        let mut deform: Vec<DeformPart> = Vec::new();
-        let mut lod_lists = LodLists::default();
+        let mut acc = CarAccum::default();
         for (ai, a) in arts.iter().enumerate() {
-            lod_lists.admit(car, &style, ai, a);
-            // the glare articles hold no geometry, only an `ef` record (`particles.md` §4): its
-            // lamp, the slot `Base[0x50]` that switches it (0x43C427 / 0x43D8C0), and a mirrored copy
-            // across x with the slot `L+0x4E` (0x43DAC5…0x43DB32) when `L+0x48 & 8`. One `ef` per article in
-            // every shipped model (0x43DDA5…0x43DE48 would walk on through consecutive ones).
-            //
-            // The effect pass 0x43D800 walks the LOD's part list, which 0x43C1B0 builds from the
-            // articles the style admits (`carinfo[0x56C + 4·Base+68] == Base+69`, 0x43C2A1) that have
-            // a `Base` LOD record for this LOD — the first `k` in `[Base+8, Base+0xC)` whose `word
-            // Base+0x6C + 12k` is it (0x43C2AA…0x43C2C9); the part's `[article+0x48]` is that record
-            // (0x43C42A…0x43C431), and the pass skips the part when the record's **byte +1** is 0
-            // (0x43D863…0x43D872) before it looks for the `ef` (0x43D88B). Across every shipped
-            // model the byte is 1 on each LOD record of an article with an `ef` and 0 on every
-            // other, so it is the "has effects" flag; the style test is what drops lamps: glare
-            // articles carry types 0, 1, 4, 5, 7, 18, 19, 20 and 27 with their variants, and one
-            // of another variant was lit alongside the style's own.
-            let effect_part = effect_part(car, &style, a, lod);
-            if !effect_part && a.parts.iter().any(|p| p.is_part(b"ef")) {
-                continue;
-            }
-            if let Some(lamps) = glare_lamps(car, a, lod) {
-                lights.extend(lamps);
-                continue;
-            }
-            let g = car.crp.article_geometry(&car.crp_data, a)?;
-            let (ty, variant) = g.base.as_ref().map(|b| (b.tag[0], b.tag[1])).unwrap_or((0, 0));
-            if !style.article_enabled(ty, variant) {
-                continue;
-            }
-            let is_wheel = matches!(ty, 0x0D | 0x0E);
-            // an animated article's morph frames: each frame's geometry — 0x43C4FB probes `vt`
-            // part `frame·0x10 + index` until one is missing, and the count is the animation's
-            // length when it is the largest (0x43C54B…0x43C56F)
-            let anim = g.base.as_ref().map(|b| b.anim as usize).filter(|&n| n > 0 && n < ANIMS).unwrap_or(0);
-            let frame_geometry: Vec<nfs_formats::crp::ArticleGeometry> = if !is_wheel && anim != 0 {
-                (1u16..).map_while(|f| car.crp.article_geometry_frame(&car.crp_data, a, f).ok()).collect()
-            } else {
-                Vec::new()
-            };
-            // 0x43E390 crushes the parts whose `Base+78` has bit 3 (0x43E3D8) from their
-            // `vt#(0x8000|lod)` vectors by their `dz#lod` zones, into the buffer `*(part+0x40)`
-            // points at. *(Settled 2026-09-27: a part that also morphs (the convertibles' roof,
-            // `Base+77`) is not excluded there — 0x43E390 only gates on `Base+78 & 8` and a
-            // non-null `part+0x40` (0x43E3D8, 0x43E3EF) — so it IS crushed. The two writers of
-            // `*(part+0x40)`: the crush, 0x43E390, called from `R3DCar` slot 7's `0x438230(0)`
-            // (0x4383CC); the morph blend, 0x43E120 (its own destination load at 0x43E225,
-            // `ebp = *(part+0x40)`), called from the SAME slot's `0x438030` (0x4383D3) — right
-            // after 0x438230, in the same per-frame update. Both are edge-triggered (0x438230 on a
-            // changed zone value, 0x438030 on a queued, changed animation), so on a frame where
-            // both trigger the morph runs last and wins; the crush persists on a stationary part
-            // between hits and is erased the next time that part's animation changes. Ported: the
-            // article now goes in both `deform` and `morph`; `App::update_damage_decals` already
-            // calls `update_damage` before `update_animation` / `update_driver`
-            // (`CarModel::blend`'s own dedup on `(frame, next, frac)` gives the edge-triggering).)*
-            let damage_geometry = if g.base.as_ref().is_some_and(|b| b.draw_bytes[0] & 8 != 0) { car.crp.article_geometry_damage(&car.crp_data, a).ok() } else { None };
-            // Every LOD the article has primitives in: the car draw 0x444E00 takes each pass from
-            // its own LOD object (`CarPass`). (history: `game-history.md` §10.7)
-            let lods: std::collections::BTreeSet<u8> = g.primitives.iter().map(|p| p.lod).filter(|l| (1..=7).contains(l)).collect();
-            for l in lods {
-                // 0x43C8F8: the part's `"tr"` + the LOD, **no fallback** — without one the part
-                // is drawn in the car's own frame and the whole matrix block, the translation and
-                // rotation channels with it, is skipped (0x43C902 → 0x43CAFA). Such parts are
-                // modelled in car space: the 356's `DoorWindow` at LOD 4 sits where LOD 1's does
-                // through its `tr` (`lodtris` example; 314 articles of the shipped cars, none at
-                // LOD 1).
-                let tr = g.transforms.iter().find(|(i, _)| *i == l).map(|t| Mat4::from_cols_array(&t.1));
-                let local = tr.unwrap_or(Mat4::IDENTITY);
-                let info = PartInfo {
-                    lod: l,
-                    mask: g.base.as_ref().map_or(0, |b| b.draw_bytes[0]),
-                    inside: g.base.as_ref().is_some_and(|b| b.draw_bytes[3] != 0),
-                    inside_only: g.base.as_ref().is_some_and(|b| b.draw_bytes[4] != 0),
-                    move_channel: if tr.is_some() { g.base.as_ref().map_or(-1, |b| b.move_channel) } else { -1 },
-                };
-                let rot_channel = if tr.is_some() { g.base.as_ref().map_or(0, |b| b.rot_channel) } else { 0 };
-                let roof_frames: Vec<Vec<MeshData>> = frame_geometry
-                    .iter()
-                    .map(|gf| {
-                        let mut sk = 0;
-                        article_meshes(gf, l, &mut sk).into_iter().map(|m| m.mesh).collect()
-                    })
-                    .collect();
-                if !roof_frames.is_empty() {
-                    anim_length[anim] = anim_length[anim].max(roof_frames.len() as u32 + 1);
-                }
-                // the crush vectors and zones laid out as the meshes are: the damage geometry, and
-                // the geometry with each vertex's position replaced by its zone (the `dz` lists
-                // index the whole `vt#lod`, a primitive's window starting at `vt_first`)
-                let crush = damage_geometry.as_ref().and_then(|dg| crush_meshes(car, a, &g, dg, l));
-                let mut parts = Vec::new();
-                let mut part_channels: Vec<u8> = Vec::new();
-                for (k, mm) in article_meshes(&g, l, &mut skipped).into_iter().enumerate() {
-                    let mut mesh = mm.mesh;
-                    // the port's own measures (the model box, the tyre radius, the track) come
-                    // from the reference LOD alone
-                    if l == lod {
-                        for v in &mut mesh.vertices {
-                            let p = (MODEL_TO_BODY * local).transform_point3(Vec3::from(v.position));
-                            if !is_wheel {
-                                min = min.min(p);
-                                max = max.max(p);
-                            } else {
-                                // the tyre's rolling radius is its extent about the hub, not the distance
-                                // to a corner of the wheel's quad: the 993's wheel mesh spans ±0.3148 in
-                                // both y and z, and the `.sim` tyre (16\" rim, 205/55) has a radius of
-                                // 16·12.7 + 205·0.55 = 315.95 mm
-                                let lp = Vec3::from(v.position);
-                                wheel_radius = wheel_radius.max(lp.y.abs()).max(lp.z.abs());
-                            }
-                        }
-                    }
-                    let material = material_for(r, mm.material);
-                    let id = r.upload_mesh(&mesh);
-                    if !roof_frames.is_empty() {
-                        let mut positions = vec![mm_positions(&mesh)];
-                        for f in &roof_frames {
-                            match f.get(k) {
-                                Some(m) if m.vertices.len() == mesh.vertices.len() => positions.push(mm_positions(m)),
-                                _ => break,
-                            }
-                        }
-                        morph[anim].push(MorphPart { mesh: id, scratch: mesh.vertices.clone(), seen: 0, frames: positions });
-                    }
-                    if let Some((dm, zm)) = &crush
-                        && let (Some(d), Some(z)) = (dm.get(k), zm.get(k))
-                        && d.mesh.vertices.len() == mesh.vertices.len()
-                        && z.mesh.vertices.len() == mesh.vertices.len()
-                    {
-                        deform.push(DeformPart {
-                            mesh: id,
-                            base: mesh.vertices.clone(),
-                            indices: mesh.indices.clone(),
-                            delta: d.mesh.vertices.iter().map(|v| v.position).collect(),
-                            zone: z.mesh.vertices.iter().map(|v| v.position[0] as u8).collect(),
-                        });
-                    }
-                    parts.push((id, material, local));
-                    part_channels.push(rot_channel);
-                }
-                if parts.is_empty() {
-                    continue;
-                }
-                if is_wheel && tr.is_some() {
-                    let pivot = MODEL_TO_BODY.transform_point3(local.w_axis.truncate());
-                    if l == lod {
-                        half_track = half_track.max(pivot.x.abs());
-                    }
-                    lists.wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel: rot_channel, order: u32::MAX, info, parts });
-                    lists.wheel_art.push(ai);
-                } else {
-                    lists.body_art.extend(std::iter::repeat_n(ai, parts.len()));
-                    lists.body_info.extend(std::iter::repeat_n(info, parts.len()));
-                    lists.body.extend(parts);
-                    lists.body_channel.extend(part_channels);
-                }
-            }
+            acc.add_article(r, &mut mats, car, &style, lod, ai, a)?;
         }
+        let CarAccum { mut lists, skipped, min, max, lights, morph, anim_length, wheel_radius, half_track, deform, mut lod_lists } = acc;
+        let MaterialCache { light: material_light, shadowed, .. } = mats;
         let (body_order, unlisted) = lists.order(&mut lod_lists.list);
         let CarParts { body, body_channel, body_info, wheels, .. } = lists;
         tracing::info!(unlisted, "car part order");

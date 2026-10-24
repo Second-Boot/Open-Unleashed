@@ -152,7 +152,7 @@ impl App {
         }
         self.fe.cd_current = id as i32;
         // `[[0x65B928]+0xE0]`, the bottom layer's list
-        let cd_screen = self.fe_list_now() == "ID_OPTIONSSCREEN";
+        let cd_screen = self.fe_list_is("ID_OPTIONSSCREEN");
         if cd_screen {
             self.fe_music(|m, a, draw| {
                 m.stop(a);
@@ -267,7 +267,7 @@ impl App {
     /// REFERENCE-2026-10-02-SRVB.md §2; until 2026-10-02 the port counted from the entry).
     pub(crate) fn fe_main_screen_music_tick(&mut self) {
         // a tick of the callback list object `[fe+0xE0]`, the bottom layer's
-        if self.vehicle.is_some() || self.fe_list_now() != "ID_MAINSCREEN" {
+        if self.vehicle.is_some() || !self.fe_list_is("ID_MAINSCREEN") {
             return;
         }
         if self.idle_movie_due || self.idle_movie_running {

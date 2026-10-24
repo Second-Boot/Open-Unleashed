@@ -212,6 +212,9 @@ pub struct NetPlay {
     next_seat: usize,
     /// TEST GLUE `NFS_NET_LAG_MS`: the car-state packets held back, with when they are heard
     lagged: VecDeque<(Instant, Vec<u8>)>,
+    /// TEST GLUE `NFS_NET_LOCKSTEP`: the car-state packets held for their due tick (sender tick), and the highest sender tick seen
+    lockstep: VecDeque<(u32, Vec<u8>)>,
+    lockstep_seen: Option<u32>,
     /// A `0xB3` came in (0x48F82F): the host is starting the race. Taken by [`NetPlay::take_start`].
     start_due: bool,
     /// see [`JoinState`]
@@ -272,6 +275,10 @@ pub struct NetPlay {
     server: nfs_net::exchange::Server,
     /// Whether this race runs by input exchange (set by [`NetPlay::exchange_race_frame`]).
     exchange: bool,
+    /// Whether the race's tick clock is the room's (a network race through [`NetPlay::exchange_race_frame`], **positional or not**):
+    /// the frame driver runs ticks only below `[0x6559F8]`, the 64 Hz counter the 128 Hz timer callback 0x4A45D0 advances against
+    /// the host's synchronised clock (`network.md` §11.44).
+    clocked: bool,
     /// The 128 Hz timer callback's emulation: when it started counting (`net+0xC4` cleared) and how
     /// many callbacks have run since (0x4A45D0; **glue**: the original's is a thread).
     timer_anchor: Option<Instant>,
@@ -386,7 +393,7 @@ pub const JOIN_TIMEOUT: Duration = Duration::from_secs(16);
 /// The well-known port. **TEST GLUE** (not in the original): `NFS_NET_PORT` moves it, so two
 /// test sessions (or two two-instance runs) on one machine do not fight over 9442.
 fn port() -> u16 {
-    std::env::var("NFS_NET_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(nfs_net::PORT)
+    nfs_game::config::cfg().nfs_net_port.as_str().and_then(|v| v.parse().ok()).unwrap_or(nfs_net::PORT)
 }
 
 /// How long the launch barrier, PLAYGAME's wait and the race frame's wait last at most. PORT-DEVIATION

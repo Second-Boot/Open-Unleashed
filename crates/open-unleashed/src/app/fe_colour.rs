@@ -23,7 +23,7 @@ impl App {
     ///   both stripes, the interior list for the interior;
     /// * anything else, and `OwnedCar.*` with no garage car — the catalogue car's paint sets.
     ///
-    /// The third is the colour when it is not a row (`OwnedCar::custom`, `Menu::paint_custom`):
+    /// The third is the colour when it is not a row (`OwnedCar::custom`, `FeCatalogues::paint_custom`):
     /// a saved custom colour, which is what the accessor's `[+0x2C]` then holds.
     pub(crate) fn colour_state(&self, base: &str) -> Option<(Vec<u32>, usize, Option<u32>)> {
         if matches!(base, "DealerCar.Colour" | "DealerCar.IntColour")
@@ -271,7 +271,7 @@ pub(crate) fn colour_rgba(c: u32) -> [u8; 4] {
 
 /// **The colour `GenericCar.Colour`/`DealerCar.Colour` starts on — not row 0 of the car later
 /// shown.** `FEColourAccessor`'s constructor (0x4B91F0, `controls.md` §4.171.1) sets `[+0x2C] =
-/// colour_fn(0)` exactly once, when the accessor itself is built — before `Menu::cars`/`set_cars`
+/// colour_fn(0)` exactly once, when the accessor itself is built — before `FeCatalogues::cars`/`set_cars`
 /// ever sorts or filters the merged list (`a7104509`/`dealer_flag_admitted`, a
 /// report of 2026-09-30) — so `colour_fn(0)` reads whichever car `GenericCar.Car`'s
 /// pointer starts on: `nfs5.car`'s own record **0** (`'50 356 1100 Cabriolet`, the raw file's

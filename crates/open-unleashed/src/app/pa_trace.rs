@@ -152,6 +152,24 @@ impl App {
         // (numbered as the gdb script numbers the original's: `[0x606AC4] − 1`, the tick that left it)
         let t = self.tick as i64 - 1;
         row(&mut *f, t, 0, v);
+        // TEST GLUE: the human's four wheel trackers (PA-VYBLIP): patch corners, flags word, height_d, zone, world_pos
+        static WHL: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+        let whl = WHL.get_or_init(|| {
+            let p = nfs_game::config::cfg().nfs_pa_trace.as_str()?;
+            Some(Mutex::new(std::io::BufWriter::new(std::fs::File::create(format!("{p}.whl")).ok()?)))
+        });
+        if let Some(Ok(mut c)) = whl.as_ref().map(|m| m.lock()) {
+            for (i, wh) in v.wheels.iter().enumerate() {
+                let _ = write!(c, "{t} {i} hd {:.6} z {:#x} wp {:?} ch {} ", wh.height_d, wh.zone, wh.world_pos, wh.tracker.changed);
+                match wh.tracker.patch_corners() {
+                    Some((a, b, cc, w)) => { let _ = writeln!(c, "patch {:?} {:?} {:?} w {:#x} n {:?}", a, b, cc, w, wh.tracker.normal); }
+                    None => { let _ = writeln!(c, "nopatch"); }
+                }
+            }
+            let tr = &v.tracker;
+            let _ = writeln!(c, "{t} car ch {} patch {:?} plane_n {:?} plane_p {:?} n {:?}", tr.changed, tr.patch_corners(), tr.plane_normal, tr.plane_point, tr.normal);
+            let _ = c.flush();
+        }
         for (k, o) in self.road.opponents.iter().enumerate() {
             row(&mut *f, t, k + 1, &o.vehicle);
         }
@@ -188,6 +206,18 @@ impl App {
             }
         }
         let _ = f.flush();
+        // `[0x5E6674]` as the tick left it (the gdb script's `.cap` file: tick and the three speed-cap globals
+        // 0x5E6670 / 0x5E6674 / 0x5E6678; the port keeps only the hard cap one, the others print as 0)
+        static CAP: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+        let cap = CAP.get_or_init(|| {
+            let p = nfs_game::config::cfg().nfs_pa_trace.as_str()?;
+            Some(Mutex::new(std::io::BufWriter::new(std::fs::File::create(format!("{p}.cap")).ok()?)))
+        });
+        if let Some(Ok(mut c)) = cap.as_ref().map(|m| m.lock()) {
+            let v = self.road.police.as_ref().map(|p| p.lane_cap).or_else(|| self.road.traffic.as_ref().map(|t| t.lane_cap));
+            let _ = writeln!(c, "{t} 0.000000 {:.6} 0.000000", v.unwrap_or(0.0));
+            let _ = c.flush();
+        }
     }
 }
 

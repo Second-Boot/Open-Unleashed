@@ -185,13 +185,9 @@ impl App {
         };
         let mut setup = f.setup.clone();
         resolve_replay_car(&self.paths, &mut setup);
-        let (mut track, car) = match (TrackAssets::load(&self.paths, &setup.track), CarAssets::load(&self.paths, &setup.car), CarAssets::load_sim(&self.paths, if setup.sim.is_empty() { "default" } else { &setup.sim })) {
-            (Ok(t), Ok(c), Ok(sim)) => (t, (c, sim)),
-            (t, c, s) => {
-                tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "replay load failed");
-                return;
-            }
-        };
+        let req = AssetRequest { track: &setup.track, derby: false, model: &setup.car, style: None, sim: &setup.sim, sim_default: true, failed: "replay load failed" };
+        let Some((mut track, c, sim)) = self.load_assets(req) else { return };
+        let car = (c, sim);
         tracing::info!(path = %path.display(), track = setup.track, car = setup.car, "front end: start replay");
         let race_class = setup.sim.to_lowercase().starts_with("gt") || setup.sim.starts_with("935");
         self.specs = CarSpecs::from_sim(&car.1, race_class);

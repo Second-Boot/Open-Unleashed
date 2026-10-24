@@ -394,6 +394,79 @@ pub struct Billboard<'a> {
     pub hints: Option<(&'a str, Option<&'a str>)>,
 }
 
+/// What [`Hud::results_sprites`] lays out (the race results table).
+pub struct ResultsTable<'a> {
+    pub rows: &'a [SummaryRow],
+    pub player: usize,
+    pub head: &'a [String],
+    pub widths: &'a [f32],
+    pub best_lap: bool,
+    pub points: bool,
+    pub ord: &'a [String],
+}
+
+/// What [`Hud::standings_sprites`] lays out (the tournament standings, with the winnings panel when there is one).
+pub struct StandingsTable<'a> {
+    pub rows: &'a [(String, String, String)],
+    pub player: Option<usize>,
+    pub head: &'a [String; 3],
+    pub timed: bool,
+    pub ord: &'a [String],
+    pub winnings: Option<(&'a nfs_game::career::Winnings, [String; 4], Option<(f32, f32)>)>,
+}
+
+/// What [`Hud::mission_summary_sprites`] lays out (the Factory Driver mission page).
+pub struct MissionSummary<'a> {
+    pub narrator: Option<usize>,
+    pub name: &'a str,
+    pub lines: &'a [String],
+    pub race_again: &'a str,
+    pub typed: Option<usize>,
+    pub button: (bool, bool),
+}
+
+/// What [`Hud::yes_no_sprites`] lays out (a two-line question over two buttons).
+pub struct YesNoDialog<'a> {
+    pub lines: [&'a str; 2],
+    pub buttons: [&'a str; 2],
+    pub sel: usize,
+    pub pressed: bool,
+}
+
+/// What [`Hud::replay_save_sprites`] lays out (the replay name field over two buttons).
+pub struct ReplaySaveDialog<'a> {
+    pub label: &'a str,
+    pub name: &'a str,
+    pub caret: bool,
+    pub buttons: [&'a str; 2],
+    pub hover: Option<usize>,
+    pub pressed: bool,
+}
+
+/// What [`Hud::map_sprites`] draws besides the tray position: the blips, the footprint scale, the lap counter and whether the tray slides.
+pub(crate) struct MapView<'a> {
+    /// every blip, the player last (the loop runs from the last car down to car 0, so the
+    /// player's is drawn on top): position, forward, half width / half length, colour
+    pub(crate) blips: &'a [(Vec3, Vec3, [f32; 2], [[f32; 4]; 4])],
+    /// the footprint scale 0x4337D2…0x4337ED: 60 in the whole-track view (`+0x14A`, set by the
+    /// camera 0x433498 when the zoom is 0x41EA40's 600), 20 otherwise, 1 in radar mode (0x41E7C0)
+    pub(crate) k: f32,
+    /// the counter and its `hud.loc` 0x13 (FE 19 "lap") label, see [`Hud::map_sprites`]
+    pub(crate) lap: Option<(&'a str, String, String)>,
+    /// the tray is mid-slide (0x42A410, state 1 or 2)
+    pub(crate) sliding: bool,
+}
+
+/// What [`Hud::opponent_list_sprites`] lists (the opponents tray).
+pub(crate) struct OpponentList<'a> {
+    pub(crate) pos: (f32, f32),
+    pub(crate) rows: &'a [(usize, [f32; 4], String, String)],
+    pub(crate) links: &'a [Option<LinkBadge>],
+    pub(crate) place: usize,
+    pub(crate) label: &'a str,
+    pub(crate) derby: bool,
+}
+
 /// `HButtonVisual` (0x41B140) size on the dialogs: 142 × 19 (`[0x5B2C78]`/`[0x5B2D48]`).
 pub(crate) const HUD_BUTTON: (f32, f32) = (142.0, 19.0);
 

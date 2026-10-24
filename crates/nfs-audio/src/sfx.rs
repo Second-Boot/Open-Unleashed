@@ -1035,6 +1035,7 @@ impl CollisionSfx {
         let v = road_v(speed, nibble);
         let level = (v / 2 + 64).clamp(0, 127);
         let vol = road_volume(a, v, half);
+        tracing::trace!(slot, a, v, vol, level, pitch_base, pan, "road call");
         let mut voice = self.road;
         if vol == 0 {
             // 0x4AA454: 0x565DD0(h, 5, −1)

@@ -110,10 +110,13 @@ impl FeRng {
         Self { s: [a, b, c, d, e, f] }
     }
 
-    /// Seeded from the wall clock, the way the front end does it.
+    /// Seeded from the wall clock, the way the front end does it. TEST GLUE: `NFS_FE_TIME=<seconds>`
+    /// pins `time(0)` (as in the race load's reseed, `race_start.rs`), so scripted quick-race
+    /// opponents and paints repeat from run to run; without the variable this is the clock.
     pub fn from_clock() -> Self {
+        let pinned = crate::config::cfg().nfs_fe_time.as_str().and_then(|v| v.trim().parse::<u32>().ok());
         // det-allow: the original seeds the FE RNG from the clock; FE picks, not the race simulation
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
+        let t = pinned.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0));
         Self::new(t)
     }
 

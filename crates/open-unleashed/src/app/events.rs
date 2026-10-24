@@ -102,7 +102,7 @@ impl ApplicationHandler for App {
         if matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::CursorMoved { .. })
             && self.fe.menu.is_some()
             && self.vehicle.is_none()
-            && self.fe_list_now() == "ID_MAINSCREEN"
+            && self.fe_list_is("ID_MAINSCREEN")
         {
             self.fe.main_music_stamp = self.fe_timer_ticks();
         }
@@ -751,7 +751,7 @@ impl ApplicationHandler for App {
                 // local time's
                 // the HUD tick's `HInfo` (0x425E0B): the network notices, once a frame
                 self.net_race_notice();
-                let exchange = self.net.session.as_ref().is_some_and(|n| n.exchanging());
+                let exchange = self.net.session.as_ref().is_some_and(|n| n.clocked());
                 if exchange && halted {
                     let _ = self.net_exchange_gate();
                 }

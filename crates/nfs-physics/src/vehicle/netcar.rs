@@ -78,7 +78,8 @@ impl Vehicle {
     ///    (`word == 0`) `P` steps by the unit vector toward the slice's centre until it does, and takes
     ///    two more such steps (0x4A0C2B…0x4A0D23);
     /// 4. 0x4A04A0: `d = |P − pos|`; above 20 a snap ([`Self::net_snap`]), else a blend;
-    /// 5. unless the block says airborne: the re-seat ([`Self::net_reseat`]).
+    /// 5. unless the block says airborne: the re-seat ([`Self::net_reseat`]), whose probes are the stored world points of the last
+    ///    tick's end ([`Vehicle::net_points`]); then 0x49AE30 again ([`Self::refresh_net_points`], 0x4A0DB3).
     ///
     /// **Not carried**: `car+0xEC4 = |v'|` (0x4A0D5B…0x4A0D61; no reader in the port) and `car+0x6C`'s
     /// counter, which the store resets and nothing reads.
@@ -114,6 +115,8 @@ impl Vehicle {
         if !b.airborne {
             self.net_reseat(grid, specs);
         }
+        // 0x4A0DB3: 0x49AE30 refreshes the stored world points (the airborne jump 0x4A0D69 lands there too)
+        self.refresh_net_points();
         age.abs() > 0x100
     }
 
@@ -199,19 +202,37 @@ impl Vehicle {
         self.speed_est = if ax <= az { ax * 0.25 + az } else { az * 0.25 + ax };
         self.net_reseat(grid, specs);
         self.tracker.forget_patch();
+        // 0x49AE30, the snap tail's last call
+        self.refresh_net_points();
+    }
+
+    /// **0x49AE30** for a network car: the stored world collision points `car+0x1DC…` are rebuilt from the position and rows
+    /// the car has now — at the end of the apply (0x4A0DB3, the snap tail) and of every `Car_integrateOrient` (0x49B9FC),
+    /// whether or not the apply ran. The next apply's `Susp_update` probes from them.
+    pub fn refresh_net_points(&mut self) {
+        self.net_points = Some((self.position, self.orientation));
     }
 
     /// The re-seat 0x4A0D6B…0x4A0DB2 (and 0x4A02A0's identical tail): `car+0x41C = Susp_update`,
     /// `car+0x334 −= car+0x424`, `car+0x424 = 0`, and each wheel's `+0x68` (compression), `+0x70`
-    /// (render angle — the port has no such field) and `+0x84` (airborne) cleared.
-    pub fn net_reseat(&mut self, grid: &TriangleGrid, specs: &CarSpecs) {
-        self.ground_h = self.susp_update(grid, specs, false);
+    /// (render angle — the port has no such field) and `+0x84` (airborne) cleared. `Susp_update` probes from the **stored** world
+    /// points `car+0x1DC…` (0x499AD4…0x499B13) — where 0x49AE30 left them at the end of the previous tick (or in the car's own
+    /// `Car_ground` of an even tick), 0.3 m behind a car doing 20 m/s — not from the position the blend has just given the body
+    /// ([`Vehicle::net_points`]; RE/notes/REFERENCE-2026-10-24-PA-DEADRECK2.md). The very first apply has none yet and probes from the body.
+    /// Answers the body height `car+0x424` `BodyHeight` found, which the re-seat takes off `y` (the harness compares it).
+    pub fn net_reseat(&mut self, grid: &TriangleGrid, specs: &CarSpecs) -> f32 {
+        // 0x499AD4…0x499B13: the probes are the stored world points, 0x49AE30's output of the last tick's end
+        let (origin, rows) = self.net_points.unwrap_or((self.position, self.orientation));
+        self.point_rows = Some(rows);
+        self.ground_h = self.susp_update_from(grid, specs, false, origin);
         self.position.y -= self.body_height;
+        let bh = self.body_height;
         self.body_height = 0.0;
         for w in &mut self.wheels {
             w.compression = 0.0;
             w.airborne = false;
         }
+        bh
     }
 
     /// **The two snap arms of 0x4A0680** (0x4A0803…0x4A086B and 0x4A0930…0x4A0994): the stale remote
@@ -332,5 +353,78 @@ mod tests {
         v.net_dead_reckon(&b, 100, &grid, &specs, Some(Vec3::ZERO));
         // the walk ends within 500 − 2 m of the centre, so the gap to the car is above 20: a snap
         assert!(v.position.x < 500.0 && v.position.x > 490.0, "{}", v.position.x);
+    }
+
+    /// A slope rising 0.1 m per metre along x.
+    fn slope() -> TriangleGrid {
+        let s = 500.0;
+        let (a, b, c, d) = (Vec3::new(-s, -50.0, -s), Vec3::new(s, 50.0, -s), Vec3::new(s, 50.0, s), Vec3::new(-s, -50.0, s));
+        TriangleGrid::build(vec![Triangle::new(a, b, c, 1), Triangle::new(a, c, d, 1)], 100.0)
+    }
+
+    /// 0x499AD4…0x499B13: `Susp_update` probes from the **stored** world points `car+0x1DC…`, which 0x49AE30 left at the end of the last tick —
+    /// where the body stood then, not where the blend has since put it (0.3 m behind at 20 m/s, RE/notes/REFERENCE-2026-10-24-PA-DEADRECK2.md).
+    #[test]
+    fn the_reseat_probes_from_the_stored_points() {
+        let grid = slope();
+        let (mut v, specs) = car();
+        v.net_car = true;
+        v.position = Vec3::new(10.0, 1.5, 0.0);
+        v.tracker.track(&grid, v.position);
+        // the points were built where the car stood 4 m earlier
+        v.net_points = Some((Vec3::new(6.0, 0.5, 0.0), Mat3::IDENTITY));
+        v.net_reseat(&grid, &specs);
+        for w in &v.wheels {
+            // the probe's x is the stored one (the wheel offsets are a metre or two either side), its contact height the slope's there
+            assert!(w.world_pos.x < 9.0, "probe at the stored points: {}", w.world_pos.x);
+            let want = 0.1 * w.world_pos.x;
+            assert!((w.world_pos.y - v.ride_height - want).abs() < 1e-3, "contact on the slope: {} vs {want}", w.world_pos.y);
+        }
+        // and without them (the first apply) the probes sit under the body
+        let (mut v, specs) = car();
+        v.net_car = true;
+        v.position = Vec3::new(10.0, 1.5, 0.0);
+        v.tracker.track(&grid, v.position);
+        v.net_reseat(&grid, &specs);
+        assert!(v.wheels.iter().all(|w| w.world_pos.x > 8.0));
+    }
+
+    /// 0x49A8CA…: `Susp_update` calls 0x49AE30 itself before `BodyHeight`, so a network car's stored points are where the call left the body
+    /// (the car's own `Car_ground` on an even tick refreshes them too); any other car's stay untouched.
+    #[test]
+    fn susp_update_leaves_a_network_cars_points_at_the_body() {
+        let grid = flat();
+        let (mut v, specs) = car();
+        v.net_car = true;
+        v.position = Vec3::new(3.0, 0.5, 4.0);
+        v.susp_update(&grid, &specs, false);
+        assert_eq!(v.net_points.map(|p| p.0), Some(v.position));
+        let (mut v, specs) = car();
+        v.susp_update(&grid, &specs, false);
+        assert_eq!(v.net_points, None);
+    }
+
+    /// 0x49A612: a network car (`car+0xDAC`) holds the roll filter `car+0xDC8` at 0 as it holds the dive filter `car+0xDC4` (0x49A4BE).
+    #[test]
+    fn a_network_car_holds_both_filters_at_zero() {
+        let grid = flat();
+        let (mut v, mut specs) = car();
+        specs.dive_gain = 0.0045;
+        specs.roll_gain = 0.0033;
+        v.cos_tilt = 1.0;
+        v.accel_local = Vec3::new(5.0, 0.0, 5.0);
+        v.net_car = true;
+        v.position = Vec3::ZERO;
+        v.susp_update(&grid, &specs, false);
+        assert_eq!((v.dive, v.roll_lp), (0.0, 0.0));
+        // an ordinary car filters
+        let (mut v, mut specs) = car();
+        specs.dive_gain = 0.0045;
+        specs.roll_gain = 0.0033;
+        v.cos_tilt = 1.0;
+        v.accel_local = Vec3::new(5.0, 0.0, 5.0);
+        v.position = Vec3::ZERO;
+        v.susp_update(&grid, &specs, false);
+        assert!(v.roll_lp != 0.0 || v.dive != 0.0);
     }
 }

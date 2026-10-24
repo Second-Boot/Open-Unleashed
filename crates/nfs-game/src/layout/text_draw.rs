@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Where and how a text is drawn: its anchor, the wrap width, the alignment (0 left, 1 centre,
+/// 2 right) and the colour.
+#[derive(Clone, Copy)]
+pub(super) struct TextBox {
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) w: f32,
+    pub(super) align: i64,
+    pub(super) color: [f32; 4],
+}
+
 impl LayoutScreen {
     /// The font a widget draws its text in: its own `fontPathName`, or the one its class template
     /// gives the part it draws (a header's is `Univers17b.ffn`), or the front end's default.
@@ -102,8 +113,8 @@ impl LayoutScreen {
     /// The break is the original's, **0x523600** (`RE/notes/controls.md` §4.51), and the lines sit
     /// the last line's measured height + 2 apart ([`wrap_metrics`], 0x523916 / 0x523576) — not the
     /// font's line height, as this said before.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn wrapped_text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, x: f32, y: f32, w: f32, align: i64, color: [f32; 4], budget: Option<(usize, i64)>) {
+    pub(super) fn wrapped_text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, at: TextBox, budget: Option<(usize, i64)>) {
+        let TextBox { x, y, w, align, color } = at;
         if w <= 0.0 {
             self.text(out, aspect, f, s, x, y, w, align, color);
             return;
@@ -125,7 +136,7 @@ impl LayoutScreen {
                 left -= chars.len();
                 self.text(out, aspect, f, &line, x, ly, w, align, color);
             } else {
-                self.typed_line(out, aspect, f, &chars, left, rem, x, ly, w, align, color);
+                self.typed_line(out, aspect, f, &chars, (left, rem), TextBox { y: ly, ..at });
                 left = 0;
             }
             ly += pitch;
@@ -154,8 +165,8 @@ impl LayoutScreen {
     /// and writes no depth), and inside it the `weeicons.fsh` `GLNT` at `(letter x − 18, y)` in
     /// `0x4D87D0(alpha)` (0x523535…0x523561): a glint on the letter being typed. Without the
     /// mask's conditions the letter is not drawn at all (0x52356E restores it).
-    #[allow(clippy::too_many_arguments)]
-    fn typed_line(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, chars: &[char], n: usize, rem: i64, x: f32, y: f32, w: f32, align: i64, color: [f32; 4]) {
+    fn typed_line(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, chars: &[char], (n, rem): (usize, i64), at: TextBox) {
+        let TextBox { x, y, w, align, color } = at;
         let prefix: String = chars[..n - 1].iter().collect();
         let ch = chars[n - 1].to_string();
         let rest: String = chars.get(n + 1..).map(|r| r.iter().collect()).unwrap_or_default();

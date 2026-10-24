@@ -358,6 +358,7 @@ impl NetPlay {
         self.remotes.clear();
         self.driven.clear();
         self.exchange = false;
+        self.clocked = false;
     }
 
     /// The seats the network owns this tick. In an input-exchange race that is every seat with a player

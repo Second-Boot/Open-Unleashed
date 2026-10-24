@@ -160,7 +160,7 @@ impl App {
                 let list = &mut self.scene.sprites;
                 let n0 = list.len();
                 let label = self.fe.strings.hud(17).unwrap_or_default();
-                h.opponent_list_sprites(list, hud_aspect, (px, py), rows, links, *place, label, self.cheat_bits & CHEAT_DERBY != 0);
+                h.opponent_list_sprites(list, hud_aspect, OpponentList { pos: (px, py), rows, links, place: *place, label, derby: self.cheat_bits & CHEAT_DERBY != 0 });
                 Hud::slide(list, n0, hud_aspect, (px, py, 138.0, (rows.len() as f32 + 1.0) * 15.0 + 4.0), tray4);
             }
         }
@@ -620,7 +620,7 @@ impl App {
             let k = if map_mode == 3 { 1.0 } else if zoom == 600.0 { 60.0 } else { 20.0 };
             let map = &mut self.scene.sprites;
             let n0 = map.len();
-            h.map_sprites(map, hud_aspect, layout.track_map, &others, k, lap, matches!(slide.state, 1 | 2));
+            h.map_sprites(map, hud_aspect, layout.track_map, MapView { blips: &others, k, lap, sliding: matches!(slide.state, 1 | 2) });
             let (mpx, mpy) = layout.track_map;
             Hud::slide(map, n0, hud_aspect, (mpx, mpy, MAP_PX as f32, MAP_PX as f32), slide);
         }
@@ -653,7 +653,7 @@ impl App {
                     let head = [fe(hud_str::COL_NAME), fe(hud_str::COL_CAR), fe(hud_str::COL_BEST_LAP), fe(hud_str::COL_TIME), fe(hud_str::COL_POINTS)];
                     let bb = Billboard { left: &fe(Self::summary_title(self.race_fegame_type())), right: &fe(hud_str::TITLE_RACE_SUMMARY), hints: Some((&fe(hud_str::HINT_ESC), Some(&fe(hud_str::HINT_SPACE)))) };
                     let ord: Vec<String> = (18116..18124).map(fe).collect();
-                    h.results_sprites(&mut c, hud_aspect, &rows, 0, &bb, &head, &[30.0, 90.0, 140.0, 100.0, 80.0, 60.0], true, true, &ord);
+                    h.results_sprites(&mut c, hud_aspect, &bb, ResultsTable { rows: &rows, player: 0, head: &head, widths: &[30.0, 90.0, 140.0, 100.0, 80.0, 60.0], best_lap: true, points: true, ord: &ord });
                 }
                 // the standings with the pointer on the player's WINNINGS cell, so `HWinnings` shows
                 "standings" => {
@@ -666,11 +666,11 @@ impl App {
                     let bb = Billboard { left: "", right: &fe(hud_str::TITLE_TOURNAMENT_STANDINGS), hints: Some((&fe(hud_str::HINT_ESC), Some(&fe(hud_str::HINT_SPACE)))) };
                     let ord: Vec<String> = (18116..18124).map(fe).collect();
                     let panel = (&w, [fe(hud_str::PRIZE_LABEL), fe(hud_str::PRIZE_SAFE_BONUS), fe(hud_str::PRIZE_TOURNAMENT_BONUS), fe(hud_str::PRIZE_TOTAL)], Some(((x0 + x1) / 2.0, (y0 + y1) / 2.0)));
-                    h.standings_sprites(&mut c, hud_aspect, &rows, Some(0), &bb, &[fe(hud_str::COL_NAME), fe(hud_str::COL_TOTAL_POINTS), fe(hud_str::COL_WINNINGS)], false, &ord, Some(panel));
+                    h.standings_sprites(&mut c, hud_aspect, &bb, StandingsTable { rows: &rows, player: Some(0), head: &[fe(hud_str::COL_NAME), fe(hud_str::COL_TOTAL_POINTS), fe(hud_str::COL_WINNINGS)], timed: false, ord: &ord, winnings: Some(panel) });
                 }
-                "yesno" => h.yes_no_sprites(&mut c, hud_aspect, &Billboard { left: "", right: &fe(hud_str::TITLE_YES_NO), hints: None }, [&fe(hud_str::QUIT_CONFIRM_LINE), ""], [&fe(hud_str::YES_NO_YES), &fe(hud_str::YES_NO_NO)], 1, false),
+                "yesno" => h.yes_no_sprites(&mut c, hud_aspect, &Billboard { left: "", right: &fe(hud_str::TITLE_YES_NO), hints: None }, YesNoDialog { lines: [&fe(hud_str::QUIT_CONFIRM_LINE), ""], buttons: [&fe(hud_str::YES_NO_YES), &fe(hud_str::YES_NO_NO)], sel: 1, pressed: false }),
                 "pause" => h.pause_sprites(&mut c, hud_aspect, &Billboard { left: "", right: &fe(hud_str::TITLE_PAUSE), hints: None }, &[&fe(hud_str::PAUSE_BUTTON_1), &fe(hud_str::PAUSE_BUTTON_2), &fe(hud_str::PAUSE_BUTTON_3)], 0, false),
-                "mission" => h.mission_summary_sprites(&mut c, hud_aspect, &Billboard { left: &fe(hud_str::TITLE_MISSION_LEFT), right: &fe(hud_str::TITLE_MISSION_RIGHT), hints: Some((&fe(hud_str::HINT_ESC), Some(&fe(hud_str::HINT_SPACE)))) }, Some(0), &fe(18176), &[fe(18156)], &fe(hud_str::PAUSE_BUTTON_2), None, (false, false)),
+                "mission" => h.mission_summary_sprites(&mut c, hud_aspect, &Billboard { left: &fe(hud_str::TITLE_MISSION_LEFT), right: &fe(hud_str::TITLE_MISSION_RIGHT), hints: Some((&fe(hud_str::HINT_ESC), Some(&fe(hud_str::HINT_SPACE)))) }, MissionSummary { narrator: Some(0), name: &fe(18176), lines: &[fe(18156)], race_again: &fe(hud_str::PAUSE_BUTTON_2), typed: None, button: (false, false) }),
                 _ => {}
             }
             self.scene.sprites.extend(c);
@@ -790,7 +790,7 @@ impl App {
                 // its "race again" button's hover (0x41B340), once the box is open
                 let over = h.billboard_h.get() >= BILLBOARD.3 && Hud::over_button(Hud::mission_button(), self.fe.cursor);
                 *hud_hover = Some(over.then_some((2, 0)));
-                h.mission_summary_sprites(&mut table, hud_aspect, &bb, narrator, &name, &lines, &fe(hud_str::PAUSE_BUTTON_2), Some(self.page_frames as usize), (over, over && self.fe.mouse_down));
+                h.mission_summary_sprites(&mut table, hud_aspect, &bb, MissionSummary { narrator, name: &name, lines: &lines, race_again: &fe(hud_str::PAUSE_BUTTON_2), typed: Some(self.page_frames as usize), button: (over, over && self.fe.mouse_down) });
             } else if let Some((place, t)) = race_congrats {
                 h.congrats_sprites(&mut table, hud_aspect, place, t, false);
             } else if let ResultPage::TournamentPlace(rank) = page {
@@ -844,7 +844,7 @@ impl App {
                     }
                 });
                 let panel = (&winnings, [fe(hud_str::PRIZE_LABEL), fe(hud_str::PRIZE_SAFE_BONUS), fe(hud_str::PRIZE_TOURNAMENT_BONUS), fe(hud_str::PRIZE_TOTAL)], parked.or(self.fe.cursor));
-                h.standings_sprites(&mut table, hud_aspect, &rows, player, &bb, &head, timed, &ordinals, Some(panel));
+                h.standings_sprites(&mut table, hud_aspect, &bb, StandingsTable { rows: &rows, player, head: &head, timed, ord: &ordinals, winnings: Some(panel) });
             } else if let ResultPage::Notice(id) = page {
                 // `HInfo` 0x4282F0: the text centred on the 500 × 325 box (`[0x5B2BF0]`/`[0x5B2BF4]`)
                 // `HInfo` 0x428328: "" left, 18157 "Race Info" right, both hints — its Spacebar
@@ -886,7 +886,7 @@ impl App {
             } else {
                 // 0x42BD08: the game type's title left, 18130 "Race Summary" right, both hints
                 let bb = Billboard { left: &title, right: &fe(hud_str::TITLE_RACE_SUMMARY), hints: Some((&esc, Some(&space))) };
-                h.results_sprites(&mut table, hud_aspect, &rows, player, &bb, &head, widths, circuit, points, &ordinals);
+                h.results_sprites(&mut table, hud_aspect, &bb, ResultsTable { rows: &rows, player, head: &head, widths, best_lap: circuit, points, ord: &ordinals });
             }
             h.billboard_h.set(BILLBOARD.3);
             self.scene.sprites.extend(table);
@@ -1013,7 +1013,7 @@ impl App {
             let hover = Hud::yes_no_buttons().iter().position(|b| Hud::over_button(*b, self.fe.cursor));
             *hud_hover = Some(hover.map(|k| (4, k)));
             let bb = Billboard { left: "", right: fe(hud_str::TITLE_YES_NO), hints: None };
-            h.yes_no_sprites(out, aspect, &bb, [fe(hud_str::OVERWRITE_LINE_1), fe(hud_str::OVERWRITE_LINE_2)], [fe(hud_str::YES_NO_YES), fe(hud_str::YES_NO_NO)], hover.unwrap_or(usize::MAX), pressed && hover.is_some());
+            h.yes_no_sprites(out, aspect, &bb, YesNoDialog { lines: [fe(hud_str::OVERWRITE_LINE_1), fe(hud_str::OVERWRITE_LINE_2)], buttons: [fe(hud_str::YES_NO_YES), fe(hud_str::YES_NO_NO)], sel: hover.unwrap_or(usize::MAX), pressed: pressed && hover.is_some() });
         } else {
             let hover = Hud::replay_save_buttons().iter().position(|b| Hud::over_button(*b, self.fe.cursor));
             *hud_hover = Some(hover.map(|k| (3, k)));
@@ -1021,7 +1021,7 @@ impl App {
             // the caret flips each time `[0x606AC8]` is 16 past the last flip — every 17 ticks
             let t = self.replay_save.opened.map_or(0, |o| (o.elapsed().as_secs_f64() * TICKS_PER_SEC_F64) as u64);
             let caret = (t / 17) % 2 == 0;
-            h.replay_save_sprites(out, aspect, &bb, fe(hud_str::REPLAY_SAVE_LABEL), &self.replay_save.name, caret, [fe(hud_str::REPLAY_SAVE_BUTTON_1), fe(hud_str::REPLAY_SAVE_BUTTON_2)], hover, pressed && hover.is_some());
+            h.replay_save_sprites(out, aspect, &bb, ReplaySaveDialog { label: fe(hud_str::REPLAY_SAVE_LABEL), name: &self.replay_save.name, caret, buttons: [fe(hud_str::REPLAY_SAVE_BUTTON_1), fe(hud_str::REPLAY_SAVE_BUTTON_2)], hover, pressed: pressed && hover.is_some() });
         }
     }
 
@@ -1063,7 +1063,7 @@ impl App {
             Some(sel) => {
                 let bb = Billboard { left: "", right: fe(hud_str::TITLE_YES_NO), hints: None };
                 h.billboard_clock.set((clock, 0));
-                h.yes_no_sprites(out, aspect, &bb, [fe(hud_str::QUIT_CONFIRM_LINE), ""], [fe(hud_str::YES_NO_YES), fe(hud_str::YES_NO_NO)], sel as usize, pressed);
+                h.yes_no_sprites(out, aspect, &bb, YesNoDialog { lines: [fe(hud_str::QUIT_CONFIRM_LINE), ""], buttons: [fe(hud_str::YES_NO_YES), fe(hud_str::YES_NO_NO)], sel: sel as usize, pressed });
             }
         }
     }

@@ -287,7 +287,7 @@ impl App {
     /// The catalogue car in `GenericCar.Colour`'s saved custom colour, when one is chosen: slot 29
     /// answers the colour accessor's `[+0x2C]` (0x4F388F), slots 30…32 the record's interior 0 and
     /// paint set 0's stripes, 33 package 0 (§4.137).
-    pub(crate) fn menu_custom_paint(m: &Menu, car: &nfs_formats::fedata::CarCatalogEntry) -> Option<Paint> {
+    pub(crate) fn menu_custom_paint(m: &FeCatalogues, car: &nfs_formats::fedata::CarCatalogEntry) -> Option<Paint> {
         let c = m.paint_custom?;
         Some(Paint::from_catalogue(car, 0).with_custom([Some(c), None, None, None]))
     }
@@ -589,7 +589,7 @@ impl App {
             && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
             && let Some(img) = images.iter().find(|t| t.name.trim() == "SHAD")
         {
-            let tex = r.upload_texture_mips(img.width, img.height, &img.mips);
+            let tex = r.upload_texture_mips(img.width, img.height, &img.cache_mips());
             let mut quad = nfs_renderer::MeshData::default();
             // the corner order of 0x43B471…0x43B5A3 with the uvs of 0x5CD5F0
             for (x, z, u, v) in [(-1.0f32, -1.0f32, 0.0f32, 0.0f32), (1.0, -1.0, 1.0, 0.0), (1.0, 1.0, 1.0, 1.0), (-1.0, 1.0, 0.0, 1.0)] {
@@ -686,7 +686,7 @@ impl App {
                 && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
                 && let Some(img) = images.iter().find(|t| t.name.trim() == "FESH")
             {
-                self.fe.garage_shadow_tex = Some(r.upload_texture_mips(img.width, img.height, &img.mips));
+                self.fe.garage_shadow_tex = Some(r.upload_texture_mips(img.width, img.height, &img.cache_mips()));
             }
             let shadow = (room.id == "ID_GARAGE")
                 .then(|| {
