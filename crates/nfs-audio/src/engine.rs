@@ -550,7 +550,7 @@ impl EngineSound {
         let mut rec_volume = ((self.spl.record_volume(inp.mode) as i32 * master_vol) >> 6).min(0x7FF);
         rec_volume = (rec_volume * self.start_stop(out, &inp, pan, rec_volume)) >> 9;
 
-        tracing::trace!(rpm = inp.rpm, bin, load, blend, rec_volume, pitch_word, mode = inp.mode, audible = self.level.iter().filter(|l| **l > 0).count(), "engine record");
+        tracing::trace!(tick = crate::trace_tick(), dist = inp.distance, rpm_lvl = rpm_level(inp.rpm, inp.redline, inp.automatic, inp.airborne_count), master_vol, gain = self.last_gain, a = self.last_a, spl_vol = self.spl.record_volume(inp.mode), rpm = inp.rpm, bin, load, blend, rec_volume, pitch_word, mode = inp.mode, audible = self.level.iter().filter(|l| **l > 0).count(), "engine record");
         for i in 0..32 {
             let Some(d) = self.layers[i].as_ref() else { continue };
             // mode 0 plays the cockpit half, every other mode the exterior half
@@ -579,6 +579,7 @@ impl EngineSound {
             // ([`layer_step`]); the updates on it do nothing, as 0x589D20 fails the old handle
             for (k, slot, wanted, pan_x, lvl_x) in [(0, &mut self.voices[i], lvl > 0, pan_a, lvl_a), (1, &mut self.voices_b[i], lvl > 0 && stereo_pair, pan_b, lvl)] {
                 let vol = byte_gain(lvl_x);
+                tracing::trace!(tick = crate::trace_tick(), layer = i, k, level = lvl_x, pitch_word, pan = pan_x, "engine layer");
                 match (layer_step(wanted, *slot), *slot) {
                     (LayerStep::Stop, Some(v)) => {
                         out.stop(v);

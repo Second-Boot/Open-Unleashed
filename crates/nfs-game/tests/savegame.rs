@@ -65,10 +65,17 @@ fn career_round_trips_through_the_original_format() {
     // …the settings screens' values, each a plain dword (§6.1)
     assert!(acc.entries.iter().any(|(n, v)| n == "Audio.MusicLevel" && *v == nfs_formats::sav::AccessorValue::Dword(127)));
     assert!(acc.entries.iter().any(|(n, _)| n == "Graphics.ViewDistance"));
-    // …and the selected car's setup, whose floats ride in the same dword
-    let setup = acc.entries.iter().find(|(n, _)| n == "FTirePressure").expect("a setup accessor");
-    let nfs_formats::sav::AccessorValue::Dword(bits) = setup.1 else { panic!("{setup:?}") };
-    assert_eq!(f32::from_bits(bits), 30.0, "the tyre pressure FECar starts a car with");
+    // …and the selected car's setup, each as its `FEFloatRangeAccessor`'s index (PA-SAVNET): the stock car's
+    // values are the ones the original's own `8DRIVER.sav` holds (BrakeBias 20, FDownForce 50, FTirePressure 5,
+    // ShockRate 30, SteeringToe 50, Gear0 10, Gear2 9, Gear3 8)
+    let idx = |name: &str| match acc.entries.iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("{name}")).1 {
+        nfs_formats::sav::AccessorValue::Dword(v) => v,
+        ref v => panic!("{v:?}"),
+    };
+    assert_eq!(
+        [idx("BrakeBias"), idx("FDownForce"), idx("RDownForce"), idx("FTirePressure"), idx("RTirePressure"), idx("ShockRate"), idx("SteeringToe"), idx("RideHeight"), idx("Suspension"), idx("Gear0"), idx("Gear2"), idx("Gear3")],
+        [20, 50, 50, 5, 5, 30, 50, 20, 30, 10, 9, 8]
+    );
     // the block stays in byte-wise name order, which is what the original's reader walks
     let names: Vec<&str> = acc.entries.iter().map(|(n, _)| n.as_str()).collect();
     let mut sorted = names.clone();

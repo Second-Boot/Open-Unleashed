@@ -521,6 +521,8 @@ pub struct LayoutScreen {
     /// box's list is the custom row (0x4C6D63…0x4C6D6C), read by 0x4C3A00; the editor draws while
     /// the box holds focus and this is up (0x4C3D0C). §4.171.
     picker_latch: bool,
+    /// the colour boxes' bind 0x4C3A10 has run for this screen ([`Layout::bind_colour_boxes`])
+    picker_bound: bool,
     /// `NFS5.ColorBox`'s picker state — `RE/notes/controls.md` §4.66
     picker: Picker,
     /// the analogue devices the front end can see, in enumeration order — the port's own stand-in
@@ -1290,6 +1292,7 @@ impl LayoutScreen {
             open_combo: crate::config::cfg().nfs_fe_open.as_str().and_then(|v| v.parse().ok()),
             // `NFS_FE_PICKER=1` with `NFS_FE_OPEN` raises the latch for a still of the editor
             picker_latch: crate::config::cfg().nfs_fe_picker.as_str().is_some_and(|v| v != "0"),
+            picker_bound: false,
             picker: Picker::default(),
             pads: Vec::new(),
             pad_sel: 0,

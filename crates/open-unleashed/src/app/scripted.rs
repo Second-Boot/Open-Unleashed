@@ -980,6 +980,10 @@ impl App {
         // event but never the track record. *(Until 2026-09-27 this diagnostic path called
         // neither `file_track_record` nor `end_finished_race`.)*
         self.file_track_record();
+        // no front end follows a scripted run, so no launch will save: write the buffer now (TEST GLUE)
+        if let Err(e) = Records::flush_staged() {
+            tracing::warn!(error = %e, "records save failed");
+        }
         self.rebuild_scene();
         self.update_damage_decals();
         // 0x501340 + `LoadInfo` (0x4D3B52), same as the interactive `end_finished_race` path
@@ -1159,7 +1163,7 @@ impl App {
             && let Ok(rgba) = r.render_to_image(&self.scene, &self.camera, w, h)
         {
             image::save_buffer(&out, &rgba, w, h, image::ColorType::Rgba8).expect("write png");
-            tracing::info!(path = out, tick = self.tick, "NFS_SHOT_TICKS: still written");
+            tracing::info!(path = out, tick = self.tick, eye = ?self.camera.position, target = ?self.camera.target, view = self.camera_view(), "NFS_SHOT_TICKS: still written");
         }
     }
 }

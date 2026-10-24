@@ -19,6 +19,9 @@ pub fn home_dir() -> Option<PathBuf> {
 /// Falls back to `./PorscheUnleashed` when no home can be found. `NFS5_SAVE_DIR` is handled by the
 /// callers (it replaces `SaveData` itself).
 pub fn data_dir() -> PathBuf {
+    // PORT-DEVIATION D41 (RE/notes/PORT-DEVIATIONS.md): the saves live in the per-OS data folder, not in the
+    // original's `.\SaveData\` (install.txt directory entry 48, `[0x65B360]`) under the game folder, and an
+    // existing original profile is not imported.
     if cfg!(target_os = "macos") {
         let base = home_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("Library").join("Application Support").join("PorscheUnleashed")

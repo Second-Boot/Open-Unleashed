@@ -560,8 +560,12 @@ fn the_scripted_mix_is_pinned() {
 
 // re-pinned for REG-AUDIO2: a changed quality reopens the sound (every voice and stream stopped,
 // the service clock from 0) — the script's own changes at 60 / 120 and the forced quality 0 / 1 / 3
-// over its step-0 quality 2; the quality-2 run (no change) kept its hash
-const PINNED_MIX: [u64; 5] = [0x08bae4bd5d4507d1, 0x056dc4acbe1708f5, 0x202055c77ce4cd0d, 0x61c4478b8b8eecc1, 0x0dcfa221d76b08d5];
+// over its step-0 quality 2; the quality-2 run (no change) kept its hash.
+// Re-pinned for PA-AUDIOMIX (2026-10-24): the library's channel 0 is the frame's second sample
+// (0x59BCE0 interleaves `[plane 1, plane 0]`, `pan::pan_gains`): every panned mono voice of the
+// script changed sides, its stereo voices take 127 a side at the centre (`pan::stereo_gains`), the
+// stereo stream kept its channels.
+const PINNED_MIX: [u64; 5] = [0x43b06fd19d77e42a, 0x5611313e9eae8adc, 0x61c9988faa7a78f4, 0xbcbdd983ae7ffef3, 0x1516dd88399a42a2];
 
 /// REG-AUDIO2: a reported session — the output opened at `AUDIOQUALITY` 0 (32000 Hz, a fresh
 /// profile's default) with the front end's song and loops playing, then the profile's 1 (22050

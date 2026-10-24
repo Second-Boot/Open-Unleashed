@@ -36,7 +36,8 @@ pub struct LoopCall {
     pub word: u16,
     pub bend: u8,
     pub pan: u16,
-    /// the strip hook's value for the update arm ([`crate::mixer::voice_play_filter`])
+    /// the strip hook's value for the update arm ([`crate::mixer::voice_play_filter`]) — and for a
+    /// start, which 0x4A98E0 hands the same value in its request ([`PlayArgs::filter`])
     pub filter: Option<i32>,
 }
 
@@ -45,6 +46,7 @@ impl LoopVoice {
     /// the voice started with. `clip` is asked only when a start is needed; a start whose clip is
     /// missing leaves `cur` empty (after the old sample's release, if there was one).
     pub fn drive(cur: &mut Option<LoopVoice>, out: &AudioOutput, c: LoopCall, latched: bool, clip: impl FnOnce() -> Option<Arc<Clip>>) {
+        tracing::trace!(tick = crate::trace_tick(), slot = c.slot, amp = c.amp, pan = c.pan, pan_byte = crate::mixer::pan_byte(c.pan), bend = c.bend, "loop voice");
         match *cur {
             Some(v) if v.slot == c.slot => {
                 out.set_word(v.id, c.amp, c.word, if latched { v.bend } else { c.bend });
@@ -58,7 +60,8 @@ impl LoopVoice {
                     out.release_replaced(v.id);
                 }
                 *cur = clip().map(|clip| LoopVoice {
-                    id: out.play(PlayArgs::new(clip, c.amp, c.word, c.bend, c.pan, true)),
+                    // the start carries the update's filter word in its request (0x4A9B2B, `PlayArgs::filter`)
+                    id: out.play(PlayArgs::new(clip, c.amp, c.word, c.bend, c.pan, true).filter(c.filter)),
                     slot: c.slot,
                     bend: c.bend,
                 });

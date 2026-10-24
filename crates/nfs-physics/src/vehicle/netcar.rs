@@ -103,23 +103,7 @@ impl Vehicle {
         let m = mul(&b.matrix, &rot_y(age as f32 * wd));
         // 0x4A0C0B…0x4A0D23: the retrack on a copy of the body tracker
         if let Some(centre) = centre {
-            let mut t = self.tracker;
-            t.update_zone(grid, p);
-            if t.word == 0 {
-                let mut d = centre - p;
-                if d != Vec3::ZERO {
-                    // 0x5328D0: `[0x5B24A8] / |d|`, 1.0
-                    d *= 1.0 / d.length();
-                }
-                let mut n = 0;
-                while t.word == 0 && n < 4096 {
-                    p += d;
-                    t.update_zone(grid, p);
-                    n += 1;
-                }
-                p += d;
-                p += d;
-            }
+            p = self.net_retrack(grid, p, centre);
         }
         self.net_blend_or_snap(w, p, v2, &m, grid, specs);
         // 0x4A0D47…0x4A0D5B: `car+0xD7E = car+0xD82 = 1` — the wanted and the engaged gear are neutral, so
@@ -131,6 +115,29 @@ impl Vehicle {
             self.net_reseat(grid, specs);
         }
         age.abs() > 0x100
+    }
+
+    /// 0x4A0C0B…0x4A0D23: the car's tracker `car+8` is copied and updated at `P` (0x474060); while the copy reports no patch (`word == 0`) `P`
+    /// steps by the unit vector toward the slice's centre (0x5328D0, 0x532300) and is retracked, then takes two more such steps untracked.
+    pub fn net_retrack(&self, grid: &TriangleGrid, mut p: Vec3, centre: Vec3) -> Vec3 {
+        let mut t = self.tracker;
+        t.update_zone(grid, p);
+        if t.word == 0 {
+            let mut d = centre - p;
+            if d != Vec3::ZERO {
+                // 0x5328D0: `[0x5B24A8] / |d|`, 1.0
+                d *= 1.0 / d.length();
+            }
+            let mut n = 0;
+            while t.word == 0 && n < 4096 {
+                p += d;
+                t.update_zone(grid, p);
+                n += 1;
+            }
+            p += d;
+            p += d;
+        }
+        p
     }
 
     /// **0x4A04A0(car, ω, P, v', M)**.

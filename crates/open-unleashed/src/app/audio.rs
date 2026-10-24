@@ -551,8 +551,6 @@ pub(crate) struct AudioState {
     pub(crate) countdown_said: u8,
     /// the catalogue sound set of the car being driven (`nfs5.car +0x179`)
     pub(crate) sound_set: String,
-    /// player gear on the previous tick (shift click)
-    pub(crate) last_gear: usize,
     /// the roll-over crash sound fires once per roll-over
     pub(crate) crash_played: bool,
     /// the front end's one-shots, `fesfx.bnk` (0x4AADB0) — loaded on the first one played
@@ -583,7 +581,10 @@ pub(crate) fn prop_sfx(impact: f32, e: nfs_physics::vehicle::PropEvent) -> nfs_a
 /// `forward × Y` (screen left through the renderer's x flip) is that side's opposite — its pan had
 /// `+1` on channel 1 — so the side is `Y × forward`; `MIRROR` negates it (0x4A704D, 0x4A78C1,
 /// 0x4A7C1A negate the side dot before the `atan2`). Returns the angle of an offset from the
-/// listener, not unit: 0x4A6FE0 takes the raw offset, and no distance gate.
+/// listener, not unit: 0x4A6FE0 takes the raw offset, and no distance gate. *(2026-10-24: channel 0
+/// is the output frame's **second** sample — 0x59BCE0 interleaves `[plane 1, plane 0]`,
+/// `nfs_audio::mixer::pan_gains` — so the `+side` hand, screen right, is heard on the right; the
+/// mixer had channel 0 first and every panned sound mirrored, measured against the running original.)*
 pub(crate) fn listener_pan_of(cam: Vec3, target: Vec3, mirror: bool) -> impl Fn(Vec3) -> u16 {
     let fwd = (target - cam).normalize_or_zero();
     let side = Vec3::Y.cross(fwd).normalize_or_zero() * if mirror { -1.0 } else { 1.0 };

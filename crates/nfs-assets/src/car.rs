@@ -68,6 +68,21 @@ pub struct TexturePage {
     pub bpp: i64,
 }
 
+impl TexturePage {
+    /// The texels as the original's texture cache holds them: a **32-bit** page (the `.tpg` `bpp = 32` ones — 901's
+    /// pages 4, 5 and 8) becomes 4444 on its way to the device, 0x570540's `>> 4` per byte
+    /// ([`crate::texture::cache_4444_from_8888`]); a 1555, 4444 or 565 page is already what it will be.
+    pub fn cache_rgba(&self) -> std::borrow::Cow<'_, [u8]> {
+        if self.bpp == page_bpp::ARGB8888 {
+            let mut v = self.rgba.clone();
+            crate::texture::cache_4444_from_8888(&mut v);
+            std::borrow::Cow::Owned(v)
+        } else {
+            std::borrow::Cow::Borrowed(&self.rgba)
+        }
+    }
+}
+
 /// A car's four colours and its stripe package — the car-info `+0x218` exterior, `+0x21C` stripe 1,
 /// `+0x220` stripe 2 and `+0x224` interior, and `+0x514` the package — which 0x443DB0 turns into
 /// the 18-slot tint table (`RE/notes/car-model.md` §5.0a).
@@ -1312,6 +1327,22 @@ pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_page_tests {
+    use super::*;
+
+    /// 0x570540: `>> 4` per byte (truncation), read back as `x · 17`; only a 32-bit page is converted.
+    #[test]
+    fn a_32_bit_page_reaches_the_device_as_4444() {
+        let mut p = TexturePage { width: 1, height: 1, rgba: vec![0x77, 0x6F, 0x10, 0x2C], is_window: false, is_alpha: true, bpp: page_bpp::ARGB8888 };
+        assert_eq!(p.cache_rgba().as_ref(), [0x77, 0x66, 0x11, 0x22]);
+        for bpp in [page_bpp::ARGB1555, page_bpp::ARGB4444, page_bpp::RGB565] {
+            p.bpp = bpp;
+            assert_eq!(p.cache_rgba().as_ref(), [0x77, 0x6F, 0x10, 0x2C], "bpp {bpp}");
         }
     }
 }

@@ -720,8 +720,10 @@ impl App {
         // the weather fog the sky manager sets at the camera's slice: the sky pass's own (0x45D2E0)
         // and, as that pass ends, the scene's (0x45D3B0) over everything drawn after it
         // (`SkyBin::fog_at`); the front end has none
+        // `nfs5.ini` `Fog=0` (dll 0x100035F0 over the Thrash setter 0x5752D5): states 0x0E / 0x0F / 0x16 / 0x17 are
+        // dropped and 0x14 / 0x15 / 0x69 are sent as 0, so no fog is ever enabled
         let fog = |sky: bool| {
-            if self.vehicle.is_none() {
+            if self.vehicle.is_none() || !self.ini.fog {
                 return None;
             }
             let (colour, density) = self.track.sky_bin.as_ref()?.fog_at(sky, cam_slice, lap)?;
@@ -823,7 +825,7 @@ impl App {
         // 1, far 65000 (the projection; the scene stops at the cull distance below), cleared 0xFF77BBFF — with camera slot 0 in its type-1 form (0x464F80's branch at
         // 0x46503B): the eye at the car's position raised by the current view's height (`[0x5CF614 +
         // 16·view]`, y only), the car's matrix with its right and forward rows negated — a half turn
-        // about the car's up axis, not a left-right mirror. Skipped in a replay (`[0x657424]` 2/3) and
+        // about the car's up axis; the left-right reflection comes after, in 0x46537B (`Self::render_mirror`). Skipped in a replay (`[0x657424]` 2/3) and
         // unless the tray is in (0x4275A0); `REARVIEWMIRRROR` gates the tray (0x41E9A0). The field of
         // view is the mirror view's own `+0x130`, 45.0 from its constructor (0x4673D5,
         // `camera::VIEW_HALF_ANGLE`): the build 0x464F80 writes slot 0's `+0x58` / `+0x5C` into the
@@ -1290,6 +1292,8 @@ impl App {
         if self.slot_view.is_none_or(|old| (old != view || slot_entered) && !(0x02..=0x07).contains(&old)) {
             self.chase_offset = Some((car_rot * Vec3::Z * -4.0, u16::MAX));
         }
+        // SetSlotView ran this pass (a new view, or the same one entered again)
+        let view_entered = self.slot_view.is_none_or(|old| old != view) || slot_entered;
         self.slot_view = Some(view);
         let ws = self.widescreen();
         // the dll's SetMode cells (`camera::set_mode`) for the window as it is now — the
@@ -1776,7 +1780,16 @@ impl App {
                     self.camera.position = car_pos + target;
                     car_rot * look
                 } else {
+                    // **SetSlotView of a view outside 2…7 calls 0x4618B0** (0x465997…0x4659D4: `[0x5E99F4] < 2`), which
+                    // overwrites the slot's `+0x08` with the view's table offset turned by the car's matrix (0x4619B1…
+                    // 0x4619BA) — after the seed 0x465CF0 — so the first update of the driver view lags from its own
+                    // target, not from the seed's 4 m behind. PA-SCENES, gdb on the original: the offset reads
+                    // (−3.617, 0.270, 1.686) at 0x465790's entry and (0.037, 0.405, 0.405) at the update's entry, the
+                    // first cockpit tick 274 shows the settled eye. (The ceiling test on y, 0x461370, is not applied.)
                     let mut cur = self.chase_offset.map_or(target, |(o, _)| o);
+                    if view_entered && upd == anim_done {
+                        cur = target;
+                    }
                     for _ in 0..steps {
                         cur.x += (target.x - cur.x) * 0.2;
                         cur.y += (target.y - cur.y) * 0.2;

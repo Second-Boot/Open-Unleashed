@@ -260,6 +260,10 @@ pub struct Vehicle {
     pub game_tick: u64,
     /// `car+0xB50`, the finish state: 0 racing, 2 finished, 3 out.
     pub race_state: RaceState,
+    /// `nfs5.ini` `CarControl=1` (dll 0x100025E8): the `jge` at 0x49DD4C is NOPped, so a human car whose
+    /// `car+0xB50 >= 2` (finished / out) no longer takes the exit that clears its pedals — it keeps the
+    /// controller's throttle and brake, and the gearbox and steering run on. Off (0) in the shipped file.
+    pub keep_control: bool,
     /// `RALLY` `[0x6573F8]`, the race option the Dakar code sets (cheat bit 0) — global, so every
     /// car in the race has it: surfaces 1 and 10 read as 2 (0x499B90, 0x49AFE1), the steering
     /// ramps 18 a tick (0x49DFC0), the front grip limits ×1.1 (0x4A1ADD), the drive
@@ -551,6 +555,7 @@ impl Vehicle {
             // a car no race clock drives (the scenarios) behaves as one made on the start tick
             game_tick: 0x1C1,
             race_state: RaceState::Racing,
+            keep_control: false,
             rally: false,
             tcs: false,
             tiny: false,

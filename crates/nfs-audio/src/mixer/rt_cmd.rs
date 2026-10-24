@@ -14,7 +14,7 @@ pub(super) enum Cmd {
     FxAux { id: VoiceId, aux: u8 },
     Silence,
     Pan { id: VoiceId, pan: u16 },
-    Start { id: VoiceId, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, sel: u8, tabled: bool },
+    Start { id: VoiceId, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, sel: u8, tabled: bool, filter: Option<i32> },
     SetWord { id: VoiceId, volume: f32, word: u16, bend: u8 },
     Ramp { id: VoiceId, ticks: i32, target: i32 },
     Filter { id: VoiceId, value: i32 },
@@ -219,11 +219,16 @@ impl Core {
                     v.hook = true;
                 }
             }
-            Cmd::Start { id, clip, volume, word, bend, pan, looping, sel, tabled } => {
+            Cmd::Start { id, clip, volume, word, bend, pan, looping, sel, tabled, filter } => {
                 g.start_patch_as(id, clip, volume, word, looping, sel, tabled);
+                let rate = g.mix_rate();
                 for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
                     v.bend = bend as i8;
                     v.pan = pan_byte(pan);
+                    // the strip build's hook call with the request's `+0x12` (0x589FE0, `PlayArgs::filter`)
+                    if let Some(value) = filter {
+                        LowPass::set(&mut v.lowpass, value, rate);
+                    }
                 }
             }
             Cmd::SetWord { id, volume, word, bend } => {
@@ -321,7 +326,7 @@ impl Tx {
         let state = Mutex::new(TxState { prod, gc, next_id: 0, seq: 0, cfg_rate: None, cfg_quality: None, pending: Vec::with_capacity(256) });
         let mut tx = Tx { state, snap, lat, bus: [AtomicI8::new(0), AtomicI8::new(0)], offline: None };
         if offline {
-            tx.offline = Some(Mutex::new(Offline { core, n: 0 }));
+            tx.offline = Some(Mutex::new(Offline { core, n: 0, ticks: 0, written: 0 }));
             return (Arc::new(tx), None);
         }
         (Arc::new(tx), Some(core))

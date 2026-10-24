@@ -986,7 +986,7 @@ impl CarModel {
         let pages = car.build_pages(paths, paint, &style)?;
         let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages
             .iter()
-            .map(|p| (r.upload_texture_mips(p.width, p.height, std::slice::from_ref(&p.rgba)), p.is_window || p.is_alpha))
+            .map(|p| (r.upload_texture_mips(p.width, p.height, &[p.cache_rgba().into_owned()]), p.is_window || p.is_alpha))
             .collect();
         // the damage decals, `L` for a paint brighter than 0x50, `D` otherwise
         let damage_patches = nfs_assets::car::damage_patches(paths, &car.model, light_paint).unwrap_or_default();
@@ -1336,7 +1336,7 @@ impl CarModel {
             let mut tex_remap: HashMap<nfs_renderer::TextureId, nfs_renderer::TextureId> = HashMap::new();
             for page_index in touched {
                 let (Some(base), Some(&old_tex)) = (c.damage_pages.get(page_index), c.page_textures.get(page_index)) else { continue };
-                let new_tex = r.upload_texture_mips(base.width, base.height, std::slice::from_ref(&base.rgba));
+                let new_tex = r.upload_texture_mips(base.width, base.height, &[base.cache_rgba().into_owned()]);
                 c.page_textures[page_index] = new_tex;
                 tex_remap.insert(old_tex, new_tex);
             }
@@ -1426,7 +1426,7 @@ impl CarModel {
             for patch in self.damage_patches.iter().filter(|p| p.page == page_index) {
                 nfs_assets::car::blend_patch(&mut page, patch, damage[patch.zone as usize]);
             }
-            r.update_texture(tex, &TextureData::single(page.width, page.height, page.rgba));
+            r.update_texture(tex, &TextureData::single(page.width, page.height, page.cache_rgba().into_owned()));
         }
     }
 
@@ -1794,7 +1794,7 @@ impl CarModel {
                 p.rgba[k..k + 4].copy_from_slice(&t);
             }
         }
-        r.update_texture(tex, &TextureData::single(p.width, p.height, p.rgba.clone()));
+        r.update_texture(tex, &TextureData::single(p.width, p.height, p.cache_rgba().into_owned()));
     }
 
     /// A channel's three turns — 0x443F10(n).

@@ -55,7 +55,8 @@ impl Vehicle {
             self.engine_alive += 1;
         }
         // (`>= 2` over the three states 0 / 2 / 3 = not racing)
-        let dead = self.engine_alive == 0 || (!self.ai_driven && self.race_state != RaceState::Racing);
+        // `nfs5.ini` `CarControl=1` NOPs the `jge` at 0x49DD4C (dll 0x10002606), the finished-state half of this test
+        let dead = self.engine_alive == 0 || (!self.ai_driven && self.race_state != RaceState::Racing && !self.keep_control);
         (self.throttle_byte, self.brake_byte) = if dead || self.engine_alive < 0x40 {
             (0, 0xFF)
         } else if !self.race_started {

@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 winit.workspace = true
-gilrs.workspace = true
+sdl2.workspace = true
 tracing.workspace = true
 
 # macOS rumble backend (`ff_macos.rs`): GameController + CoreHaptics

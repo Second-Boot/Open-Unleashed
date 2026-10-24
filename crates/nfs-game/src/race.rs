@@ -523,7 +523,8 @@ pub struct RaceProgress {
     pub lap_times: Vec<u64>,
     pub wrong_way_ticks: u32,
     /// `car+0xD30` as the original counts it: 0x4A7660 runs in the odd-tick group 0x4A8120, so one
-    /// step per two 64 Hz ticks while the car heads against the slice.
+    /// step per two 64 Hz ticks while the car heads against the slice
+    /// ([`RaceProgress::wrong_way_audio_step`]).
     pub wrong_way_steps: u32,
     /// what 0x4A7660's gates allow this step — set by the caller before `update`
     pub wrong_way_gate: WrongWayGate,
@@ -680,14 +681,32 @@ impl RaceProgress {
         let gate = self.wrong_way_gate;
         if gate == WrongWayGate::Reset || forward.dot(table.slices[self.slice].forward) >= 0.0 {
             self.wrong_way_ticks = 0;
-            self.wrong_way_steps = 0;
         } else if gate == WrongWayGate::Count {
             self.wrong_way_ticks += 1;
-            if tick & 1 == 1 {
-                self.wrong_way_steps += 1;
-            }
         }
         lap_done
+    }
+
+    /// **0x4A7660's counter `car+0xD30`** (0x4A76B1…0x4A774D), at the head of the player's audio
+    /// update — one step per odd tick's 0x4A8120, against the car's forward row `car+0x37C` and its
+    /// slice `car+8`'s direction (0x4A76B1…0x4A76D2): a gated car (`wrong_way_gate`, set by the
+    /// even tick's progress pass) or one heading along the slice clears it (0x4A774D), an airborne
+    /// one holds it, one heading against it counts on (0x4A7725…0x4A772E). Answers whether the
+    /// "wrong way" cue 0x4AAE70 sounds this step ([`wrong_way_cue`], 0x4A7734…0x4A7744).
+    /// *(Until 2026-10-24 the count sat in [`Self::update`] behind `tick & 1 == 1`; the port runs
+    /// `update` on the even ticks only, so the counter never moved and the cue never sounded —
+    /// measured against the running original, `REFERENCE-2026-10-24-PA-AUDIOMIX.md`.)*
+    pub fn wrong_way_audio_step(&mut self, table: &SliceTable, forward: Vec3) -> bool {
+        let gate = self.wrong_way_gate;
+        if gate == WrongWayGate::Reset || forward.dot(table.slices[self.slice].forward) >= 0.0 {
+            self.wrong_way_steps = 0;
+            false
+        } else if gate == WrongWayGate::Count {
+            self.wrong_way_steps += 1;
+            wrong_way_cue(self.wrong_way_steps)
+        } else {
+            false
+        }
     }
 }
 
@@ -1111,17 +1130,31 @@ mod finish_tests {
         let n = 100;
         let t = crate::test_support::ring_of(n, crate::test_support::Road::one_lane(5.0));
         let mut p = RaceProgress::new(10, &t);
-        let back = |p: &mut RaceProgress, tick: u64| p.update(&t, t.slices[10].centre, -t.slices[10].forward, tick, 3);
-        for tick in 1..=4 {
-            back(&mut p, tick);
+        // one step per audio update (the odd tick's 0x4A8120)
+        let back = |p: &mut RaceProgress| p.wrong_way_audio_step(&t, -t.slices[10].forward);
+        for _ in 0..2 {
+            back(&mut p);
         }
         assert_eq!(p.wrong_way_steps, 2);
         p.wrong_way_gate = WrongWayGate::Hold;
-        back(&mut p, 5);
+        back(&mut p);
         assert_eq!(p.wrong_way_steps, 2, "held while airborne");
         p.wrong_way_gate = WrongWayGate::Reset;
-        back(&mut p, 7);
+        back(&mut p);
         assert_eq!(p.wrong_way_steps, 0, "cleared when gated");
+        // along the slice clears it too
+        p.wrong_way_gate = WrongWayGate::Count;
+        back(&mut p);
+        p.wrong_way_audio_step(&t, t.slices[10].forward);
+        assert_eq!(p.wrong_way_steps, 0);
+        // the cue at 64, 96 and 128 steps (0x4A7734…0x4A7744)
+        let mut cues = Vec::new();
+        for _ in 0..160 {
+            if back(&mut p) {
+                cues.push(p.wrong_way_steps);
+            }
+        }
+        assert_eq!(cues, [64, 96, 128]);
     }
 }
 

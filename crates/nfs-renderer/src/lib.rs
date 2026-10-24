@@ -7,6 +7,19 @@
 /// The chosen GPU and graphics API (`"Apple M1 Pro · Metal"`), set once at start-up — for diagnostics and the demo title.
 pub static ADAPTER_LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+static POINT_FILTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `nfs5.ini` `Filtering=0` (the Verok patch, dll 0x100035F0 over the Thrash state setter, `RE/notes/nfs5-dll.md`
+/// §3.3): every texture sampler takes `POINT` magnification and minification instead of `LINEAR`. Read once by
+/// `Renderer::new`, so call it before the renderer is made. Off by default (`Filtering=1`).
+pub fn set_point_filter(on: bool) {
+    POINT_FILTER.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn point_filter() -> bool {
+    POINT_FILTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 mod camera;
 mod front;
 mod gpu;

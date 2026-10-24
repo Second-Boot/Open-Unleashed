@@ -104,9 +104,15 @@ impl App {
     pub(crate) fn simulate(&mut self) {
         // TEST GLUE: `NFS_PA_TRACE`, the state the last tick left (`pa_trace.rs`)
         self.pa_trace_tick();
+        // TEST GLUE: the tick for the audio's debug lines
+        nfs_audio::TRACE_TICK.store(self.tick, std::sync::atomic::Ordering::Relaxed);
         self.game_tick();
         // 0x415101
         self.tick += 1;
+        // TEST GLUE: `NFS_AUDIO_DUMP_TICKS`, the offline mix on the game's clock (`pa_trace.rs`)
+        if let Some(a) = &self.snd.audio {
+            a.offline_game_tick();
+        }
     }
 
     /// The body of [`Self::simulate`]: the tick under `self.tick`, before the count.
@@ -634,6 +640,7 @@ impl App {
         v.race_started = self.tick >= RACE_START_TICK;
         v.game_tick = self.tick;
         v.rally = rally_on;
+        v.keep_control = self.ini.car_control;
         v.tiny = self.cheat_bits & CHEAT_TINY != 0;
         // `DERBY` `[0x657400]`, which only the Smash Up code sets (cheat bit 7): `Damage` takes ×1.5, not ×0.5 (0x49452F)
         // (a network race's `DERBY` is the launch's, the same on every machine: a joiner has no cheat of its own)
@@ -2358,8 +2365,11 @@ impl App {
         // at `car+0x430 / 8` over 1.5), when no later contact of the tick replaced its word
         if let Some((effect, nibble)) = ground_event {
             tracing::debug!(effect, nibble, "player body-ground one-shot (0x40F740 kind 3)");
-            self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::Ground { effect, nibble });
+            self.snd.player_loops.push_ground_impact(nfs_audio::sfx::QueuedSfx::Ground { effect, nibble });
         }
+        // 0x40F740 in `Car_postImpact` 0x410280: the tick's one collision event from the contact
+        // slot the tick's last contact wrote (`SfxQueue::push_impact`)
+        self.snd.player_loops.commit_impact();
     }
 
     /// **The non-player cars' sound queues** (see [`Self::simulate`]): each body's landing, roll-over and crash flags, the body-ground events and the tick's collision events (`ai_hits`), queued in the order the original pushes them. Moved out of `simulate` unchanged.
@@ -2407,11 +2417,15 @@ impl App {
                 let replaced = ai_hits.iter().any(|(k, _)| *k == key);
                 tracing::debug!(car = ?key, effect, nibble, replaced, "ai body-ground event (0x40F740 kind 3)");
                 if !replaced {
-                    q.entry(key).or_default().push_impact(nfs_audio::sfx::QueuedSfx::Ground { effect, nibble });
+                    q.entry(key).or_default().push_ground_impact(nfs_audio::sfx::QueuedSfx::Ground { effect, nibble });
                 }
             }
             for (key, e) in ai_hits.drain(..) {
                 q.entry(key).or_default().push_impact(e);
+            }
+            // each car's 0x40F740: its tick's one collision event from its contact slot
+            for e in q.values_mut() {
+                e.commit_impact();
             }
         }
     }
@@ -2936,7 +2950,6 @@ impl App {
         }
         if let (Some(t), Some(r)) = (&self.slices, self.race.as_mut()) {
             let was_finished = r.finished;
-            let steps_before = r.wrong_way_steps;
             // 0x4A7660's gates: finished or in a mission clears the counter; `word car+0x418`
             // non-zero holds it — `Vehicle::airborne_count`, which the suspension, the landing,
             // a car–car hit and a heavy `Damage` write. `+0x1104` (0x4948F0, cleared by
@@ -2975,15 +2988,6 @@ impl App {
             {
                 Self::place_player_on_reset(v, &self.specs, w, t, r, &self.road, &self.smackables, true);
                 self.resets += 1;
-            }
-            // the "wrong way" cue at 64, 96 and 128 steps (0x4A7734…0x4A7744)
-            if r.wrong_way_steps != steps_before
-                && nfs_game::race::wrong_way_cue(r.wrong_way_steps)
-                && self.mission.is_none()
-                && self.skill.is_none()
-                && let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut())
-            {
-                s.wrong_way_cue(a);
             }
             let n_cars = self.road.opponents.len() + 1;
             let place = 1 + self
@@ -3160,6 +3164,15 @@ impl App {
         self.input.end_tick();
     }
 
+    /// The point the player's audio measures from: `car+0x330` of the car the camera follows (a
+    /// network replay's viewed car, as [`Self::car_pos`] takes it, else the player's own) — the
+    /// physics position, not the draw origin.
+    fn audio_car_position(&self, v: &Vehicle) -> Vec3 {
+        Self::viewed_seat_of(self.replay_net.as_ref(), self.replay_view)
+            .and_then(|k| self.road.opponents.get(k))
+            .map_or(v.position, |o| o.vehicle.position)
+    }
+
     /// **The odd tick's audio update** (`0x4A8120`, see the comment above its call in [`Self::simulate`]):
     /// the speech service, the thunder, the audio slots and the cars in them, the loop producers, the
     /// ambience, the car effects, the music, the tunnel reverb, the player's engine and SFX. Moved out
@@ -3167,6 +3180,7 @@ impl App {
     /// session's human cars in registration order, both taken by `simulate` before the car was borrowed.
     fn simulate_audio(&mut self, view: u16, exch_humans_now: Vec<HumanCar>) {
         let Some(v) = self.vehicle.as_ref() else { return };
+        let car_330 = self.audio_car_position(v);
         let Some(w) = self.world.as_ref() else { return };
         // the speech service 0x4B0A20 is the audio update's first call (0x4A813A) — on the odd
         // tick, after race over (0x4150D9) has asked whether the announcer is busy. *(Until
@@ -3677,7 +3691,12 @@ impl App {
             let attached = view <= 1;
             let interior = view == nfs_game::camera::VIEW_DRIVER as u16;
             let mode = nfs_game::camera::audio_mode(view, attached, interior);
-            let to_car = self.car_pos - self.camera.position;
+            // the car's `+0x330` (0x4A7753…0x4A7790 → 0x4AA050's distance, 0x4A7862 its angle, 0x4A7918
+            // its `cos`), not the draw origin `car_pos`, which sits the body lift below it. *(Until
+            // 2026-10-24 the port measured from the draw origin: in the cockpit 1.11 m for the
+            // original's 0.57 m, the engine 1.6 dB quieter and its pair pan narrower —
+            // `REFERENCE-2026-10-24-PA-AUDIOMIX.md`.)*
+            let to_car = car_330 - self.camera.position;
             let dist = to_car.length();
             let cos = if dist > 0.1 {
                 (to_car / dist).dot(v.forward())
@@ -3723,27 +3742,45 @@ impl App {
                     crowding: self.snd.crowding,
                     engine_level: self.snd.audio_settings.engine_level,
                     // §4.3's dip runs while the shift timer is up, `car+0xD82 > car+0xD81` (an
-                    // upshift) **and `car+0xD81 != 1`** — out of neutral it does not dip at all
-                    shift: (v.shift_timer > 0 && v.gear > self.snd.last_gear && v.prev_gear != 1)
+                    // upshift: the gear over the one before it, `car+0xD81` = `prev_gear`, kept from
+                    // the change to the next, 0x4AA62C…0x4AA63A) **and `car+0xD81 != 1`** — out of
+                    // neutral it does not dip at all (0x4AA640). *(Until 2026-10-24 the port compared
+                    // the gear with the one its last audio update saw, true on the change's update
+                    // alone: the dip ran for one update instead of the whole shift.)*
+                    shift: (v.shift_timer > 0 && v.gear > v.prev_gear && v.prev_gear != 1)
                         .then_some((v.shift_timer, self.specs.shift_ticks)),
                 },
             );
-            // The click fires on the last tick of the shift, not at the gear change, and it lives
-            // inside §4.3's gear-shift dip: the shift timer is running, `car+0xD82 > car+0xD81`
-            // (an upshift) and **`car+0xD81 != 1`** — the previous gear was not neutral, so the
-            // pull away off the grid is silent. Then at `car+0xD84 == 1` it needs
-            // `[0x627F43] & 8` (viewId <= 1) **and** `viewId ∉ {0, 0xF}`, which together leave
-            // exactly **view 1**. This port had neither gate.
-            if v.shift_timer == 1 && v.gear > self.snd.last_gear && v.prev_gear != 1 && view == 1 {
+            // The click fires on the last tick of the shift (`car+0xD84 == 1`), not at the gear
+            // change, with `[0x627F43] & 8` (viewId <= 1) **and** `viewId ∉ {0, 0xF}`, which together
+            // leave exactly **view 1** (0x4AA6C5…0x4AA6FE) — on **every** gear change: the test is
+            // after §4.3's dip, which every one of its exits reaches (0x4AA626 / 0x4AA63A / 0x4AA642
+            // → 0x4AA6C2 → 0x4AA6C5), so an upshift, a downshift and the pull away out of neutral all
+            // click. Measured on the running original (`REFERENCE-2026-10-24-PA-AUDIOMIX.md`): the click
+            // a shift's length after the launch, each upshift and each downshift. *(Until 2026-10-24
+            // the port took it as part of the dip — upshifts out of a forward gear only — and compared
+            // the gear with its last audio update's, so it never fired.)*
+            if v.shift_timer == 1 && view == 1 {
                 e.play_shift(a, self.snd.audio_settings.sfx_level);
             }
         }
-        self.snd.last_gear = v.gear;
+        // **0x4A7660's head** (0x4A76B1…0x4A7744), the player's audio update: the wrong-way counter
+        // `car+0xD30` steps here, on the odd tick, and its 64th, 96th and 128th step sound the cue
+        // 0x4AAE70 (outside a mission, which gates the counter to 0, and a skill test)
+        let forward = v.forward();
+        if let (Some(t), Some(r)) = (&self.slices, self.race.as_mut())
+            && r.wrong_way_audio_step(t, forward)
+            && self.mission.is_none()
+            && self.skill.is_none()
+            && let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut())
+        {
+            s.wrong_way_cue(a);
+        }
         if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
             s.update();
             // the queue's distance is the car's own (`car+0x330`, 0x4A78E8) and so is the loops'
             // pan (0x4A7862…0x4A78E5, `MIRROR` negating it at 0x4A78C1 as for the engine above)
-            let to_car = self.car_pos - self.camera.position;
+            let to_car = car_330 - self.camera.position;
             let dist = to_car.length();
             let pan_of = listener_pan_of(self.camera.position, self.camera.target, self.mirror);
             // 0x4A7855: on view 0 the angle is not computed — `ebp` stays 0 (centre) for the engine,
@@ -3791,6 +3828,8 @@ impl App {
             // not each one's own moment (`CollisionSfx::drain_player`; approximation withdrawn
             // 2026-09-27, `sfx.md` "The drain's distance and pan")
             let one_shot_pan = listener_pan(self.camera.position, self.camera.target, self.mirror, v.last_contact);
+            // TEST GLUE: `NFS_PA_LOOPS`, the drain's loop entries (the original's 0x4A93C0 calls)
+            super::pa_trace::loops(self.tick, self.snd.player_loops.entries(), self.camera.position, v.position, (self.camera.target - self.camera.position).normalize_or_zero(), v.orientation.row(2));
             s.drain_player(a, &self.snd.player_loops, one_shot_pan);
             self.snd.player_loops.clear();
             // road roll (§4.4), wind (§4.5) and the turbo layer (§4.6) of 0x4AA050, with the view

@@ -5,6 +5,10 @@
 ## Что нужно
 
 - Rust 1.95 или новее (`rustup`);
+- CMake и компилятор C (Xcode command line tools, Visual Studio build tools или `build-essential`): библиотека
+  контроллеров SDL2 (лицензия zlib) собирается из исходников, которые поставляет крейт `sdl2-sys`, и линкуется
+  статически, так что ставить ничего в систему не нужно. Для CMake 4 `.cargo/config.toml` уже задаёт
+  `CMAKE_POLICY_VERSION_MINIMUM`;
 - данные игры, как описано в разделе [данные игры](game-data.md);
 - Linux: пакеты для разработки `libasound2-dev libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
   libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libvulkan-dev pkg-config`.
@@ -65,6 +69,20 @@ packaging/build_linux.sh      # Linux x86_64, сборка в Docker
 | `NFS_AI_TRACE=<номер>` | трассировка одной машины ИИ в журнале раз в четверть секунды |
 | `NFS_MIC=1` | голосовой чат с микрофона: в сетевой игре ваш голос с устройства ввода по умолчанию передаётся остальным игрокам, как в оригинале. По умолчанию выключено (голос других слышен всегда) |
 | `WGPU_BACKEND=vulkan`/`gl`/`dx12`/`metal` | графический API (по умолчанию Vulkan / Metal / Direct3D 12, OpenGL — только без них) |
+
+## `nfs5.ini`
+
+Порт читает `nfs5.ini` патча Verok из папки с данными игры (рядом с `nfs5.exe`) с теми же ключами, значениями по умолчанию и действием, что у пропатченного оригинала; без файла действуют значения по умолчанию. Секция `[NFS5]`:
+
+| Ключ (по умолчанию) | Что делает |
+|---|---|
+| `Language=English` | `English`, `French`, `German`, `Italian`, `Spanish`, `Swedish`, `PortBrzl` (регистр любой); всё прочее — английский |
+| `NoMovies=0` | 1 пропускает вступительные ролики |
+| `Fog=1` | 0 выключает погодный туман |
+| `Filtering=1` | 0 — текстуры выбираются по ближайшему тексельному значению вместо билинейной фильтрации |
+| `CarControl=0` | 1 оставляет руль, газ и тормоз живыми после финиша машины игрока |
+
+`ThrashDriver`, `WindowedMode`, `SingleProcAffinity`, `CpuLimit` и `NoErrorReporting` относятся к запуску оригинала под Windows / Direct3D и игнорируются.
 
 ## Устройство кода
 

@@ -76,6 +76,12 @@ impl App {
 
     /// `LINEAR_TRACK [0x657494]` = `trk+0x6E != 1` (`modes.md` §2): the track is point-to-point.
     pub(crate) fn linear_track(&self) -> bool {
+        // A race the original launches with `fe.txt`'s `fe = 0` runs no 0x4ECDF0 and has `LINEAR_TRACK` from the
+        // file's `linear_track` key (0 for a missing one: the option block is cleared, `modes.md` §1.2, `hud.md`
+        // §3.7). The port's command-line race with the shipped `fe = 1` file stays the front end's rule.
+        if self.fe0 && self.registry.get("fe").is_some_and(|v| v.trim().parse::<u32>() == Ok(0)) {
+            return self.registry.u32("linear_track", 0) != 0;
+        }
         !self.records.track(&self.track.name).map(|t| t.circuit).unwrap_or(true)
     }
 
@@ -150,7 +156,11 @@ impl App {
             self.anim_cam = AnimCamSlot::Off;
         }
         let AnimCamSlot::Playing { index, start } = self.anim_cam else { return None };
-        let ticks = tick as i64 - start as i64;
+        // `tick` is the count of ticks done: the update of the count's last tick runs at `gGameTick = tick − 1`
+        // (0x414FF0 counts at its end; its Sc64 dispatch reads the pre-increment value). PA-SCENES: the original's
+        // slot 0 per tick (gdb, eye `0x627EA4`) leaves the animation on the update at gGameTick 273 (the first
+        // count shown with the cockpit eye is 274); the port's was one tick ahead, over at count 273
+        let ticks = tick as i64 - 1 - start as i64;
         match self.cam_anims.get(index).and_then(|t| nfs_game::camera::anim_cam::sample(t, ticks)) {
             Some((a, t)) => {
                 let car = glam::Mat3::from_quat(car_rot).transpose();

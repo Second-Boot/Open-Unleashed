@@ -193,7 +193,15 @@ impl App {
         // grid order: `.STARTINGPOS` (`[0x658200 + slot·0x580]`, 1 = pole) — 0x4ECF00 gives slot
         // `i` `(nPlayers + nOpp) − i` outside the knockout and the tournament (`modes.md` §1), so
         // the player (slot 0) starts last; the port keeps `STARTINGPOS − 1`
-        self.player_grid = self.player_grid_override.unwrap_or(n_cars - 1);
+        self.player_grid = self.player_grid_override.unwrap_or_else(|| {
+            // TEST GLUE `NFS_PA_FE0` (`pa_trace.rs`, PA-SCENES): an `fe = 0` race never runs 0x4ECF00, so the
+            // grid is `fe.txt`'s `car[0].startingpos` (shipped 0: one row AHEAD of the pole, `grid_slot`'s `g = 0`
+            // = `3·n + 1` slices) — measured on the original's Monaco 1 start (the four cars at slots 0, 1, 2, 3)
+            if std::env::var_os("NFS_PA_FE0").is_some() {
+                return (super::pa_trace::fe0_startingpos(&self.paths.root, 0) as u32).wrapping_sub(1);
+            }
+            n_cars - 1
+        });
         // `Grid_slot` 0x410580's globals: `LINEAR_TRACK`, and the network smash-up's spacing
         // (`FEGAME_TYPE == 3 && DERBY`, the stream's `DERBY`)
         // (`NUMCARS` at the grid is the players and the kept traffic, 0x4B5079's fix-up on the launch's 8 + traffic)
@@ -1286,7 +1294,11 @@ impl App {
                     tracing::debug!(name, "particle texture not in particle.fsh");
                     continue;
                 };
-                let tex = *textures.entry(name.clone()).or_insert_with(|| renderer.upload_texture_mips(img.width, img.height, &img.mips));
+                // `particle.fsh` is a pack like the cars': its 8888 entries (`sstk`, `rain`, `snow`, `DRIP`,
+                // `GRSS`, ...) sit in the original's texture cache as 4444, `>> 4` per byte
+                // (`cache_4444_from_8888`, `thrash.md` §6d.9 — PA-SMOKE: the bytes found by a gdb search of
+                // the running original)
+                let tex = *textures.entry(name.clone()).or_insert_with(|| renderer.upload_texture_mips(img.width, img.height, &particle_mips(img)));
                 let mesh = renderer.upload_mesh(&quad);
                 let material = renderer.create_material(nfs_renderer::MaterialDesc {
                     alpha_blend: true,
@@ -1306,7 +1318,7 @@ impl App {
             for (k, params) in [nfs_game::weather::Params::snow(0.0), nfs_game::weather::Params::rain(0.0)].iter().enumerate() {
                 let img = params.texture_names(level).iter().find_map(|n| images.iter().find(|t| t.name.trim() == n.as_str()));
                 self.weather_draws[k] = img.map(|img| {
-                    let tex = renderer.upload_texture_mips(img.width, img.height, &img.mips);
+                    let tex = renderer.upload_texture_mips(img.width, img.height, &particle_mips(img));
                     let material = renderer.create_material(nfs_renderer::MaterialDesc {
                         alpha_blend: true,
                         cull_back: false,
@@ -1328,4 +1340,14 @@ impl App {
         self.car_effect_defs = car_defs;
         self.car_effects = None;
     }
+}
+
+/// A `particle.fsh` entry's texels as the original's texture cache keeps them: 4444 for an 8888 entry
+/// (code `0x7D`), the rest as decoded (`PA-SMOKE`, `thrash.md` §6d.9).
+fn particle_mips(img: &nfs_assets::texture::TextureImage) -> Vec<Vec<u8>> {
+    let mut mips = img.mips.clone();
+    if img.code == 0x7D {
+        mips.iter_mut().for_each(|m| nfs_assets::texture::cache_4444_from_8888(m));
+    }
+    mips
 }

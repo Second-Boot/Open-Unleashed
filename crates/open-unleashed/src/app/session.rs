@@ -53,6 +53,10 @@ impl App {
             && self.fe.menu.is_some()
             && self.fe.layout_name.is_some()
             && !self.registry.bool("nointromovies", false)
+            // `nfs5.ini` `NoMovies` (dll 0x10002477): 0x4DD611, the top of 0x4DD600, jumps to 0x4DD70B — over the
+            // two movie players (0x4DC850 for `earts-av.mad` and the second, 0x4DD4A0) but not over the loading
+            // mosaic below, which the block further down still draws
+            && !self.ini.no_movies
         {
             if self.snd.audio.is_none() {
                 self.snd.audio = nfs_audio::AudioOutput::new().map_err(|e| tracing::warn!(error = %e, "audio disabled")).ok();

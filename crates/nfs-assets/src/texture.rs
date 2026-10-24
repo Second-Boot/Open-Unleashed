@@ -57,6 +57,29 @@ pub fn build_levels(width: u32) -> u32 {
     c + 1
 }
 
+/// What the original's key-3 texture cache (the player's car, `carcmn.fsh`; keys 2 and 5 take the same path) keeps of
+/// a **32-bit** source — `RE/notes/thrash.md` §6d.8 / `REFERENCE-2026-10-24-PA-TEX4444.md`.
+///
+/// 0x44DFE0 hands the build 0x44D7E0 a descriptor (`0x5CE59C + 4·(key + 6·TEXTUREDETAIL)`) whose cache depth byte is
+/// **0x10** for keys 2, 3 and 5 at every `TEXTUREDETAIL` (and at every screen depth: the byte is the table's, not
+/// the mode's), so 0x44D7E0 installs the 16-bit lists for the opaque class (`0x5CE48C`) and, `bl` = 1 with the
+/// descriptor's flag 0x20 clear (0x44D80A…0x44D817), the alpha class (`0x5CE4AC`, 4444 first) through
+/// 0x554950(4 / 6, list). The cache (0x554820 over the driver's formats, which dx7z lists with 4444 and wine's
+/// ddraw too) picks 4444 for every 8888 source; 0x5350E0 takes the pair from its table at 0x5DE2FC /
+/// 0x5DE4FC (source type 6, target 7) and runs **0x570540**: each byte `>> 4`, packed `A R G B` — truncation, no
+/// rounding, no dither — and the sampler reads a nibble back as `x/15`, i.e. `x · 17`. Measured live on the
+/// original (gdb at the call 0x555708, 2026-10-24): the player's `SPC2`, `SPC3`, `FE  `, `FESH` and the car's 32-bit
+/// pages (901: pages 4, 5, 8) come out type 7; 1555, 4444 and 565 pages stay as they are.
+///
+/// Applied to the texels of an entry whose file format `code` is `0x7D` (ARGB8888) — what 0x44D7E0 receives; other
+/// formats keep their bytes (the port already carries their own quantisation).
+pub fn cache_4444_from_8888(rgba: &mut [u8]) {
+    for c in rgba.iter_mut() {
+        let x = *c >> 4;
+        *c = (x << 4) | x;
+    }
+}
+
 /// Decode every entry of a SHPI pack, **the base level only**. `path` is used for diagnostics only.
 ///
 /// The original samples every texture but a track's with the mip filter `NONE`, i.e. its top level

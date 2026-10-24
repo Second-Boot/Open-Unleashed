@@ -303,6 +303,25 @@ impl LayoutScreen {
         self.picker.wells = wells;
     }
 
+    /// **What building an `NFS5.ColorBox` does to the profile's custom colours** (PA-SAVNET). The box's
+    /// bind, 0x4C3A10 (vtable 0x5B5BA8 slot 20, run as the screen is built), ends with
+    /// `0x5019C0([this+0x284], 0x4D8900([this+0x288], [this+0x28C], [this+0x290]))` (0x4C3BC7…0x4C3BD4):
+    /// the widget's three floats (0.5 out of the factory, 0x4C38B9…0x4C38C5) packed and stored into
+    /// well `[this+0x284]` (0 out of the factory, 0x4C38B3). So **every screen with a colour box
+    /// overwrites well 0 with 0xFF3FBFBF** — the profile an original-written `.sav` carries
+    /// after the quick-race screen (`0TEST`, `8DRIVER` and the launch save all hold it in slot 0) —
+    /// whatever well 0 held before. Once per built screen (a layer's screen under another is
+    /// never rebuilt, 0x4D1E70); `wells` are the global's, already handed in by
+    /// [`Layout::set_picker_wells`]. Returns `true` when a write happened.
+    pub fn bind_colour_boxes(&mut self) -> bool {
+        if self.picker_bound || !self.layout.elements.iter().any(|e| e.class == "NFS5.ColorBox") {
+            return false;
+        }
+        self.picker_bound = true;
+        self.commit_well();
+        true
+    }
+
     /// The `NFS5.ColorBox` whose picker is up, if one is.
     ///
     /// The original's gate is two things at 0x4C3D0C: the widget holds **focus** and the class's

@@ -1518,7 +1518,15 @@ pub fn car_specular_maps(r: &mut Renderer, paths: &nfs_assets::GamePaths, front_
     names.map(|name| {
         pack.iter()
             .find(|t| t.name.trim() == name)
-            .map(|t| r.upload_texture_mips(t.width, t.height, &t.mips))
+            .map(|t| {
+                // 8888 in the file, 4444 in the original's key-3 cache (0x44DFE0 → 0x44D7E0 → 0x5350E0 → 0x570540,
+                // `nfs_assets::texture::cache_4444_from_8888`)
+                let mut mips = t.mips.clone();
+                if t.code == 0x7D {
+                    mips.iter_mut().for_each(|m| nfs_assets::texture::cache_4444_from_8888(m));
+                }
+                r.upload_texture_mips(t.width, t.height, &mips)
+            })
     })
 }
 

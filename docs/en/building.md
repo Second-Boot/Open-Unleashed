@@ -5,6 +5,9 @@
 ## Requirements
 
 - Rust 1.95 or newer (`rustup`);
+- CMake and a C compiler (Xcode command line tools, Visual Studio build tools or `build-essential`): the controller
+  library SDL2 (zlib licence) is built from the source the `sdl2-sys` crate ships and linked statically, so nothing
+  has to be installed system-wide. CMake 4 users: `.cargo/config.toml` already sets `CMAKE_POLICY_VERSION_MINIMUM`;
 - the game data as described in [game data](game-data.md);
 - Linux: the development packages `libasound2-dev libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
   libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libvulkan-dev pkg-config`.
@@ -65,6 +68,20 @@ and `THIRD-PARTY-LICENSES.txt` — never any file of the original game.
 | `NFS_AI_TRACE=<idx>` | a quarter-second trace of one AI car in the log |
 | `NFS_MIC=1` | voice chat from the microphone: in a network session the game sends your voice from the default input device to the other players, as the original did. Off by default (you still hear the others) |
 | `WGPU_BACKEND=vulkan`/`gl`/`dx12`/`metal` | the graphics API (by default Vulkan / Metal / Direct3D 12, OpenGL only without them) |
+
+## `nfs5.ini`
+
+The port reads the `nfs5.ini` of the Verok patch, from the game data folder (beside `nfs5.exe`), with the same keys, defaults and effects as the patched original; without the file the defaults apply. Section `[NFS5]`:
+
+| Key (default) | Effect |
+|---|---|
+| `Language=English` | `English`, `French`, `German`, `Italian`, `Spanish`, `Swedish`, `PortBrzl` (any case); anything else is English |
+| `NoMovies=0` | 1 skips the start-up movies |
+| `Fog=1` | 0 turns the weather fog off |
+| `Filtering=1` | 0 samples textures with nearest-neighbour instead of bilinear filtering |
+| `CarControl=0` | 1 keeps the steering, throttle and brake live after a human car has finished the race |
+
+`ThrashDriver`, `WindowedMode`, `SingleProcAffinity`, `CpuLimit` and `NoErrorReporting` belong to the original's Windows / Direct3D start-up and are ignored.
 
 ## Code layout
 

@@ -10,7 +10,7 @@
 //!   `min(127·slipSum, 127)` (rear × 0.5), pitch 1.0. CONFIRMED.
 //! * Gear-shift click: engine bank slot 2 (`engine::EngineSound::play_shift`).
 
-use crate::mixer::{byte_gain, AudioOutput, Clip, ClipCache, VoiceId, BEND_ROOT, LEVEL_MAX};
+use crate::mixer::{byte_gain, AudioOutput, Clip, ClipCache, PlayArgs, VoiceId, BEND_ROOT, LEVEL_MAX};
 use crate::voice_loop::{LoopCall, LoopVoice};
 use nfs_formats::bnk::Bnk;
 use std::collections::HashMap;
@@ -171,6 +171,10 @@ pub struct SfxQueue {
     /// original's arithmetic (`dec`, `add −2`, `add −4`), which the roof-scrape stop arm
     /// (0x410269) applies without testing the bit
     loop_bits: u32,
+    /// the tick's contact slot `car+0x430` / `+0x438` / `+0x440` ([`Self::push_impact`]): the last
+    /// contact written stands, 0x40F740 turns it into the tick's one collision event
+    /// ([`Self::commit_impact`])
+    pending: Option<QueuedSfx>,
 }
 
 impl SfxQueue {
@@ -183,9 +187,36 @@ impl SfxQueue {
         }
     }
 
-    /// 0x40F740's gate for the collision one-shot: it is pushed only when `car+0x430 > 1.5`
-    /// (0x40F952). The landing and the crash are pushed straight (0x49C1E6, 0x494500).
+    /// **A contact's store into the car's slot** `car+0x430` (magnitude) / `+0x438` (kind word) /
+    /// `+0x440` (point): every writer stores plainly — the wall 0x49555D, the bush 0x498EF6 /
+    /// 0x498F00, the prop 0x498F39 / 0x498F43, the pair rounds 0x496B42…0x496C3E, the ground
+    /// 0x4960E6 / 0x496844 — so the tick's **last** contact stands, and `Car_postImpact`
+    /// 0x410280 → 0x40F740 makes **one** collision event per tick from it and clears the slot
+    /// ([`Self::commit_impact`]). Measured on the running original
+    /// (`REFERENCE-2026-10-24-PA-AUDIOMIX.md`): a tick with a bush and a wall contact queues the
+    /// bush alone (0x4A93C0 called once, idB 15), where the port queued both. *(Until 2026-10-24
+    /// each contact pushed its own event — the APPROXIMATION "an event per wall / prop / pair call
+    /// rather than 0x40F740's one per tick" of `sfx.md` §4.2.)* APPROXIMATION left: the gate takes
+    /// the standing event's own magnitude; a pair round's store that keeps the larger of two
+    /// values is not modelled across writers.
     pub fn push_impact(&mut self, e: QueuedSfx) {
+        self.pending = Some(e);
+    }
+
+    /// The body–ground contact's store (`Car_ground`, priority 0x1E — before the collision pass
+    /// of priority 0x28, so any wall, prop, bush or car contact of the tick is written after it):
+    /// it stands only when no other contact has been written this tick.
+    pub fn push_ground_impact(&mut self, e: QueuedSfx) {
+        if self.pending.is_none() {
+            self.pending = Some(e);
+        }
+    }
+
+    /// **0x40F740**: the tick's contact slot ([`Self::push_impact`]) into the queue — pushed only
+    /// when `car+0x430 > 1.5` (0x40F952) — and the slot cleared (0x40FB01). The landing and the
+    /// crash are pushed straight (0x49C1E6, 0x494500), before it.
+    pub fn commit_impact(&mut self) {
+        let Some(e) = self.pending.take() else { return };
         let mag = match e {
             QueuedSfx::WallHit { j, .. } => 3.0 * j,
             QueuedSfx::WallScrape { speed, .. } => speed * 0.25,
@@ -716,7 +747,9 @@ impl CollisionSfx {
         self.gate = (level as i32) >> 4;
         let vol = self.atten.clamp(0, 127);
         if let Some(clip) = self.clip(slot) {
-            let id = out.play_word_sel_untabled(clip, self.one_shot_volume(slot, vol), crate::resample::PITCH_UNIT, BEND_ROOT, self.one_shot_pan, false, level as i32 as u8);
+            // `Voice_play(0x33, …)` → `Bank_playOneShot`: the cockpit's 3000 Hz in the start request (0x4A9B2B)
+            let args = PlayArgs::new(clip, self.one_shot_volume(slot, vol), crate::resample::PITCH_UNIT, BEND_ROOT, self.one_shot_pan, false);
+            let id = out.play(args.sel(level as i32 as u8).untabled().filter(self.filter));
             // the aux byte is taken only for slots from 0x30 (0x4A9A56 `jl`), which every
             // collision group is
             if slot >= FIRST_COLLISION_SLOT {
@@ -832,7 +865,7 @@ impl CollisionSfx {
     /// `Voice_play` call, so not in the pause's table (`AudioOutput::silence_voices`).
     pub fn trigger_chime(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(2) {
-            out.play_word_untabled(clip, self.sfx_volume(LEVEL_MAX), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false);
+            out.play(PlayArgs::new(clip, self.sfx_volume(LEVEL_MAX), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false).untabled().filter(self.filter));
         }
     }
 
@@ -840,7 +873,8 @@ impl CollisionSfx {
     /// direct `Bank_playOneShot` path as [`trigger_chime`](Self::trigger_chime), not in the table.
     pub fn wrong_way_cue(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(1) {
-            out.play_word_untabled(clip, self.sfx_volume(0x28), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false);
+            // in the cockpit the start request carries 0xBB8 (0x4A9B2B): heard through the 3000 Hz low-pass
+            out.play(PlayArgs::new(clip, self.sfx_volume(0x28), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false).untabled().filter(self.filter));
         }
     }
 
@@ -878,7 +912,7 @@ impl CollisionSfx {
                     tracing::debug!(audio_slot, sample = siren_slot(audio_slot, false), distance, "siren start");
                     // 0x4AAE90 is a direct Bank_playOneShot 0x4A98E0, no Voice_play voice number:
                     // not in the pause's table (AudioOutput::silence_voices)
-                    self.sirens.insert(audio_slot, out.play_word_untabled(c, 0.0, SIREN_WORD, SIREN_START_BEND, 0x40, true));
+                    self.sirens.insert(audio_slot, out.play(PlayArgs::new(c, 0.0, SIREN_WORD, SIREN_START_BEND, 0x40, true).untabled().filter(self.filter)));
                 }
             }
         }
@@ -891,7 +925,7 @@ impl CollisionSfx {
     /// `Bank_playOneShot` path as [`trigger_chime`](Self::trigger_chime): not in the pause's table.
     pub fn pylon_hit(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(0) {
-            out.play_word_untabled(clip, self.sfx_volume(LEVEL_MAX), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false);
+            out.play(PlayArgs::new(clip, self.sfx_volume(LEVEL_MAX), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false).untabled().filter(self.filter));
         }
     }
 
@@ -1363,12 +1397,38 @@ mod tests {
     fn queue_cap_and_impact_gate() {
         let mut q = SfxQueue::default();
         q.push_impact(QueuedSfx::CarCar { effect: 1.5 });
+        q.commit_impact();
         q.push_impact(QueuedSfx::WallHit { j: 0.4, class: 0 });
+        q.commit_impact();
         assert!(q.entries().is_empty());
         for _ in 0..9 {
             q.push_impact(QueuedSfx::CarCar { effect: 9.0 });
+            q.commit_impact();
         }
         assert_eq!(q.entries().len(), SfxQueue::CAP);
+    }
+
+    /// 0x40F740 makes one event a tick from the contact slot the tick's last contact wrote: a
+    /// wall then a bush leaves the bush (measured, `REFERENCE-2026-10-24-PA-AUDIOMIX.md`); the
+    /// body–ground contact, written before the collision pass, stands only alone.
+    #[test]
+    fn the_ticks_last_contact_is_its_one_collision_event() {
+        let mut q = SfxQueue::default();
+        q.push_impact(QueuedSfx::WallScrape { speed: 28.0, class: 5 });
+        q.push_impact(QueuedSfx::Bush);
+        q.commit_impact();
+        assert_eq!(q.entries(), &[QueuedSfx::Bush]);
+        q.commit_impact();
+        assert_eq!(q.entries().len(), 1, "the slot is cleared");
+        q.clear();
+        q.push_impact(QueuedSfx::WallHit { j: 5.0, class: 0 });
+        q.push_ground_impact(QueuedSfx::Ground { effect: 20.0, nibble: 1 });
+        q.commit_impact();
+        assert_eq!(q.entries(), &[QueuedSfx::WallHit { j: 5.0, class: 0 }]);
+        q.clear();
+        q.push_ground_impact(QueuedSfx::Ground { effect: 20.0, nibble: 1 });
+        q.commit_impact();
+        assert_eq!(q.entries(), &[QueuedSfx::Ground { effect: 20.0, nibble: 1 }]);
     }
 
     /// `main.rs`'s player collision pass pushes the tick's one-shots — `Car_ground`'s landing /
@@ -1387,18 +1447,11 @@ mod tests {
         q.push(QueuedSfx::Crash);
         q.push_impact(QueuedSfx::WallHit { j: 5.0, class: 0 });
         q.push_impact(QueuedSfx::CarCar { effect: 4.0 });
+        q.commit_impact();
         q.produce_loops(&LoopInput { front_slip: 1.0, ..input() }, || 0);
         let entries = q.entries().to_vec();
-        assert_eq!(
-            entries[..4],
-            [
-                QueuedSfx::Landing { closing: 10.0 },
-                QueuedSfx::Crash,
-                QueuedSfx::WallHit { j: 5.0, class: 0 },
-                QueuedSfx::CarCar { effect: 4.0 },
-            ]
-        );
-        assert!(matches!(entries[4], QueuedSfx::Loop { .. }), "{entries:?}");
+        assert_eq!(entries[..3], [QueuedSfx::Landing { closing: 10.0 }, QueuedSfx::Crash, QueuedSfx::CarCar { effect: 4.0 }]);
+        assert!(matches!(entries[3], QueuedSfx::Loop { .. }), "{entries:?}");
         // the drain's walk (`.iter().rev()`): the loop plays first, this tick's landing last
         let reversed: Vec<_> = entries.iter().rev().copied().collect();
         assert!(matches!(reversed[0], QueuedSfx::Loop { .. }));

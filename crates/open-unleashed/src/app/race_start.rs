@@ -973,6 +973,13 @@ impl App {
             }
             _ => player_paint,
         };
+        // The HUD reads the same word as the body: the map's blips (0x4333A0 `[[car+0x558]+0x218]`, hud.md
+        // "Audit 2026-09-26") and the opponent list's swatch take `carinfo+0x218`, which in a `fe = 0` launch is
+        // the registry's `car[0].colorconfig` (above), not the catalogue's first set (the port's `self.paint`
+        // default: yellow for the 901 RS 2.7 where the original's blip and body are the fe.txt's red).
+        if self.fe0 && self.registry.get("car[0].colorconfig").is_some() && player_paint.exterior != self.paint {
+            self.paint = player_paint.exterior;
+        }
         let mut text = self.page_text(0, &self.player_name, None);
         // a garage car brings its own race number (the front end's 0x4D1800 from `DecalNum`)
         if let (Some(n), true) = (self.owned_decal, self.owned_paint.is_some_and(|p| p.exterior == self.paint)) {

@@ -479,6 +479,9 @@ impl App {
                 && self.rear_mirror.is_some()
                 && let Some(tex) = self.mirror_tex
             {
+                // The picture is drawn as it came: the left-right reversal of the original's tray is in the mirror
+                // pass's camera (0x46537B…0x4653A8, `Self::render_mirror`), not in the tray quad (PA-MIRROR, `hud.md`
+                // "Mirror image sense")
                 m.push(h.image(hud_aspect, tex, rx, ry, 240.0, 84.0));
             }
             Hud::slide(m, n0, hud_aspect, (rx, ry, 240.0, 84.0), slide);

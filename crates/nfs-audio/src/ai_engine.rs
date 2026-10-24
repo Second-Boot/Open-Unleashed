@@ -10,7 +10,7 @@
 //! `tbl[0x40 − blend]` and `tbl[0x40 + blend]`.
 
 use crate::engine::WEIGHT_CURVE;
-use crate::mixer::{byte_gain, AudioOutput, Clip, VoiceId, BEND_ROOT, LEVEL_MAX};
+use crate::mixer::{byte_gain, AudioOutput, Clip, PlayArgs, VoiceId, BEND_ROOT, LEVEL_MAX};
 use nfs_formats::{bigf::Bigf, bnk::Bnk};
 use std::collections::HashMap;
 use std::path::Path;
@@ -397,7 +397,8 @@ impl AiEngines {
                     out.set_pan(id, pan);
                     out.voice_play_filter(id, self.filter);
                 }
-                (None, Some(c)) => *voice = Some(out.play_word(c, amp, word, BEND_ROOT, pan, true)),
+                // the start's request carries the same filter word (0x4A9B2B, `PlayArgs::filter`)
+                (None, Some(c)) => *voice = Some(out.play(PlayArgs::new(c, amp, word, BEND_ROOT, pan, true).filter(self.filter))),
                 (None, None) => {}
             }
         }
@@ -410,7 +411,7 @@ impl AiEngines {
                 out.set_pan(id, pan);
                 out.voice_play_filter(id, self.filter);
             }
-            (None, Some(c)) => self.cars[index].road = Some(out.play_word(c.clone(), mix(levels.sfx, self.sfx_trim, road_vol), road_word, road_bend, pan, true)),
+            (None, Some(c)) => self.cars[index].road = Some(out.play(PlayArgs::new(c.clone(), mix(levels.sfx, self.sfx_trim, road_vol), road_word, road_bend, pan, true).filter(self.filter))),
             _ => {}
         }
     }
@@ -451,7 +452,7 @@ impl AiEngines {
                 out.release(id);
                 self.cars[index].horn = None;
             }
-            (None, true, Some(c)) => self.cars[index].horn = Some(out.play_word(c.clone(), amp, word, HORN_BEND, pan, true)),
+            (None, true, Some(c)) => self.cars[index].horn = Some(out.play(PlayArgs::new(c.clone(), amp, word, HORN_BEND, pan, true).filter(self.filter))),
             _ => {}
         }
     }

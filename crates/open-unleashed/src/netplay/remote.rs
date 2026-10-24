@@ -7,6 +7,37 @@ pub(super) fn lag_glue() -> Option<u64> {
     std::env::var("NFS_NET_LAG_MS").ok().and_then(|v| v.parse().ok()).filter(|ms| *ms > 0)
 }
 
+/// **TEST GLUE** (`NFS_NET_REMOTE_DUMP=<file>`): the remote cars' dead reckoning in the line format of the
+/// original's gdb trace (`RE/notes/REFERENCE-2026-10-24-PA-DEADRECK.md`) — `SI` around the store 0x4A0DF0, `AI`/`AO`
+/// around the apply 0x4A0A40, every float as its bit pattern in the car's memory order.
+pub(super) fn remote_dump(line: impl FnOnce() -> String) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static OUT: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        let path = std::env::var("NFS_NET_REMOTE_DUMP").ok()?;
+        std::fs::File::create(path).ok().map(|f| Mutex::new(std::io::BufWriter::new(f)))
+    });
+    if let Some(m) = out
+        && let Ok(mut w) = m.lock()
+    {
+        let _ = writeln!(w, "{}", line());
+        let _ = w.flush();
+    }
+}
+
+/// The car as `AI`/`AO` print it: position, velocity, the matrix rows, the spin (all `f32` bits).
+pub(super) fn car_words(v: &Vehicle) -> String {
+    let mut f: Vec<f32> = Vec::new();
+    f.extend(v.position.to_array());
+    f.extend(v.velocity.to_array());
+    for r in 0..3 {
+        f.extend(v.orientation.row(r).to_array());
+    }
+    f.extend(v.angular_velocity.to_array());
+    f.iter().map(|x| format!("{:08x}", x.to_bits())).collect::<Vec<_>>().join(" ")
+}
+
 /// One remote player's car as the receiver keeps it — the block `car+0x38…+0x5B` and the lag book
 /// `car+0x5C…+0x70`, `+0xDA8`, `+0xDAC` that 0x4A0DF0 maintains (`network.md` §8.4).
 #[derive(Debug, Clone)]

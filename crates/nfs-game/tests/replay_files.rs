@@ -154,8 +154,10 @@ fn a_network_replay_reads_back_as_master_wrote_it() {
 /// the side carries `UserList.NameInput`'s text, and the dead-zone `.Max` a file does not
 /// carry starts at 127 (the clamp of 0x80, 0x4BC240) with the selection written; the career digest did not move. Moved again
 /// with PA-STOCK: a `.sav` kept its part lists as written, the stock list no longer rebuilt on load; and back with REG-PHYS:
-/// a car with no stock list gets its stock parts on load again (PORT-DEVIATION D40), the digests of before PA-STOCK.)*
-const SAV: (u64, u64, u64) = (0x9901_2848_0975_68d3, 0x70f4_87fc_897c_cec6, 0x9a6f_8e22_d590_8bb4);
+/// a car with no stock list gets its stock parts on load again (PORT-DEVIATION D40), the digests of before PA-STOCK.
+/// Moved again with PA-SAVNET: the setup accessors are written as range indices (0x4BC460) and custom well 0 as
+/// 0xFF3FBFBF (0x4C3BC7); the career and side digests did not move.)*
+const SAV: (u64, u64, u64) = (0x9901_2848_0975_68d3, 0x70f4_87fc_897c_cec6, 0x8943_0774_527f_2dca);
 
 #[test]
 fn a_master_written_save_converts_as_before() {

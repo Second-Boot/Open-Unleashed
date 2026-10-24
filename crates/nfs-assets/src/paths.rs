@@ -83,10 +83,25 @@ impl GamePaths {
         out
     }
 
-    /// **0x4B73F0**'s language index: the `Language` string under the game's key
-    /// ([`nfs_formats::regfile::GAME_KEY`]), mapped by [`nfs_formats::regfile::language_index`]
-    /// (missing → `"English"` → 0). This install's `reg.reg` says `"English"`.
+    /// The Verok patch's `nfs5.ini` beside the game's exe ([`nfs_formats::nfs5ini::Nfs5Ini`], dll 0x100022B0);
+    /// a missing file gives the dll's defaults.
+    pub fn nfs5_ini(&self) -> nfs_formats::nfs5ini::Nfs5Ini {
+        nfs_formats::nfs5ini::Nfs5Ini::load(&self.root)
+    }
+
+    /// The language index the four callers of **0x4B73F0** (0x41E1F0, 0x4A5D31, 0x4E0581, 0x508C6A) get. In the
+    /// shipped game `nfs5.dll` has replaced the registry read there by `mov eax, [0x100060A0]`, the `Language` of
+    /// `nfs5.ini` (`ENGLISH` … `PORTBRZL` -> 0 … 6, missing file / key -> `"English"` -> 0;
+    /// `RE/notes/nfs5-dll.md` §3.3) — so the registry's `Language` is not read at all. (The unpatched exe's
+    /// own rule, [`nfs_formats::regfile::language_index`] over the registry export, stays available as
+    /// [`Self::registry_language`].)
     pub fn language(&self) -> u16 {
+        self.nfs5_ini().language
+    }
+
+    /// The unpatched exe's 0x4B73F0: the `Language` string under the game's registry key, mapped by
+    /// [`nfs_formats::regfile::language_index`] (missing -> `"English"` -> 0).
+    pub fn registry_language(&self) -> u16 {
         let reg = self.registry();
         nfs_formats::regfile::language_index(reg.value(nfs_formats::regfile::GAME_KEY, "Language"))
     }
@@ -111,6 +126,7 @@ mod tests {
             let v = reg.value(nfs_formats::regfile::GAME_KEY, "Language");
             assert_eq!(v, Some(&nfs_formats::regfile::RegValue::Sz("English".into())));
         }
-        assert_eq!(p.language(), 0);
+        assert_eq!(p.registry_language(), 0);
+        assert_eq!(p.language(), p.nfs5_ini().language);
     }
 }

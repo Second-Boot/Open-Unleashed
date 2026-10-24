@@ -79,25 +79,11 @@ pub fn voice_pan(byte: u8, patch_pan: u8, scale: i8) -> u8 {
 /// at 0x4000 and channel 1 at 0xC000 (`[0x6B48FC]` / `[0x6B48FE]`, 0x58A5DF / 0x58A5E8); between
 /// them the angle splits **linearly**, and each channel's share `x` (0…127, `idiv`) becomes
 /// `f(x) = 2x − x²/127` (0x58E0B0), scaled by 1/127 (`[0x5C1788]`). Front and back mirror.
-///
-/// The angle is the library's `(p − 0x40) << 8` of the voice's pan byte `p` ([`voice_pan`]), so
-/// the step is `(p − 0x40) & 0xFF` and the two shares come out as `127·p/128` for channel 0 and
-/// `127·(128 − p)/128` for channel 1 — 0x7F: 127 / 0, 0x40: 95 / 95, 0: 0 / 127. Channel 0 is the
-/// first of the stereo pair the buffer holds (`nChannels` 2, 0x58ED6A) — the port's first output
-/// channel; a source on the `+side` hand of [`pan_angle`] is heard there.
-///
-/// This is the path of every voice the game starts: the hardware-3D voice count `[0x6B48DF]` is
-/// 0 whatever the card — 0x4A66B0 configures it only when `[0x657C9C]` is set, and both start-ups
-/// clear that just before the call (0x4A684C, 0x4A6A61) — so 0x58A7C4…0x58A7D6 drops every 3D
-/// type and the one voice type left is the configuration's 0x24 (0x4A670B), never flag 0x10. A
-/// hardware-3D voice would be positioned with `SetPosition` (0x596370) instead. *(Until
-/// 2026-09-27 this was an approximation "for a card without DirectSound3D buffers".)*
-/// (Until 2026-09-25 this was an equal-power cos / sin law of the port's own.)
-/// (Until 2026-09-27 the port fed this law the sine of the angle, taken back to an angle and
-/// rounded onto the grid, instead of the pan byte.)
-pub(super) fn pan_gains(p: u8) -> [f32; 2] {
+/// Answers the table's entry for the 16-bit `angle`: `[channel 0, channel 1]`, the library's
+/// planes — **not** the output's order ([`pan_gains`]).
+pub(super) fn plane_gains(angle: u16) -> [f32; 2] {
     // the table's step and the angle it stands for
-    let x = ((p as i32 - 0x40) & 0xFF) << 8;
+    let x = (angle as i32 >> 8) << 8;
     let (s0, s1) = (0x4000, 0xC000);
     // (distance to channel 0, distance to channel 1) along the arc between them (0x58E137…0x58E24C)
     let (d0, d1) = if x <= s0 {
@@ -111,6 +97,58 @@ pub(super) fn pan_gains(p: u8) -> [f32; 2] {
     let f = |x: i32| ((2 * x - x * x / 127) as f64 * (1.0f32 / 127.0) as f64) as f32;
     // each channel's share grows with the distance to the other one
     [f(127 * d1 / (d0 + d1)), f(127 * d0 / (d0 + d1))]
+}
+
+/// The library's angle of a voice's pan byte `p` ([`voice_pan`]): `(p − 0x40) << 8`
+/// (0x59070C…0x590716), the byte back on the front half circle, 0x4000 at 0x80.
+pub(super) fn byte_angle(p: u8) -> u16 {
+    ((p as i32 - 0x40) << 8) as u16
+}
+
+/// **The two output gains of a mono voice at pan byte `p`, in the order the output frame holds
+/// its samples** — `[first (left), second (right)]` = `[channel 1, channel 0]` of
+/// [`plane_gains`] at [`byte_angle`]: the step is `(p − 0x40) & 0xFF`, and the shares come out as
+/// `127·p/128` for channel 0 and `127·(128 − p)/128` for channel 1 — 0x7F: 127 / 0, 0x40: 95 / 95,
+/// 0: 0 / 127 (channel 0 / channel 1).
+///
+/// **Channel 0 is the frame's second sample.** The library mixes every channel into a plane of
+/// its own (0x598940: plane 0 at `[0x6B177C]`, plane 1 `n` samples after it, handed to 0x598760 as
+/// its output array), and with `[0x6B16A6]` set — measured 1 on the running original
+/// (`[0x6B16A4]` = `00 02 01 30`: two channels, the interleaving arm) — **0x59BCE0** interleaves the
+/// pair into the DirectSound buffer as `[plane 1, plane 0]` (`rol edx, 0x10 ; xchg dx, ax ; rol
+/// edx, 0x10`: each 32-bit frame takes plane 1's sample in its low word). The buffer is PCM, 2
+/// channels (0x58ED6A), whose first sample is the left one. So a source on the `+side` hand of
+/// [`pan_angle`] (pan byte 0x7F, channel 0) is heard on the right — what the running original's
+/// buffer shows (`RE/notes/REFERENCE-2026-10-24-PA-AUDIOMIX.md`: the car's own sounds from the
+/// driver's seat, the ambience). *(Until 2026-10-24 the port took channel 0 for the first sample:
+/// every panned sound came out mirrored.)*
+///
+/// This is the path of every voice the game starts: the hardware-3D voice count `[0x6B48DF]` is
+/// 0 whatever the card — 0x4A66B0 configures it only when `[0x657C9C]` is set, and both start-ups
+/// clear that just before the call (0x4A684C, 0x4A6A61) — so 0x58A7C4…0x58A7D6 drops every 3D
+/// type and the one voice type left is the configuration's 0x24 (0x4A670B), never flag 0x10. A
+/// hardware-3D voice would be positioned with `SetPosition` (0x596370) instead. *(Until
+/// 2026-09-27 this was an approximation "for a card without DirectSound3D buffers".)*
+/// (Until 2026-09-25 this was an equal-power cos / sin law of the port's own.)
+/// (Until 2026-09-27 the port fed this law the sine of the angle, taken back to an angle and
+/// rounded onto the grid, instead of the pan byte.)
+pub(super) fn pan_gains(p: u8) -> [f32; 2] {
+    let [c0, c1] = plane_gains(byte_angle(p));
+    [c1, c0]
+}
+
+/// The output gains of a **stereo** voice's two channels at pan byte `p`: the software pan
+/// 0x596890 runs once per channel of the strip, at the voice's angle plus the offset
+/// `[0x6B4A14 + 2·(k + 4·n)]` for channel `k` of `n` (0x59690A…0x596917) — for `n = 2`
+/// **0xC000** and **0x4000** (read on the running original, 2026-10-24) — so at the centre the
+/// source's first channel lands on plane 1 alone (the frame's first sample) and its second on
+/// plane 0 (the second), each at the full 127. Answers `[gain of channel 0 into the first sample,
+/// gain of channel 1 into the second]`. APPROXIMATION: off the centre each channel also feeds the
+/// other plane (its own angle's other entry); the port's voice mixes channel `k` into output `k`
+/// only — no race voice is stereo (counted 2026-10-24), the music streams are centred.
+pub(super) fn stereo_gains(p: u8) -> [f32; 2] {
+    let a = byte_angle(p);
+    [plane_gains(a.wrapping_add(0xC000))[1], plane_gains(a.wrapping_add(0x4000))[0]]
 }
 
 #[cfg(test)]
@@ -164,14 +202,25 @@ mod pan_tests {
 
     #[test]
     fn the_pan_law_is_the_software_mixers() {
-        // one channel at 127/127, the other silent (0x58E0E0)
-        assert_eq!(pan_gains(0x7F), [1.0, 0.0]);
-        assert_eq!(pan_gains(0), [0.0, 1.0]);
+        // one channel at 127/127, the other silent (0x58E0E0) — channel 0 (byte 0x7F, the +side
+        // hand) is the frame's second sample (0x59BCE0)
+        assert_eq!(pan_gains(0x7F), [0.0, 1.0]);
+        assert_eq!(pan_gains(0), [1.0, 0.0]);
         // centre: x = 63, f = 126 − 31 = 95 → 95/127 on both (0x58E0B0)
         let c = pan_gains(0x40);
         assert!((c[0] - 95.0 / 127.0).abs() < 1e-6 && (c[1] - 95.0 / 127.0).abs() < 1e-6);
         // 0x60 (angle 0x2000): shares 127·96/128 = 95 and 127·32/128 = 31 → f = 119 and 55
         let g = pan_gains(0x60);
-        assert!((g[0] - 119.0 / 127.0).abs() < 1e-6 && (g[1] - 55.0 / 127.0).abs() < 1e-6);
+        assert!((g[1] - 119.0 / 127.0).abs() < 1e-6 && (g[0] - 55.0 / 127.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_centred_stereo_voice_keeps_its_channels_at_full_level() {
+        use super::stereo_gains;
+        // 0x596890 at the offsets 0xC000 / 0x4000 (`[0x6B4A24]`, `[0x6B4A26]`): each channel on
+        // its own plane at 127, the first on plane 1 = the frame's first sample (0x59BCE0)
+        assert_eq!(stereo_gains(0x40), [1.0, 1.0]);
+        // not the mono law's 95/127 a centred mono voice takes on each side
+        assert!((pan_gains(0x40)[0] - 95.0 / 127.0).abs() < 1e-6);
     }
 }

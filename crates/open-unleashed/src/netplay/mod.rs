@@ -41,6 +41,8 @@ mod remote;
 mod players;
 mod session;
 #[cfg(test)]
+mod deadreck_tests;
+#[cfg(test)]
 mod tests;
 
 pub use keys::*;

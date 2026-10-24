@@ -1,0 +1,4 @@
+# sdl2-sys (bundled SDL2) configures with CMake; CMake 4 refuses SDL2's old
+# `cmake_minimum_required`, this lets it through
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

@@ -25,6 +25,15 @@ pub mod voicechat;
 
 pub use mixer::{AudioOutput, PlayArgs, StopHandle, VoiceId};
 
+/// TEST GLUE (not in the original): the game tick the app is running, for the audio's debug lines
+/// only (`RE/notes/REFERENCE-2026-10-24-PA-AUDIOMIX.md`) — nothing reads it back.
+pub static TRACE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`TRACE_TICK`] as it stands.
+pub fn trace_tick() -> u64 {
+    TRACE_TICK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The distance attenuations every audio pass builds the same way: the listener distance in 16.16
 /// (`ftol(|p − 0x655E50| · 65536)`, 0x5A0F98 truncating), `fixdiv(num, d16 + add)` 0x4A6160 — a
 /// true 16.16 divide, `(a/b) << 16 | ((a%b) << 16)/b` — shifted left by `shl`, then `>> 16` rounded

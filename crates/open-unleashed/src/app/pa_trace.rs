@@ -43,6 +43,33 @@ pub(crate) fn input(tick: u64, controls: Controls) -> Controls {
     }
 }
 
+/// TEST GLUE: `NFS_PA_LOOPS=<file>` — the player's loop entries the odd tick's drain hands 0x4A93C0
+/// (`CollisionSfx::drain_player`), last-first as it walks them: `tick chan sample v·65535`, the
+/// columns the PA-AUDIOMIX gdb script logs at the original's 0x4A93C0 entry (there `idA idB`
+/// instead of the slot, and the pan / distance words).
+pub(crate) fn loops(tick: u64, entries: &[nfs_audio::sfx::QueuedSfx], listener: Vec3, car: Vec3, look: Vec3, car_fwd: Vec3) {
+    static W: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+    let w = W.get_or_init(|| {
+        let p = nfs_game::config::cfg().nfs_pa_loops.as_str()?;
+        Some(Mutex::new(std::io::BufWriter::new(std::fs::File::create(p).ok()?)))
+    });
+    let Some(w) = w else { return };
+    let mut w = w.lock().unwrap();
+    let _ = writeln!(w, "# {tick} listener {:.4} {:.4} {:.4} car {:.4} {:.4} {:.4} d {:.3} look {:.4} {:.4} {:.4} carfwd {:.4} {:.4} {:.4}", listener.x, listener.y, listener.z, car.x, car.y, car.z, (listener - car).length(), look.x, look.y, look.z, car_fwd.x, car_fwd.y, car_fwd.z);
+    for e in entries.iter().rev() {
+        match *e {
+            nfs_audio::sfx::QueuedSfx::Loop { chan, sample, v } => {
+                let _ = writeln!(w, "{tick} {chan} {sample} {}", (v as f64 * 65535.0) as i64);
+            }
+            // a one-shot (the original's `chan` −1): its kind and `car+0x430`
+            ref other => {
+                let _ = writeln!(w, "# {tick} oneshot {other:?}");
+            }
+        }
+    }
+    let _ = w.flush();
+}
+
 fn writer() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
     static W: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
     W.get_or_init(|| {
@@ -198,11 +225,19 @@ pub(crate) fn fe0_opponents(root: &std::path::Path, catalog: &[nfs_formats::feda
             car.stock_parts = Vec::new();
             let pair = |s: &str| [float(k, &format!("skill{s}"), 1.0), float(k, &format!("skillrange{s}"), 0.0)];
             Some(CareerOpponent {
-                paint: car.paint_sets.first().map_or([0x20, 0x40, 0xC0], |s| s.colours[0]),
+                // `fe.txt`'s `car[k].colorconfig = c, c, c, c'` (signed ARGB words): the first as the body colour
+                // (TEST GLUE, APPROXIMATION: the original's reader of the key was not traced; the shipped
+                // values give the original's red / red / blue / red at slots 1..3 on the screen)
+                paint: reg
+                    .get(&format!("car[{k}].colorconfig"))
+                    .and_then(|v| v.split(',').next()?.trim().parse::<i32>().ok())
+                    .map(|c| [(c >> 16) as u8, (c >> 8) as u8, c as u8])
+                    .unwrap_or_else(|| car.paint_sets.first().map_or([0x20, 0x40, 0xC0], |s| s.colours[0])),
                 name: text(k, "drivername", &car.display_name),
                 difficulty: 1.0,
                 skill: [pair("slow"), pair("medium"), pair("fast"), pair("default")],
-                grid: None,
+                // `fe.txt`'s `car[k].startingpos` (shipped = k, 1 = pole), the port's 0-based `STARTINGPOS - 1`
+                grid: Some(reg.u32(&format!("car[{k}].startingpos"), 0).wrapping_sub(1)),
                 personality: reg.u32(&format!("car[{k}].personality"), k as u32) as i16,
                 parts: Vec::new(),
                 decal: -1,

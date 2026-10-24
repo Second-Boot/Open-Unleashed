@@ -33,6 +33,7 @@ pub mod lay;
 pub mod loc;
 pub mod locale;
 pub mod mad;
+pub mod nfs5ini;
 pub mod refpack;
 pub mod regfile;
 pub mod schl;

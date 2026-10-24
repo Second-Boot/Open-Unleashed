@@ -76,6 +76,8 @@ fn main() {
 fn run() -> Result<()> {
     let paths = GamePaths::locate()?;
     tracing::info!(root = %paths.root.display(), "located original game data");
+    // the Verok patch's `nfs5.ini` (dll 0x100022B0): `Filtering=0` is the renderer's, before it is made
+    nfs_renderer::set_point_filter(!paths.nfs5_ini().filtering);
     let cli = cli::Cli::from_env();
     // the strings every `Registry::load` reads after `fe.txt` (0x4B6698); PLATFORM GLUE: the port's own `--flags` stay out
     nfs_formats::fetxt::set_command_line(cli.options.clone());
@@ -205,6 +207,11 @@ fn run() -> Result<()> {
         .map(|r| r.sim.clone())
         .or_else(|| career_request.as_ref().map(|r| r.car.sim.clone()))
         .or_else(|| positional.get(2).cloned())
+        // TEST GLUE `NFS_PA_FE0`: an `fe = 0` race of the original builds the car from `default.sim` (see the
+        // `NFS_PA_FE0` set-up below), so the glue takes it without a third argument too. Without it the
+        // 993's own `.sim` ran (other limiter / drivetrain figures: the car left the original's trace from
+        // tick 178, REFERENCE-2026-10-24-PA-SIMDRIFT.md)
+        .or_else(|| std::env::var_os("NFS_PA_FE0").is_some().then(|| "default".to_string()))
         .or_else(|| {
             catalog
                 .iter()

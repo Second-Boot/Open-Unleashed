@@ -896,11 +896,19 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
     if let Some((selection, cars)) = &side.opponent_cars {
         entries.push(("OpponentCar.Car".into(), AccessorValue::OpponentCars { selection: *selection, cars: cars.clone() }));
     }
-    // the selected car's setup, which the screen mirrors into `FEFloatAccessor`s — a float rides in
-    // the same dword (`career.md` §12, `layouts.md`)
+    // the selected car's setup, which the screen mirrors into the seventeen `FEFloatRangeAccessor`s
+    // (`layouts.md` "The car-setup accessors"). Their payload dword is the accessor's **index**
+    // `[this+0x18]` (0x4BC460), not the float: the setter 0x4B9C10 turns the float into
+    // `(v - min) / step` and 0x4BC240 clamps it. *(Until PA-SAVNET the float's bits rode in the dword;
+    // the original loads that as an index and writes the range's count back: a port-written seed came
+    // out of the original's launch save as BrakeBias 40 / FDownForce 100 / FTirePressure 20 / ShockRate
+    // 80, where the original's own `8DRIVER.sav` holds the stock car's 20 / 50 / 5 / 30, and `0TEST.sav`
+    // — setup screen never shown — all zeros.)* APPROXIMATION: the original's accessors hold these
+    // only once a screen has put the car's setup into them (0x4F10xx); the port writes the first
+    // garage car's on every save, as it always did.
     if let Some(car) = c.garage.first() {
-        for (name, v) in crate::career::CAR_SETUP_NAMES.iter().zip(car.setup.iter()) {
-            entries.push(((*name).into(), AccessorValue::Dword(v.to_bits())));
+        for (i, (name, v)) in crate::career::CAR_SETUP_NAMES.iter().zip(car.setup.iter()).enumerate() {
+            entries.push(((*name).into(), AccessorValue::Dword(crate::career::car_setup_index(i, *v).0 as u32)));
         }
     }
     let accessors = AccessorBlock { entries };
@@ -1194,6 +1202,10 @@ pub fn write_profile(dir: &Path, profile: &Profile, save: &SaveFile) -> std::io:
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SaveInfo refuses the empty name (0x4DEDB9)"));
     }
     std::fs::create_dir_all(dir)?;
+    // the `TrackRecords` module's side effect (0x4FAD80): `nfs5.trk` is written with every profile save
+    if let Err(e) = crate::records::Records::flush_staged() {
+        tracing::warn!(error = %e, "records save failed");
+    }
     std::fs::write(profile.path(dir), save.write())?;
     write_player_lst(dir, &profile.stem())
 }

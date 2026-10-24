@@ -59,6 +59,10 @@ def main():
             parts.append(f"{p['repository']}\n")
         parts.append("=" * 78 + "\n")
         files = licence_files(d)
+        if p["name"] == "sdl2-sys" and (d / "SDL" / "LICENSE.txt").is_file():
+            # the crate builds and statically links the bundled SDL2 itself (zlib licence)
+            parts.append("This crate statically links SDL2 (https://libsdl.org), built from the source it ships; its licence (zlib) follows.\n")
+            files = files + [d / "SDL" / "LICENSE.txt"]
         if not files:
             authors = ", ".join(p.get("authors") or []) or "its authors"
             parts.append(f"(the crate's source ships no licence file. Licence: {p.get('license')}; copyright {authors}.\n"

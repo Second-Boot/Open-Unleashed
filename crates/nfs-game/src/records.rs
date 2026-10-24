@@ -13,8 +13,21 @@
 use nfs_assets::GamePaths;
 use nfs_formats::career::{parse_track_table, TrackRecord, TrackRecordFile};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub use nfs_formats::career::NO_RECORD_TIME;
+
+/// **The live record buffer's unsaved state** (PA-SAVNET). The original files a race's record in the
+/// live buffer only (`Records_insert` 0x4FAFC0 from the race end 0x4EDF00 writes no file): the
+/// `TrackRecords` save module 0x4FAD80 — a side effect of `SaveInfo` 0x4DEDA0, which writes the whole
+/// `nfs5.trk` and no byte of the `.sav` — is what puts it on disk, at the next save site (the race
+/// launch 0x4D52EA, `LOADGAMEBUTTON`, a profile's creation). Observed on the original: `nfs5.trk` and
+/// the profile were both rewritten at a launch (12:34:07.894 / .898), neither at the end of the
+/// finished race that followed, and the second launch wrote the record. So a record filed and the game
+/// quit before the next save is lost, as the profile's own progress is (`savegame.md` "Save timing").
+/// `(path, bytes)` of the buffer after [`Records::stage`]; [`Records::load`] (0x4FAE20, every front-end
+/// entry) replaces the buffer from disk and so drops it.
+static STAGED: Mutex<Option<(PathBuf, Vec<u8>)>> = Mutex::new(None);
 
 /// One track's records, as the HUD and the results screen want them.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +116,8 @@ impl Records {
     /// it back and apply the empty-slot fixup. A save that cannot be read falls back to the seed.
     pub fn load(paths: &GamePaths, save: &Path) -> Self {
         let seed_path = paths.fe_data().join("Data").join("nfs5.trk");
+        // 0x4FAE20 re-reads the file into the live buffer: an unsaved filing is gone
+        *STAGED.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let seed = std::fs::read(&seed_path).ok();
         let data = match std::fs::read(save) {
             Ok(d) if !d.is_empty() => Some(d),
@@ -129,6 +144,24 @@ impl Records {
             tracing::warn!(error = %e, "track records not reset");
         }
         Self::load(paths, save)
+    }
+
+    /// Keep this buffer as the one the next `SaveInfo` writes to `path` ([`Records::flush_staged`]).
+    pub fn stage(&self, path: &Path) {
+        if !self.file.raw.is_empty() {
+            *STAGED.lock().unwrap_or_else(|e| e.into_inner()) = Some((path.to_path_buf(), self.file.raw.clone()));
+        }
+    }
+
+    /// The `TrackRecords` module's write (0x4FAD80), run by every profile save: the staged buffer goes to
+    /// its file. Nothing staged, nothing written (the live buffer is what the file already holds).
+    pub fn flush_staged() -> std::io::Result<()> {
+        let staged = STAGED.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some((path, raw)) = staged else { return Ok(()) };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, raw)
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -237,6 +270,31 @@ mod tests {
     }
 
     use super::*;
+
+    /// PA-SAVNET: a filed record sits in the live buffer; `nfs5.trk` is written by the next profile save
+    /// (the `TrackRecords` module's side effect of `SaveInfo`, 0x4FAD80), and a re-read of the file
+    /// (0x4FAE20, every front-end entry) drops what was not saved.
+    #[test]
+    fn a_filed_record_reaches_the_file_with_the_next_save_only() {
+        let dir = std::env::temp_dir().join(format!("pa_savnet_trk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nfs5.trk");
+        let live = Records { file: TrackRecordFile { raw: vec![1, 2, 3, 4] }, meta: Vec::new() };
+        live.stage(&path);
+        assert!(!path.exists(), "filing writes no file");
+        Records::flush_staged().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3, 4], "the next save writes the buffer");
+        std::fs::remove_file(&path).unwrap();
+        Records::flush_staged().unwrap();
+        assert!(!path.exists(), "nothing staged, nothing written");
+        // a reload from disk drops an unsaved filing
+        live.stage(&path);
+        *STAGED.lock().unwrap() = None;
+        Records::flush_staged().unwrap();
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn format_matches_the_original() {

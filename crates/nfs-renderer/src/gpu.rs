@@ -609,14 +609,18 @@ impl Core {
         // loads with no state block (0x44D270 → 0x44D2E9 pushes 0), so `HEAD` keeps the
         // constructor's default 0x5379D0 — `CLAMP` / `CLAMP`, `LINEAR`, mip `NONE`
         // (`RE/notes/lighting.md` §5.2).
+        // `nfs5.ini` `Filtering=0` (dll 0x100035F0): the wrapper sends Thrash 7 (`MAG`/`MINFILTER`) as 0 =
+        // `POINT` whatever the state block says (the block's value is 1, `LINEAR`) - every sampler below
+        // takes it; the mip filters (state 0x0B) are untouched
+        let mag_min_linear = if crate::point_filter() { wgpu::FilterMode::Nearest } else { wgpu::FilterMode::Linear };
         let make_proj_sampler = |mip: wgpu::MipmapFilterMode| {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("projector clamp"),
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
                 address_mode_v: wgpu::AddressMode::ClampToEdge,
                 address_mode_w: wgpu::AddressMode::ClampToEdge,
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
+                mag_filter: mag_min_linear,
+                min_filter: mag_min_linear,
                 mipmap_filter: mip,
                 ..Default::default()
             })
@@ -691,7 +695,7 @@ impl Core {
         };
         let samplers = std::array::from_fn(|i| {
             let mip = if i & 4 == 0 { wgpu::MipmapFilterMode::Linear } else { wgpu::MipmapFilterMode::Nearest };
-            make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Linear, mip)
+            make_sampler(i & 1 != 0, i & 2 != 0, mag_min_linear, mip)
         });
         // `LayerFalseSort1`/`2`'s other arm sets Thrash 7 ← 0 for the one draw (`MAG`/`MINFILTER`
         // `POINT`) and never touches state 0x0B, so the mip filter here follows the same `POINT`
@@ -709,8 +713,8 @@ impl Core {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: mag_min_linear,
+            min_filter: mag_min_linear,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             lod_max_clamp: 0.0,
             ..Default::default()

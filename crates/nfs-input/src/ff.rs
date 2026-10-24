@@ -1,23 +1,19 @@
-//! Rumble output through gilrs 0.11's `ff` module — the port's only force-feedback backend, and a
-//! narrow one (`RE/notes/force-feedback.md` §7).
+//! Rumble output — the port's force-feedback mechanism, and a narrow one (`RE/notes/force-feedback.md`
+//! §7). Two sustained motor levels (strong / weak) and one-shot strong pulses.
 //!
-//! gilrs can drive exactly one kind of effect: a **constant strong or weak motor magnitude** with an
-//! envelope and a schedule, on Linux (evdev `FF_RUMBLE`) and Windows (XInput / Windows.Gaming.Input
-//! rumble). On macOS `Gamepad::is_ff_supported()` is `false` and `Device::set_ff_state` is an empty
-//! function (gilrs-core 0.6.8 `platform/macos/ff.rs`), so on macOS this backend is **not used**:
-//! `crate::ff_macos` (GameController + CoreHaptics) provides the same `Rumbler` interface, selected
-//! with `cfg(target_os = "macos")`; everything below the `Motor` enum is compiled on the other
-//! platforms only. This backend's time base is a 50 ms tick (`Ticks`), so no periodic waveform of the
-//! original's 6…35 Hz can be shaped, and a DirectInput constant force, spring or condition has no
-//! counterpart at all. The mapping onto this is therefore a **PORT-DEVIATION D24** and lives with the
-//! caller (`open_unleashed::app::force_feedback`), which labels each choice; this module only provides the
-//! mechanism: two sustained motor effects whose level is changed through `Effect::set_gain`, and
-//! one-shot pulses.
-
-#[cfg(not(target_os = "macos"))]
-use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
-#[cfg(not(target_os = "macos"))]
-use gilrs::{GamepadId, Gilrs};
+//! * macOS: `crate::ff_macos` (GameController + CoreHaptics) — unchanged by the move to SDL2
+//!   (PA-SDL): SDL's own rumble on macOS goes through the same framework, but the existing path is
+//!   the one that has been tested, so it stays.
+//! * Linux / Windows: SDL2's `SDL_JoystickRumble` (evdev `FF_RUMBLE` / XInput / DirectInput rumble /
+//!   HIDAPI), the two motors being the low- and high-frequency ones. It replaces `gilrs`' effect
+//!   scheduler (50 ms ticks) one for one: a constant strong or weak magnitude and a timed pulse.
+//!
+//! No periodic waveform of the original's 6…35 Hz can be shaped, and a DirectInput constant force,
+//! spring or condition has no counterpart: SDL's haptic subsystem could drive them on a wheel, but
+//! that mapping (the original's `CreateEffect` parameters, `ff_drive`) is **not done yet** — see the
+//! PA-SDL note in `RE/notes/controls.md`. The mapping onto motors is therefore a **PORT-DEVIATION
+//! D24** and lives with the caller (`open_unleashed::app::force_feedback`); this module only
+//! provides the mechanism.
 
 #[cfg(target_os = "macos")]
 pub use crate::ff_macos::Rumbler;
@@ -31,122 +27,93 @@ pub enum Motor {
     Weak,
 }
 
-#[cfg(not(target_os = "macos"))]
-#[derive(Default)]
-struct Sustained {
-    effect: Option<Effect>,
-    playing: bool,
-}
-
-/// The rumble state on one pad.
+/// The rumble state: both sustained levels and the pulse in flight. SDL's rumble call sets both
+/// motors at once for a duration, so every change re-sends the combined state.
 #[cfg(not(target_os = "macos"))]
 #[derive(Default)]
 pub struct Rumbler {
-    pad: Option<GamepadId>,
-    strong: Sustained,
-    weak: Sustained,
+    strong: f32,
+    weak: f32,
+    /// (end, level) of a pulse in flight
+    pulse: Option<(std::time::Instant, f32)>,
+    /// (low, high, when) of the last call sent
+    sent: Option<(u16, u16, std::time::Instant)>,
 }
+
+/// How long one sustained call runs before SDL stops the motors by itself; renewed whenever the
+/// caller touches the rumbler after half of it.
+#[cfg(not(target_os = "macos"))]
+const SUSTAIN_MS: u32 = 60_000;
 
 #[cfg(not(target_os = "macos"))]
 impl Rumbler {
-    /// The first connected pad that reports force-feedback support, if any. `false` on macOS.
-    pub fn find_pad(gilrs: &Gilrs) -> Option<GamepadId> {
-        gilrs.gamepads().find(|(_, g)| g.is_connected() && g.is_ff_supported()).map(|(id, _)| id)
-    }
-
-    fn pad(&mut self, gilrs: &Gilrs) -> Option<GamepadId> {
-        if let Some(id) = self.pad
-            && gilrs.connected_gamepad(id).is_some_and(|g| g.is_ff_supported())
-        {
-            return Some(id);
-        }
-        // lost or never found: drop what was built for the old one
-        self.strong = Sustained::default();
-        self.weak = Sustained::default();
-        self.pad = Self::find_pad(gilrs);
-        self.pad
-    }
-
-    /// Set a motor's sustained level, 0…1 (gain over a full-scale infinite effect). 0 stops it.
-    pub fn sustain(&mut self, gilrs: &mut Gilrs, motor: Motor, level: f32) {
-        let Some(pad) = self.pad(gilrs) else { return };
-        let slot = match motor {
-            Motor::Strong => &mut self.strong,
-            Motor::Weak => &mut self.weak,
-        };
-        if level <= 0.0 {
-            if slot.playing
-                && let Some(e) = &slot.effect
-            {
-                let _ = e.stop();
+    fn apply(&mut self, pads: &mut crate::gamepad::Devices) {
+        let now = std::time::Instant::now();
+        let pulse = match self.pulse {
+            Some((end, level)) if end > now => level,
+            _ => {
+                self.pulse = None;
+                0.0
             }
-            slot.playing = false;
+        };
+        let to_u16 = |l: f32| (l.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
+        let (low, high) = (to_u16(self.strong.max(pulse)), to_u16(self.weak));
+        let fresh = matches!(self.sent, Some((l, h, t)) if l == low && h == high && t.elapsed().as_millis() < u128::from(SUSTAIN_MS / 2));
+        if fresh || (self.sent.is_none() && low == 0 && high == 0) {
             return;
         }
-        if slot.effect.is_none() {
-            let kind = match motor {
-                Motor::Strong => BaseEffectType::Strong { magnitude: u16::MAX },
-                Motor::Weak => BaseEffectType::Weak { magnitude: u16::MAX },
-            };
-            let built = EffectBuilder::new()
-                .add_effect(BaseEffect { kind, scheduling: Replay { play_for: Ticks::from_ms(1_000_000), ..Default::default() }, ..Default::default() })
-                .gamepads(&[pad])
-                .repeat(Repeat::Infinitely)
-                .finish(gilrs);
-            match built {
-                Ok(e) => slot.effect = Some(e),
-                Err(err) => {
-                    tracing::debug!(%err, "rumble effect not created");
-                    return;
-                }
-            }
-        }
-        if let Some(e) = &slot.effect {
-            let _ = e.set_gain(level.min(1.0));
-            if !slot.playing {
-                let _ = e.play();
-                slot.playing = true;
-            }
+        // a lone pulse stops by itself when it ends; with a motor sustained the call runs long
+        let ms = match self.pulse {
+            Some((end, _)) if self.weak <= 0.0 && self.strong <= 0.0 => end.saturating_duration_since(now).as_millis().max(1) as u32,
+            _ => SUSTAIN_MS,
+        };
+        if low == 0 && high == 0 {
+            pads.rumble(0, 0, 0);
+            self.sent = None;
+        } else if pads.rumble(low, high, ms) {
+            self.sent = Some((low, high, now));
         }
     }
 
-    /// A one-shot strong pulse of `level` (0…1) for `ms` milliseconds (rounded up to 50 ms ticks).
-    pub fn pulse(&mut self, gilrs: &mut Gilrs, level: f32, ms: u32) {
-        let Some(pad) = self.pad(gilrs) else { return };
-        let ticks = Ticks::from_ms(ms.max(1));
-        let magnitude = (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-        let built = EffectBuilder::new()
-            .add_effect(BaseEffect { kind: BaseEffectType::Strong { magnitude }, scheduling: Replay { play_for: ticks, ..Default::default() }, ..Default::default() })
-            .gamepads(&[pad])
-            .repeat(Repeat::For(ticks))
-            .finish(gilrs);
-        if let Ok(e) = built {
-            let _ = e.play();
+    /// Set a motor's sustained level, 0…1 (0 stops it).
+    pub fn sustain(&mut self, pads: &mut crate::gamepad::Devices, motor: Motor, level: f32) {
+        let level = level.clamp(0.0, 1.0);
+        match motor {
+            Motor::Strong => self.strong = level,
+            Motor::Weak => self.weak = level,
         }
+        self.apply(pads);
+    }
+
+    /// A one-shot strong pulse of `level` (0…1) for `ms` milliseconds.
+    pub fn pulse(&mut self, pads: &mut crate::gamepad::Devices, level: f32, ms: u32) {
+        let level = level.clamp(0.0, 1.0);
+        if level <= 0.0 {
+            return;
+        }
+        self.pulse = Some((std::time::Instant::now() + std::time::Duration::from_millis(u64::from(ms.max(1))), level));
+        self.sent = None;
+        self.apply(pads);
     }
 
     /// Stop both sustained motors (a pause, a menu, the end of the race).
-    pub fn stop_all(&mut self) {
-        for slot in [&mut self.strong, &mut self.weak] {
-            if slot.playing
-                && let Some(e) = &slot.effect
-            {
-                let _ = e.stop();
-            }
-            slot.playing = false;
-        }
+    pub fn stop_all(&mut self, pads: &mut crate::gamepad::Devices) {
+        self.strong = 0.0;
+        self.weak = 0.0;
+        self.pulse = None;
+        self.apply(pads);
     }
 
-    /// Whether a pad that can rumble is connected.
-    pub fn supported(&self, gilrs: &Gilrs) -> bool {
-        Self::find_pad(gilrs).is_some()
+    /// Whether a device that can rumble is connected.
+    pub fn supported(&self, pads: &crate::gamepad::Devices) -> bool {
+        pads.rumble_device_name().is_some()
     }
 
-    /// One line for the log: which backend this is and which pad it drives.
-    pub fn describe(&self, gilrs: &Gilrs) -> String {
-        match Self::find_pad(gilrs).and_then(|id| gilrs.connected_gamepad(id)) {
-            Some(g) => format!("gilrs rumble (strong / weak motor), pad \"{}\"", g.name()),
-            None => "gilrs rumble (strong / weak motor), no pad that supports it".to_string(),
+    /// One line for the log: which backend this is and which device it drives.
+    pub fn describe(&self, pads: &crate::gamepad::Devices) -> String {
+        match pads.rumble_device_name() {
+            Some(n) => format!("SDL rumble (strong / weak motor), device \"{n}\""),
+            None => "SDL rumble (strong / weak motor), no device that supports it".to_string(),
         }
     }
 }

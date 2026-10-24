@@ -34,6 +34,21 @@ impl App {
     /// `[0x627F43] & 0x10`; 0xFF77BBFF, the view's constructor colour, only without a `.bin`).
     pub(crate) fn render_mirror(&mut self) {
         let Some(cam) = self.rear_mirror else { return };
+        // **The reflection** (PA-MIRROR): the camera build 0x464F80 ends (0x46537B…0x4653A8) with `al = ([0x65742C] != 0)`,
+        // inverted for the view type 1 (`cmp ecx, 1; sete`, 0x46538D…0x465394), and when it holds negates the first row of
+        // the camera's 3×3 (`+0xC`, `+0x10`, `+0x14`, 0x46539B…0x4653AB): a reflection of the screen's x, before the
+        // view matrix 0x4662E0 is made of it. The main view (types 0, 2…) takes it under `MIRROR`; the rear-view
+        // mirror (type 1) takes it **without** `MIRROR`. The pass 0x468CA0 sets the view's cull to the other mode
+        // than the main pass does (0x468DA8…0x468DD7: `[0x65742C] == 0` → CCW 1, else CW 2; the main pass's
+        // 0x468C2C…0x468C55 the reverse). That is the port's `MIRROR` state (clip x, the winding, the flare basis)
+        // with the state toggled for this pass; the earlier tray UV flip was only its image.
+        let main_mirror = self.scene.mirror;
+        self.scene.mirror = !main_mirror;
+        self.render_mirror_pass(cam);
+        self.scene.mirror = main_mirror;
+    }
+
+    fn render_mirror_pass(&mut self, cam: Camera) {
         // the tray's 240 × 84 **pixels** (constant, the port's HiDPI mapping), times the HiDPI scale
         let k = self.hud_geometry().2;
         let (w, h) = ((240.0 * k).round() as u32, (84.0 * k).round() as u32);
@@ -183,7 +198,7 @@ impl App {
             if let Some(c) = bin.background_at(self.sky_level(), 1, main_slice, lap) {
                 clear = [c[0] as f64, c[1] as f64, c[2] as f64, 1.0];
             }
-            let fog = |sky: bool| bin.fog_at(sky, mirror_slice, lap).map(|(colour, density)| nfs_renderer::Fog { colour, density });
+            let fog = |sky: bool| bin.fog_at(sky, mirror_slice, lap).filter(|_| self.ini.fog).map(|(colour, density)| nfs_renderer::Fog { colour, density });
             (scene.sky_fog, scene.fog) = (fog(true), fog(false));
         }
         if let Some(r) = self.renderer.as_mut() {

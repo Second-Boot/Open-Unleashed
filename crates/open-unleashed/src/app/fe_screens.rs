@@ -676,8 +676,13 @@ impl App {
     /// screen's editor started from eight zeros, whatever the profile held.)*
     fn bind_picker_wells(&mut self) {
         let Some(wells) = self.career.as_ref().map(|c| c.career.custom_colours) else { return };
-        if let Some(l) = self.fe.layout_preview.as_mut() {
+        let bound = self.fe.layout_preview.as_mut().map(|l| {
             l.set_picker_wells(wells);
+            l.bind_colour_boxes()
+        });
+        // the colour box's own bind wrote well 0 (0x4C3BD4): the profile follows it
+        if bound == Some(true) {
+            self.store_picker_wells();
         }
     }
 

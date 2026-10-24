@@ -154,7 +154,7 @@ impl Hud {
             trays_in: std::cell::Cell::new(true),
             map: None,
             map_route: Vec::new(),
-            map_frame: std::cell::Cell::new([0.0, 0.0, 1.0, 0.0, 1.0]),
+            map_frame: std::cell::Cell::new([0.0, 0.0, 1.0, 0.0, 0.0]),
             map_drawn: std::cell::RefCell::new(None),
             map_scratch: std::cell::RefCell::new(Vec::new()),
             text_runs: Default::default(),
@@ -260,7 +260,7 @@ impl Hud {
             }
             // the static view is `R(head, z)` never built at all, i.e. `head = 0`: `(sin 0, cos
             // 0) = (0, 1)`, not `(0, −1)` (2026-09-27, with the sense correction above)
-            _ => (0.0, 1.0),
+            _ => (0.0, 0.0),
         };
         self.map_frame.set([cx, cz, scale, fx, fz]);
         // The picture is a pure function of the route's **pixel endpoints** (`map_px` truncated to
@@ -349,16 +349,19 @@ impl Hud {
         }
     }
 
-    /// World `(x, z)` → map pixels for the frame transform `[cx, cz, scale, fx, fz]`: `u = x·fz −
-    /// z·fx`, `v = x·fx + z·fz` (0x433440's `R(−90°, x)` then `R(head, z)`, un-flipped into the
-    /// render target — [`Hud::map_update`]'s doc). The heading `(fx, fz)` points **down** on the
-    /// map (for the static `(0, 1)` this is the plain `x` right, `z` down of the north-up
-    /// picture).
+    /// World `(x, z)` → map pixels for the frame transform `[cx, cz, scale, fx, fz]`: with a heading
+    /// `u = x·fz − z·fx`, `v = −(x·fx + z·fz)` — the car's heading points **up** on the map, the road
+    /// ahead above the car (PA-SCENES: measured against the original, see below; 0x433440's
+    /// `R(−90°, x)` then `R(head, z)`). Without one (`(0, 0)`, the static view) `x` right, `z` down.
     pub(crate) fn map_px(f: [f32; 5], x: f32, z: f32) -> (f32, f32) {
         let [cx, cz, scale, fx, fz] = f;
         let (dx, dz) = (x - cx, z - cz);
-        let u = dx * fz - dz * fx;
-        let v = dx * fx + dz * fz;
+        // the static view (`head` never built, `(fx, fz) = (0, 0)`): `x` right, `z` down. The rotating view
+        // (PA-SCENES, measured on the original's alps handbrake slide with six map crops against the
+        // port's, every one matching): the heading points straight UP and the road ahead is above the car,
+        // `u = x·fz − z·fx`, `v = −(x·fx + z·fz)` — the derivation above had `v` without the minus (the car's
+        // heading down) and was marked unproven
+        let (u, v) = if fx == 0.0 && fz == 0.0 { (dx, dz) } else { (dx * fz - dz * fx, -(dx * fx + dz * fz)) };
         let m = MAP_PX as f32 * 0.5;
         (m + u * scale, m + v * scale)
     }

@@ -9,14 +9,50 @@ use super::*;
 pub(super) struct Offline {
     pub(super) core: Core,
     pub(super) n: u32,
+    /// TEST GLUE (`NFS_AUDIO_DUMP_TICKS=1`): the mix is advanced by the game's ticks instead
+    /// ([`AudioOutput::offline_game_tick`]): the game ticks seen so far and the mix-rate frames written
+    pub(super) ticks: u64,
+    pub(super) written: u64,
 }
 
 pub(super) static DUMP: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
 
+/// TEST GLUE: `NFS_AUDIO_DUMP_TICKS=1` (with `NFS_AUDIO_DUMP`) — the dump is the mix at its own rate
+/// `[0x6B48DA]`, 16-bit stereo, `rate / 64` frames per game tick (`RE/notes/REFERENCE-2026-10-24-PA-AUDIOMIX.md`):
+/// the same samples the original's driver pass hands DirectSound (0x58FBC0), on the game's clock.
+pub(super) fn dump_ticked() -> bool {
+    std::env::var_os("NFS_AUDIO_DUMP_TICKS").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 impl Offline {
+    /// TEST GLUE: one game tick of mix ([`dump_ticked`]).
+    pub(super) fn game_tick(&mut self) {
+        self.core.drain();
+        self.ticks += 1;
+        if self.ticks == 1 {
+            tracing::info!(game_tick = crate::trace_tick(), "audio dump: the first tick of mix (NFS_AUDIO_DUMP_TICKS)");
+        }
+        let rate = self.core.shared.mix_rate() as u64;
+        let target = self.ticks * rate / 64;
+        let n = target.saturating_sub(self.written) as usize;
+        self.written = target;
+        let mut buf = Vec::new();
+        self.core.shared.render_into(&mut buf, n, rate as u32);
+        let bytes: Vec<u8> = buf.iter().flat_map(|f| f.iter().flat_map(|x| ((x * 32768.0).round().clamp(-32768.0, 32767.0) as i16).to_le_bytes())).collect();
+        use std::io::Write;
+        if let Some(dump) = DUMP.get() {
+            dump.lock().unwrap().write_all(&bytes).unwrap();
+        }
+        self.core.publish();
+    }
+
     pub(super) fn step(&mut self) {
         self.core.drain();
         self.n += 1;
+        if dump_ticked() {
+            self.core.publish();
+            return;
+        }
         if self.n.is_multiple_of(4) {
             let mut buf = vec![0.0f32; 441 * 2];
             self.core.fill(&mut buf, 2, 44100.0);
@@ -58,12 +94,31 @@ pub struct PlayArgs {
     pub sel: u8,
     /// written to the pause's voice table (`Voice_play`) or not (a bare `Voice_start`)
     pub tabled: bool,
+    /// the request's word `+0x12`, the strip hook's value at the start ([`PlayArgs::filter`])
+    pub filter: Option<i32>,
 }
 
 impl PlayArgs {
     /// `play_word`'s request: `sel` 0x7F, tabled.
     pub fn new(clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool) -> Self {
-        Self { clip, volume, word, bend, pan, looping, sel: 0x7F, tabled: true }
+        Self { clip, volume, word, bend, pan, looping, sel: 0x7F, tabled: true, filter: None }
+    }
+
+    /// **`Bank_playOneShot` 0x4A98E0's filter word**: the request's `+0x12` (0xFFFF from 0x561960)
+    /// becomes **0xBB8** at 0x4A9B2B when the bank is not the player's engine bank (`[0x6564A0]` /
+    /// `[0x6564B0]`, 0x4A9AE0…0x4A9AEA), `AUDIOQUALITY` is below 2 (0x4A9AEC) and the view is the
+    /// cockpit (`[0x627F43] & 8`, the view word neither 0 nor 0xF, 0x443EE0 not exterior,
+    /// 0x4A9AF5…0x4A9B29) — the same gate as `Voice_play`'s update ([`voice_play_filter`]). The start
+    /// hands it on (0x561508 → 0x5897C0 → 0x589FE0, which calls the strip hook `+0xE0` with it,
+    /// 0x596AC0), so such a voice is low-passed at 3000 Hz **from its first sample**, a one-shot
+    /// included. `value` is [`voice_play_filter`]'s (0xFFFF or nothing: no filter). Measured on the
+    /// running original (`REFERENCE-2026-10-24-PA-AUDIOMIX.md`: the wrong-way cue, 0xBB8 in its
+    /// start request, 12.8 dB under the port's unfiltered one). *(Until 2026-10-24 the port read
+    /// the start as returning before the filter — true of 0x4A9C10's update tail only — and played
+    /// every one-shot in the cockpit unfiltered, a loop for its first update.)*
+    pub fn filter(mut self, value: Option<i32>) -> Self {
+        self.filter = value;
+        self
     }
 
     /// With the request's byte `+6`.
@@ -134,6 +189,16 @@ impl AudioOutput {
             }
         }
         Err(last.expect("an attempt was made").into())
+    }
+
+    /// TEST GLUE (`NFS_AUDIO_DUMP_TICKS=1`): one game tick of the offline mix, `rate / 64` frames at
+    /// the mix rate appended to the dump — called once per `GameTick`; nothing otherwise.
+    pub fn offline_game_tick(&self) {
+        if let Some(o) = &self.tx.offline
+            && dump_ticked()
+        {
+            o.lock().unwrap().game_tick();
+        }
     }
 
     /// TEST GLUE: the offline mixer of a muted run (no device, nothing written), for the tests of
@@ -331,16 +396,16 @@ impl AudioOutput {
     }
 
     pub(super) fn play_word_tabled(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, sel: u8, tabled: bool) -> VoiceId {
-        self.play(PlayArgs { clip, volume, word, bend, pan, looping, sel, tabled })
+        self.play(PlayArgs { clip, volume, word, bend, pan, looping, sel, tabled, filter: None })
     }
 
     /// Every `play_word*` start in one call: the [`PlayArgs`] are the request the wrappers fill.
     pub fn play(&self, args: PlayArgs) -> VoiceId {
-        let PlayArgs { clip, volume, word, bend, pan, looping, sel, tabled } = args;
+        let PlayArgs { clip, volume, word, bend, pan, looping, sel, tabled, filter } = args;
         let mut st = self.tx.state.lock().unwrap();
         let id = VoiceId(st.next_id);
         st.next_id += 1;
-        self.tx.push(&mut st, Cmd::Start { id, clip, volume, word, bend, pan, looping, sel, tabled }, Some(Pend::Start(id)));
+        self.tx.push(&mut st, Cmd::Start { id, clip, volume, word, bend, pan, looping, sel, tabled, filter }, Some(Pend::Start(id)));
         id
     }
 

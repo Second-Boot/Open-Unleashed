@@ -72,7 +72,10 @@ impl NetPlay {
         } else {
             r.held = false;
             let blk = r.block();
-            if v.net_dead_reckon(&blk, tick as i32, grid, specs, centre) {
+            super::remote::remote_dump(|| format!("AI {tick} seat={seat} {}", super::remote::car_words(v)));
+            let stale = v.net_dead_reckon(&blk, tick as i32, grid, specs, centre);
+            super::remote::remote_dump(|| format!("AO {tick} seat={seat} {}", super::remote::car_words(v)));
+            if stale {
                 // 0x4A0DC3: `|age| > 0x100` — the next ticks leave the car alone until the lag recovers
                 r.stale = true;
             }

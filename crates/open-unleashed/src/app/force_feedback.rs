@@ -1,6 +1,6 @@
 //! Force feedback: the original's producers ([`nfs_physics::force_feedback`], read to the
 //! instruction, `RE/notes/force-feedback.md`) wired to the race loop, and the one place where their
-//! DirectInput effect parameters are **approximated** onto what gilrs can drive (a pad's two rumble
+//! DirectInput effect parameters are **approximated** onto what the rumble backend can drive (a pad's two rumble
 //! motors, [`nfs_input::ff`]). The producers' output never reaches the simulation.
 //!
 //! What is the original's: when the driver runs (every Sc32 tick, before the player's physics
@@ -11,11 +11,11 @@
 //! The port's choices are **PORT-DEVIATION D24** (each labelled where it is made):
 //! * **A1, the device.** The original arms force feedback only when the player has a
 //!   force-feedback-capable DirectInput device bound in the control config (0x4116D0, 0x411D20) and
-//!   picks the *last* such device of 32. The port arms it when gilrs reports a connected pad that
+//!   picks the *last* such device of 32. The port arms it when SDL (macOS: GameController) reports a connected pad that
 //!   supports rumble (on macOS through GameController / CoreHaptics, `nfs_input::ff_macos`) and treats it as a pad, not a wheel (0x412D5A's class test
 //!   `devtype & 0xFF00 == 0x600` — `dwDevType` of the legacy `DIDEVICEINSTANCE` (0x56FDB0, filled by `GetDeviceInfo`, returned by 0x532E10 kind 2): subtype 6 = `DIDEVTYPEJOYSTICK_WHEEL`; an Xbox pad is GAMEPAD, subtype 4, so not a wheel — `force-feedback.md` §2).
 //! * **A2, the effect types.** (the same on macOS, where the motors are a pad's left / right handle
-//!   haptic engines.) gilrs has constant strong / weak motor magnitudes only (50 ms ticks).
+//!   haptic engines.) The backend has constant strong / weak motor magnitudes only (50 ms ticks).
 //!   Road (a square wave of 6…17 Hz, magnitude ≤ 5000 of 10000) → the strong motor at a constant
 //!   level `magnitude · gain · total`; engine (a sine, 10…35 Hz) → the weak motor, the same level
 //!   law; jolt (a constant force with a polar direction and an envelope) → a strong pulse of its

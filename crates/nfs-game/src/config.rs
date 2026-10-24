@@ -169,6 +169,7 @@ switches! {
     nfs_skid_script = "NFS_SKID_SCRIPT",
     nfs_pa_input = "NFS_PA_INPUT",
     nfs_pa_trace = "NFS_PA_TRACE",
+    nfs_pa_loops = "NFS_PA_LOOPS",
     nfs_skid_stats = "NFS_SKID_STATS",
     nfs_sky_level = "NFS_SKY_LEVEL",
     nfs_slow_log = "NFS_SLOW_LOG",

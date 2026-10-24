@@ -1,7 +1,7 @@
 //! Rumble output on macOS through Apple's **GameController** framework and **CoreHaptics**
-//! (`RE/notes/force-feedback.md` §11) — the macOS counterpart of the gilrs backend in `crate::ff`
+//! (`RE/notes/force-feedback.md` §11) — the macOS counterpart of the SDL backend in `crate::ff`
 //! with the **same interface** (`Rumbler`: two sustained motor levels 0…1, one-shot strong pulses),
-//! selected with `cfg(target_os = "macos")`. gilrs 0.11 has no force feedback on macOS
+//! selected with `cfg(target_os = "macos")`. gilrs 0.11 (the previous input layer) had no force feedback on macOS
 //! (`is_ff_supported` is `false`, `set_ff_state` is empty), so without this a pad gets nothing.
 //!
 //! The original game had DirectInput force feedback only; nothing here is the original's. The
@@ -28,7 +28,7 @@
 //! * a pulse is a continuous event of the given intensity and duration, played once on the Strong
 //!   engine through its own player (kept alive until it has finished).
 //!
-//! Threading: everything is called from the thread that calls the gilrs backend (the game's main
+//! Threading: everything is called from the thread that calls the input layer (the game's main
 //! thread). GameController delivers connections through the main run loop, and `GCController.controllers`
 //! may be empty until the app's run loop has run (winit runs it), so the controller is **queried
 //! lazily, at most once a second**, on whichever tick wants a rumble; a pad that has gone away is
@@ -41,7 +41,6 @@
 
 use crate::ff::Motor;
 use block2::RcBlock;
-use gilrs::Gilrs;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, msg_send};
@@ -289,7 +288,7 @@ fn find_controller() -> Option<Retained<GCController>> {
     unsafe { GCController::controllers().iter().find(|c| c.haptics().is_some()) }
 }
 
-/// The rumble state on one pad (the macOS backend; the same interface as the gilrs `Rumbler`).
+/// The rumble state on one pad (the macOS backend; the same interface as the SDL `Rumbler`).
 #[derive(Default)]
 pub struct Rumbler {
     pad: Option<Pad>,
@@ -299,12 +298,12 @@ pub struct Rumbler {
 
 impl Rumbler {
     /// Whether a controller that can rumble is connected (a fresh look at `GCController.controllers`).
-    pub fn supported(&self, _gilrs: &Gilrs) -> bool {
+    pub fn supported(&self, _pads: &crate::gamepad::Devices) -> bool {
         find_controller().is_some()
     }
 
     /// One line for the log: this backend, the controller it drives and its haptic localities.
-    pub fn describe(&self, _gilrs: &Gilrs) -> String {
+    pub fn describe(&self, _pads: &crate::gamepad::Devices) -> String {
         match find_controller() {
             None => "GameController + CoreHaptics (macOS), no controller with haptics connected".to_string(),
             Some(c) => {
@@ -350,7 +349,7 @@ impl Rumbler {
     }
 
     /// Set a motor's sustained level, 0…1. 0 stops it.
-    pub fn sustain(&mut self, _gilrs: &mut Gilrs, motor: Motor, level: f32) {
+    pub fn sustain(&mut self, _pads: &mut crate::gamepad::Devices, motor: Motor, level: f32) {
         let Some(pad) = self.pad() else { return };
         let Some(haptics) = (unsafe { pad.controller.haptics() }) else { return };
         match motor {
@@ -360,7 +359,7 @@ impl Rumbler {
     }
 
     /// A one-shot strong pulse of `level` (0…1) for `ms` milliseconds, on the Strong engine.
-    pub fn pulse(&mut self, _gilrs: &mut Gilrs, level: f32, ms: u32) {
+    pub fn pulse(&mut self, _pads: &mut crate::gamepad::Devices, level: f32, ms: u32) {
         let Some(pad) = self.pad() else { return };
         let Some(haptics) = (unsafe { pad.controller.haptics() }) else { return };
         let level = level.clamp(0.0, 1.0);
@@ -388,7 +387,7 @@ impl Rumbler {
     }
 
     /// Stop both sustained motors (a pause, a menu, the end of the race).
-    pub fn stop_all(&mut self) {
+    pub fn stop_all(&mut self, _pads: &mut crate::gamepad::Devices) {
         if let Some(pad) = self.pad.as_mut() {
             pad.strong.stop();
             pad.weak.stop();

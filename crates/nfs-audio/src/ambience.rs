@@ -22,7 +22,7 @@
 //! doppler that goes with them) — the port has no animated objects yet. Static elements are never
 //! doppler-shifted in the original either, so the rest plays at exactly 1.0.
 
-use crate::mixer::{byte_gain, pan_angle, AudioOutput, Clip, ClipCache, VoiceId, BEND_ROOT, LEVEL_MAX};
+use crate::mixer::{byte_gain, pan_angle, AudioOutput, Clip, ClipCache, PlayArgs, VoiceId, BEND_ROOT, LEVEL_MAX};
 use nfs_formats::{bigf::Bigf, bnk::Bnk, scn::{ElementKind, Scene}};
 use std::collections::HashMap;
 use std::path::Path;
@@ -593,7 +593,7 @@ impl Ambience {
                 }
                 if consume {
                     self.list_mut(list)[i].triggered = false;
-                    tracing::debug!(element = e.scene_index, label = e.label, patch = e.patch, d, "ambience: triggered element plays");
+                    tracing::debug!(tick = crate::trace_tick(), element = e.scene_index, label = e.label, patch = e.patch, d, "ambience: triggered element plays");
                 }
             }
         }
@@ -629,8 +629,9 @@ impl Ambience {
             _ => {
                 if let Some(c) = self.clip(e.patch as u16) {
                     let looping = c.loop_range.is_some();
-                    tracing::debug!(patch = e.patch, label = e.label, d = d as i32, level, looping, pitch, "ambience voice");
-                    self.pool[slot].voice = Some(out.play_word(c, vol, pitch, BEND_ROOT, pan, looping));
+                    tracing::debug!(tick = crate::trace_tick(), patch = e.patch, label = e.label, d = d as i32, level, looping, pitch, "ambience voice");
+                    // 0x4AEEDB `Voice_play` → `Bank_playOneShot`: the cockpit's filter word in the start (0x4A9B2B)
+                    self.pool[slot].voice = Some(out.play(PlayArgs::new(c, vol, pitch, BEND_ROOT, pan, looping).filter(self.filter)));
                 } else {
                     self.release(out, list, i);
                 }
@@ -693,7 +694,7 @@ impl Ambience {
                 match self.clip(patch as u16) {
                     Some(c) => {
                         let looping = c.loop_range.is_some();
-                        let id = out.play_word(c, vol, crate::resample::PITCH_UNIT, BEND_ROOT, pan as u16, looping);
+                        let id = out.play(PlayArgs::new(c, vol, crate::resample::PITCH_UNIT, BEND_ROOT, pan as u16, looping).filter(self.filter));
                         tracing::info!(patch, pan, vol, playing = out.is_playing(id), "thunder");
                     }
                     None => tracing::info!(patch, "thunder: patch missing from track.viv"),

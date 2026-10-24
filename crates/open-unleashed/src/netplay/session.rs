@@ -640,7 +640,21 @@ impl NetPlay {
             self.driven.push(seat);
         }
         // 0x48F671 → 0x4A0DF0: the store, with `gGameTick` as the receiver's clock
-        self.remotes.entry(who).or_insert_with(|| Remote::new(seat)).store(st, tick as i32);
+        let r = self.remotes.entry(who).or_insert_with(|| Remote::new(seat));
+        let taken = r.store(st, tick as i32);
+        super::remote::remote_dump(|| {
+            format!(
+                "SI {tick} seat={seat} sender_tick={} taken={taken} lag={} avg={} fresh={} late={} stale={} got={} blk {}",
+                st.tick,
+                r.lag,
+                r.lag_avg,
+                r.fresh,
+                r.late,
+                r.stale,
+                r.got,
+                st.encode().chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]]))).collect::<Vec<_>>().join(" ")
+            )
+        });
     }
 
     /// The front end's poll: the same drain as the race's, with no seats to drive. Answers whether

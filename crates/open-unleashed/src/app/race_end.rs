@@ -317,9 +317,9 @@ impl App {
         let (driver, car_name) = (self.player_name.clone(), self.player_car_family());
         if let Some(rank) = self.records.insert(&self.track.name, &driver, &car_name, time) {
             tracing::info!(rank, time = format_ticks(time as u64), circuit, car = %car_name, "track record entered (0x4EDF00)");
-            if let Err(e) = self.records.save(&self.records_path) {
-                tracing::warn!(error = %e, "records save failed");
-            }
+            // filed in the live buffer only: `nfs5.trk` is written by the next `SaveInfo` (the
+            // `TrackRecords` module, 0x4FAD80), see [`Records::stage`]
+            self.records.stage(&self.records_path);
         } else {
             tracing::info!(time = format_ticks(time as u64), circuit, "no track record (0x4EDF00)");
         }

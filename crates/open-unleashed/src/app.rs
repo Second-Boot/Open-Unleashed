@@ -353,6 +353,11 @@ pub(crate) struct App {
     /// (`GamePaths::language`): `[0x690710]` / the `LANGUAGE` option (0x4E0598, 0x4D53A9), the HUD's
     /// and the car files' block (0x41E1FE, 0x508C78).
     pub(crate) language: u16,
+    /// The Verok patch's `nfs5.ini` (`GamePaths::nfs5_ini`, dll 0x100022B0; `RE/notes/nfs5-dll.md` §3.3), read
+    /// once: `NoMovies` (session.rs), `Fog` (render_scene.rs, mirror.rs), `CarControl` (the vehicle's
+    /// `keep_control`); `Language` is [`Self::language`] and `Filtering` the renderer's `set_point_filter`
+    /// (main.rs).
+    pub(crate) ini: nfs_formats::nfs5ini::Nfs5Ini,
     /// The choices the player has changed on the options screens this session, by `fe.txt` key.
     /// The original writes them straight back into the registry slot; the port keeps them here
     /// rather than rewriting the read-only game directory.
