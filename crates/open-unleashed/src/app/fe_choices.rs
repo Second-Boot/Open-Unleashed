@@ -444,13 +444,7 @@ impl App {
             // `0x51F080(i)` says so. §4.103.
             "Controller.AllControllers" | "Controller.AllPads" => {
                 let pads_only = base == "Controller.AllPads";
-                let rows: Vec<ListRow> = self
-                    .gamepads
-                    .devices()
-                    .into_iter()
-                    .filter(|(_, is_pad)| !pads_only || *is_pad)
-                    .map(|(n, _)| ListRow::Text(n.to_string()))
-                    .collect();
+                let rows: Vec<ListRow> = self.controller_list(pads_only).into_iter().map(ListRow::Text).collect();
                 let sel = if pads_only { self.fe.pads_sel } else { self.fe.controllers_sel }.min(rows.len().saturating_sub(1));
                 (!rows.is_empty()).then(|| (rows, Some(sel)))
             }

@@ -2,9 +2,14 @@
 
 **English** | [Русский](../ru/controls.md)
 
-The defaults are the original's. Keys and gamepad buttons can be changed in the game's own options
-(Options → Controls). Gamepads: the left stick steers, the triggers are throttle and brake, Start pauses,
-Select looks back; force feedback is used where the system and the pad support it.
+The keyboard defaults are the original's. Keys and gamepad controls can be changed in the game's own options
+(Options → Controls), where "Default" on a device restores its layout. A gamepad works only through these
+bindings: pick it in the device list and press "Default". On a standard pad (Xbox, PlayStation, Switch Pro)
+that gives a modern layout — left stick steers, RT throttle and LT brake (both analogue), A handbrake,
+B look back, X reset the car, Y camera, RB / LB shift up / down, Start pause, L3 horn, d-pad up lights,
+d-pad left / right turn signals, d-pad down hazards, right stick looks left / right. Wheels and other
+devices get the original's layout. In the menus the d-pad or left stick moves, A selects. Force feedback
+is used where the system and the pad support it.
 
 ## Driving
 

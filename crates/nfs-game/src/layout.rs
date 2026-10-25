@@ -2799,6 +2799,19 @@ impl LayoutScreen {
             let step = e.int("step").unwrap_or(0) as i32;
             out.push(Control { index: i, x, y, destination: dest, callback, accessor, string_id: e.string_id(), offset, step });
         }
+        // an open embedded screen's buttons are this screen's too, under their routed index —
+        // `Controllers.lay`'s `gamectrl` panel holds `DEFAULTCONTROLS`, which a click could not
+        // reach while only the outer screen's own elements were listed
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut base = self.layout.elements.len();
+        for k in keys {
+            let g = &self.groups[&k];
+            if !self.closed.contains(&k) {
+                out.extend(g.controls().into_iter().map(|c| Control { index: c.index + base, ..c }));
+            }
+            base += g.span();
+        }
         out.sort_by(|a, b| (a.y, a.x).partial_cmp(&(b.y, b.x)).unwrap_or(std::cmp::Ordering::Equal));
         out
     }

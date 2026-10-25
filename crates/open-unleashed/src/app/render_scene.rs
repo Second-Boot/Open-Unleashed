@@ -38,10 +38,13 @@ impl App {
             }
         }
         // slot 9's race animations (the wing off the speed gate, a tiny car's aerial) and slot 6's
-        // pop-up headlights off the track's night flag (`car-model.md`)
+        // pop-up headlights off each car's lamp bit (`car-model.md`)
         let speed = self.vehicle.as_ref().map(|v| v.speed()).unwrap_or(0.0);
         let reverse = self.vehicle.as_ref().is_some_and(|v| v.gear == 0);
-        let night = self.track.is_night();
+        // slot 6's headlight bit is the car's own lamp byte, `car+0xD87 & 1` (0x4394CC…0x4394D2,
+        // compared with `R3DCar+0x567` at 0x43950E), not the track's night flag: `Car_init` 0x410C74
+        // starts it from the flag and the lights key (0x49941D) toggles it
+        let night = self.lamp_bits & 1 != 0;
         let tiny = self.cheat_bits & CHEAT_TINY != 0;
         // slot 9's driver: `[0x6197C4]` is `CARDETAIL`, the `Graphics.CarDetail` choice (0x44EF80)
         let detail = self.choice_index(choice::GRAPHICS_CAR_DETAIL).map_or(0, |(i, _)| i as u8);
@@ -74,7 +77,7 @@ impl App {
             for o in &self.road.opponents {
                 let Some(m) = self.road.opponent_models.get_mut(o.model) else { continue };
                 let v = &o.vehicle;
-                m.update_animation(r, 16, v.speed(), night, o.tiny, v.gear == 0);
+                m.update_animation(r, 16, v.speed(), o.lamp_bits & 1 != 0, o.tiny, v.gear == 0);
                 m.update_driver(
                     r,
                     16,

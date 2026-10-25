@@ -1521,8 +1521,9 @@ impl CarModel {
     /// `min(0.067 · car+0xEC4, 1)` (`[0x5B3690]`), 0 in reverse (`car+0xD82 == 0`).
     ///
     /// **The headlights**, channel 17, are slot 6's easer at 0x43950E…0x439620: a **1000 ms**
-    /// travel from the car's headlight bit — which `Car_init` freezes at 0x410C74 as
-    /// `word[0x628A28] ? 3 : 0`, so it is the track's night flag and never changes during a race.
+    /// travel to the car's headlight bit `bl = [[this+0xF4]+0xD87] & 1` (0x4394CC…0x4394D2).
+    /// `Car_init` 0x410C74 starts `car+0xD87` as `word[0x628A28] ? 3 : 0` and the lights key
+    /// toggles it (`^= 3`, 0x49941D), so a day race's lamps rise when the player switches them on.
     pub fn update_animation(&mut self, r: &mut Renderer, dt_ms: u32, speed_mps: f32, headlights_on: bool, tiny: bool, reverse: bool) {
         // the wing's easer: advance, then (0x43892B) re-arm when the gate holds and it is done
         let e = &mut self.spoiler;

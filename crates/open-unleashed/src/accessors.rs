@@ -664,8 +664,7 @@ impl App {
         Some(match base {
             "Controller.AllControllers" | "Controller.AllPads" => {
                 let pads_only = name == "Controller.AllPads";
-                let v: Vec<String> =
-                    self.gamepads.devices().into_iter().filter(|(_, is_pad)| !pads_only || *is_pad).map(|(n, _)| n).collect();
+                let v = self.controller_list(pads_only);
                 let sel = if pads_only { self.fe.pads_sel } else { self.fe.controllers_sel };
                 v.get(sel.min(v.len().saturating_sub(1))).map(|n| n.to_string()).unwrap_or_default()
             }
@@ -681,7 +680,11 @@ impl App {
                 let action = controller_action(b)?;
                 let (text, arc) = match nfs_input::binding_id(action).and_then(|i| self.input.bindings.get(i)) {
                     Some(b) if b.kind == 3 => nfs_game::keyname::keyboard_row(b.key, &self.fe.strings),
-                    Some(b) => nfs_game::keyname::pad_row(b.kind, b.device, b.index, b.dir, b.pov, &self.fe.strings),
+                    Some(b) => {
+                        // PORT-DEVIATION D44: a connected standard pad's controls by its labels
+                        let standard = self.input.pads.get(b.device as usize).is_some_and(|r| r.standard);
+                        nfs_game::keyname::pad_row(b.kind, b.device, b.index, b.dir, b.pov, standard, &self.fe.strings)
+                    }
                     None => nfs_game::keyname::keyboard_row(nfs_input::key_code_for(action)?, &self.fe.strings),
                 };
                 match modifier {
@@ -840,6 +843,46 @@ impl App {
 }
 
 /// The action a `Controller.*` binding row stands for (`GameCtrl.lay`, `fluffctrl.lay`).
+/// The name of `Controller.AllControllers`' keyboard row. **PLATFORM GLUE** (PORT-DEVIATION D44,
+/// PAD-MODERN): the original shows DirectInput's own instance name of the
+/// system keyboard (`tszInstanceName`, copied to the descriptor's `+0x14` and read by 0x51F060),
+/// which is Windows' text in the system's language — "Keyboard" on an English system — and in no
+/// game file. `FEStrings[0xD0]`, the key rows' `"keyboard %s"`, is no device name: the Russian
+/// block has «клавиша %s» ("key %s"). So the row is «Клавиатура» when the loaded `FEStrings` block
+/// is the Russian one — its `[0xD0]` in Windows-1251 Cyrillic (the language index is 0 for this
+/// install's Russian block too, `regfile::language_index`) — and "Keyboard" otherwise.
+pub(crate) fn keyboard_device_name(strings: &nfs_formats::locale::Strings) -> String {
+    // the word before `%s`, as the bytes the block holds: Cyrillic letters are 0xC0…0xFF in 1251
+    let word: Vec<u8> = strings.get(0xD0).unwrap_or_default().chars().take_while(|&c| c != '%' && c != ' ').filter_map(nfs_formats::locale::to_cp1252).collect();
+    if !word.is_empty() && word.iter().all(|&b| b >= 0xC0) {
+        "Клавиатура".chars().filter_map(nfs_formats::locale::typed_char).collect()
+    } else {
+        "Keyboard".to_string()
+    }
+}
+
+impl App {
+    /// `Controller.AllControllers` (`pads_only` false) or `Controller.AllPads` (true) as 0x511809
+    /// fills them: every device DirectInput enumerates (0x532BDE `EnumDevices` with type 0, so the
+    /// mouse, the keyboard and the game devices, in that order) but those 0x51F0C0 skips — class
+    /// **2**, `DIDEVTYPE_MOUSE` (0x532CBD keeps `dwDevType & 0xFF` as the record's class) — and the
+    /// pads' list only the class-4 ones 0x51F080 passes. So `AllControllers` leads with the
+    /// **keyboard** and row `r ≥ 1` is pad `r − 1`; `AllPads` is the pads alone. *(Until
+    /// 2026-10-25, PAD-XBOX, the port's `AllControllers` had no keyboard row, so with a pad
+    /// attached `DEFAULTCONTROLS` could never put the keyboard's defaults back.)*
+    pub(crate) fn controller_list(&self, pads_only: bool) -> Vec<String> {
+        let pads = self.gamepads.devices().into_iter().filter(|(_, is_pad)| !pads_only || *is_pad).map(|(n, _)| n);
+        if pads_only { pads.collect() } else { std::iter::once(keyboard_device_name(&self.fe.strings)).chain(pads).collect() }
+    }
+
+    /// **0x51F230(row)**: the pad behind `Controller.AllControllers`' row — `None` for the keyboard
+    /// row 0 and for a row past the list, which 0x51F230 answers with device 0 (not analogue, so
+    /// 0x51D1D0 binds the keys).
+    pub(crate) fn controllers_row_pad(&self, row: usize) -> Option<usize> {
+        row.checked_sub(1).filter(|&p| p < self.gamepads.devices().len())
+    }
+}
+
 pub(crate) fn controller_action(accessor: &str) -> Option<nfs_input::Action> {
     use nfs_input::Action;
     Some(match accessor.strip_prefix("Controller.")? {
@@ -867,4 +910,26 @@ pub(crate) fn controller_action(accessor: &str) -> Option<nfs_input::Action> {
         "LookForward" => Action::LookForward,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PAD-MODERN (D44): the keyboard row is «Клавиатура» over the Russian block (its `[0xD0]`
+    /// «клавиша %s» in Windows-1251), "Keyboard" over any other.
+    #[test]
+    fn the_keyboard_row_follows_the_strings_language() {
+        let with = |t: &str| {
+            let mut s = nfs_formats::locale::Strings::default();
+            s.by_id.insert(0xD0, t.chars().filter_map(nfs_formats::locale::typed_char).collect());
+            s
+        };
+        let ru = keyboard_device_name(&with("клавиша %s"));
+        let bytes: Vec<u8> = ru.chars().filter_map(nfs_formats::locale::to_cp1252).collect();
+        assert_eq!(bytes, [0xCA, 0xEB, 0xE0, 0xE2, 0xE8, 0xE0, 0xF2, 0xF3, 0xF0, 0xE0], "«Клавиатура» in 1251");
+        assert_eq!(keyboard_device_name(&with("keyboard %s")), "Keyboard");
+        assert_eq!(keyboard_device_name(&with("Tastatur %s")), "Keyboard");
+        assert_eq!(keyboard_device_name(&nfs_formats::locale::Strings::default()), "Keyboard");
+    }
 }

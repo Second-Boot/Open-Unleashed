@@ -5,9 +5,9 @@
 ## Requirements
 
 - Rust 1.95 or newer (`rustup`);
-- CMake and a C compiler (Xcode command line tools, Visual Studio build tools or `build-essential`): the controller
-  library SDL2 (zlib licence) is built from the source the `sdl2-sys` crate ships and linked statically, so nothing
-  has to be installed system-wide. CMake 4 users: `.cargo/config.toml` already sets `CMAKE_POLICY_VERSION_MINIMUM`;
+- CMake 3.16 or newer and a C compiler (Xcode command line tools, Visual Studio build tools or `build-essential`): the
+  controller library SDL3 (zlib licence) is built from the source the `sdl3-src` crate ships (through `sdl3-sys`) and
+  linked statically, joystick / gamepad / haptic parts only, so nothing has to be installed system-wide;
 - the game data as described in [game data](game-data.md);
 - Linux: the development packages `libasound2-dev libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
   libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libvulkan-dev pkg-config`.

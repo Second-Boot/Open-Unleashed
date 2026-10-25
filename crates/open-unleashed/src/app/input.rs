@@ -524,10 +524,12 @@ impl App {
                     return;
                 }
                 // `DEFAULTCONTROLS` 0x511F50: 0x51D1D0 on the device `Controller.AllControllers`
-                // is on (its slot 0x28, mapped to a device by 0x51F230) — `nfs_input::bindings`
+                // is on (its slot 0x28, mapped to a device by 0x51F230) — `nfs_input::bindings`.
+                // Row 0 is the keyboard (`controller_list`), so it puts the keys back.
                 if c.callback.as_deref() == Some("DEFAULTCONTROLS") {
-                    let pad = (!self.gamepads.devices().is_empty()).then_some(self.fe.controllers_sel);
+                    let pad = self.controllers_row_pad(self.fe.controllers_sel);
                     self.input.default_controls(pad, |n| accessors::controller_action(n).and_then(nfs_input::binding_id));
+                    tracing::info!(row = self.fe.controllers_sel, ?pad, "DEFAULTCONTROLS: the rows' defaults (0x51D1D0)");
                     return;
                 }
                 // 0x50D330 / 0x50D350 / 0x50D370 arm the `Game.GameType` override `[0x5DC1C0]`

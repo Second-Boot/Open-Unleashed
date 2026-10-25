@@ -83,7 +83,6 @@ pub(crate) struct App {
     pub(crate) opp_choice: u32,
     /// the `nfs5.car` id of the car the player picked, so the opponent rule can match era/class
     pub(crate) player_car_id: Option<u16>,
-    pub(crate) pad_stick_latched: bool,
     /// Factory Driver mission in progress (skill test state and the mission record).
     pub(crate) skill: Option<SkillTest>,
     /// The race's smackables — the mission scene's cones and the track's own placed `kSmackable`
@@ -920,9 +919,8 @@ pub(crate) struct FrontEnd {
     /// the pads as they were when a binding row took focus — the baseline 0x51F310 copies into
     /// `[[0x69C9E8]]`, which the capture 0x51F3B0 compares against every frame (§4.117)
     pub(crate) binding_base: Option<Vec<nfs_input::bindings::PadRecord>>,
-    /// `Controller.AllControllers`' row — the device `DEFAULTCONTROLS` binds (§4.103). The
-    /// original's list leads with the keyboard, this port's has only the pads, so row `r` here
-    /// is the original's row `r + 1`.
+    /// `Controller.AllControllers`' row — the device `DEFAULTCONTROLS` binds (§4.103): 0 the
+    /// keyboard, `r ≥ 1` pad `r − 1`, as the original's list (`App::controller_list`).
     pub(crate) controllers_sel: usize,
     /// `Controller.AllPads`' row (`deadzone.lay`) — the pad whose sixteen `<Axis>.Min` / `.Max`
     /// values the dead-zone accessors hold: their slot 2 (0x51BE70) swaps in that pad's own when

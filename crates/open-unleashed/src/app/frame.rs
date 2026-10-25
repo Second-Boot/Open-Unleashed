@@ -156,11 +156,10 @@ impl App {
     /// The controls screens: the steering band the dead-zone screen sets, and a binding row
     /// waiting for a control.
     fn fe_frame_controls(&mut self) {
-        // the steering band is the front end's own `XAxis.Min` / `XAxis.Max`, not a constant of
-        // this port's (`nfs-input/src/gamepad.rs`)
+        // every axis binding's band is the front end's own `<Axis>.Min` / `<Axis>.Max`, not a
+        // constant of this port's (`nfs-input/src/gamepad.rs`)
         if let Some(l) = self.fe.layout_preview.as_ref() {
             let bands = l.deadzone_values();
-            self.gamepads.set_axis_band(bands[0][0], bands[0][1]);
             self.input.axis_bands = bands;
         }
         // **A binding row waiting for a control polls the pads** — slot 1, 0x51C4E0, every frame
@@ -173,7 +172,7 @@ impl App {
                 {
                     if let Some(id) = accessors::controller_action(&acc).and_then(nfs_input::binding_id) {
                         self.input.bindings.assign(id, b);
-                        tracing::info!(row = %acc, kind = b.kind, index = b.index, "control rebound");
+                        tracing::info!(row = %acc, kind = b.kind, device = b.device, index = b.index, dir = b.dir, pov = b.pov, "control rebound");
                     }
                     if let Some(l) = self.fe.layout_preview.as_mut() {
                         l.release_focus(i);

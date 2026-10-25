@@ -9,8 +9,6 @@
 
 pub mod bindings;
 pub mod ff;
-#[cfg(target_os = "macos")]
-mod ff_macos;
 pub mod gamepad;
 
 use std::collections::HashSet;
@@ -222,6 +220,18 @@ fn action_of_id(id: u16) -> Option<Action> {
     ACTIONS.iter().find(|d| d.id == id).map(|d| d.action)
 }
 
+/// A front-end key from a standard pad (PORT-DEVIATION D10: the original's front end reads no
+/// pad), queued by `Gamepads::poll` whatever the bindings say — the d-pad, the left stick, A and B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuNav {
+    Up,
+    Down,
+    Left,
+    Right,
+    Select,
+    Back,
+}
+
 /// Current logical input state, updated from window events and sampled once per tick.
 #[derive(Debug, Default, Clone)]
 pub struct InputState {
@@ -238,8 +248,8 @@ pub struct InputState {
     /// each axis's `<Axis>.Min` / `.Max` (0…0x80), what an axis binding's band is baked from
     pub axis_bands: [[i32; 2]; 8],
     pub mouse_delta: (f32, f32),
-    /// Analogue axes from a gamepad (−1..1 steer, 0..1 throttle/brake); `None` when no pad is used.
-    pub pad: Option<gamepad::PadAxes>,
+    /// the front end's pad keys since the last tick ([`MenuNav`]); a race drops them
+    pub pad_menu: Vec<MenuNav>,
 }
 
 /// An action's bit in [`InputState`]'s held / pressed masks.
@@ -284,13 +294,23 @@ impl InputState {
             }
         }
         let Some(action) = default_binding(code) else { return };
-        if binding_id(action).is_some_and(|i| self.bindings.get(i).is_some()) {
-            return;
+        if let Some(b) = binding_id(action).and_then(|i| self.bindings.get(i)) {
+            // PORT-DEVIATION D44 (PAD-HANG): a row bound to a pad control still answers its
+            // default key (0x51D1D0's keyboard half, `bindings::default_key`) unless a row is
+            // bound to that key — the keyboard keeps working beside the pad. In the original a
+            // row has one binding (`[0x5E9130 + id·4]`) and a pad-bound row reads no key.
+            if b.kind_class() == bindings::BindingKind::Key || self.key_bound(code) {
+                return;
+            }
         }
         match state {
             ElementState::Pressed => self.hold(action),
             ElementState::Released => self.unhold(action),
         }
+    }
+    /// Whether a row is bound to physical key `code` (a key binding of its scancode).
+    fn key_bound(&self, code: KeyCode) -> bool {
+        scancode(code).is_some_and(|sc| self.bindings.by_id.values().any(|b| b.kind_class() == bindings::BindingKind::Key && b.index == u32::from(sc)))
     }
     pub fn press(&mut self, action: Action) {
         self.hold(action);
@@ -308,6 +328,11 @@ impl InputState {
         if self.pad_bound(a) && self.read(a) > 0x40 {
             return true;
         }
+        self.held_by_press(a)
+    }
+    /// [`held`](Self::held) without the pad read: a key or a `press` holding the action, gated
+    /// by a modifier for a key binding (0x411C5F).
+    fn held_by_press(&self, a: Action) -> bool {
         let gated = binding_id(a).is_some_and(|i| self.bindings.get(i).is_some_and(|b| b.kind_class() == bindings::BindingKind::Key)) && self.modifier_down();
         self.held & bit(a) != 0 && !gated
     }
@@ -328,11 +353,17 @@ impl InputState {
     /// 0x51F230 answers for a row it does not find — **0**, which is not analogue, so every row
     /// gets its key. The language is **0**, English: the one this port reads everything in.
     /// `id_of` names the option id behind a `Controller.*` row.
+    ///
+    /// PORT-DEVIATION D44 (PAD-MODERN): an SDL **standard pad** gets the modern layout
+    /// ([`bindings::modern_pad_bindings`]) instead of 0x51D1D0's pad half; a wheel or any other raw
+    /// device the original's.
     pub fn default_controls(&mut self, pad: Option<usize>, id_of: impl Fn(&str) -> Option<u16>) {
-        let (device, caps) = pad
-            .and_then(|p| self.pads.get(p).map(|r| (p as u32, r.caps())))
-            .unwrap_or((0, bindings::DeviceCaps::default()));
-        self.bindings.set_defaults(&bindings::default_bindings(device, caps, 0), id_of);
+        let rows = match pad.and_then(|p| self.pads.get(p).map(|r| (p as u32, r))) {
+            Some((device, r)) if r.standard => bindings::modern_pad_bindings(device, 0),
+            Some((device, r)) => bindings::default_bindings(device, r.caps(), 0),
+            None => bindings::default_bindings(0, bindings::DeviceCaps::default(), 0),
+        };
+        self.bindings.set_defaults(&rows, id_of);
     }
     /// How many keys are down — 0x51C610 takes a key for a binding row only when exactly one is.
     pub fn keys_down_count(&self) -> usize {
@@ -370,9 +401,17 @@ impl InputState {
     /// `.RAMPS` / `.RAMPG` / `.RAMPB` — 0x51CC00 writes `kind != 1` for the `C1_RIGHT`, `C1_GAS`
     /// and `C1_BRAKE` bindings into option ids 0x222 / 0x223 / 0x224 (0x51CF54…0x51CFFC): every
     /// control but an axis is ramped. Without a binding the port's keyboard is digital.
+    ///
+    /// PORT-DEVIATION D44 (PAD-HANG): while a key holds a side of an axis-bound control (its default
+    /// key beside the pad, [`key_changed`](Self::key_changed)) that control is ramped as a key's is.
     pub fn ramps(&self) -> (bool, bool, bool) {
         let digital = |a: Action| binding_id(a).and_then(|i| self.bindings.get(i)).is_none_or(|b| b.kind_class() != bindings::BindingKind::Axis);
-        (digital(Action::SteerRight), digital(Action::Throttle), digital(Action::Brake))
+        let key = |a: Action| self.held_by_press(a);
+        (
+            digital(Action::SteerRight) || key(Action::SteerLeft) || key(Action::SteerRight),
+            digital(Action::Throttle) || key(Action::Throttle),
+            digital(Action::Brake) || key(Action::Brake),
+        )
     }
     /// Edge-triggered: true once per key press.
     pub fn take_pressed(&mut self, a: Action) -> bool {
@@ -380,36 +419,41 @@ impl InputState {
         self.pressed &= !bit(a);
         was
     }
-    /// −1..1 steering: gamepad axis if present, else digital keys (no ramp yet — see module docs).
+    /// −1..1 steering: through the bindings — a pad-bound side in proportion, a key full lock.
+    /// *(PAD-MODERN, D44: a pad no binding reads no longer steers through the port's fixed map.)*
     pub fn steer(&self) -> f32 {
         // the packer's steering, `(C1_RIGHT − C1_LEFT) / 4` (0x412F39), when a pad control is bound
         // to either side; handed on doubled, in the −1…1 where 126 is full lock
+        //
+        // *(Corrected 2026-10-25, PAD-XBOX: each side was `read.max(held ? 255 : 0)`, and `held`
+        // of a pad-bound side is `read > 0x40` — so a stick past a quarter of its half-travel
+        // jumped to full lock. Only a key or a `press` holding the side counts as 255 now.)*
         if self.pad_bound(Action::SteerLeft) || self.pad_bound(Action::SteerRight) {
-            let r = self.read(Action::SteerRight).max(if self.held(Action::SteerRight) { 255 } else { 0 }) as i32;
-            let l = self.read(Action::SteerLeft).max(if self.held(Action::SteerLeft) { 255 } else { 0 }) as i32;
+            let r = self.read(Action::SteerRight).max(if self.held_by_press(Action::SteerRight) { 255 } else { 0 }) as i32;
+            let l = self.read(Action::SteerLeft).max(if self.held_by_press(Action::SteerLeft) { 255 } else { 0 }) as i32;
             return ((r - l) / 4 * 2) as f32 / 126.0;
         }
-        let keys = (self.held(Action::SteerRight) as i32 - self.held(Action::SteerLeft) as i32) as f32;
-        match self.pad {
-            Some(p) if keys == 0.0 => p.steer,
-            _ => keys,
-        }
+        (self.held(Action::SteerRight) as i32 - self.held(Action::SteerLeft) as i32) as f32
     }
     pub fn throttle(&self) -> f32 {
         // `C1_GAS / 2`, capped at 0x7E (0x412F66, 0x412F9A)
+        // a pad-bound pedal and its default key beside it (D44, PAD-HANG): the larger of the two
         if self.pad_bound(Action::Throttle) {
-            return (self.read(Action::Throttle) / 2).min(0x7E) as f32 / 126.0;
+            return (self.pedal(Action::Throttle) / 2).min(0x7E) as f32 / 126.0;
         }
-        let k = self.held(Action::Throttle) as i32 as f32;
-        self.pad.map(|p| p.throttle.max(k)).unwrap_or(k)
+        self.held(Action::Throttle) as i32 as f32
     }
     pub fn brake(&self) -> f32 {
         // `C1_BRAKE / 2`, capped at 0x7E (0x412F89, 0x412FB0)
         if self.pad_bound(Action::Brake) {
-            return (self.read(Action::Brake) / 2).min(0x7E) as f32 / 126.0;
+            return (self.pedal(Action::Brake) / 2).min(0x7E) as f32 / 126.0;
         }
-        let k = self.held(Action::Brake) as i32 as f32;
-        self.pad.map(|p| p.brake.max(k)).unwrap_or(k)
+        self.held(Action::Brake) as i32 as f32
+    }
+    /// A pad-bound pedal's read, or 255 while a key or a `press` holds it (as [`steer`](Self::steer)
+    /// takes each side).
+    fn pedal(&self, a: Action) -> u8 {
+        self.read(a).max(if self.held_by_press(a) { 255 } else { 0 })
     }
     /// The window lost or regained the keyboard focus (FOCUS-INPUT): forget every held key, action and
     /// pending press. PORT-DEVIATION D17 (PORT-DEVIATIONS.md): the release events of keys / modifiers
@@ -419,11 +463,13 @@ impl InputState {
         self.pressed = 0;
         self.keys_down.clear();
         self.mouse_delta = (0.0, 0.0);
+        self.pad_menu.clear();
     }
     /// Call at the end of each tick.
     pub fn end_tick(&mut self) {
         self.pressed = 0;
         self.mouse_delta = (0.0, 0.0);
+        self.pad_menu.clear();
     }
 }
 
@@ -539,6 +585,154 @@ mod tests {
         assert!(st.held(Action::Horn) && st.take_pressed(Action::Horn));
         st.release(Action::Horn);
         assert!(!st.held(Action::Horn));
+    }
+
+    /// PAD-XBOX: a stick bound to both steering rows (0x51D1D0's `{1, dev, 0, ∓1}`) steers in
+    /// proportion through 0x411B80 and `(right − left) / 4` (0x412F39) — before, a side past a read
+    /// of 0x40 counted as held and jumped to full lock. A key or a `press` still gives 255.
+    #[test]
+    fn a_bound_stick_steers_in_proportion() {
+        let mut st = InputState::default();
+        st.axis_bands = [[0, 0x80]; 8];
+        st.bindings.by_id.insert(bindings::id::C1_LEFT, bindings::Binding { kind: 1, device: 0, index: 0, dir: -1, pov: 0, key: 0 });
+        st.bindings.by_id.insert(bindings::id::C1_RIGHT, bindings::Binding { kind: 1, device: 0, index: 0, dir: 1, pov: 0, key: 0 });
+        let mut rec = bindings::PadRecord { mask: 0x1B, ..Default::default() };
+        for (x, want) in [(0x8000, 0), (0x8000 + 0x4000, 32), (0x8000 + 0x2000, 16), (0xFFFF, 63), (0x8000 - 0x4000, -31), (0, -63)] {
+            rec.axes[0] = x;
+            st.set_pads(&[rec]);
+            let packet = (st.steer() * 126.0).round() as i32 / 2;
+            assert_eq!(packet, want, "axis at {x:#x}");
+        }
+        // half-way right is half lock, not full
+        rec.axes[0] = 0x8000 + 0x4000;
+        st.set_pads(&[rec]);
+        assert!(st.steer() < 0.6 && st.held(Action::SteerRight));
+        // the autotest's press of a pad-bound side is full lock, as a key is
+        rec.axes[0] = 0x8000;
+        st.set_pads(&[rec]);
+        st.press(Action::SteerLeft);
+        assert_eq!((st.steer() * 126.0).round() as i32, -126);
+    }
+
+    /// PAD-XBOX: a player's rebound rows (Accel / Brake on buttons 9 / 8, both
+    /// steering rows on axis 3, …) and `DEFAULTCONTROLS` (0x511F50 → 0x51D1D0): on the keyboard
+    /// row every row is its key again; on an SDL standard pad's record the pad half binds the
+    /// sticks and buttons 0, 2, 3, 7, 8 (not 5, `Z`, which such a pad has not), the rest keys.
+    #[test]
+    fn default_controls_reset_rebound_rows() {
+        let rows = |n: &str| {
+            Some(match n.strip_prefix("Controller.")? {
+                "Accel" => Action::Throttle,
+                "Brake" => Action::Brake,
+                "HandBrake" => Action::Handbrake,
+                "SteerLeft" => Action::SteerLeft,
+                "SteerRight" => Action::SteerRight,
+                "Horn" => Action::Horn,
+                "ShiftUp" => Action::ShiftUp,
+                "ShiftDown" => Action::ShiftDown,
+                "LookBehind" => Action::RearView,
+                "Lights" => Action::Lights,
+                "ResetCar" => Action::Reset,
+                "CameraView" => Action::CameraNext,
+                "Pause" => Action::Pause,
+                "LeftTurnSignal" => Action::SignalLeft,
+                "RightTurnSignal" => Action::SignalRight,
+                "Hazards" => Action::Hazards,
+                "LookLeft" => Action::LookLeft,
+                "LookRight" => Action::LookRight,
+                _ => Action::LookForward,
+            })
+            .and_then(binding_id)
+        };
+        let rebound = |st: &mut InputState| {
+            st.default_controls(None, rows);
+            let b = |kind, index, dir| bindings::Binding { kind, device: 0, index, dir, pov: 0, key: 0 };
+            for (a, nb) in [
+                (Action::Throttle, b(2, 9, 0)),
+                (Action::Brake, b(2, 8, 0)),
+                (Action::Handbrake, b(2, 3, 0)),
+                (Action::SteerLeft, b(1, 3, -1)),
+                (Action::SteerRight, b(1, 3, 1)),
+                (Action::Reset, b(2, 6, 0)),
+                (Action::CameraNext, b(2, 2, 0)),
+                (Action::RearView, b(2, 1, 0)),
+            ] {
+                st.bindings.assign(binding_id(a).unwrap(), nb);
+            }
+        };
+        let pad = gamepad::pad_record(&gamepad::PadSnapshot::default());
+        let mut st = InputState { pads: vec![pad], ..Default::default() };
+        rebound(&mut st);
+        // both directions of axis 3 survive 0x51DCC0: equality includes `dir` (0x51DC20)
+        let get = |st: &InputState, a: Action| *st.bindings.get(binding_id(a).unwrap()).unwrap();
+        assert_eq!((get(&st, Action::SteerLeft).dir, get(&st, Action::SteerRight).dir), (-1, 1));
+        assert_eq!(get(&st, Action::SteerLeft).kind, 1);
+        // the keyboard row: every row its key
+        st.default_controls(None, rows);
+        for a in [Action::Throttle, Action::Brake, Action::Handbrake, Action::SteerLeft, Action::SteerRight, Action::Reset, Action::CameraNext, Action::RearView] {
+            let b = get(&st, a);
+            assert_eq!((b.kind, b.key), (3, key_code_for(a).unwrap()), "{a:?}");
+        }
+        // the pad's row: a standard pad gets the modern layout (PAD-MODERN, D44)
+        rebound(&mut st);
+        st.default_controls(Some(0), rows);
+        let k = |a| {
+            let b = get(&st, a);
+            (b.kind, b.index, b.dir, b.pov)
+        };
+        assert_eq!(k(Action::SteerLeft), (1, 0, -1, 0));
+        assert_eq!(k(Action::SteerRight), (1, 0, 1, 0));
+        assert_eq!(k(Action::Throttle), (1, 5, 1, 0)); // RT
+        assert_eq!(k(Action::Brake), (1, 2, 1, 0)); // LT
+        assert_eq!(k(Action::Handbrake), (2, 0, 0, 0)); // A
+        assert_eq!(k(Action::RearView), (2, 1, 0, 0)); // B
+        assert_eq!(k(Action::Reset), (2, 3, 0, 0)); // X
+        assert_eq!(k(Action::CameraNext), (2, 2, 0, 0)); // Y
+        assert_eq!(k(Action::ShiftUp), (2, 7, 0, 0)); // RB
+        assert_eq!(k(Action::ShiftDown), (2, 6, 0, 0)); // LB
+        assert_eq!(k(Action::Lights), (5, 0x20, 0, 0)); // d-pad up
+        assert_eq!(k(Action::LookForward).0, 3, "LookForward keeps its key");
+        // a raw device with the same axes and buttons (a wheel, a stick): the original's pad half
+        let mut raw = pad;
+        raw.standard = false;
+        raw.button_mask = 0xFFF;
+        st.pads = vec![raw];
+        st.default_controls(Some(0), rows);
+        let k = |a| {
+            let b = get(&st, a);
+            (b.kind, b.index, b.dir, b.pov)
+        };
+        assert_eq!(k(Action::Throttle), (1, 1, -1, 0));
+        assert_eq!(k(Action::Brake), (1, 1, 1, 0));
+        assert_eq!(k(Action::ShiftDown), (2, 8, 0, 0));
+        assert_eq!(k(Action::CameraNext), (2, 5, 0, 0));
+    }
+
+    /// PAD-MODERN (D44): the port's fixed in-race pad map is gone — a pad no binding reads moves
+    /// nothing (stick right, both triggers and every button down, all rows on keys), and the same
+    /// pad drives the car once the rows are its (`DEFAULTCONTROLS`).
+    #[test]
+    fn a_pad_drives_only_through_its_bindings() {
+        let rows = |n: &str| match n {
+            "Controller.Accel" => binding_id(Action::Throttle),
+            "Controller.Brake" => binding_id(Action::Brake),
+            "Controller.SteerLeft" => binding_id(Action::SteerLeft),
+            "Controller.SteerRight" => binding_id(Action::SteerRight),
+            "Controller.HandBrake" => binding_id(Action::Handbrake),
+            _ => None,
+        };
+        let mut p = gamepad::PadSnapshot { sticks: [32767, 0, 0, 0], triggers: [32767, 32767], ..Default::default() };
+        p.buttons = [true; 15];
+        let rec = gamepad::pad_record(&p);
+        let mut st = InputState { axis_bands: [[0, 127]; 8], ..Default::default() };
+        st.default_controls(None, rows);
+        st.set_pads(&[rec]);
+        assert_eq!((st.steer(), st.throttle(), st.brake()), (0.0, 0.0, 0.0));
+        assert!(!st.held(Action::Handbrake) && !st.take_pressed(Action::Throttle));
+        st.default_controls(Some(0), rows);
+        st.set_pads(&[rec]);
+        assert_eq!((st.steer(), st.throttle(), st.brake()), (1.0, 1.0, 1.0));
+        assert!(st.held(Action::Handbrake));
     }
 
     /// The table's row `i` is the action whose discriminant is `i`, and every row is the action's own.
@@ -661,5 +855,86 @@ mod tests {
             assert_eq!((b.kind, b.index), (3, scancode(k).unwrap() as u32), "{a:?}");
         }
         assert_eq!(default_binding(KeyCode::Escape), None);
+    }
+
+    /// The modern pad layout (D44) on a standard pad at rest: every `Controller.*` row's binding.
+    fn modern_pad_state(p: &gamepad::PadSnapshot) -> InputState {
+        let row = |n: &str| {
+            let i = bindings::CONTROLLER_ROWS.iter().position(|r| *r == n)?;
+            const ROW_ACTIONS: [Action; 19] = [
+                Action::Throttle, Action::Brake, Action::Handbrake, Action::SteerLeft, Action::SteerRight, Action::Horn,
+                Action::ShiftUp, Action::ShiftDown, Action::RearView, Action::Lights, Action::Reset, Action::CameraNext,
+                Action::Pause, Action::SignalLeft, Action::SignalRight, Action::Hazards, Action::LookLeft, Action::LookRight,
+                Action::LookForward,
+            ];
+            binding_id(ROW_ACTIONS[i])
+        };
+        let mut st = InputState { axis_bands: [[0, 127]; 8], ..Default::default() };
+        st.set_pads(&[gamepad::pad_record(p)]);
+        st.default_controls(Some(0), row);
+        let _ = st.take_pressed(Action::Pause);
+        st
+    }
+
+    /// PAD-HANG (D44): the pad's Start on the pause row presses `I_PAUSE` once per push, through
+    /// `set_pads` (the race frame reads it after `Gamepads::poll`).
+    #[test]
+    fn the_pads_start_presses_pause() {
+        let rest = gamepad::PadSnapshot::default();
+        let mut st = modern_pad_state(&rest);
+        assert!(st.pad_bound(Action::Pause));
+        let mut start = rest;
+        start.buttons[gamepad::BUTTON_ORDER.iter().position(|b| *b == gamepad::Button::Start).unwrap()] = true;
+        st.set_pads(&[gamepad::pad_record(&start)]);
+        assert!(st.take_pressed(Action::Pause));
+        st.set_pads(&[gamepad::pad_record(&start)]);
+        assert!(!st.take_pressed(Action::Pause), "held: no second press");
+        st.set_pads(&[gamepad::pad_record(&rest)]);
+        st.set_pads(&[gamepad::pad_record(&start)]);
+        assert!(st.take_pressed(Action::Pause), "the next push");
+    }
+
+    /// PAD-HANG (D44): a row bound to a pad control still answers its default key — P pauses, the
+    /// arrows steer, accelerate and brake beside the pad, the larger of key and pad wins, and a
+    /// pedal a key holds is ramped as a key's is.
+    #[test]
+    fn a_pad_bound_row_still_answers_its_default_key() {
+        let rest = gamepad::PadSnapshot::default();
+        let mut st = modern_pad_state(&rest);
+        assert!(st.pad_bound(Action::Pause) && st.pad_bound(Action::Throttle) && st.pad_bound(Action::SteerLeft));
+        st.key_changed(KeyCode::KeyP, ElementState::Pressed);
+        assert!(st.take_pressed(Action::Pause), "P pauses beside the pad's Start");
+        st.key_changed(KeyCode::KeyP, ElementState::Released);
+        assert_eq!((st.throttle(), st.brake(), st.steer()), (0.0, 0.0, 0.0));
+        assert_eq!(st.ramps(), (false, false, false), "axes are not ramped");
+        st.key_changed(KeyCode::ArrowUp, ElementState::Pressed);
+        st.key_changed(KeyCode::ArrowLeft, ElementState::Pressed);
+        assert_eq!((st.throttle(), st.steer()), (1.0, -1.0));
+        assert_eq!(st.ramps(), (true, true, false), "a key holding the control ramps it");
+        st.key_changed(KeyCode::ArrowUp, ElementState::Released);
+        st.key_changed(KeyCode::ArrowLeft, ElementState::Released);
+        // the pad alone, then both: the larger read
+        let half = gamepad::PadSnapshot { triggers: [0, 16384], sticks: [16384, 0, 0, 0], ..Default::default() };
+        st.set_pads(&[gamepad::pad_record(&half)]);
+        let pad_gas = st.throttle();
+        assert!((0.49..0.52).contains(&pad_gas), "{pad_gas}");
+        assert!(st.steer() > 0.4 && st.steer() < 0.6);
+        st.key_changed(KeyCode::ArrowUp, ElementState::Pressed);
+        assert_eq!(st.throttle(), 1.0);
+        st.key_changed(KeyCode::ArrowLeft, ElementState::Pressed);
+        assert!(st.steer() < 0.0, "the key's full left against the stick's half right: {}", st.steer());
+        st.key_changed(KeyCode::ArrowUp, ElementState::Released);
+        assert_eq!(st.throttle(), pad_gas);
+    }
+
+    /// PAD-HANG (D44): a default key another row is bound to belongs to that row.
+    #[test]
+    fn a_default_key_bound_to_another_row_is_that_rows() {
+        let mut st = modern_pad_state(&gamepad::PadSnapshot::default());
+        let p = bindings::Binding { kind: bindings::BindingKind::Key.as_u32(), device: 0, index: u32::from(scancode(KeyCode::KeyP).unwrap()), dir: 0, pov: 0, key: u32::from(b'p') };
+        st.bindings.by_id.insert(binding_id(Action::Horn).unwrap(), p);
+        st.key_changed(KeyCode::KeyP, ElementState::Pressed);
+        assert!(st.held(Action::Horn));
+        assert!(!st.take_pressed(Action::Pause), "P is the horn's now");
     }
 }

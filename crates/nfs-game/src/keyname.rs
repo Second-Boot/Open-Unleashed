@@ -72,25 +72,60 @@ pub fn keyboard_row(code: u32, strings: &Strings) -> (String, Option<u8>) {
 /// kind 2 button 0x51C77C  FEStrings[0xDA] "%s Button %d" over that and index + 1
 /// kind 5 hat    0x51C932  FEStrings[0xD9] "%s pov %d" over that and index − 0x1F; arc = pov [+0x24]
 /// ```
-pub fn pad_row(kind: u32, device: u32, index: u32, dir: i32, pov: u32, strings: &Strings) -> (String, Option<u8>) {
+///
+/// `standard` (PORT-DEVIATION D44, PAD-MODERN): the device is an SDL standard pad, whose controls
+/// read as the pad's own labels after the same `"joystick %d"` — `A`, `RB`, `Start`, `L3`, `LT`,
+/// `LS X`, `D-pad` ([`standard_pad_label`]) — where the original's names would be DirectInput's
+/// `"z axis"` for LT, `"z rotation axis"` for RT and `"Button 12"` for Start. The arcs stay the
+/// original's. A raw device, or a binding of a pad not connected, keeps the original's text.
+pub fn pad_row(kind: u32, device: u32, index: u32, dir: i32, pov: u32, standard: bool, strings: &Strings) -> (String, Option<u8>) {
     let fe = |n: u32| strings.get(n).unwrap_or_default().to_string();
     let joy = fe(0xDB).replacen("%d", &(device + 1).to_string(), 1);
+    if standard && let Some(label) = standard_pad_label(kind, index) {
+        let arc = match kind {
+            1 => original_arc(index & 7, dir),
+            5 => Some((pov & 7) as u8),
+            _ => None,
+        };
+        return (format!("{joy} {label}"), arc);
+    }
     match kind {
         1 => {
             let axis = index & 7;
             let text = format!("{joy} {}", fe(0xD1 + axis));
-            let plus = dir == 1;
-            let arc = match axis {
-                1 | 4 => if plus { 4 } else { 0 },
-                2 | 5 => if plus { 0 } else { 4 },
-                _ => if plus { 2 } else { 6 },
-            };
-            (text, Some(arc))
+            (text, original_arc(axis, dir))
         }
         2 => (fe(0xDA).replacen("%s", &joy, 1).replacen("%d", &(index + 1).to_string(), 1), None),
         5 => (fe(0xD9).replacen("%s", &joy, 1).replacen("%d", &(index as i32 - 0x1F).to_string(), 1), Some((pov & 7) as u8)),
         _ => (String::new(), None),
     }
+}
+
+/// 0x51C7D5's arc of an axis binding by axis and direction (see [`pad_row`]).
+fn original_arc(axis: u32, dir: i32) -> Option<u8> {
+    let plus = dir == 1;
+    Some(match axis {
+        1 | 4 => if plus { 4 } else { 0 },
+        2 | 5 => if plus { 0 } else { 4 },
+        _ => if plus { 2 } else { 6 },
+    })
+}
+
+/// **PORT-DEVIATION D44** (PAD-MODERN): a standard pad's control by the pad's own label, the
+/// numbering of `nfs_input::gamepad::pad_record` — axes `LS X, LS Y, LT, RS X, RS Y, RT`, buttons
+/// in `BUTTON_ORDER` (PORT-DEVIATION D25), the d-pad as the first hat. No `FEStrings` entry names
+/// them (0xD1…0xDB are DirectInput's axis, button and hat words), so they are the labels printed on
+/// the pads themselves, the same in every language. `None` for a slot the standard pad has not.
+pub fn standard_pad_label(kind: u32, index: u32) -> Option<&'static str> {
+    const AXES: [&str; 6] = ["LS X", "LS Y", "LT", "RS X", "RS Y", "RT"];
+    const BUTTONS: [&str; 15] = ["A", "B", "Y", "X", "", "", "LB", "RB", "", "", "Back", "Start", "Guide", "L3", "R3"];
+    let s = match kind {
+        1 => AXES.get(index as usize)?,
+        2 => BUTTONS.get(index as usize)?,
+        5 if index == 0x20 => "D-pad",
+        _ => return None,
+    };
+    (!s.is_empty()).then_some(s)
 }
 
 #[cfg(test)]
@@ -130,10 +165,31 @@ mod tests {
         for (id, t) in [(0xD1, "x axis"), (0xD2, "y axis"), (0xD9, "%s pov %d"), (0xDA, "%s Button %d"), (0xDB, "joystick %d")] {
             s.by_id.insert(id, t.to_string());
         }
-        assert_eq!(pad_row(1, 0, 0, -1, 0, &s), ("joystick 1 x axis".to_string(), Some(6)));
-        assert_eq!(pad_row(1, 0, 1, 1, 0, &s), ("joystick 1 y axis".to_string(), Some(4)));
-        assert_eq!(pad_row(2, 1, 2, 0, 0, &s), ("joystick 2 Button 3".to_string(), None));
-        assert_eq!(pad_row(5, 0, 0x20, 0, 6, &s), ("joystick 1 pov 1".to_string(), Some(6)));
-        assert_eq!(pad_row(0, 0, 0, 0, 0, &s), (String::new(), None));
+        assert_eq!(pad_row(1, 0, 0, -1, 0, false, &s), ("joystick 1 x axis".to_string(), Some(6)));
+        assert_eq!(pad_row(1, 0, 1, 1, 0, false, &s), ("joystick 1 y axis".to_string(), Some(4)));
+        assert_eq!(pad_row(2, 1, 2, 0, 0, false, &s), ("joystick 2 Button 3".to_string(), None));
+        assert_eq!(pad_row(5, 0, 0x20, 0, 6, false, &s), ("joystick 1 pov 1".to_string(), Some(6)));
+        assert_eq!(pad_row(0, 0, 0, 0, 0, false, &s), (String::new(), None));
+    }
+
+    /// PAD-MODERN (D44): a standard pad's rows by the pad's labels, the arcs the original's; a
+    /// slot the pad has not (button 8, the old LT button) falls back to the original's text.
+    #[test]
+    fn standard_pad_rows_read_as_the_pad() {
+        let mut s = strings();
+        for (id, t) in [(0xD3, "z axis"), (0xD6, "z rotation axis"), (0xD9, "%s pov %d"), (0xDA, "%s Button %d"), (0xDB, "joystick %d")] {
+            s.by_id.insert(id, t.to_string());
+        }
+        assert_eq!(pad_row(1, 0, 5, 1, 0, true, &s), ("joystick 1 RT".to_string(), Some(0)));
+        assert_eq!(pad_row(1, 0, 2, 1, 0, true, &s), ("joystick 1 LT".to_string(), Some(0)));
+        assert_eq!(pad_row(1, 0, 0, -1, 0, true, &s), ("joystick 1 LS X".to_string(), Some(6)));
+        assert_eq!(pad_row(1, 0, 3, 1, 0, true, &s), ("joystick 1 RS X".to_string(), Some(2)));
+        assert_eq!(pad_row(2, 0, 11, 0, 0, true, &s), ("joystick 1 Start".to_string(), None));
+        assert_eq!(pad_row(2, 0, 13, 0, 0, true, &s), ("joystick 1 L3".to_string(), None));
+        assert_eq!(pad_row(5, 0, 0x20, 0, 4, true, &s), ("joystick 1 D-pad".to_string(), Some(4)));
+        assert_eq!(pad_row(2, 0, 8, 0, 0, true, &s), ("joystick 1 Button 9".to_string(), None));
+        // the original's words for the same axes
+        assert_eq!(pad_row(1, 0, 5, 1, 0, false, &s).0, "joystick 1 z rotation axis");
+        assert_eq!(pad_row(1, 0, 2, 1, 0, false, &s).0, "joystick 1 z axis");
     }
 }

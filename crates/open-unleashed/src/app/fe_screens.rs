@@ -162,7 +162,7 @@ impl App {
         // clamps it into the list
         if matches!(base, "Controller.AllControllers" | "Controller.AllPads") {
             let pads_only = base == "Controller.AllPads";
-            let n = self.gamepads.devices().into_iter().filter(|(_, is_pad)| !pads_only || *is_pad).count();
+            let n = self.controller_list(pads_only).len();
             let sel = if pads_only { &mut self.fe.pads_sel } else { &mut self.fe.controllers_sel };
             *sel = (*sel as i32 + delta).clamp(0, n.saturating_sub(1) as i32) as usize;
             return;

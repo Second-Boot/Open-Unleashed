@@ -764,9 +764,10 @@ fn run() -> Result<()> {
     // …then the `Controller.*` accessors' factory values: once it has built them, 0x51E89B
     // counts the listed devices and, with more than one, runs 0x51D1D0 on row 1's (0x51F230(1))
     // and puts `Controller.AllControllers` there (slot 0x2C) — else on device 0, the keyboard.
-    // The port's list has no keyboard row, so that is its first pad, row 0.
+    // Row 0 is the keyboard (`App::controller_list`), so with a pad that is row 1, the first pad.
     app.input.pads = app.gamepads.records();
     let first_pad = (!app.input.pads.is_empty()).then_some(0);
+    app.fe.controllers_sel = usize::from(first_pad.is_some());
     app.input.default_controls(first_pad, |n| accessors::controller_action(n).and_then(nfs_input::binding_id));
     // 0x4DE880 at 0x4D3B76: `XXDefXX` is the state before any profile is applied
     app.fe.xxdefxx = Some(app.startup_side());

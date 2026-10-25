@@ -52,6 +52,131 @@ impl App {
             _ => {}
         }
     }
+
+    /// A key on the pause menu (PORT-DEVIATION D10: the arrows and Enter, and a standard pad's
+    /// d-pad / left stick and A, pick and answer its buttons; `HButtonVisual` picks by the cursor
+    /// only, 0x41B3BA…0x41B3CE).
+    pub(crate) fn pause_menu_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
+        match key {
+            MenuKey::Up | MenuKey::Left => match self.pause_confirm.as_mut() {
+                Some(c) => *c = 0,
+                None => self.pause_sel = self.pause_sel.saturating_sub(1),
+            },
+            MenuKey::Down | MenuKey::Right => match self.pause_confirm.as_mut() {
+                Some(c) => *c = 1,
+                None => self.pause_sel = (self.pause_sel + 1).min(2),
+            },
+            MenuKey::Enter => match (self.pause_confirm, self.pause_sel) {
+                (Some(0), _) => {
+                    self.paused = false;
+                    self.pause_confirm = None;
+                    if !self.leave_race() {
+                        event_loop.exit();
+                    }
+                }
+                (Some(_), _) => self.pause_confirm = None,
+                (None, 0) => self.paused = false,
+                (None, 1) => {
+                    // 0x426011…0x42602B: no restart in game types 2, 4, 10 — the menu stays up
+                    if self.pause_restart_allowed() {
+                        self.paused = false;
+                        self.restart_race(event_loop);
+                    }
+                }
+                _ => self.pause_confirm = Some(1),
+            },
+            _ => {}
+        }
+    }
+
+    /// The interface bits `RaceFrame` reads on the press (0x4138D0, the packer's ring `0x5E954C`):
+    /// the pause (bit 8), the pause orbit's steps, the HUD toggles, the sound and the music. Run on
+    /// every key event and, for a pad-bound control (PAD-HANG: Start on the pause row never reached
+    /// this code, which ran on key events only), once a race frame after `Gamepads::poll`.
+    pub(crate) fn race_interface_keys(&mut self, event_loop: &ActiveEventLoop) {
+        // `I_PAUSE` (P, or a pad's Start under D44's layout; Escape is no in-race key,
+        // `nfs_input::default_binding`): pause. The pause action (`0x4138D0(8, 1)`, 0x415170) opens the
+        // pause menu (0x461740, 0x426800) only while the HUD's dialog queue is empty —
+        // 0x41518C tests it with 0x426A60 first — and with a dialog up it goes to
+        // 0x4151ED, which acts only in a network game (`[0x6573E8] == 3` → 0x41523A, the
+        // resume). So in a single-player race the key does nothing while the pause menu,
+        // its quit question or a post-race page is up: the menu is left through its own
+        // buttons (0x42A6A0), and leaving the race through quit and its question, as
+        // 0x426154 does. *(Until 2026-09-26 the port's pause key backed out of the
+        // question or resumed — an approximation of a key the original does not have.)*
+        // Once the pages have closed it opens the menu, whose quit leaves
+        let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some());
+        if self.vehicle.is_some() && self.fe.race_game_type == Some(game_type::NETWORK) {
+            // a network race (`[0x6573E8] == 3`): 0x415110's own rules, not the single-player pause
+            if self.input.take_pressed(Action::Pause) {
+                self.net_pause_action(event_loop);
+            }
+        } else if dialog_up {
+            let _ = self.input.take_pressed(Action::Pause);
+        } else if self.input.take_pressed(Action::Pause) {
+            if self.vehicle.is_some() {
+                self.paused = true;
+                // 0x4151E3 → 0x461740: the orbit's yaw and step start at 0
+                self.orbit = Orbit::default();
+                self.pause_sel = 0;
+                self.pause_confirm = None;
+            } else {
+                event_loop.exit();
+            }
+        }
+        // the pause orbit's step keys, read on the press only while a dialog is up outside
+        // a replay (0x415855…0x41589D, in this order, so the last wins): `I_ROTCAMCCLOCK`
+        // (F4, bit 0x0A) +3 (0x461790), `I_ROTCAMCLOCK` (F2, 0x0C) −3 (0x4617A0),
+        // `I_ROTCAMSTOP` (F3, 0x0B) 0 (0x4617B0)
+        if self.vehicle.is_some()
+            && self.hud_dialog_up()
+            && !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted))
+        {
+            for (a, step) in [(Action::RotCamCounter, 3), (Action::RotCamClock, -3), (Action::RotCamStop, 0)] {
+                if self.input.take_pressed(a) {
+                    self.orbit.step = step;
+                }
+            }
+        }
+        // `I_TOGGLEPAUSEMENU` (F1): 0x41596E reads bit 0x0E on the press whatever the pause,
+        // and 0x425750 flips `[0x60CA00]` only with a dialog up
+        if self.input.take_pressed(Action::TogglePauseMenu) && self.vehicle.is_some() && self.hud_dialog_up() {
+            self.hud_hidden = !self.hud_hidden;
+        }
+        // the HUD toggles, read on the press in this order while the pause is off
+        // (`[0x606A90]`, 0x415982): F5 0x18, "2" 0x1C, F6 0x1A, F7 0x1B, F8 0x1F
+        // (0x4159C9…0x415A8E)
+        for a in [Action::ToggleHud, Action::CycleMap, Action::ToggleRearView, Action::ToggleMap, Action::HudTransparency] {
+            if self.input.take_pressed(a) && self.vehicle.is_some() && !self.paused {
+                self.hud_key(a);
+            }
+        }
+        // `I_SFX` (F10, bit 0x11) → 0x4AB4E0 and `I_MUSIC` (F9, bit 0x12) → 0x4AD790, read
+        // on the press by `RaceFrame` whatever the pause (0x415A93…0x415AB6), both only with
+        // the audio up (`[0x657C94]` clear, 0x4AB4E0; `[0x656AB4]`, 0x4AD790)
+        if self.input.take_pressed(Action::Sfx)
+            && self.vehicle.is_some()
+            && let Some(a) = &self.snd.audio
+        {
+            if self.snd.sfx_saved.is_none() {
+                a.silence_voices();
+            }
+            self.snd.audio_settings.toggle_effects(&mut self.snd.sfx_saved);
+            tracing::info!(on = self.snd.sfx_saved.is_none(), "I_SFX (0x4AB4E0)");
+        }
+        if self.input.take_pressed(Action::Music)
+            && self.vehicle.is_some()
+            && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
+        {
+            // the pick is `0x538040() + timeGetTime()` (0x4AD87E…0x4AD88B); the port's
+            // clock is the wall clock's milliseconds — PORT-DEVIATION D20 for the time since
+            // Windows started
+            let rng = &mut self.fe_rng;
+            let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u32);
+            m.toggle(a, &mut || rng.next_u32().wrapping_add(ms));
+            tracing::info!(playing = ?m.now_playing(), "I_MUSIC (0x4AD790)");
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -298,87 +423,8 @@ impl ApplicationHandler for App {
                     self.input.end_tick();
                     return;
                 }
-                // Esc / P / Start: pause. The pause action (`0x4138D0(8, 1)`, 0x415170) opens the
-                // pause menu (0x461740, 0x426800) only while the HUD's dialog queue is empty —
-                // 0x41518C tests it with 0x426A60 first — and with a dialog up it goes to
-                // 0x4151ED, which acts only in a network game (`[0x6573E8] == 3` → 0x41523A, the
-                // resume). So in a single-player race the key does nothing while the pause menu,
-                // its quit question or a post-race page is up: the menu is left through its own
-                // buttons (0x42A6A0), and leaving the race through quit and its question, as
-                // 0x426154 does. *(Until 2026-09-26 the port's pause key backed out of the
-                // question or resumed — an approximation of a key the original does not have.)*
-                // Once the pages have closed it opens the menu, whose quit leaves
-                let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some());
-                if self.vehicle.is_some() && self.fe.race_game_type == Some(game_type::NETWORK) {
-                    // a network race (`[0x6573E8] == 3`): 0x415110's own rules, not the single-player pause
-                    if self.input.take_pressed(Action::Pause) {
-                        self.net_pause_action(event_loop);
-                    }
-                } else if dialog_up {
-                    let _ = self.input.take_pressed(Action::Pause);
-                } else if self.input.take_pressed(Action::Pause) {
-                    if self.vehicle.is_some() {
-                        self.paused = true;
-                        // 0x4151E3 → 0x461740: the orbit's yaw and step start at 0
-                        self.orbit = Orbit::default();
-                        self.pause_sel = 0;
-                        self.pause_confirm = None;
-                    } else {
-                        event_loop.exit();
-                    }
-                }
-                // the pause orbit's step keys, read on the press only while a dialog is up outside
-                // a replay (0x415855…0x41589D, in this order, so the last wins): `I_ROTCAMCCLOCK`
-                // (F4, bit 0x0A) +3 (0x461790), `I_ROTCAMCLOCK` (F2, 0x0C) −3 (0x4617A0),
-                // `I_ROTCAMSTOP` (F3, 0x0B) 0 (0x4617B0)
-                if self.vehicle.is_some()
-                    && self.hud_dialog_up()
-                    && !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted))
-                {
-                    for (a, step) in [(Action::RotCamCounter, 3), (Action::RotCamClock, -3), (Action::RotCamStop, 0)] {
-                        if self.input.take_pressed(a) {
-                            self.orbit.step = step;
-                        }
-                    }
-                }
-                // `I_TOGGLEPAUSEMENU` (F1): 0x41596E reads bit 0x0E on the press whatever the pause,
-                // and 0x425750 flips `[0x60CA00]` only with a dialog up
-                if self.input.take_pressed(Action::TogglePauseMenu) && self.vehicle.is_some() && self.hud_dialog_up() {
-                    self.hud_hidden = !self.hud_hidden;
-                }
-                // the HUD toggles, read on the press in this order while the pause is off
-                // (`[0x606A90]`, 0x415982): F5 0x18, "2" 0x1C, F6 0x1A, F7 0x1B, F8 0x1F
-                // (0x4159C9…0x415A8E)
-                for a in [Action::ToggleHud, Action::CycleMap, Action::ToggleRearView, Action::ToggleMap, Action::HudTransparency] {
-                    if self.input.take_pressed(a) && self.vehicle.is_some() && !self.paused {
-                        self.hud_key(a);
-                    }
-                }
-                // `I_SFX` (F10, bit 0x11) → 0x4AB4E0 and `I_MUSIC` (F9, bit 0x12) → 0x4AD790, read
-                // on the press by `RaceFrame` whatever the pause (0x415A93…0x415AB6), both only with
-                // the audio up (`[0x657C94]` clear, 0x4AB4E0; `[0x656AB4]`, 0x4AD790)
-                if self.input.take_pressed(Action::Sfx)
-                    && self.vehicle.is_some()
-                    && let Some(a) = &self.snd.audio
-                {
-                    if self.snd.sfx_saved.is_none() {
-                        a.silence_voices();
-                    }
-                    self.snd.audio_settings.toggle_effects(&mut self.snd.sfx_saved);
-                    tracing::info!(on = self.snd.sfx_saved.is_none(), "I_SFX (0x4AB4E0)");
-                }
-                if self.input.take_pressed(Action::Music)
-                    && self.vehicle.is_some()
-                    && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
-                {
-                    // the pick is `0x538040() + timeGetTime()` (0x4AD87E…0x4AD88B); the port's
-                    // clock is the wall clock's milliseconds — PORT-DEVIATION D20 for the time since
-                    // Windows started
-                    let rng = &mut self.fe_rng;
-                    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u32);
-                    m.toggle(a, &mut || rng.next_u32().wrapping_add(ms));
-                    tracing::info!(playing = ?m.now_playing(), "I_MUSIC (0x4AD790)");
-                }
+                // the interface bits read on the press (pause, the orbit's steps, the HUD, the sound)
+                self.race_interface_keys(event_loop);
                 // The playback speeds (replay.md §7 commands 4…7), the replay's pause (3) and quit
                 // (1 / 2) have no key: `RaceFrame`'s action switch (table 0x415D9C) takes its
                 // action from 0x425EF0, the top HUD dialog's answer — the replay bar's cells, by
@@ -391,35 +437,14 @@ impl ApplicationHandler for App {
                 // PORT-DEVIATION D10 (PORT-DEVIATIONS.md) [HButtonVisual picks by the cursor only, 0x41B3BA…0x41B3CE]: the arrows and Enter pick and answer the pause menu's buttons
                 if self.paused && event.state == winit::event::ElementState::Pressed {
                     use winit::keyboard::{KeyCode, PhysicalKey};
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::ArrowUp | KeyCode::ArrowLeft) => match self.pause_confirm.as_mut() {
-                            Some(c) => *c = 0,
-                            None => self.pause_sel = self.pause_sel.saturating_sub(1),
-                        },
-                        PhysicalKey::Code(KeyCode::ArrowDown | KeyCode::ArrowRight) => match self.pause_confirm.as_mut() {
-                            Some(c) => *c = 1,
-                            None => self.pause_sel = (self.pause_sel + 1).min(2),
-                        },
-                        PhysicalKey::Code(KeyCode::Enter) => match (self.pause_confirm, self.pause_sel) {
-                            (Some(0), _) => {
-                                self.paused = false;
-                                self.pause_confirm = None;
-                                if !self.leave_race() {
-                                    event_loop.exit();
-                                }
-                            }
-                            (Some(_), _) => self.pause_confirm = None,
-                            (None, 0) => self.paused = false,
-                            (None, 1) => {
-                                // 0x426011…0x42602B: no restart in game types 2, 4, 10 — the menu stays up
-                                if self.pause_restart_allowed() {
-                                    self.paused = false;
-                                    self.restart_race(event_loop);
-                                }
-                            }
-                            _ => self.pause_confirm = Some(1),
-                        },
-                        _ => {}
+                    let key = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::ArrowUp | KeyCode::ArrowLeft) => Some(MenuKey::Up),
+                        PhysicalKey::Code(KeyCode::ArrowDown | KeyCode::ArrowRight) => Some(MenuKey::Down),
+                        PhysicalKey::Code(KeyCode::Enter) => Some(MenuKey::Enter),
+                        _ => None,
+                    };
+                    if let Some(k) = key {
+                        self.pause_menu_key(k, event_loop);
                     }
                     self.input.end_tick();
                     return;
@@ -618,50 +643,42 @@ impl ApplicationHandler for App {
                 self.fe_left_button(event_loop, state == ElementState::Pressed);
             }
             WindowEvent::RedrawRequested if self.fe.menu.is_some() => {
-                // gamepad: d-pad / left stick moves, South (A / cross) selects — PORT-DEVIATION D10
+                // gamepad: d-pad / left stick moves, A (cross) selects, B backs — PORT-DEVIATION D10
                 // (PORT-DEVIATIONS.md) [the FE reads no pad, event pump 0x529700]
                 self.gamepads.poll(&mut self.input);
                 if nfs_game::config::cfg().nfs_ff_test.is_set() {
                     self.gamepads.rumble_test_tick();
                 }
-                let stick = self.input.pad.map(|p| p.steer).unwrap_or(0.0);
-                let mut keys = Vec::new();
-                if self.input.take_pressed(Action::SteerLeft) {
-                    keys.push(MenuKey::Left);
-                }
-                if self.input.take_pressed(Action::SteerRight) {
-                    keys.push(MenuKey::Right);
-                }
-                if self.input.take_pressed(Action::Throttle) {
-                    keys.push(MenuKey::Up);
-                }
-                if self.input.take_pressed(Action::Brake) {
-                    keys.push(MenuKey::Down);
-                }
-                if self.input.take_pressed(Action::ShiftUp) {
-                    keys.push(MenuKey::Enter);
-                }
-                // the pad's back is the text menu's alone. **The original's front end reads no
+                // the pad's keys are a standard pad's d-pad / left stick, A and B, whatever the
+                // bindings (`nfs_input::MenuNav`; PAD-MODERN, D44: they used to be the in-race
+                // fixed map's actions, so a bound trigger or button also moved the menu). The
+                // pad's back is the text menu's alone. **The original's front end reads no
                 // pad** (`controls.md` §4.169.5): its event pump 0x529700 builds key events
                 // (type 2) only from the window's keyboard ring — the two message handlers
                 // 0x53B3D0 / 0x53B450 → 0x53A9E0 → 0x53AB00 → 0x55FF60 — plus the mouse and the
-                // timers, so
-                // the `b` of 0x4D2970 comes from the keyboard only and no pad button goes back on
-                // a layout screen. (The pad's other keys above are the port's own on both.)
-                if self.input.take_pressed(Action::Handbrake) && self.fe.layout_preview.is_none() {
-                    keys.push(MenuKey::Back);
-                }
-                if stick.abs() > 0.6 && !self.pad_stick_latched {
-                    keys.push(if stick < 0.0 {
-                        MenuKey::Left
-                    } else {
-                        MenuKey::Right
-                    });
-                }
-                self.pad_stick_latched = stick.abs() > 0.6;
+                // timers, so the `b` of 0x4D2970 comes from the keyboard only and no pad button
+                // goes back on a layout screen. (The pad's other keys are the port's own on both.)
+                let text_menu = self.fe.layout_preview.is_none();
+                let mut keys: Vec<MenuKey> = self
+                    .input
+                    .pad_menu
+                    .iter()
+                    .filter_map(|k| {
+                        Some(match k {
+                            nfs_input::MenuNav::Up => MenuKey::Up,
+                            nfs_input::MenuNav::Down => MenuKey::Down,
+                            nfs_input::MenuNav::Left => MenuKey::Left,
+                            nfs_input::MenuNav::Right => MenuKey::Right,
+                            nfs_input::MenuNav::Select => MenuKey::Enter,
+                            nfs_input::MenuNav::Back if text_menu => MenuKey::Back,
+                            nfs_input::MenuNav::Back => return None,
+                        })
+                    })
+                    .collect();
                 self.input.end_tick();
-                // the pad's keys are the port's own; they go the way 0x4D2850 sends keys
-                if self.fe_input_swallowed() {
+                // the pad's keys are the port's own; they go the way 0x4D2850 sends keys — and
+                // not while a binding row listens (0x51C4E0): the button is the row's capture
+                if self.fe_input_swallowed() || self.fe.binding_base.is_some() {
                     keys.clear();
                 }
                 for k in keys {
@@ -697,6 +714,41 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested if event_loop.exiting() => {}
             WindowEvent::RedrawRequested => {
                 self.gamepads.poll(&mut self.input);
+                // PAD-HANG: a force-feedback device connected after the race armed (a Bluetooth
+                // pad's discovery ends after the arm, or the player switches one on) is armed now
+                if self.gamepads.take_ff_hotplug() && super::force_feedback::ff_rearm_wanted(self.vehicle.is_some(), self.ff.as_ref(), self.gamepads.haptic_armed(), self.gamepads.haptic_device().is_some()) {
+                    self.ff_arm();
+                }
+                // PAD-HANG: a pad-bound interface control (Start on the pause row under D44's
+                // layout) is read here, once a frame — the keyboard's run on its key events. On the
+                // pause menu the pad's d-pad / left stick and A pick and answer as the arrows and
+                // Enter do (D10); a key that answered starts the next frame afresh, as the
+                // keyboard's handler returns
+                if self.vehicle.is_some() {
+                    if self.paused && !self.input.pad_menu.is_empty() {
+                        for k in std::mem::take(&mut self.input.pad_menu) {
+                            let key = match k {
+                                nfs_input::MenuNav::Up => MenuKey::Up,
+                                nfs_input::MenuNav::Down => MenuKey::Down,
+                                nfs_input::MenuNav::Left => MenuKey::Left,
+                                nfs_input::MenuNav::Right => MenuKey::Right,
+                                nfs_input::MenuNav::Select => MenuKey::Enter,
+                                nfs_input::MenuNav::Back => continue,
+                            };
+                            self.pause_menu_key(key, event_loop);
+                            if !self.paused || self.vehicle.is_none() {
+                                break;
+                            }
+                        }
+                        if !self.paused || self.vehicle.is_none() {
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                    self.race_interface_keys(event_loop);
+                }
                 if nfs_game::config::cfg().nfs_ff_test.is_set() {
                     self.gamepads.rumble_test_tick();
                 }

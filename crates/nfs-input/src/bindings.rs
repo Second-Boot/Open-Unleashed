@@ -21,6 +21,14 @@ pub const SC_ALT: u8 = 0x38;
 pub const POV_STEP: i32 = 4500;
 /// 0x51F3B0's window: an axis counts as moved once it is this far (of 65535) from its snapshot.
 pub const CAPTURE_THRESHOLD: i32 = 5000;
+/// PORT-DEVIATION D44 (PAD-MODERN): a **standard pad**'s axis counts as moved only this far from
+/// its snapshot — 0x5000, about 62 % of a stick's half-travel (and of a trigger's whole travel,
+/// [`crate::gamepad::pad_record`]). An Xbox pad seen here rests its right stick about 45 % off
+/// centre (−14 673…−14 691 of ±32 768, and 0 before its first report), so the original's
+/// ±5000 took that resting offset — or its jump when the pad wakes — for a moved axis and bound a
+/// row nobody had touched. A deliberate push to the end still clears it. Raw devices (wheels,
+/// pedals, sticks) keep the original's ±5000.
+pub const PAD_CAPTURE_TRAVEL: i32 = 0x5000;
 /// 0x51F3B0 numbers a captured hat `0x20 + n`.
 pub const HAT_INDEX_BASE: u32 = 0x20;
 
@@ -240,11 +248,16 @@ pub struct PadRecord {
     pub axes: [i32; 8],
     pub pov: [i32; 4],
     pub buttons: [bool; 32],
+    /// **PORT-DEVIATION D44** (PAD-MODERN), not in the original's record: the device is an SDL
+    /// standard pad (a game controller with a mapping, `gamepad::pad_record`), which gets the
+    /// modern defaults ([`modern_pad_bindings`]), the capture's larger window
+    /// ([`PAD_CAPTURE_TRAVEL`]) and its controls' names on the setup rows
+    pub standard: bool,
 }
 
 impl Default for PadRecord {
     fn default() -> Self {
-        Self { mask: 0, button_mask: 0, axes: [0x7FFF; 8], pov: [-1; 4], buttons: [false; 32] }
+        Self { mask: 0, button_mask: 0, axes: [0x7FFF; 8], pov: [-1; 4], buttons: [false; 32], standard: false }
     }
 }
 
@@ -262,8 +275,17 @@ impl PadRecord {
 /// past ±5000 of its snapshot (kind 1, direction −1 below `base + 5000`, else +1) — and for the
 /// sliders 6 and 7 the direction is taken from **axis 5** (ZRot), as the operands at
 /// 0x51F67A/0x51F67D are. The first device that moved wins.
+///
+/// The snapshot is the original's own: the row takes it on the click that starts the listening
+/// (0x51C5F0 → 0x51F310; the port's `binding_base` at the same release), so an axis's resting
+/// value — a drifting stick, a pedal or trigger resting at an end — is the reference, and only a
+/// movement from it counts. On a **standard pad** the window is [`PAD_CAPTURE_TRAVEL`] instead of
+/// ±5000 (PORT-DEVIATION D44): its triggers rest at the axis centre ([`crate::gamepad::pad_record`])
+/// and a drifting stick's resting offset, or the jump of that offset when the pad sends its first
+/// report, is no movement.
 pub fn capture(base: &[PadRecord], cur: &[PadRecord]) -> Option<Binding> {
     for (d, (b, c)) in base.iter().zip(cur).enumerate() {
+        let window = if c.standard { PAD_CAPTURE_TRAVEL } else { CAPTURE_THRESHOLD };
         let mut out: Option<Binding> = None;
         for n in 0..32 {
             if b.buttons[n] != c.buttons[n] {
@@ -275,13 +297,13 @@ pub fn capture(base: &[PadRecord], cur: &[PadRecord]) -> Option<Binding> {
                 out = Some(Binding { kind: BindingKind::Hat.as_u32(), device: d as u32, index: HAT_INDEX_BASE + n as u32, dir: 0, pov: (c.pov[n] / POV_STEP) as u32, key: 0 });
             }
         }
-        let moved = |n: usize| c.axes[n] >= b.axes[n] + CAPTURE_THRESHOLD || c.axes[n] <= b.axes[n] - CAPTURE_THRESHOLD;
+        let moved = |n: usize| c.axes[n] >= b.axes[n] + window || c.axes[n] <= b.axes[n] - window;
         for n in 0..8 {
             if c.mask & (1 << n) == 0 || !moved(n) {
                 continue;
             }
             let from = if n < 6 { n } else { 5 };
-            let dir = if c.axes[from] < b.axes[from] + CAPTURE_THRESHOLD { -1 } else { 1 };
+            let dir = if c.axes[from] < b.axes[from] + window { -1 } else { 1 };
             out = Some(Binding { kind: BindingKind::Axis.as_u32(), device: d as u32, index: n as u32, dir, pov: 0, key: 0 });
         }
         if out.is_some() {
@@ -522,6 +544,72 @@ pub fn default_bindings(device: u32, caps: DeviceCaps, lang: u32) -> [Binding; 1
             let (key, sc) = default_key(row, lang);
             out[row] = Binding { kind: BindingKind::Key.as_u32(), device: 0, index: sc as u32, dir: 0, pov: 0, key };
         }
+    }
+    out
+}
+
+/// The standard-pad buttons by their [`crate::gamepad::BUTTON_ORDER`] number (PORT-DEVIATION D25).
+mod pad {
+    pub const A: u32 = 0;
+    pub const B: u32 = 1;
+    pub const Y: u32 = 2;
+    pub const X: u32 = 3;
+    pub const LB: u32 = 6;
+    pub const RB: u32 = 7;
+    pub const START: u32 = 11;
+    pub const L3: u32 = 13;
+    /// the record's axes (`gamepad::pad_record`): left stick X, LT on `lZ`, right stick X, RT on `lRz`
+    pub const LS_X: u32 = 0;
+    pub const LT: u32 = 2;
+    pub const RS_X: u32 = 3;
+    pub const RT: u32 = 5;
+}
+
+/// **PORT-DEVIATION D44** (PAD-MODERN): `DEFAULTCONTROLS` on an
+/// SDL **standard pad** — the original's pad half of 0x51D1D0 ([`PAD_DEFAULTS`]) puts gas and
+/// brake on the left stick's Y and six rows on DirectInput button numbers a modern pad does not
+/// have, so on such a pad the rows get a modern layout instead, `(row, kind, index, dir, pov)` of
+/// [`CONTROLLER_ROWS`]:
+///
+/// ```text
+/// Accel  RT (axis 5, +1)      Brake  LT (axis 2, +1)      HandBrake A     SteerLeft / Right  left stick X −1 / +1
+/// Horn   L3                   ShiftUp RB                  ShiftDown LB    LookBehind B
+/// Lights d-pad up (hat 0x20, pov 0)                       ResetCar X      CameraView Y       Pause Start
+/// LeftTurnSignal / RightTurnSignal d-pad left / right (pov 6 / 2)         Hazards d-pad down (pov 4)
+/// LookLeft / LookRight right stick X −1 / +1              LookForward     its key (0x51DBFA's row)
+/// ```
+///
+/// Wheels, sticks and every other raw device keep the original's [`default_bindings`].
+const MODERN_PAD_DEFAULTS: [(usize, u32, u32, i32, u32); 18] = [
+    (0, 1, pad::RT, 1, 0),
+    (1, 1, pad::LT, 1, 0),
+    (2, 2, pad::A, 0, 0),
+    (3, 1, pad::LS_X, -1, 0),
+    (4, 1, pad::LS_X, 1, 0),
+    (5, 2, pad::L3, 0, 0),
+    (6, 2, pad::RB, 0, 0),
+    (7, 2, pad::LB, 0, 0),
+    (8, 2, pad::B, 0, 0),
+    (9, 5, HAT_INDEX_BASE, 0, 0),
+    (10, 2, pad::X, 0, 0),
+    (11, 2, pad::Y, 0, 0),
+    (12, 2, pad::START, 0, 0),
+    (13, 5, HAT_INDEX_BASE, 0, 6),
+    (14, 5, HAT_INDEX_BASE, 0, 2),
+    (15, 5, HAT_INDEX_BASE, 0, 4),
+    (16, 1, pad::RS_X, -1, 0),
+    (17, 1, pad::RS_X, 1, 0),
+];
+
+/// [`MODERN_PAD_DEFAULTS`] for standard pad `device`, the rows it leaves (`LookForward`) their key
+/// as 0x51D1D0's keyboard half gives it.
+pub fn modern_pad_bindings(device: u32, lang: u32) -> [Binding; 19] {
+    let mut out: [Binding; 19] = std::array::from_fn(|row| {
+        let (key, sc) = default_key(row, lang);
+        Binding { kind: BindingKind::Key.as_u32(), device: 0, index: sc as u32, dir: 0, pov: 0, key }
+    });
+    for &(row, kind, index, dir, pov) in &MODERN_PAD_DEFAULTS {
+        out[row] = Binding { kind, device, index, dir, pov, key: 0 };
     }
     out
 }
@@ -788,5 +876,77 @@ mod tests {
         assert_eq!(bs.get(id::C1_HORN).map(|b| (b.kind, b.index, b.key)), Some((3, 0x23, b'h' as u32)));
         assert_eq!(bs.get(id::C1_ABORT).map(|b| b.index), Some(0x10));
         assert_eq!(bs.by_id.len(), 3);
+    }
+
+    /// PAD-MODERN (D44): the standard-pad preset is the D44 table, row by row, `LookForward`
+    /// keeps its key, and the nineteen differ pairwise (0x51DC20), so 0x51DCC0 takes none of them
+    /// from another.
+    #[test]
+    fn the_modern_pad_preset() {
+        let d = modern_pad_bindings(1, 0);
+        let k = |n: &str| {
+            let b = d[row(n)];
+            (b.kind, b.index, b.dir, b.pov)
+        };
+        assert_eq!(k("Controller.Accel"), (1, 5, 1, 0)); // RT
+        assert_eq!(k("Controller.Brake"), (1, 2, 1, 0)); // LT
+        assert_eq!(k("Controller.SteerLeft"), (1, 0, -1, 0));
+        assert_eq!(k("Controller.SteerRight"), (1, 0, 1, 0));
+        assert_eq!(k("Controller.HandBrake"), (2, 0, 0, 0)); // A
+        assert_eq!(k("Controller.LookBehind"), (2, 1, 0, 0)); // B
+        assert_eq!(k("Controller.ResetCar"), (2, 3, 0, 0)); // X
+        assert_eq!(k("Controller.CameraView"), (2, 2, 0, 0)); // Y
+        assert_eq!(k("Controller.ShiftUp"), (2, 7, 0, 0)); // RB
+        assert_eq!(k("Controller.ShiftDown"), (2, 6, 0, 0)); // LB
+        assert_eq!(k("Controller.Pause"), (2, 11, 0, 0)); // Start
+        assert_eq!(k("Controller.Horn"), (2, 13, 0, 0)); // L3
+        assert_eq!(k("Controller.Lights"), (5, 0x20, 0, 0)); // d-pad up
+        assert_eq!(k("Controller.LeftTurnSignal"), (5, 0x20, 0, 6)); // d-pad left
+        assert_eq!(k("Controller.RightTurnSignal"), (5, 0x20, 0, 2)); // d-pad right
+        assert_eq!(k("Controller.Hazards"), (5, 0x20, 0, 4)); // d-pad down
+        assert_eq!(k("Controller.LookLeft"), (1, 3, -1, 0)); // right stick X
+        assert_eq!(k("Controller.LookRight"), (1, 3, 1, 0));
+        let fwd = d[row("Controller.LookForward")];
+        assert_eq!((fwd.kind, fwd.index, fwd.key), (3, 0x16, b'u' as u32));
+        assert!(d.iter().filter(|b| b.kind != 3).all(|b| b.device == 1));
+        for (i, a) in d.iter().enumerate() {
+            assert!(d[i + 1..].iter().all(|b| !same(a, b)), "row {i}");
+        }
+        // each pad binding reads its control on a standard pad's record
+        let mut p = crate::gamepad::PadSnapshot::default();
+        p.triggers = [32767, 32767];
+        p.sticks = [32767, 0, -32768, 0];
+        p.buttons[13] = true;
+        let pads = [PadRecord::default(), crate::gamepad::pad_record(&p)];
+        let bands = [[0, 127]; 8];
+        assert_eq!(axis_read(&d[row("Controller.Accel")], &pads, &bands), 255);
+        assert_eq!(axis_read(&d[row("Controller.Brake")], &pads, &bands), 255);
+        assert_eq!(axis_read(&d[row("Controller.SteerRight")], &pads, &bands), 255);
+        assert_eq!(axis_read(&d[row("Controller.SteerLeft")], &pads, &bands), 0);
+        assert_eq!(axis_read(&d[row("Controller.LookLeft")], &pads, &bands), 255);
+        assert_eq!(button_read(&d[row("Controller.Horn")], &pads), 255);
+    }
+
+    /// PAD-MODERN (D44): on a standard pad the capture ignores a drifting stick's resting offset
+    /// and its jump at the first report (an Xbox pad's right stick Y seen here, about −14 680), a resting
+    /// trigger is no movement, a full push or squeeze is caught in its direction; a raw device
+    /// keeps the original's ±5000.
+    #[test]
+    fn the_capture_ignores_a_drifting_rest() {
+        let rec = |ry: i16, rt: i16| crate::gamepad::pad_record(&crate::gamepad::PadSnapshot { sticks: [0, 0, 0, ry], triggers: [0, rt], ..Default::default() });
+        // the baseline before the pad's first report (0) and the drift it then reports
+        assert_eq!(capture(&[rec(0, 0)], &[rec(-14691, 0)]), None);
+        // the baseline taken on the drift: the drift itself is no movement
+        assert_eq!(capture(&[rec(-14680, 0)], &[rec(-14673, 0)]), None);
+        // a resting trigger, at whatever the record says when released
+        assert_eq!(capture(&[rec(0, 0)], &[rec(0, 0)]), None);
+        // RT squeezed: axis 5, +1; the stick pushed up to its end from the drift: axis 4, −1
+        assert_eq!(capture(&[rec(-14680, 0)], &[rec(-14680, 32767)]).map(|b| (b.kind, b.index, b.dir)), Some((1, 5, 1)));
+        assert_eq!(capture(&[rec(0, 0)], &[rec(-32768, 0)]).map(|b| (b.kind, b.index, b.dir)), Some((1, 4, -1)));
+        // a raw device: the original's window
+        let raw = PadRecord { mask: 0x3F, ..Default::default() };
+        let mut moved = raw;
+        moved.axes[4] = raw.axes[4] - 5000;
+        assert_eq!(capture(&[raw], &[moved]).map(|b| (b.index, b.dir)), Some((4, -1)));
     }
 }

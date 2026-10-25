@@ -5,10 +5,9 @@
 ## Что нужно
 
 - Rust 1.95 или новее (`rustup`);
-- CMake и компилятор C (Xcode command line tools, Visual Studio build tools или `build-essential`): библиотека
-  контроллеров SDL2 (лицензия zlib) собирается из исходников, которые поставляет крейт `sdl2-sys`, и линкуется
-  статически, так что ставить ничего в систему не нужно. Для CMake 4 `.cargo/config.toml` уже задаёт
-  `CMAKE_POLICY_VERSION_MINIMUM`;
+- CMake 3.16 или новее и компилятор C (Xcode command line tools, Visual Studio build tools или `build-essential`):
+  библиотека контроллеров SDL3 (лицензия zlib) собирается из исходников, которые поставляет крейт `sdl3-src` (через
+  `sdl3-sys`), и линкуется статически, только джойстики / геймпады / отдача, так что ставить ничего в систему не нужно;
 - данные игры, как описано в разделе [данные игры](game-data.md);
 - Linux: пакеты для разработки `libasound2-dev libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
   libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libvulkan-dev pkg-config`.

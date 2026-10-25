@@ -226,7 +226,6 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
             player_car_id: None,
-            pad_stick_latched: false,
             skill,
             smackables: Default::default(),
             mission: mission_start,

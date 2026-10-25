@@ -59,10 +59,15 @@ def main():
             parts.append(f"{p['repository']}\n")
         parts.append("=" * 78 + "\n")
         files = licence_files(d)
-        if p["name"] == "sdl2-sys" and (d / "SDL" / "LICENSE.txt").is_file():
-            # the crate builds and statically links the bundled SDL2 itself (zlib licence)
-            parts.append("This crate statically links SDL2 (https://libsdl.org), built from the source it ships; its licence (zlib) follows.\n")
-            files = files + [d / "SDL" / "LICENSE.txt"]
+        if p["name"] == "sdl3-sys":
+            # the crate builds SDL3 from the source of its build dependency `sdl3-src` and links it
+            # statically (zlib licence); sdl3-src is build-time only, so it is not in the list above
+            src = next((q for q in meta["packages"] if q["name"] == "sdl3-src"), None)
+            lic = pathlib.Path(src["manifest_path"]).parent / "SDL" / "LICENSE.txt" if src else None
+            if lic is None or not lic.is_file():
+                sys.exit("sdl3-src's SDL/LICENSE.txt not found: the SDL3 licence must ship with the binary")
+            parts.append(f"This crate statically links SDL3 (https://libsdl.org), built from the source of sdl3-src {src['version']}; its licence (zlib) follows.\n")
+            files = files + [lic]
         if not files:
             authors = ", ".join(p.get("authors") or []) or "its authors"
             parts.append(f"(the crate's source ships no licence file. Licence: {p.get('license')}; copyright {authors}.\n"
