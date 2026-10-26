@@ -83,7 +83,7 @@ impl LoadingScreen {
         for (first, count, size, y) in ROWS {
             for k in 0..count {
                 if let Some(a) = self.tiles.get(first + k) {
-                    out.push(design_sprite(aspect, a.0, k as f32 * size, y, size, size, [1.0; 4], false));
+                    out.push(design_sprite(aspect, a.0, [k as f32 * size, y, size, size], [1.0; 4], false));
                 }
             }
         }
@@ -120,9 +120,8 @@ impl LoadingScreen {
 }
 
 /// A 640×480 design rectangle as a sprite letterboxed into `aspect` — the same placement
-/// [`LoadingScreen::sprites`] uses. `flip` mirrors the art left to right (0x563320).
-#[allow(clippy::too_many_arguments)]
-fn design_sprite(aspect: f32, tex: TextureId, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], flip: bool) -> Sprite {
+/// [`LoadingScreen::sprites`] uses; the rectangle is `[x, y, w, h]`. `flip` mirrors the art left to right (0x563320).
+fn design_sprite(aspect: f32, tex: TextureId, [x, y, w, h]: [f32; 4], color: [f32; 4], flip: bool) -> Sprite {
     let design = DESIGN.0 / DESIGN.1;
     let (fw, x0) = if aspect > design { (design / aspect, (1.0 - design / aspect) * 0.5) } else { (1.0, 0.0) };
     let (u0, u1) = if flip { (1.0, 0.0) } else { (0.0, 1.0) };
@@ -141,9 +140,8 @@ fn design_sprite(aspect: f32, tex: TextureId, x: f32, y: f32, w: f32, h: f32, co
 }
 
 /// A rectangle of the 640×480 picture on a `width × height` target, in pixels, the picture at
-/// `((W − 640) / 2, (H − 480) / 2)` (0x53D570). `flip` mirrors the art left to right (0x563320).
-#[allow(clippy::too_many_arguments)]
-fn centred_sprite(width: f32, height: f32, tex: TextureId, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], flip: bool) -> Sprite {
+/// `((W − 640) / 2, (H − 480) / 2)` (0x53D570); the rectangle is `[x, y, w, h]`. `flip` mirrors the art left to right (0x563320).
+fn centred_sprite(width: f32, height: f32, tex: TextureId, [x, y, w, h]: [f32; 4], color: [f32; 4], flip: bool) -> Sprite {
     let (ox, oy) = (((width as i32) / 2) as f32 - 320.0, ((height as i32) / 2) as f32 - 240.0);
     let (u0, u1) = if flip { (1.0, 0.0) } else { (0.0, 1.0) };
     Sprite {
@@ -334,19 +332,19 @@ impl RaceLoading {
     /// (the port's HiDPI mapping, 2026-10-01). `width` / `height` are the HUD's logical resolution, the window's
     /// physical size over its scale factor (the port's HiDPI mapping, not a game rule).
     pub fn sprites(&self, width: f32, height: f32) -> Vec<Sprite> {
-        let mut out: Vec<Sprite> = self.surface.iter().map(|&(t, x, y, w, h, f)| centred_sprite(width, height, t, x, y, w, h, [1.0; 4], f)).collect();
+        let mut out: Vec<Sprite> = self.surface.iter().map(|&(t, x, y, w, h, f)| centred_sprite(width, height, t, [x, y, w, h], [1.0; 4], f)).collect();
         if let Some(w) = self.bar {
-            out.push(centred_sprite(width, height, self.white, 302.0, 467.0, w, 6.0, [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
+            out.push(centred_sprite(width, height, self.white, [302.0, 467.0, w, 6.0], [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
         }
         for row in &self.rows {
             match *row {
-                LoadingRow::Absent { x } => out.push(centred_sprite(width, height, self.white, x, 364.0, 54.0, 64.0, [0.0, 0.0, 0.0, 1.0], false)),
+                LoadingRow::Absent { x } => out.push(centred_sprite(width, height, self.white, [x, 364.0, 54.0, 64.0], [0.0, 0.0, 0.0, 1.0], false)),
                 LoadingRow::Player { x, picture, w, h, progress } => {
-                    out.push(centred_sprite(width, height, picture, x, 364.0, w, h, [1.0; 4], false));
+                    out.push(centred_sprite(width, height, picture, [x, 364.0, w, h], [1.0; 4], false));
                     let done = (progress * 54 / 10) as f32;
                     // 0xFF312000 for what is left, 0xFFFFBB00 for what is done (0x4A5299, 0x4A52E7)
-                    out.push(centred_sprite(width, height, self.white, x + done, 436.0, 54.0 - done, 6.0, [0x31 as f32 / 255.0, 0x20 as f32 / 255.0, 0.0, 1.0], false));
-                    out.push(centred_sprite(width, height, self.white, x, 436.0, done, 6.0, [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
+                    out.push(centred_sprite(width, height, self.white, [x + done, 436.0, 54.0 - done, 6.0], [0x31 as f32 / 255.0, 0x20 as f32 / 255.0, 0.0, 1.0], false));
+                    out.push(centred_sprite(width, height, self.white, [x, 436.0, done, 6.0], [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
                 }
             }
         }

@@ -1,8 +1,9 @@
 # Shared by build_macos.sh / build_windows.sh / build_linux.sh (sourced from the repository root).
 #   parse_pack_args "$@"   sets WITH_DATA (0 = the public build: code only; 1 = --with-data: the player's
 #                          game data inside, for your own machines only) and SUFFIX for the archive name
-#   stage_legal <dir> <target triple>
-#                          LICENSE, THIRD-PARTY-LICENSES.txt and the README's disclaimer files
+#   stage_legal <dir> <target triple> [<unpacked DXC dir>]
+#                          LICENSE, THIRD-PARTY-LICENSES.txt (with the DirectX Shader Compiler's licences when the
+#                          Windows build ships it) and the README's disclaimer files
 #   stage_game_dir <dir>   the public build's empty game/ with the instructions where the data goes
 . packaging/brand.sh
 parse_pack_args() {
@@ -22,7 +23,7 @@ parse_pack_args() {
 }
 stage_legal() {
   cp LICENSE "$1/LICENSE.txt"
-  python3 packaging/third_party_licenses.py "$1/THIRD-PARTY-LICENSES.txt" --target "$2" >/dev/null
+  python3 packaging/third_party_licenses.py "$1/THIRD-PARTY-LICENSES.txt" --target "$2" ${3:+--dxc "$3"} >/dev/null
 }
 stage_game_dir() {
   mkdir -p "$1"

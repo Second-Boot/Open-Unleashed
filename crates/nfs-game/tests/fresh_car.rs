@@ -47,22 +47,6 @@ fn the_neutral_fold_scales_grip_and_roll_gain_by_the_transfer_divisor_for_every_
         assert_eq!(folded.probe_offset, 0.0, "{}: ride height", entry.sim);
         assert!(!folded.parts.is_empty());
         checked += 1;
-        if std::env::var_os("NK_SURVEY").is_some() {
-            eprintln!(
-                "NKSURVEY {:<14} fam={:<4} stock={:>2}  parts: mass {:+.1} top {:+.3}% grip {:+.4}% td {:+.4}% roll_gain {:+.3}% torque_pk {:+.3}%  | setup: grip {:+.3}% roll_gain {:+.3}%",
-                entry.sim,
-                entry.sim_family,
-                stock.len(),
-                parts_only.mass - raw.mass,
-                (parts_only.top_speed / raw.top_speed - 1.0) * 100.0,
-                (parts_only.grip / raw.grip - 1.0) * 100.0,
-                (parts_only.transfer_div / raw.transfer_div - 1.0) * 100.0,
-                (parts_only.roll_gain / raw.roll_gain - 1.0) * 100.0,
-                (parts_only.torque.iter().copied().fold(0.0, f32::max) / raw.torque.iter().copied().fold(0.0, f32::max) - 1.0) * 100.0,
-                (folded.grip / parts_only.grip - 1.0) * 100.0,
-                (folded.roll_gain / parts_only.roll_gain - 1.0) * 100.0,
-            );
-        }
     }
     if checked == 0 {
         eprintln!("skipping: no game data");
@@ -82,12 +66,6 @@ fn a_traffic_car_block_is_default_sim_through_the_neutral_fold() {
     let shock = (1.0f32 + 2.0) * raw.transfer_div * (1.0 / 3.0);
     assert!((folded.grip / raw.grip - (shock + 9.0) * 0.1).abs() < 1e-5);
     assert_eq!(folded.probe_offset, 0.0);
-    if std::env::var_os("NK_SURVEY").is_some() {
-        eprintln!(
-            "NKSURVEY default.sim td {} grip {} -> {} roll_gain {} -> {} probe {} -> {} pitch {} roll {}",
-            raw.transfer_div, raw.grip, folded.grip, raw.roll_gain, folded.roll_gain, raw.probe_offset, folded.probe_offset, folded.pitch_ret, folded.roll_ret
-        );
-    }
 }
 
 /// The traffic cars' catalogue records (`nfs5.trk +0x7C`) carry no stock parts, so the traffic's fold
@@ -101,9 +79,6 @@ fn the_traffic_records_carry_no_stock_parts() {
     for r in &tracks {
         for id in r.traffic_cars.iter().copied().filter(|i| *i != 0) {
             let Some(e) = t.catalog.iter().find(|c| c.id == id) else { continue };
-            if std::env::var_os("NK_SURVEY").is_some() {
-                eprintln!("NKTRAFFIC {} id {} model {} sim {:?} family {:?} stock {}", r.file, id, e.model, e.sim, e.sim_family, e.stock_parts.len());
-            }
             assert!(e.stock_parts.is_empty(), "traffic record {id} ({}) carries stock parts", e.model);
         }
     }

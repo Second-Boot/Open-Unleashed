@@ -47,6 +47,7 @@ mod fe_seq;
 mod idle;
 mod quickfix;
 mod init;
+mod photo;
 pub(crate) use quickfix::*;
 pub(crate) use init::AppInit;
 pub(crate) use scripted::*;
@@ -68,6 +69,92 @@ pub(crate) use fe_lists::*;
 pub(crate) use fe_colour::*;
 pub(crate) use fe_choices::*;
 pub(crate) use menu::*;
+
+/// The launch-time state of a network race (the host's `fe.txt` half, seats, cheat flags, the finish sent …) — empty outside one
+#[derive(Default)]
+pub(crate) struct NetLaunch {
+    /// The `fe.txt` half of a network launch as the host sent it (`rand_seed`, `time`, `weather`,
+    /// `fog`): the option-table values a player's race reads in place of its own file's
+    /// (`network.md` §11.7). Empty outside a network race — every session re-reads `fe.txt`
+    /// (0x4B6C1C).
+    pub(crate) fe_txt: std::collections::HashMap<&'static str, u32>,
+    /// `[0x657408] != 0 && [0x65740C] != 0` — `COMMSPOSITIONAL` and `NOCOLLISION` both set: the
+    /// collision pass 0x498FF0 then skips the car–car half (`network.md` §11.7). Set by a network
+    /// launch, clear for every other.
+    pub(crate) nocollision: bool,
+    /// a network race's other players' grid places (`g − 1`), in room order
+    pub(crate) seat_grids: Vec<Option<u32>>,
+    /// a network race's other players' car records (0x4EEDA0's, at their race indices), in room
+    /// order — the seat's car, colour, names, set-up, roof and options
+    pub(crate) seat_cars: Vec<nfs_net::launchcar::CarSlot>,
+    /// the local car's own launch record (`NetRace::own_words`) — what the replay's `.rpl` writes at its slot
+    pub(crate) own_words: Vec<(u32, Vec<u32>)>,
+    /// `DERBY [0x657400]` of a network race the stream settled (`net_race_apply`): 0x416310's knockout arm
+    pub(crate) derby: bool,
+    /// **The launch's cheat flags of a network race** `(RALLY [0x6573F8], HEAVY [0x6573FC], DERBY [0x657400])` as
+    /// the host's stream carried them (0x4ED5D0's `0x19` / `0x1A` / `0x1B` records, 0x4B4B80 on every machine):
+    /// `None` outside a network race, where the flags are this machine's own cheat bits (0 / 8 / 7)
+    pub(crate) flags: Option<(bool, bool, bool)>,
+    /// the traffic cars' records of the network race settled (`net_race_apply`), for the replay file
+    pub(crate) traffic: Vec<nfs_net::options::TrafficCar>,
+    /// the player's `0xB7` finish time has been sent for this race (0x4168A9, once: the state-2
+    /// arm of 0x416310 runs on one tick)
+    pub(crate) time_sent: bool,
+    /// `car+0xD8A` of the local car — the packed pad byte `[0x5E9664]` its controller copy 0x4991E0 took at the last
+    /// 32 Hz run (0x499216): the block's `+0x03` (`NetPlay::send`), so the remote horn and handbrake travel
+    pub(crate) pad_buttons: u8,
+}
+
+/// The race HUD's slide states of its element groups: `(state, [0x606AC8] stamp of the last transition)`
+#[derive(Default)]
+pub(crate) struct HudSlides {
+    /// the race HUD trays' slide: state and the `[0x606AC8]` stamp of its last transition
+    pub(crate) tray: (u8, u64),
+    /// `HTime`'s and `HMultiTime`'s own state in a mission's playback (0x425A87…0x425ADA); outside
+    /// one it follows `tray_slide`
+    pub(crate) time: (u8, u64),
+    /// the `+5` elements' own states: `HTrackMap` (`[0x60CA34]`) and `HRearview` (`[0x60CA3C]`)
+    pub(crate) map: (u8, u64),
+    pub(crate) mirror: (u8, u64),
+}
+
+/// The post-race page that is up and what its billboard animation counts
+#[derive(Default)]
+pub(crate) struct ResultPages {
+    /// Index into [`App::result_pages`] of the page that is up. 0x427273 queues `HRaceSummary` and
+    /// then `HTrackRecords` (0x4272FF) for game types 0, 1, 2 and 5; 0x426DF9 queues the summary,
+    /// `HTournamentStandings` and the records for a tournament; the next opens when the one before
+    /// closes.
+    pub(crate) page: u8,
+    /// the tick the current post-race page opened
+    pub(crate) tick: u64,
+    /// the post-race page the billboard animation last counted, its frames since it opened, and
+    /// the tick it opened at (`HBillBoard +0x11C`, stamped by setState(1) at 0x41ADF4)
+    pub(crate) seen: Option<u8>,
+    pub(crate) frames: u32,
+    pub(crate) open_tick: Option<u64>,
+    /// frames the page on top has been shrinking for (`HBillBoard` state 2)
+    pub(crate) closing: Option<u32>,
+}
+
+/// **TEST GLUE**: the state of the scripted `NFS_HUD_KEYS` / `NFS_AUTOTEST_RACES` runs
+#[derive(Default)]
+pub(crate) struct ScriptedHud {
+    /// **TEST GLUE**: the pause `hud_key_script`'s hold ends in the pause menu's quit (`NFS_HUD_KEYS`'s
+    /// `pausequit`) — the race left for the front end as `leave_race` does
+    pub(crate) quit: bool,
+    /// diagnostic: a pause `hud_key_script` opened, left after 64 pause ticks
+    pub(crate) pause: bool,
+    /// diagnostic: the pause `hud_key_script`'s hold ends in the pause menu's restart (command 3,
+    /// 0x415721) rather than its continue (0x415701) — `NFS_HUD_KEYS`'s `pauserestart` key, for the
+    /// restart's audio pick count (`replay.md` §18.12)
+    pub(crate) restart: bool,
+    /// diagnostic: a scripted pause press in a network race asked to leave (`net_pause_press`)
+    pub(crate) net_leave: bool,
+    /// **TEST GLUE**: the races of a scripted session (`NFS_AUTOTEST_RACES`) begun after the first
+    pub(crate) race_no: u32,
+}
+
 
 pub(crate) struct App {
     pub(crate) paths: GamePaths,
@@ -132,14 +219,8 @@ pub(crate) struct App {
     /// the window's last seen scale factor ([`App::hud_geometry`]): `start_race` takes the renderer AND the window
     /// out of the `App` for the whole load, and the loading screen drawn meanwhile needs both (LOADSEAM)
     pub(crate) hud_scale: std::cell::Cell<f32>,
-    /// the race HUD trays' slide: state and the `[0x606AC8]` stamp of its last transition
-    pub(crate) tray_slide: (u8, u64),
-    /// `HTime`'s and `HMultiTime`'s own state in a mission's playback (0x425A87…0x425ADA); outside
-    /// one it follows `tray_slide`
-    pub(crate) time_trays: (u8, u64),
-    /// the `+5` elements' own states: `HTrackMap` (`[0x60CA34]`) and `HRearview` (`[0x60CA3C]`)
-    pub(crate) map_slide: (u8, u64),
-    pub(crate) mirror_slide: (u8, u64),
+    /// The race HUD's slide states of its element groups: `(state, [0x606AC8] stamp of the last transition)`
+    pub(crate) slides: HudSlides,
     /// what the HUD toggle keys F5 / F6 / F7 / F8 / "2" change (`HudKeys`)
     pub(crate) hud_keys: HudKeys,
     /// `HReplay`'s own state (`nfs_game::replay::BarState`): built once per session with the HUD
@@ -155,19 +236,8 @@ pub(crate) struct App {
     /// `pauserestart`) — the HUD toggle keys pressed on those game ticks (`hud_key`), for a
     /// `--screenshot` of their effect
     pub(crate) hud_key_script: std::collections::VecDeque<(u64, ScriptedHudKey)>,
-    /// **TEST GLUE**: the races of a scripted session (`NFS_AUTOTEST_RACES`) begun after the first
-    pub(crate) scripted_race_no: u32,
-    /// **TEST GLUE**: the pause `hud_key_script`'s hold ends in the pause menu's quit (`NFS_HUD_KEYS`'s
-    /// `pausequit`) — the race left for the front end as `leave_race` does
-    pub(crate) scripted_quit: bool,
-    /// diagnostic: a pause `hud_key_script` opened, left after 64 pause ticks
-    pub(crate) scripted_pause: bool,
-    /// diagnostic: the pause `hud_key_script`'s hold ends in the pause menu's restart (command 3,
-    /// 0x415721) rather than its continue (0x415701) — `NFS_HUD_KEYS`'s `pauserestart` key, for the
-    /// restart's audio pick count (`replay.md` §18.12)
-    pub(crate) scripted_restart: bool,
-    /// diagnostic: a scripted pause press in a network race asked to leave (`net_pause_press`)
-    pub(crate) scripted_net_leave: bool,
+    /// **TEST GLUE**: the state of the scripted `NFS_HUD_KEYS` / `NFS_AUTOTEST_RACES` runs
+    pub(crate) scripted_hud: ScriptedHud,
     /// `0x5E8B88[]` — the race-order array every car is registered in (the human, the opponents,
     /// the cops, the traffic), re-sorted at the end of every even tick (`nfs_game::race_order`)
     pub(crate) race_order: nfs_game::race_order::RaceOrder,
@@ -195,22 +265,8 @@ pub(crate) struct App {
     /// end) — set by `knockout_round`, taken by the race's end
     pub(crate) knockout_round: bool,
     pub(crate) player_grid_override: Option<u32>,
-    /// The `fe.txt` half of a network launch as the host sent it (`rand_seed`, `time`, `weather`,
-    /// `fog`): the option-table values a player's race reads in place of its own file's
-    /// (`network.md` §11.7). Empty outside a network race — every session re-reads `fe.txt`
-    /// (0x4B6C1C).
-    pub(crate) net_fe_txt: std::collections::HashMap<&'static str, u32>,
-    /// `[0x657408] != 0 && [0x65740C] != 0` — `COMMSPOSITIONAL` and `NOCOLLISION` both set: the
-    /// collision pass 0x498FF0 then skips the car–car half (`network.md` §11.7). Set by a network
-    /// launch, clear for every other.
-    pub(crate) net_nocollision: bool,
-    /// a network race's other players' grid places (`g − 1`), in room order
-    pub(crate) net_seat_grids: Vec<Option<u32>>,
-    /// a network race's other players' car records (0x4EEDA0's, at their race indices), in room
-    /// order — the seat's car, colour, names, set-up, roof and options
-    pub(crate) net_seat_cars: Vec<nfs_net::launchcar::CarSlot>,
-    /// the local car's own launch record (`NetRace::own_words`) — what the replay's `.rpl` writes at its slot
-    pub(crate) net_own_words: Vec<(u32, Vec<u32>)>,
+    /// The launch-time state of a network race (the host's `fe.txt` half, seats, cheat flags, the finish sent …) — empty outside one
+    pub(crate) net_launch: NetLaunch,
     /// The input-exchange race's controller samples for this tick — what the frame driver latched
     /// (0x415EF0) at an even tick: this car's, and each network seat's with its race index
     /// (`network.md` §11.17). `None` outside an exchange race and on an odd tick.
@@ -218,17 +274,9 @@ pub(crate) struct App {
     /// A network race played back from a file (`replay.md` §18.15): who the humans are and which lane of
     /// the stream is whose. `None` for every other race.
     pub(crate) replay_net: Option<ReplayNetRun>,
-    /// `DERBY [0x657400]` of a network race the stream settled (`net_race_apply`): 0x416310's knockout arm
-    pub(crate) net_derby: bool,
-    /// **The launch's cheat flags of a network race** `(RALLY [0x6573F8], HEAVY [0x6573FC], DERBY [0x657400])` as
-    /// the host's stream carried them (0x4ED5D0's `0x19` / `0x1A` / `0x1B` records, 0x4B4B80 on every machine):
-    /// `None` outside a network race, where the flags are this machine's own cheat bits (0 / 8 / 7)
-    pub(crate) net_flags: Option<(bool, bool, bool)>,
     /// a network race's replay: which human car the camera follows, an index into the humans by race
     /// index (`[0x606858]`, the bar's previous / next car cells)
     pub(crate) replay_view: usize,
-    /// the traffic cars' records of the network race settled (`net_race_apply`), for the replay file
-    pub(crate) net_traffic: Vec<nfs_net::options::TrafficCar>,
     /// **The C runtime's `rand()` state** (`_getptd()+0x14`, 0x5A17C9: `s = s·0x343FD + 0x269EC3`,
     /// `(s >> 16) & 0x7FFF`). The thread starts on 1 (`_initptd`, 0x5A5454) and the one `srand`
     /// (0x5A17BC, called at 0x418100 by `HMissionSummary`'s constructor, i.e. every race load)
@@ -251,12 +299,6 @@ pub(crate) struct App {
     /// Quick Knockout (`RACE_TYPE 3`): laps = opponents, the last car is out on every lap.
     pub(crate) quick_knockout: bool,
     pub(crate) player_eliminated: bool,
-    /// the player's `0xB7` finish time has been sent for this race (0x4168A9, once: the state-2
-    /// arm of 0x416310 runs on one tick)
-    pub(crate) net_time_sent: bool,
-    /// `car+0xD8A` of the local car — the packed pad byte `[0x5E9664]` its controller copy 0x4991E0 took at the last
-    /// 32 Hz run (0x499216): the block's `+0x03` (`NetPlay::send`), so the remote horn and handbrake travel
-    pub(crate) net_pad_buttons: u8,
     pub(crate) records: Records,
     /// recording and playback of the controller stream — see [`Playback`]
     pub(crate) replay: Playback,
@@ -301,8 +343,8 @@ pub(crate) struct App {
     /// The mission HUD's cone count, `[0x60CA04]` and `HMissionSummary+0x140` / `HTime+0xE4`
     /// (`nfs_game::skill::HudCones`, 0x425950)
     pub(crate) hud_cones: nfs_game::skill::HudCones,
-    /// the tick the current post-race page opened
-    pub(crate) results_page_tick: u64,
+    /// The post-race page that is up and what its billboard animation counts
+    pub(crate) pages: ResultPages,
     /// the quit confirmation (`HYesNoOverlay`, 0x426154) when it is up: 0 yes, 1 no
     pub(crate) pause_confirm: Option<u8>,
     /// The in-race dialog button under the pointer as the last draw found it — `HButtonVisual`'s
@@ -319,18 +361,6 @@ pub(crate) struct App {
     pub(crate) hover_script: Vec<(u64, Option<usize>)>,
     /// `HReplaySave` `[0x60C9B0]` and the overwrite question it raises
     pub(crate) replay_save: ReplaySave,
-    /// Index into [`App::result_pages`] of the page that is up. 0x427273 queues `HRaceSummary` and
-    /// then `HTrackRecords` (0x4272FF) for game types 0, 1, 2 and 5; 0x426DF9 queues the summary,
-    /// `HTournamentStandings` and the records for a tournament; the next opens when the one before
-    /// closes.
-    pub(crate) results_page: u8,
-    /// the post-race page the billboard animation last counted, its frames since it opened, and
-    /// the tick it opened at (`HBillBoard +0x11C`, stamped by setState(1) at 0x41ADF4)
-    pub(crate) page_seen: Option<u8>,
-    pub(crate) page_frames: u32,
-    pub(crate) page_open_tick: Option<u64>,
-    /// frames the page on top has been shrinking for (`HBillBoard` state 2)
-    pub(crate) page_closing: Option<u32>,
     /// Every racer's body-damage total at the start, `[0x60C9C8 + i·4]` — taken by the HUD's
     /// race-start arm 0x426A80(0) and judged against at the finish (`career::clean_race`).
     /// Index 0 is the player, `i + 1` opponent `i`.
@@ -566,6 +596,8 @@ pub(crate) struct App {
     /// **`HInfo`'s in-race box** `[0x60C9C0]` (0x4251D5) — the `hud.loc` text it shows, if it is up
     /// (`net_race_notice`)
     pub(crate) net_notice: Option<u32>,
+    /// PORT-DEVIATION D46: photo mode's state (`photo.rs`)
+    pub(crate) photo: photo::PhotoState,
     /// the box up is `[0x60C9FC]` (Spacebar byte 1, 0x4250BF) — the pause action's 18190 — not
     /// `[0x60C9C0]` (byte 0, 0x4251D5): Space closes it (0x42A3D0) and its hints show both keys
     pub(crate) net_notice_space: bool,
@@ -680,6 +712,8 @@ pub(crate) struct App {
     /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a command-line race, `Game.Difficutly` (`FeCatalogues::difficulty`) for a layout launch (0x4EB470), the event's in career
     pub(crate) race_skill: u8,
     pub(crate) last_frame: Instant,
+    /// winit's last `Occluded` (the window is not on screen); see `idle.rs` `window_hidden`
+    pub(crate) occluded: bool,
     /// what the window last showed, for the front end's idle redraw (`idle.rs`)
     pub(crate) presented: Option<idle::Presented>,
     /// the image of the last front-end frame rendered, kept under `NFS_FE_IDLE_VERIFY`
@@ -942,14 +976,10 @@ pub(crate) struct FrontEnd {
     /// the mode the pick was made for once one was made, and the front end's window size to give back
     /// after the race (see [`App::apply_resolution`])
     pub(crate) resolution_race: Option<((u32, u32), Option<winit::dpi::PhysicalSize<u32>>)>,
-    /// `NFS_FE_PARTS` has been applied (see `fe_car_parts_step`)
-    pub(crate) parts_forced: bool,
     /// the widget the pointer was over, for `FEControl::onMouseEnter`'s sound (0x4C7B90)
     pub(crate) last_hover: Option<usize>,
     /// the pop-up that is up or fading, and what its answer is for (§4.147)
     pub(crate) dialog: Option<(nfs_game::dialog::Dialog, DialogFor)>,
-    /// `NFS_FE_DIALOG` has been applied
-    pub(crate) dialog_forced: bool,
     /// an answer the tick took, waiting for `fe_dialog_answer`
     pub(crate) dialog_answer: Option<(bool, DialogFor)>,
     /// the input dialog's text when it was answered (0x514980 reads it back)

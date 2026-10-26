@@ -131,8 +131,6 @@ pub(crate) struct Hud {
     pub(crate) text_runs: std::cell::RefCell<[std::collections::HashMap<String, std::rc::Rc<TextRun>>; 3]>,
     /// The grid layer of the map picture (it never changes): built once, copied into each redraw.
     pub(crate) map_grid: std::cell::OnceCell<Vec<u8>>,
-    /// the picture last uploaded, kept only under `NFS_MAP_VERIFY` (see `map_update`)
-    pub(crate) map_check: std::cell::RefCell<Option<Vec<u8>>>,
     /// the picture's buffer, kept between redraws (`map_update` draws into it in place; the upload
     /// copies it into the renderer's staging bytes)
     pub(crate) map_tex: std::cell::RefCell<Option<TextureData>>,
@@ -571,11 +569,6 @@ pub(crate) fn step_slide((mut st, mut stamp): (u8, u64), clock: u64, before_star
         }
     } else if st == 0 && may_open {
         (st, stamp) = (1, clock);
-    }
-    // diagnostic: `NFS_TRAYS_IN=1` puts the trays in place at once — `--screenshot` renders too
-    // few frames to watch a slide finish
-    if st == 1 && nfs_game::config::cfg().nfs_trays_in.as_str().is_some() {
-        stamp = clock.saturating_sub(11);
     }
     if clock.saturating_sub(stamp) >= 11 {
         st = match st {

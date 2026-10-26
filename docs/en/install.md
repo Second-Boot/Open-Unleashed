@@ -54,4 +54,7 @@ each start — attach it when you report a problem. `NFS5_SAVE_DIR=<folder>` poi
 - **"original game data not found"** — the `game` folder does not hold `GameData` and `FEData`, or they are one level
   deeper. See [game data](game-data.md).
 - **The game does not start / crashes at start-up** — look at `open-unleashed.log` (above) and report it with your system
-  and GPU.
+  and GPU. A start that follows a crashed one runs once in a safe mode (a plain GPU device, on Windows Direct3D 12) and
+  the log says so; if the next start is normal again, nothing is needed. On Windows an Intel integrated GPU uses
+  Direct3D 12 by default, and the archive carries `dxcompiler.dll` and `dxil.dll` (the DirectX Shader Compiler) beside
+  the exe; `WGPU_BACKEND=vulkan` (or `dx12` / `gl`) picks the graphics API by hand.

@@ -33,9 +33,6 @@ impl App {
             // Then the cars' sets (0x43F6E0 at 0x468B6F, after 0x455260): the same draw, `d²`
             // the car's from its last drive
             let mut sprites = p.sprites();
-            if main && nfs_game::config::cfg().nfs_skid_stats.is_set() {
-                tracing::info!(drawn = sprites.len(), undrawn = p.undrawn_sprites(), "track particle sprites");
-            }
             let mut streaks = Vec::new();
             if let Some(fx) = self.car_effects.as_ref() {
                 let (sp, st) = fx.draw(|k| self.effect_car_position(k));
@@ -138,16 +135,7 @@ impl App {
         let view = nfs_game::weather::View::new(self.camera.position, fwd, self.camera.up);
         let tick = self.tick as u32;
         let (Some(w), Some(p)) = (self.weather.as_mut(), self.track_particles.as_mut()) else { return };
-        if nfs_game::config::cfg().nfs_weather_view.as_str().is_some() {
-            // `NFS_WEATHER_STEPS=<n>` (diagnostic) runs n one-tick frames instead of 40; a
-            // `NFS_WEATHER_VIEW` that is not a slice number leaves the camera where it is
-            let steps = nfs_game::config::cfg().nfs_weather_steps.as_str().and_then(|v| v.parse::<u32>().ok()).unwrap_or(40);
-            for j in 0..steps {
-                w.frame(tick.wrapping_add(j), snow, rain, view, false, p.rng_mut(), &mut self.fe_rng);
-            }
-        } else {
-            w.frame(tick, snow, rain, view, frozen, p.rng_mut(), &mut self.fe_rng);
-        }
+        w.frame(tick, snow, rain, view, frozen, p.rng_mut(), &mut self.fe_rng);
         if !w.visible() {
             return;
         }
@@ -191,7 +179,7 @@ impl App {
     /// page on screen) outside a replay (`[0x5E99F4] < 2`).
     pub(crate) fn weather_frozen(&self) -> bool {
         let replaying = self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
-        let page_up = self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some();
+        let page_up = self.results.is_some() && self.result_pages().get(self.pages.page as usize).is_some();
         (self.billboard_key != 0 || page_up) && !replaying
     }
 

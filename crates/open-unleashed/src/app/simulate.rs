@@ -7,9 +7,8 @@ impl App {
     /// **One 32 Hz sample of the controller**, the packer 0x412E70's output as the car reads it
     /// (`replay.md` §2, `Car_applyInput` 0x4991E0): the steering (negated under `MIRROR`, 0x4992D6), the
     /// throttle and brake bytes doubled, the handbrake, and the command code the packer fires on a
-    /// press (0x41312F…0x4131E9). `exchange` adds the reset key as command **5** (`C1_RESET`), which in
-    /// an input-exchange race travels in the sample like every other command — 0x40F7EB reads it back
-    /// from `car+0xD8B` for every human car — where a live race takes the key straight from the input.
+    /// press (0x41312F…0x4131E9), the reset key as command **5** (`C1_RESET`) among them: 0x40F7EB reads
+    /// it back from `car+0xD8B` for every human car, in the exchange, in a live race and in a playback.
     /// The scripted drive (`follow_road`, autotest only, not the original's) steers the car itself.
     pub(crate) fn controller_sample(
         input: &mut InputState,
@@ -18,7 +17,6 @@ impl App {
         slices: Option<&SliceTable>,
         race: Option<&RaceProgress>,
         v: &Vehicle,
-        exchange: bool,
     ) -> Controls {
         // right = +x in the body frame; rounded, so a pad's packet byte (a multiple of 2/126)
         // comes back whole
@@ -67,8 +65,11 @@ impl App {
             // `C1_SHIFTUP`, 3 `C1_SHIFTDOWN`, 4 `C1_ABORT`, 6 `C1_AIDRIVE`, 10 / 11 the turn
             // signals, 12 `C1_SIREN` (the hazards), 13 `C1_LIGHTSON`; it walks them in code
             // order and each one pressed overwrites the code (0x413178), so the highest wins.
-            // Code 5 `C1_RESET` is still taken straight from the input (the reset below) — except
-            // in an input-exchange race, where it is one of the codes.
+            // Code 5 `C1_RESET` is one of the codes in every race (PAD-END2): the packer puts the
+            // reset press into the packet like the others, `Car_applyInput` copies it to `car+0xD8B`
+            // (0x499336) and 0x40F7EB reads it back from there; the recorder (0x4143F0) and the
+            // positional block's `+0x03` (0x499216) take the whole byte. The reset request
+            // (`tick_player_reset`) reads this sample's command, not the key.
             command: [
                 (Action::ShiftUp, 2u8),
                 (Action::ShiftDown, 3),
@@ -81,7 +82,6 @@ impl App {
                 (Action::Lights, 13),
             ]
             .into_iter()
-            .filter(|(a, _)| exchange || *a != Action::Reset)
             .fold(0, |code, (a, c)| if input.take_pressed(a) { c } else { code }),
         }
     }
@@ -90,7 +90,7 @@ impl App {
     /// the host's, as its stream carried them (`net_flags`; 0x4B4B80 writes the three globals on every
     /// machine and nothing else does), otherwise this machine's own cheat bits 0, 8 and 7.
     fn launch_flags(&self) -> (bool, bool, bool) {
-        self.net_flags.unwrap_or((self.cheat_bits & CHEAT_RALLY != 0, self.cheat_bits & CHEAT_HEAVY != 0, self.cheat_bits & CHEAT_DERBY != 0))
+        self.net_launch.flags.unwrap_or((self.cheat_bits & CHEAT_RALLY != 0, self.cheat_bits & CHEAT_HEAVY != 0, self.cheat_bits & CHEAT_DERBY != 0))
     }
 
     /// **`GameTick` 0x414FF0**: one 64 Hz game tick, run under the tick counter `gGameTick`
@@ -142,7 +142,7 @@ impl App {
                     // a network race (`[0x6573E8] == 3`): 0x415110's rules — the notice, the second press leaves
                     ScriptedHudKey::Pause if self.fe.race_game_type == Some(game_type::NETWORK) => {
                         if self.net_pause_press() {
-                            self.scripted_net_leave = true;
+                            self.scripted_hud.net_leave = true;
                         }
                     }
                     ScriptedHudKey::Pause | ScriptedHudKey::PauseRestart | ScriptedHudKey::PauseQuit => {
@@ -152,9 +152,9 @@ impl App {
                             self.orbit = Orbit::default();
                             self.pause_sel = 0;
                             self.pause_confirm = None;
-                            self.scripted_pause = true;
-                            self.scripted_restart = a == ScriptedHudKey::PauseRestart;
-                            self.scripted_quit = a == ScriptedHudKey::PauseQuit;
+                            self.scripted_hud.pause = true;
+                            self.scripted_hud.restart = a == ScriptedHudKey::PauseRestart;
+                            self.scripted_hud.quit = a == ScriptedHudKey::PauseQuit;
                         }
                     }
                     ScriptedHudKey::Toggle(k) => self.hud_key(k),
@@ -205,12 +205,12 @@ impl App {
             self.race_over_check();
         }
         if self.results.is_some()
-            && let Some(page) = self.result_pages().get(self.results_page as usize).copied()
-            && let (Some(limit), Some(t0)) = (Self::page_timeout(page, self.block_game_type() == Some(game_type::NETWORK)), self.page_open_tick)
-            && self.page_seen == Some(self.results_page)
+            && let Some(page) = self.result_pages().get(self.pages.page as usize).copied()
+            && let (Some(limit), Some(t0)) = (Self::page_timeout(page, self.block_game_type() == Some(game_type::NETWORK)), self.pages.open_tick)
+            && self.pages.seen == Some(self.pages.page)
             && self.tick.saturating_sub(t0) > limit
         {
-            self.page_open_tick = None;
+            self.pages.open_tick = None;
             self.close_results_page();
         }
         if self.tick % 64 == 1
@@ -249,20 +249,6 @@ impl App {
             tracing::info!(snow, rain, snow_n = wx.snow.count(), rain_n = wx.rain.count(), "weather");
             self.weather = Some(wx);
             self.track_particles = Some(p);
-            // diagnostic: `NFS_EMITTER_VIEW=k` runs the systems 300 updates ahead so a still of
-            // emitter k (see `rebuild_scene`) shows them going
-            if nfs_game::config::cfg().nfs_emitter_view.as_str().is_some()
-                && let Some(p) = self.track_particles.as_mut()
-            {
-                for _ in 0..300 {
-                    p.draw(self.draw_distance, |_| Some((0.0, false)));
-                    p.step(self.draw_distance);
-                }
-                // (the view's draw refreshes them: 0x455260 draws only a system at `+8 == 100`)
-                p.draw(self.draw_distance, |_| Some((0.0, false)));
-                let sp = p.sprites();
-                tracing::info!(sprites = sp.len(), first = ?sp.first(), "emitter view");
-            }
         }
         if let Some(p) = self.track_particles.as_mut() {
             p.step(self.draw_distance);
@@ -298,7 +284,7 @@ impl App {
         // first block, 0 for a stale car (`SeatArm::horn`)
         let pos_seat_horns: Vec<bool> = match self.net.session.as_ref() {
             Some(n) if !pos_order.is_empty() => {
-                let local_horn = self.input.held(Action::Horn);
+                let local_horn = self.live_horn();
                 (0..self.road.opponents.len()).map(|k| n.seat_arm(k).horn(local_horn)).collect()
             }
             _ => Vec::new(),
@@ -313,11 +299,10 @@ impl App {
         let ff_replay = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
         // what the sections of the 32 Hz block read of the above (`TickCtx`)
         let ctx = TickCtx { rally_on, heavy_on, derby_on, ff_replay, view, replay_camera, net_seats, exchange_in, exch_order, n_seat_cars, pos_order, pos_seat_horns };
-        let exchange_in = &ctx.exchange_in;
         // …and what one section hands on to a later one (`TickState`)
         let mut st = TickState::default();
         // the test glue: scripted placements of the cars (it borrows the car and the world itself)
-        self.apply_tick_glue(exchange_in.as_ref());
+        self.apply_tick_glue();
         if self.tick % 2 == 0 {
             // the non-player cars' collision events of this tick, in the order they happen, for
             // their sound queues (`car+0x1110`, 0x40F740) — committed after the collision pass
@@ -522,7 +507,7 @@ impl App {
                     // colours (0x478F99)
                     let (strength, kind, a, b) = nfs_game::particles::wheel_input(i < 2, w.zone as usize, w.wet, w.slip);
                     let ground = w.world_pos - Vec3::Y * car.ride_height;
-                    skid.emit(base + i, ground, strength, kind, dir, a, b);
+                    skid.emit(base + i, &nfs_game::skidmarks::WheelMark { ground, strength, kind, dir, a, b });
                 }
             };
             feed(&mut self.skid, 0, v, self.specs.tyre_width_mm);
@@ -757,17 +742,7 @@ impl App {
                 v.shift_roll = d.shift_roll.take();
                 c
             }
-            (None, ..) => Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v, false),
-        };
-        // **TEST GLUE** (not in the original): `NFS_SKID_SCRIPT=<from_s>:<for_s>:<steer −1…1>` holds the
-        // handbrake with full throttle and that steering from `from_s` for `for_s` seconds of the
-        // race clock (`tick / 64`), so a scripted drive leaves real skid marks for stills
-        let controls = match nfs_game::config::cfg().nfs_skid_script.as_str().and_then(|v| {
-            let f: Vec<f32> = v.split(':').filter_map(|x| x.parse().ok()).collect();
-            (f.len() == 3).then(|| (f[0], f[1], f[2]))
-        }) {
-            Some((from, len, steer)) if (from..from + len).contains(&(self.tick as f32 / TICKS_PER_SEC_F32)) => Controls { throttle: 252, handbrake: true, steer: ((steer.clamp(-1.0, 1.0) * 126.0) as i32 / 2).clamp(-63, 63) * 2, ..controls },
-            _ => controls,
+            (None, ..) => Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v),
         };
         // replay.md §4: the hook sits inside the 32 Hz input step, before the car reads the
         // packet, so recording and playback are in phase with the simulation by construction
@@ -798,6 +773,7 @@ impl App {
             // `C1_BRAKE` bindings (0x51CF54…0x51CFFC) — set for keys, clear for an axis
             Some(r) => r.step(
                 controls,
+                self.input.held(Action::Horn),
                 {
                     let (steer, gas, brake) = self.input.ramps();
                     nfs_game::replay::Ramp { steer, gas, brake }
@@ -813,7 +789,7 @@ impl App {
         self.lamp_bits = lamp_command(self.lamp_bits, controls.command);
         // `car+0xD8A`, the packed pad byte the block's `+0x03` carries (0x499216 → 0x48EE20): the handbrake
         // bit, the horn bit and the command code of this even tick's sample
-        self.net_pad_buttons = nfs_game::replay::Packet::from_controls(&controls).buttons | (u8::from(self.input.held(Action::Horn)) << 1);
+        self.net_launch.pad_buttons = nfs_game::replay::Packet::from_controls(&controls).buttons | (u8::from(self.live_horn()) << 1);
         // **The other human cars' lamp bytes.** An input-exchange seat runs `Car_applyInput` on its own
         // latched sample, so its own command switches its lamps; a remote car of a positional race
         // takes the switch too, but 0x4991E0 leaves `car+0xD8B` at `[0x5E9664] >> 3` (0x499336, the
@@ -1080,11 +1056,6 @@ impl App {
                         .map(|(_, p)| *p)
                         .collect::<Vec<_>>(),
                 );
-                // diagnostic: `NFS_OFFROAD_LOG=1` prints an opponent the tick it crosses from
-                // drivable ground to none and back, which is how a car that gets past the
-                // `.edg` line is caught (the wall chain is one-sided, so "behind it" is off
-                // every patch)
-                let off_before = o.off_surface;
                 // `LoadTransfer`'s wet test, 0x4A191D…0x4A194D: `[0x606AE0]` and nothing overhead
                 o.vehicle.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(o.vehicle.position) == 0;
                 if net_seats.contains(&oi) {
@@ -1099,18 +1070,6 @@ impl App {
                     continue;
                 }
                 live[oi] = (o.vehicle.position, o.vehicle.v_long());
-                o.off_surface = w.collision.find_patch(o.vehicle.position) & 0xF == 0;
-                if o.off_surface != off_before && nfs_game::config::cfg().nfs_offroad_log.is_set() {
-                    tracing::info!(
-                        t = self.tick,
-                        opponent = oi,
-                        off = o.off_surface,
-                        pos = ?o.vehicle.position,
-                        kmh = o.vehicle.speed() * 3.6,
-                        wall = ?w.walls.nearest(o.vehicle.position, 8.0).map(|(n, d)| (n.x, n.y, d)),
-                        "offroad watch"
-                    );
-                }
                 // its walls and props run in the collision pass 0x498FF0 below (priority 0x28),
                 // after every car's step, not here (priority 0x1E). *(Until 2026-09-26 the port
                 // collided them in the step.)*
@@ -1149,19 +1108,6 @@ impl App {
         for &(oi, prev_slice) in &st.opp_grounds {
             let Some(o) = self.road.opponents.get_mut(oi) else { continue };
             o.vehicle.ground32(&w.collision, &o.specs);
-            let off_before = o.off_surface;
-            o.off_surface = w.collision.find_patch(o.vehicle.position) & 0xF == 0;
-            if o.off_surface != off_before && nfs_game::config::cfg().nfs_offroad_log.is_set() {
-                tracing::info!(
-                    t = self.tick,
-                    opponent = oi,
-                    off = o.off_surface,
-                    pos = ?o.vehicle.position,
-                    kmh = o.vehicle.speed() * 3.6,
-                    wall = ?w.walls.nearest(o.vehicle.position, 8.0).map(|(n, d)| (n.x, n.y, d)),
-                    "offroad watch"
-                );
-            }
             // the per-car progress 0x4169B0 on the slice 0x49AF70 found at the head of the AI pass
             let o_lap_done = o.progress.account(t, prev_slice, o.vehicle.forward(), self.tick, self.num_laps);
             if o_lap_done {
@@ -1359,6 +1305,7 @@ impl App {
 
     /// **The AI pass for the traffic** (see [`Self::simulate`]): `AIHigh_Traffic::update` over the lists built from the human cars, the opponents and the cops. Moved out of `simulate` unchanged; the player's pose it took goes to `st.traffic_reference`.
     fn tick_ai_traffic(&mut self, ctx: &TickCtx, st: &mut TickState) {
+        let horn_now = self.live_horn();
         let Some(v) = self.vehicle.as_mut() else { return };
         let (exchange_in, exch_order, pos_order, pos_seat_horns) = (&ctx.exchange_in, &ctx.exch_order, &ctx.pos_order, &ctx.pos_seat_horns);
         let reg_of = |s: usize| ctx.reg_of(s);
@@ -1386,7 +1333,7 @@ impl App {
                 dir,
                 // `human+0xD86`: bit 1 of the buttons byte `[0x5E9664]`, copied by 0x4991E0
                 // (`physics.md` §8) — the same button the horn sound reads
-                honking: self.input.held(Action::Horn),
+                honking: horn_now,
             };
             // **Input exchange** (`network.md` §11.18): every list the traffic reads is built from
             // the human cars in registration order (race index — the same on every machine), each
@@ -1906,7 +1853,7 @@ impl App {
         // car's entry into the list `0x628CDC[]`: with `COMMSPOSITIONAL && NOCOLLISION` no car
         // meets another (each car's walls 0x495020 and props 0x498DE0 run before the gate);
         // `NFS_NO_CARCOL` is the port's own diagnostic switch for the same skip
-        let no_carcol = self.net_nocollision || nfs_game::config::cfg().nfs_no_carcol.is_set();
+        let no_carcol = self.net_launch.nocollision || nfs_game::config::cfg().nfs_no_carcol.is_set();
         // `car+0x354`, the collision mass: `HEAVY` `[0x6573FC]` (the fetherw8 code, cheat bit 8)
         // multiplies a human car's by 12 (0x49B5FB…0x49B613, `[0x5B240C]`)
         // …and otherwise `.TINYCAR` divides any car's by 12 (0x49B615…0x49B62F, `[0x5B49B0]`) —
@@ -2579,6 +2526,7 @@ impl App {
 
     /// **The player's post-impact pass** (see [`Self::simulate`]): the crash countdown, the reset request (the key, the exchange's command 5, the scripted bot's stand-in) and the reset onto the slice. Moved out of `simulate` unchanged; the request goes to `st.asked` for the remote cars of a positional race.
     fn tick_player_reset(&mut self, ctx: &TickCtx, st: &mut TickState) {
+        let playback = self.playback_running();
         let Some(v) = self.vehicle.as_mut() else { return };
         let Some(w) = self.world.as_ref() else { return };
         let exchange_in = &ctx.exchange_in;
@@ -2587,17 +2535,6 @@ impl App {
         // (`Vehicle::reset_countdown_tick`), which runs eight times faster off the road
         // surface — `car+0x464 == 0`, the body tracker's word (0x49AFA1…0x49AFDB), which
         // `find_patch` answers. The placement is 0x40F540's: `Car_placeAtSlice` 0x49B090.
-        // diagnostic: `NFS_ESCAPE_LOG=x0,x1` prints the player's state while its x is in that
-        // band, for chasing a car that gets past the wall line
-        if let Some(band) = nfs_game::config::cfg().nfs_escape_log.as_str() {
-            let mut it = band.split(',').filter_map(|v| v.parse::<f32>().ok());
-            if let (Some(a), Some(b)) = (it.next(), it.next())
-                && v.position.x >= a.min(b)
-                && v.position.x <= a.max(b)
-            {
-                tracing::info!(t = self.tick, pos = ?v.position, kmh = v.speed() * 3.6, patch = w.collision.find_patch(v.position) & 0xF, wall = ?w.walls.nearest(v.position, 20.0).map(|(n, d)| (n.x, n.y, d)), "escape watch");
-            }
-        }
         let off_surface = w.collision.find_patch(v.position) & 0xF == 0;
         let crashed = v.reset_countdown_tick(off_surface);
         // headless runs stand in for a human pressing reset: a scripted bot that is stuck below
@@ -2621,9 +2558,16 @@ impl App {
         // in an input-exchange race the request is the latched sample's command 5 (`car+0xD8B`, 0x40F7EB)
         // — every machine's copy of the car reads the same one — and the scripted bot's own reset
         // (a stand-in for a key) is off, since it would reset this machine's copy alone
+        // **The request is the latched sample's command 5** (`car+0xD8B` = `[0x5E9664] >> 3`,
+        // 0x499336, read at 0x40F7EB) in every race (PAD-END2): the packer puts the reset press into
+        // the packet (`controller_sample`), the recorder stores it (0x4143F0), and a playback
+        // (`Replay_playbackInput` 0x4144B0 overwrites the packet) gets the stream's — so the key
+        // pressed during a playback is read by the sample and dropped by the replay's step (PAD-END),
+        // and a reset in a stream is replayed. The bot's stand-in for a key is not in the packet (the
+        // original's AI sets `car+0xD8B` itself) and is off in a playback.
         let asked = match exchange_in.as_ref() {
             Some(x) => x.local.command == nfs_net::exchange::CMD_RESET,
-            None => self.input.take_pressed(Action::Reset) || bot_stuck,
+            None => st.controls.command == nfs_net::exchange::CMD_RESET || (bot_stuck && !playback),
         };
         let requested = v.reset_request(asked, self.tick);
         let exempt = self.skill.is_some() && self.track.name.eq_ignore_ascii_case("skidpad");
@@ -2677,31 +2621,6 @@ impl App {
                     (Controller::Ai(ai), None) => ai.wants_reset(),
                     _ => false,
                 };
-                // diagnostic: `NFS_SLOW_LOG=1` prints every opponent that is barely moving,
-                // which is how a car that cannot get going is told from one that is merely slow
-                if self.tick % 32 == 0
-                    && o.vehicle.speed() < 3.0
-                    && nfs_game::config::cfg().nfs_slow_log.is_set()
-                {
-                    let surf: Vec<u32> = o.vehicle.wheels.iter().map(|wh| w.collision.find_patch(wh.world_pos) & 0xF).collect();
-                    tracing::info!(
-                        opponent = oi,
-                        t = self.tick / 64,
-                        kmh = o.vehicle.speed() * 3.6,
-                        rpm = o.vehicle.rpm,
-                        gear = o.vehicle.gear,
-                        engine = o.vehicle.engine_alive,
-                        thr = o.vehicle.throttle,
-                        arm = o.vehicle.engine_arm as u8,
-                        alive_ticks = o.vehicle.ticks_alive,
-                        brk = o.vehicle.brake,
-                        contact = o.vehicle.wheels.iter().filter(|wh| wh.contact).count(),
-                        surf = ?surf,
-                        slip = ?o.vehicle.wheels.iter().map(|wh| wh.slip as i32).collect::<Vec<_>>(),
-                        pos = ?o.vehicle.position,
-                        "slow opponent"
-                    );
-                }
                 // 0x40F740's crash countdown runs for the AI cars too, with the same
                 // off-surface rule (`car+0x464 == 0`)
                 let off_surface = w.collision.find_patch(o.vehicle.position) & 0xF == 0;
@@ -2918,7 +2837,7 @@ impl App {
     /// **`DERBY`'s knockout** (see [`Self::simulate`]): for each racer still racing, in registration order, the damage-zone outcome (out / last one standing) and the room's race-time message. Moved out of `simulate` unchanged.
     fn tick_derby_outcomes(&mut self, ctx: &TickCtx) {
         let Some(v) = self.vehicle.as_mut() else { return };
-        let (exchange_in, exch_order) = (&ctx.exchange_in, &ctx.exch_order);
+        let exch_order = &ctx.exch_order;
         // **`DERBY`'s knockout** (`Race_updateProgress` 0x416310's game-type-3 arm, 0x416407…0x41646A —
         // `nfs_game::race::derby_outcome`): for each racer still racing, in registration order (the racer
         // array `0x5E8C00[]`), state 3 when all eight ring zones are past 30, else state 2 when every
@@ -2931,7 +2850,7 @@ impl App {
         // this machine's own contacts with it did (its `0xBE` state carries no damage — 0x4A0DF0's block
         // has no zone), so each machine finds *its own* car out and the rest by the "last one wins" count
         // — `network.md` §11.20. The order is by race index (`0x5E8C00[]`, the same on every machine).
-        let derby_order: Vec<HumanCar> = if !self.net_derby {
+        let derby_order: Vec<HumanCar> = if !self.net_launch.derby {
             Vec::new()
         } else if !exch_order.is_empty() {
             exch_order.clone()
@@ -2946,24 +2865,6 @@ impl App {
         if !derby_order.is_empty() {
             let tick = self.tick;
             let racers = derby_order.len();
-            // **Test glue** (`NFS_DERBY_SMASH=<race index>:<tick>`, set on every machine): that car's ten
-            // damage zones are set to 31 at that tick — a smash-up the two-instance runs would not
-            // otherwise reach in a few seconds
-            if let Some((idx, at)) = nfs_game::config::cfg().nfs_derby_smash.as_str()
-                .and_then(|v| v.split_once(':').and_then(|(i, t)| Some((i.parse::<u32>().ok()?, t.parse::<u64>().ok()?))))
-                && tick == at
-            {
-                // (in a positional race the car's own machine alone has its zones)
-                let local_index = exchange_in.as_ref().map(|x| x.local_index).or_else(|| self.net.session.as_ref().and_then(|n| n.local_race_index()));
-                if Some(idx) == local_index {
-                    v.damage = [31.0; 10];
-                } else if let Some(x) = exchange_in.as_ref()
-                    && let Some(e) = x.seats.iter().find(|e| e.1 == idx)
-                    && let Some(o) = self.road.opponents.get_mut(e.0)
-                {
-                    o.vehicle.damage = [31.0; 10];
-                }
-            }
             let mut out = derby_order
                 .iter()
                 .filter(|h| match **h {
@@ -3407,7 +3308,7 @@ impl App {
                             let horn = if n.exchanging() {
                                 n.seat_race_index(i).is_some_and(|r| n.latched(r as usize)[0] & 2 != 0)
                             } else {
-                                n.owned_seats().contains(&i) && n.seat_arm(i).horn(self.net_pad_buttons & 2 != 0)
+                                n.owned_seats().contains(&i) && n.seat_arm(i).horn(self.net_launch.pad_buttons & 2 != 0)
                             };
                             if horn && self.tick % 32 == 1 {
                                 tracing::debug!(target: "netplay", seat = i, slot, tick = self.tick, distance = d, "a remote human's horn is voiced (0x4A7080's human arm)");

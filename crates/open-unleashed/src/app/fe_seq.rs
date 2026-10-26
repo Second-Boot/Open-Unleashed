@@ -185,14 +185,7 @@ impl App {
 
     /// `NFS_FE_SEQ`: run the scripted sequence and write its frames. `true` when it ran.
     pub(crate) fn fe_sequence(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        self.fe_sequence_in("NFS_FE_SEQ", event_loop)
-    }
-
-    /// [`Self::fe_sequence`] with the output directory read from `var`: `NFS_NET_LEAVE_SEQ` (**TEST
-    /// GLUE**) runs the same script in the front end a scripted network race has just left, so the
-    /// lobby after the return can be watched and drawn while the room's session lives on.
-    pub(crate) fn fe_sequence_in(&mut self, var: &str, event_loop: &ActiveEventLoop) -> bool {
-        let Ok(dir) = std::env::var(var) else { return false };
+        let Ok(dir) = std::env::var("NFS_FE_SEQ") else { return false };
         let frames: usize = nfs_game::config::cfg().nfs_fe_seq_frames.as_str().and_then(|v| v.parse().ok()).unwrap_or(60);
         let script = nfs_game::config::cfg().nfs_fe_seq_script.as_str().unwrap_or_default();
         let events: Vec<(usize, String)> = script

@@ -51,12 +51,21 @@ impl App {
     /// the sleep is part of that frame's time.
     // PORT-DEVIATION D4 (RE/notes/PORT-DEVIATIONS.md): NFS_FPS_CAP, opt-in and off by default; the original has no frame cap.
     pub(crate) fn pace_frame(&self) {
-        let Some(cap) = nfs_game::config::cfg().nfs_fps_cap.as_str().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0) else { return };
-        let want = Duration::from_secs_f64(1.0 / cap);
+        let user = nfs_game::config::cfg().nfs_fps_cap.as_str().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0);
+        // PORT-DEVIATION D45 (RE/notes/PORT-DEVIATIONS.md): a race whose window is hidden presents at most 30 fps
+        let hidden = self.vehicle.is_some() && self.window_hidden();
+        let Some(want) = frame_floor(user, hidden) else { return };
         let spent = self.last_frame.elapsed();
         if spent < want {
             std::thread::sleep(want - spent);
         }
+    }
+
+    /// Whether the window is not on screen: winit's `Occluded(true)` (covered by other windows
+    /// entirely, another Space, a hidden app) or minimised. A window that is only unfocused, or
+    /// partly covered, is visible and not counted.
+    pub(crate) fn window_hidden(&self) -> bool {
+        self.occluded || self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true))
     }
 
     /// **The front end's idle redraw.** `true` when this frame would put exactly the pixels on the
@@ -140,5 +149,38 @@ impl App {
         if spent < want {
             std::thread::sleep(want - spent);
         }
+    }
+}
+
+/// The frame rate a race presents at most while its window is hidden.
+// PORT-DEVIATION D45 (RE/notes/PORT-DEVIATIONS.md): host-side timing only; the 64 Hz tick loop is not touched.
+pub(crate) const HIDDEN_FPS: f64 = 30.0;
+
+/// The shortest frame time the host holds the redraw loop to: the slower of `NFS_FPS_CAP` (D4) and,
+/// while the window is hidden, [`HIDDEN_FPS`]; `None` = no cap. (On the enhanced branch the
+/// frame-limit enhancement's value joins here as one more `min` of the rates.)
+pub(crate) fn frame_floor(user_cap: Option<f64>, hidden: bool) -> Option<Duration> {
+    let rate = match (user_cap, hidden) {
+        (Some(c), true) => Some(c.min(HIDDEN_FPS)),
+        (Some(c), false) => Some(c),
+        (None, true) => Some(HIDDEN_FPS),
+        (None, false) => None,
+    };
+    rate.map(|r| Duration::from_secs_f64(1.0 / r))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_cap_is_30_fps_and_lifts_when_visible() {
+        assert_eq!(frame_floor(None, false), None);
+        let h = frame_floor(None, true).unwrap();
+        assert!((h.as_secs_f64() - 1.0 / 30.0).abs() < 1e-9);
+        // the slower of the two caps wins
+        assert_eq!(frame_floor(Some(60.0), true), frame_floor(None, true));
+        assert_eq!(frame_floor(Some(20.0), true), Some(Duration::from_secs_f64(1.0 / 20.0)));
+        assert_eq!(frame_floor(Some(60.0), false), Some(Duration::from_secs_f64(1.0 / 60.0)));
     }
 }

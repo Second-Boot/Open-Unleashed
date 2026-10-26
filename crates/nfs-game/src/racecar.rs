@@ -27,8 +27,6 @@ pub struct RaceCar {
     pub resets: u32,
     /// Knocked out (lap knockout / series): parked, ranked below the runners.
     pub eliminated: bool,
-    /// diagnostic only: was the car off every drivable patch last tick (`NFS_OFFROAD_LOG`)
-    pub off_surface: bool,
     /// `car+0xD87`, the lamp byte: bit 0 | 1 the headlights, 2 the high beams, 3 (8) / 4 (0x10) the
     /// indicators. `Car_init` 0x410C74 starts it as the night flag; only the commands of a human car's
     /// controller sample change it (`lamp_command`, 0x49933E's switch in 0x4991E0) — the racers'

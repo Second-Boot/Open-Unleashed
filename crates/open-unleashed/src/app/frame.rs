@@ -18,6 +18,8 @@ impl App {
             r.enable_render_thread();
         }
         self.sync_save_side_state();
+        // PORT-DEVIATION D46: the photo mode's free camera's move of this frame
+        self.photo_step();
         // the front end's screens slide and fade in over half a second (`RE/notes/controls.md` §6)
         // whole milliseconds, the fraction carried to the next frame so the clock's rate does not
         // depend on the display's frame rate (the original reads a free-running timer, 0x53C2E0)
@@ -49,6 +51,8 @@ impl App {
         {
             tracing::error!(error = %e, "render failed");
         }
+        // PORT-DEVIATION D46: a photo-mode still asked for this frame, taken from the scene just drawn
+        self.photo_after_frame();
         self.mirror_sky_update();
         self.mirror_weather_step();
         self.frames += 1;

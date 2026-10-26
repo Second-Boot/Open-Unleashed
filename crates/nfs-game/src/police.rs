@@ -137,6 +137,19 @@ pub fn perp_update(current: Violation, finished: bool, check: impl FnOnce(Violat
     }
 }
 
+/// What `0x405440` reads of the perp's situation besides its slice and speed: the tick (for the cooldowns), whether
+/// the perp is clean, the skill, the humans' slices, the cops that claimed it (`seen`) and `cop_near`
+/// ([`CopManager::find_spawn`]).
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnQuery<'a> {
+    pub tick: i64,
+    pub clean: bool,
+    pub skill: u8,
+    pub humans: &'a [usize],
+    pub seen: usize,
+    pub cop_near: bool,
+}
+
 /// The `.cop` records plus the state `CopManager` keeps about them.
 #[derive(Debug, Clone)]
 pub struct CopManager {
@@ -249,18 +262,17 @@ impl CopManager {
     ///
     /// This is the query for the human (perp 0) with a fixed roll; the real pass over every perp is
     /// [`CopManager::find_spawn_for`] through [`Police::tick`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn find_spawn(&mut self, table: &SliceTable, perp_slice: usize, perp_speed: f32, tick: i64, roll01: f32, clean: bool, skill: u8, humans: &[usize], seen: usize, cop_near: bool) -> Option<usize> {
+    pub fn find_spawn(&mut self, table: &SliceTable, perp_slice: usize, perp_speed: f32, roll01: f32, q: &SpawnQuery) -> Option<usize> {
         let r16 = (roll01 * 65536.0).clamp(0.0, 65535.0) as u32;
-        self.find_spawn_for(table, 0, perp_slice, perp_speed, tick, &mut || r16, clean, skill, humans, seen, cop_near)
+        self.find_spawn_for(table, 0, perp_slice, perp_speed, &mut || r16, q)
     }
 
     /// `0x405440`'s body for one perp (index `perp` into the racers, whose own cursor `+0x88` it
     /// moves). `rand16` is the shared LCG (`rng::rand16`), stepped once for **every** usable record
     /// the sweep finds, before the human veto (0x4055BA…0x4055DC, then 0x4055EE), and compared as
     /// `(r · 100) >> 16 < (int)(p · 100)` (0x4055A8…0x405604).
-    #[allow(clippy::too_many_arguments)]
-    pub fn find_spawn_for(&mut self, table: &SliceTable, perp: usize, perp_slice: usize, perp_speed: f32, tick: i64, rand16: &mut dyn FnMut() -> u32, clean: bool, skill: u8, humans: &[usize], seen: usize, cop_near: bool) -> Option<usize> {
+    pub fn find_spawn_for(&mut self, table: &SliceTable, perp: usize, perp_slice: usize, perp_speed: f32, rand16: &mut dyn FnMut() -> u32, q: &SpawnQuery) -> Option<usize> {
+        let SpawnQuery { tick, clean, skill, humans, seen, cop_near } = *q;
         if self.file.records.is_empty() {
             return None;
         }
@@ -1179,7 +1191,7 @@ pub struct Police {
     pub linear: bool,
     /// What the race-init placement ([`Self::place_at_race_init`]) needs and the grid stage knows: the
     /// start slice, the racers `[0x5E8AE8]`, the grid rule and each cop slot's `.STARTINGPOS`
-    pub grid_init: Option<(usize, u32, crate::race::GridRule, Vec<i32>)>,
+    pub grid_init: Option<crate::race::GridInit>,
 }
 
 impl Police {
@@ -1193,7 +1205,7 @@ impl Police {
     /// `.STARTINGPOS` 1 / 2, `addSlices(43, 1)` = slice 44, 8 `Roughness` draws each). The pose is thrown
     /// away by the first AI pass (the purgatory park); only the draws and the wheels' state survive.
     pub fn place_at_race_init(&mut self, table: &SliceTable, grid: &TriangleGrid, tick: u64) {
-        let Some((start, n, rule, startingpos)) = self.grid_init.clone() else { return };
+        let Some(crate::race::GridInit { start, n, rule, startingpos }) = self.grid_init.clone() else { return };
         let linear = self.linear;
         for i in 0..self.cars.len() {
             let g = startingpos.get(i).copied().unwrap_or(0);
@@ -1351,7 +1363,7 @@ impl Police {
             let seen = self.claims(p);
             // `0x403120(perp.slice, 500.0)`: a cop out of purgatory inside 500 m of the perp
             let cop_near = self.cars.iter().any(|c| c.active && track_distance(table, c.slice, r.slice).abs() < CLEAN_PERP_CLEARANCE);
-            if let Some(rec) = self.manager.find_spawn_for(table, p, r.slice, r.speed, tick as i64, rand16, clean, self.skill, humans, seen, cop_near) {
+            if let Some(rec) = self.manager.find_spawn_for(table, p, r.slice, r.speed, rand16, &SpawnQuery { tick: tick as i64, clean, skill: self.skill, humans, seen, cop_near }) {
                 tracing::debug!(tick, perp = p, perp_slice = r.slice, clean, seen, record = rec, "police spawn point");
                 return Some(rec);
             }

@@ -34,7 +34,6 @@ struct Call {
     blk_after: Vec<u32>,
     /// the car's own state `Susp_update` reads (`x…` sections of the second trace format); empty in the first
     extra: std::collections::HashMap<&'static str, Vec<u32>>,
-    post_m0: u32,
     /// the word `car+8`: the tracker's road slice
     slice: usize,
     /// the car as `SB` found it (0x4A0D6B: after the blend, before the re-seat), by section; empty when the trace has no `SB` lines
@@ -85,13 +84,12 @@ fn load() -> Option<(Vec<Call>, Vec<(i32, Vec<u32>, Vec<u32>)>)> {
                 let (tick, pre, blk, extra) = open.take().unwrap();
                 let slice = (extra["trk"][0] & 0xFFFF) as usize;
                 let body = l.split("pos/vel ").nth(1).unwrap();
-                let post_m0 = sect(l, "m").unwrap()[0];
                 let mut post = words(body.split('|').next().unwrap());
                 post.extend(sect(l, "M").unwrap());
                 post.extend(sect(l, "w").unwrap());
                 if blk[1] != 0 {
                     let blk_after = sect(l, "blk").unwrap();
-                    calls.push(Call { tick, pre, post, blk, blk_after, extra, post_m0, slice, sb: sb.clone(), snapped });
+                    calls.push(Call { tick, pre, post, blk, blk_after, extra, slice, sb: sb.clone(), snapped });
                 }
             }
             Some("SI") => {
@@ -149,13 +147,10 @@ fn env() -> Option<Env> {
     specs.apply_setup(&nfs_game::career::CAR_SETUP_DEFAULT, true);
     // the installed-part list `car+0x768` (`SuspDamage` 0x493BC0's wobble of the front wheels reads it)
     specs.parts = nfs_physics::specs::stock_parts(&entry.stock_parts, &tables.parts);
-    if let Some(po) = std::env::var("NFS_DEADRECK_PROBE").ok().and_then(|v| v.parse::<f32>().ok()) {
-        specs.probe_offset = po;
-    }
     eprintln!("car {} {} probe_offset {} mass {}", entry.sim, entry.model, specs.probe_offset, specs.mass);
     let assets = nfs_assets::car::CarAssets::load(&paths, &entry.model).unwrap();
     let (body_pts, body_half) = nfs_game::world::car_body(&assets, false);
-    let wheel_radius: f32 = std::env::var("NFS_DEADRECK_WHEEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
+    let wheel_radius: f32 = 0.3;
     let table = nfs_game::race::SliceTable::from_crp(&t.crp, &t.crp_data).unwrap();
     Some(Env { grid, specs, body_pts, body_half, wheel_radius, table })
 }
@@ -259,15 +254,12 @@ fn the_apply_leaves_the_car_where_the_original_left_it() {
     if let Some(sb) = calls.iter().find(|c| c.sb.contains_key("qspecs")).map(|c| &c.sb) {
         override_specs(&mut specs, sb);
     }
-    let skip: usize = std::env::var("NFS_DEADRECK_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let max_calls: usize = std::env::var("NFS_DEADRECK_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
 
     let m = |w: &[u32]| [[fl(w[0]), fl(w[1]), fl(w[2])], [fl(w[3]), fl(w[4]), fl(w[5])], [fl(w[6]), fl(w[7]), fl(w[8])]];
     // the wheels' own trackers live from call to call, as the original's do; the stored world points `car+0x1DC…` are the previous call's
     // post-state (0x4A0DB3 / 0x49B9FC: 0x49AE30 at the end of the tick)
     let wheel_trackers = std::cell::RefCell::new([nfs_physics::collision::PatchTracker::default(); 4]);
     let prev_post: std::cell::RefCell<Option<(i32, Vec3, Mat3)>> = std::cell::RefCell::new(None);
-    let no_points = std::env::var_os("NFS_DEADRECK_NO_STORED_POINTS").is_some();
     // one call: the port's apply on the original's pre-state with block `blk`; the five distances to the original's post-state
     let run = |c: &Call, blk_words: &[u32]| -> [f32; 5] {
         let mut v = Vehicle::new(Vec3::new(fl(c.pre[0]), fl(c.pre[1]), fl(c.pre[2])), Mat3::IDENTITY, &specs, 0.7, wheel_radius);
@@ -288,7 +280,6 @@ fn the_apply_leaves_the_car_where_the_original_left_it() {
         }
         if let Some((t, p, r)) = *prev_post.borrow()
             && t + 1 == c.tick
-            && !no_points
         {
             v.net_points = Some((p, r));
         }
@@ -298,8 +289,7 @@ fn the_apply_leaves_the_car_where_the_original_left_it() {
             v.net_points = Some((v.position - v.velocity * (1.0 / 64.0), v.orientation));
         }
         // with `SB` the original's own stored points (the even tick's `Car_ground` refreshes them: its `Susp_update` calls 0x49AE30 itself)
-        if !no_points
-            && !c.snapped
+        if !c.snapped
             && let Some(q) = c.sb.get("qpts")
             && let Some(np) = stored_points(q, &v.body_points, v.net_points.map_or(v.orientation, |n| n.1))
         {
@@ -353,27 +343,6 @@ fn the_apply_leaves_the_car_where_the_original_left_it() {
                 }
             }
         }
-        if std::env::var_os("NFS_DEADRECK_BLEND").is_some() && !c.sb.is_empty() {
-            // the blend alone (the airborne block skips the re-seat): against the position `SB` found after it
-            let mut v2 = v.clone();
-            v2.net_dead_reckon(&NetBlock { airborne: true, ..blk }, c.tick, &grid, &specs, centre);
-            let d = (v2.position - Vec3::new(fl(c.sb["q330"][0]), fl(c.sb["q330"][1]), fl(c.sb["q330"][2]))).abs().max_element();
-            eprintln!("BLEND {} {:e}", c.tick, d);
-            if c.snapped {
-                // the snap tail's own `Susp_update` (on the stored points of before the snap) left these in the wheels' blocks, which `SB` shows
-                for i in 0..4 {
-                    let b = &c.sb["qwh"][49 * i..49 * (i + 1)];
-                    let w = &v2.wheels[i];
-                    eprintln!(
-                        "SNAPWHEEL {} {i}: port probe ({}, {}) contact y {} susp_y {} zone {:x} | orig probe ({}, {}) contact y {} susp_y {} zone {:x}",
-                        c.tick, w.world_pos.x, w.world_pos.z, w.world_pos.y - v2.ride_height, w.susp_y, w.zone, fl(b[13]), fl(b[15]), fl(b[17]), fl(b[23]), b[35]
-                    );
-                }
-            }
-            if d > 0.5 {
-                eprintln!("BLENDDETAIL {} port {:?} SB {:?}", c.tick, v2.position, Vec3::new(fl(c.sb["q330"][0]), fl(c.sb["q330"][1]), fl(c.sb["q330"][2])));
-            }
-        }
         v.net_dead_reckon(&blk, c.tick, &grid, &specs, centre);
         *wheel_trackers.borrow_mut() = std::array::from_fn(|i| v.wheels[i].tracker);
         let want_pos = Vec3::new(fl(c.post[0]), fl(c.post[1]), fl(c.post[2]));
@@ -386,17 +355,11 @@ fn the_apply_leaves_the_car_where_the_original_left_it() {
         let got_m = [v.orientation.row(0).to_array(), v.orientation.row(1).to_array(), v.orientation.row(2).to_array()];
         let dm = (0..3).flat_map(|i| (0..3).map(move |j| (i, j))).map(|(i, j)| (got_m[i][j] - want_m[i][j]).abs()).fold(0.0, f32::max);
         let dw = (v.angular_velocity - want_w).abs().max_element();
-        if std::env::var_os("NFS_DEADRECK_GH").is_some() {
-            eprintln!("GH {} port ground_h {} orig {} port y {} orig y {}", c.tick, v.ground_h, fl(c.post_m0), v.position.y, want_pos.y);
-        }
-        if std::env::var_os("NFS_DEADRECK_POST").is_some() {
-            eprintln!("POST {} {:e} {:e} {:e}", c.tick, v.position.x, v.position.y, v.position.z);
-        }
         [dp, dy, dv, dm, dw]
     };
     let mut rows: Vec<[f32; 5]> = Vec::new();
     let mut raced = 0;
-    for c in calls.iter().skip(skip).take(max_calls) {
+    for c in calls.iter() {
         let mut best = run(c, &c.blk);
         if c.blk_after != c.blk {
             // a store raced the print: the apply read one of the two blocks
@@ -766,7 +729,6 @@ fn the_reseat_leaves_the_car_the_original_left() {
     if let Some(c) = calls.iter().find(|c| c.pre.contains_key("qspecs")) {
         override_specs(&mut specs, &c.pre);
     }
-    let max_calls: usize = std::env::var("NFS_DEADRECK_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     {
         // the body points the original holds (`car+0x8C…`, after 0x49ABC0 dealt the lowest four into the wheel slots) against the harness car's
         let q = &calls[0].pre["qbody"];
@@ -792,8 +754,7 @@ fn the_reseat_leaves_the_car_the_original_left() {
     // [ground h, normal, bodyheight, xz after, y after (before the re-seat's y -= bh), spin, probe xz, contact y, zone word]
     let mut rows: Vec<[f32; 14]> = Vec::new();
     let mut zone_bad = 0;
-    let (mut printed, want_print) = (0, std::env::var("NFS_DEADRECK_PRINT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0));
-    for c in calls.iter().take(max_calls) {
+    for c in calls.iter() {
         let pre = &c.pre;
         let mut v = Vehicle::new(v3(&pre["q330"]), Mat3::IDENTITY, &specs, 0.7, wheel_radius);
         v.set_car_body(body_pts.clone(), body_half);
@@ -838,7 +799,6 @@ fn the_reseat_leaves_the_car_the_original_left() {
         }
         // the shared random stream the roughness draws from, as the original's word stood
         nfs_physics::lcg::STATE.store(pre["qrng"][0], std::sync::atomic::Ordering::Relaxed);
-        let pre_pos = v.position;
         let bh = v.net_reseat(&grid, &specs);
         trackers = std::array::from_fn(|i| v.wheels[i].tracker);
         // the original's own state after Susp_update: its position then still had `+0x424` to lose, its spin `car+0x388`
@@ -877,18 +837,6 @@ fn the_reseat_leaves_the_car_the_original_left() {
             (v.roll_lp - fl(post["qdc4"][1])).abs(),
             (v.dive - fl(post["qdc4"][0])).abs(),
         ];
-        if printed < want_print && (row[7] > 1e-3 || row[3] > 1e-3) {
-            printed += 1;
-            eprintln!("RESEAT {} row {row:?} pre y {} port y_pre {y_pre} want {} ground_h port {} orig {} bh port {bh} orig {want_bh}", c.tick, pre_pos.y, want_pos.y, v.ground_h, c.ground_h);
-            for i in 0..4 {
-                let b = &post["qwh"][49 * i..49 * (i + 1)];
-                let a = &pre["qwh"][49 * i..49 * (i + 1)];
-                eprintln!(
-                    "   wheel {i}: port probe {:?} contact y {} zone {:x} | orig probe ({}, {}) contact y {} zone {:x} (pre zone {:x}, pre comp {})",
-                    v.wheels[i].world_pos, v.wheels[i].world_pos.y - v.ride_height, v.wheels[i].zone, fl(b[13]), fl(b[15]), fl(b[17]), b[35], a[35], fl(a[26])
-                );
-            }
-        }
         if std::env::var_os("NFS_DEADRECK_CSV").is_some() {
             eprintln!("RS {} {:?}", c.tick, row);
         }

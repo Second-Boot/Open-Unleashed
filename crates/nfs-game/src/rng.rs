@@ -23,11 +23,18 @@ use nfs_physics::lcg::STATE;
 
 /// `Rand_seed(seed)` — `seed mod 500` warm-up steps from 0x3ADE68B1.
 pub fn seed(seed: u32) {
+    STATE.store(seeded_state(seed), Relaxed);
+}
+
+/// The state word [`seed`] leaves: `seed mod 500` warm-up steps from 0x3ADE68B1.
+pub const fn seeded_state(seed: u32) -> u32 {
     let mut s = 0x3ADE_68B1u32;
-    for _ in 0..(seed % 500) {
+    let mut i = 0;
+    while i < seed % 500 {
         s = s.wrapping_mul(MUL) & 0xFFFF;
+        i += 1;
     }
-    STATE.store(s, Relaxed);
+    s
 }
 
 /// The stream's current state (the LCG word) — **test glue**: a dump's view of where the shared
@@ -96,18 +103,22 @@ mod tests {
 
     #[test]
     fn the_stream_is_the_originals_and_is_shared() {
-        seed(0);
-        let a: Vec<u32> = (0..4).map(|_| rand16()).collect();
+        // the stream's arithmetic on a local word: the shared one is drawn by the tests running
+        // beside this one, so a sequence read from it is not this test's
+        let draw = |s: &mut u32| {
+            let prod = s.wrapping_mul(MUL);
+            *s = prod & 0xFFFF;
+            (prod >> 8) & 0xFFFF
+        };
+        let mut s = seeded_state(0);
         // the first draws from the shipped initial state
-        assert_eq!(a[0], 65363);
-        assert_eq!(a[1], 12122);
-        // seeding again rewinds it
+        assert_eq!(draw(&mut s), 65363);
+        assert_eq!(draw(&mut s), 12122);
+        // a warm-up moves it on
+        let mut s = seeded_state(3);
+        assert_ne!(draw(&mut s), 65363);
+        // seeding sets the shared word to the same state, and rand01 stays inside [0, 1)
         seed(0);
-        assert_eq!(rand16(), 65363);
-        // and a warm-up moves it on
-        seed(3);
-        assert_ne!(rand16(), 65363);
-        // rand01 stays inside [0, 1)
         for _ in 0..100 {
             let r = rand01();
             assert!((0.0..1.0).contains(&r), "{r}");

@@ -23,11 +23,7 @@ impl NetPlay {
                 let sock = CommSocket::bind(port)?;
                 // 0x48DD97…0x48DDF8: the session's name is `<Comms.GameName>~<version>`
                 let name = nfs_net::comm::desc::name_field(game_name, &game_version());
-                // **TEST GLUE** (not in the original): `NFS_NET_LIMIT=n` sets the player limit
-                // (`session+0x84`, 8 in the game: 0x509B49), so a "game full" refusal (`-2`, 0x588F3D)
-                // can be reached with two instances instead of eight
-                let limit = nfs_game::config::cfg().nfs_net_limit.as_str().and_then(|v| v.parse().ok()).unwrap_or(nfs_net::session::DEFAULT_LIMIT);
-                let mut n = with_probe(Net::host(sock, name, key(), limit));
+                let mut n = with_probe(Net::host(sock, name, key(), nfs_net::session::DEFAULT_LIMIT));
                 n.advertise = advertised_record();
                 n.my_name = name16(who);
                 // 0x588EBF…0x588ED3 → 0x48A700: the version (the game-name test 0x49151E… is the

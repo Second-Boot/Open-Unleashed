@@ -216,6 +216,17 @@ impl Default for SkidMarks {
     }
 }
 
+/// One wheel's input to the emitter 0x478F30 ([`SkidMarks::emit`]).
+#[derive(Debug, Clone, Copy)]
+pub struct WheelMark {
+    pub ground: Vec3,
+    pub strength: f32,
+    pub kind: usize,
+    pub dir: Vec3,
+    pub a: f32,
+    pub b: f32,
+}
+
 /// The half width 0x478EA0 gives a wheel's emitter from the `.sim` tyre width in mm
 /// (`carSpecs+0x84`): `× [0x5B4744] 0.0005`, then `× [0x5B246C] 1.5` with the effects byte
 /// `[0x6197E7]` set, else `× [0x5B25E8] 0.9`.
@@ -293,20 +304,22 @@ impl SkidMarks {
     /// [`Self::cells`] through the track walk's gates (0x47F890 for an item of
     /// `WLineBundle`): `visit(cx, cz, r, registered nodes)` answers the value the walk hands the
     /// drawer's queue, or `None` for a cell the walk drops (`crate::world::CellWalk::visit`); the
-    /// cells the walk keeps come in table order with their strips.
-    pub fn cells_walked(&self, visit: impl Fn(f32, f32, f32, f32, &[crate::world::RegisteredNode]) -> Option<u32>) -> Vec<(u32, Vec<&Strip>)> {
+    /// cells the walk keeps come in table order, one `(value, strip)` entry per visible strip in the
+    /// cell's array order (flat: the draw lays them one after the other).
+    pub fn cells_walked(&self, visit: impl Fn(f32, f32, f32, f32, &[crate::world::RegisteredNode]) -> Option<u32>) -> Vec<(u32, &Strip)> {
         let mut ids: Vec<u32> = self.rings.keys().copied().collect();
         ids.sort_unstable();
-        ids.into_iter()
-            .filter_map(|id| {
-                let strips: Vec<&Strip> = self.rings[&id].strips.iter().filter(|s| s.visible()).collect();
-                if strips.is_empty() {
-                    return None;
-                }
-                let c = self.grid.cells.get(id as usize)?;
-                Some((visit(c.cx, c.cy, c.cz, c.r, &c.nodes)?, strips))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for id in ids {
+            let mut strips = self.rings[&id].strips.iter().filter(|s| s.visible()).peekable();
+            if strips.peek().is_none() {
+                continue;
+            }
+            let Some(c) = self.grid.cells.get(id as usize) else { continue };
+            let Some(key) = visit(c.cx, c.cy, c.cz, c.r, &c.nodes) else { continue };
+            out.extend(strips.map(|s| (key, s)));
+        }
+        out
     }
 
     /// The `+0xC` key the walk hands the drawer's queue (0x44FFC0: `round(v)`) for a cell: the
@@ -385,8 +398,8 @@ impl SkidMarks {
     /// The emitter 0x478F30 for one wheel and one call: `strength` against the threshold `a`, scaled
     /// by `b`, `kind` the surface, `ground` where the mark is laid and `dir` the car's direction of
     /// travel (`car+0x348`). The caller gates it on the effects byte `[0x6197E7]`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit(&mut self, id: usize, ground: Vec3, strength: f32, kind: usize, dir: Vec3, a: f32, b: f32) {
+    pub fn emit(&mut self, id: usize, m: &WheelMark) {
+        let WheelMark { ground, strength, kind, dir, a, b } = *m;
         if self.emitters.len() <= id {
             return;
         }
@@ -515,7 +528,7 @@ mod tests {
         let mut m = SkidMarks::new();
         m.set_width(0, half_width(245.0, true));
         for i in 0..17 {
-            m.emit(0, Vec3::new(0.0, 0.0, -(i as f32)), 1.0, 1, Vec3::new(0.0, 0.0, -1.0), 0.5, 2.0);
+            m.emit(0, &WheelMark { ground: Vec3::new(0.0, 0.0, -(i as f32)), strength: 1.0, kind: 1, dir: Vec3::new(0.0, 0.0, -1.0), a: 0.5, b: 2.0 });
         }
         let s = m.strips().next().expect("a strip");
         // the opening pair is invisible, the rest are the surface colour
@@ -532,8 +545,8 @@ mod tests {
         // 0x478F4A `test ah, 0x41`: C0|C3, both set by a NaN compare
         let mut m = SkidMarks::new();
         m.set_width(0, 0.1);
-        m.emit(0, Vec3::ZERO, 1.0, 1, Vec3::Z, 0.5, 2.0);
-        m.emit(0, Vec3::ZERO, f32::NAN, 1, Vec3::Z, 0.5, 2.0);
+        m.emit(0, &WheelMark { ground: Vec3::ZERO, strength: 1.0, kind: 1, dir: Vec3::Z, a: 0.5, b: 2.0 });
+        m.emit(0, &WheelMark { ground: Vec3::ZERO, strength: f32::NAN, kind: 1, dir: Vec3::Z, a: 0.5, b: 2.0 });
         assert_eq!((m.emitters[0].state, m.emitters[0].counter), (2, 1));
     }
 
@@ -542,11 +555,11 @@ mod tests {
         let mut m = SkidMarks::new();
         m.set_width(0, 0.1);
         for i in 0..4 {
-            m.emit(0, Vec3::new(0.0, 0.0, i as f32), 1.0, 1, Vec3::Z, 0.5, 2.0);
+            m.emit(0, &WheelMark { ground: Vec3::new(0.0, 0.0, i as f32), strength: 1.0, kind: 1, dir: Vec3::Z, a: 0.5, b: 2.0 });
         }
-        m.emit(0, Vec3::ZERO, 0.2, 1, Vec3::Z, 0.5, 2.0);
+        m.emit(0, &WheelMark { ground: Vec3::ZERO, strength: 0.2, kind: 1, dir: Vec3::Z, a: 0.5, b: 2.0 });
         for i in 0..4 {
-            m.emit(0, Vec3::new(5.0, 0.0, i as f32), 1.0, 1, Vec3::Z, 0.5, 2.0);
+            m.emit(0, &WheelMark { ground: Vec3::new(5.0, 0.0, i as f32), strength: 1.0, kind: 1, dir: Vec3::Z, a: 0.5, b: 2.0 });
         }
         assert_eq!(m.strips().count(), 2);
     }
@@ -572,7 +585,7 @@ mod tests {
         let mut m = SkidMarks::for_world(Vec3::ZERO, Vec3::new(5000.0, 0.0, 5000.0));
         m.set_width(0, 0.1);
         for i in 0..40 {
-            m.emit(0, Vec3::new(1230.0 + i as f32, 0.0, 10.0), 1.0, 1, Vec3::X, 0.5, 2.0);
+            m.emit(0, &WheelMark { ground: Vec3::new(1230.0 + i as f32, 0.0, 10.0), strength: 1.0, kind: 1, dir: Vec3::X, a: 0.5, b: 2.0 });
         }
         // x from 1230 to 1269 crosses 1250: two strips, the second seeded with the first's head
         assert_eq!(m.rings.len(), 2);

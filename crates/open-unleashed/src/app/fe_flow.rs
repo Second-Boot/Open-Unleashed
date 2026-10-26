@@ -203,33 +203,6 @@ impl App {
     /// One frame of the dialog: the tick, the answer kept for `fe_dialog_answer`, the screens
     /// covered while it is up.
     pub(crate) fn fe_dialog_step(&mut self) {
-        // `NFS_FE_DIALOG=<FEStrings id>` raises a two-button dialog with that text at tick 0, for
-        // a still — the way `NFS_FE_PARTS` opens the car's parts
-        if self.fe.dialog.is_none()
-            && !self.fe.dialog_forced
-            && let Some(id) = nfs_game::config::cfg().nfs_fe_dialog.as_str().and_then(|v| v.parse::<u32>().ok())
-        {
-            self.fe.dialog_forced = true;
-            let text = self.fe.strings.get(id).unwrap_or_default().to_string();
-            let mut d = nfs_game::dialog::Dialog::new(nfs_game::dialog::DialogKind::Two, text, [700, 701]);
-            d.raise(0);
-            self.fe.dialog = Some((d, DialogFor::Quit));
-        }
-        // `NFS_FE_DIALOG=input:<FEStrings id>:<typed>` — the input dialog with that text typed
-        if self.fe.dialog.is_none()
-            && !self.fe.dialog_forced
-            && let Some(spec) = nfs_game::config::cfg().nfs_fe_dialog.as_str().and_then(|v| v.strip_prefix("input:").map(str::to_string))
-        {
-            self.fe.dialog_forced = true;
-            let (id, typed) = spec.split_once(':').unwrap_or((&spec, ""));
-            let text = self.fe.strings.get(id.parse().unwrap_or(0)).unwrap_or_default().to_string();
-            let mut d = nfs_game::dialog::Dialog::input(text, true, 2);
-            d.raise(0);
-            typed.chars().for_each(|c| {
-                d.type_char(c);
-            });
-            self.fe.dialog = Some((d, DialogFor::Notice));
-        }
         let now = self.fe.layout_preview.as_ref().or(self.fe.layout_bottom.as_ref()).map(|l| l.ticks()).unwrap_or(0);
         let mut answer = None;
         let mut up = false;

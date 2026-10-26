@@ -32,7 +32,7 @@ Tests that read the original data skip themselves when the game is not found.
 
 ```sh
 packaging/build_macos.sh      # universal macOS app (arm64 + x86_64)
-packaging/build_windows.sh    # Windows x64, cross-built in Docker
+packaging/build_windows.sh    # Windows x64, cross-built in Docker (+ the official DirectX Shader Compiler: dxcompiler.dll, dxil.dll beside the exe)
 packaging/build_linux.sh      # Linux x86_64, built in Docker
 ```
 
@@ -66,8 +66,11 @@ and `THIRD-PARTY-LICENSES.txt` — never any file of the original game.
 | `NFS_DEMO=1` | frame rate, GPU, graphics API and system in the window title; the window stays on top (for recordings) |
 | `NFS_AUTOPILOT=1` with `--follow` | a windowed race drives itself (for recordings); `NFS_AUTOPILOT=ai` — the opponents' AI drives the player's car |
 | `NFS_AI_TRACE=<idx>` | a quarter-second trace of one AI car in the log |
+| `NFS_PHOTO_DIR=<folder>` | where photo mode saves its pictures (default `Pictures/PorscheUnleashed`) |
 | `NFS_MIC=1` | voice chat from the microphone: in a network session the game sends your voice from the default input device to the other players, as the original did. Off by default (you still hear the others) |
 | `WGPU_BACKEND=vulkan`/`gl`/`dx12`/`metal` | the graphics API (by default Vulkan / Metal / Direct3D 12, OpenGL only without them) |
+| `NFS_GPU_PROFILE=1` | a per-pass GPU timing in the log, every 120 frames (diagnostics; slows the frame down). `NFS_GPU_PROFILE=minimal` asks for a plain GPU device with no optional features |
+| `NFS_GUARD=0`/`1` | the start-up crash guard (see [install](install.md)): on by default in a normal release run, `0` turns it off, `1` forces it |
 
 ## `nfs5.ini`
 

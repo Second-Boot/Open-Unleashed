@@ -166,7 +166,6 @@ impl App {
         }
         self.hud_replay_bar(hud_aspect, clock);
         self.hud_track_map(hud_aspect, clock, live, layout);
-        self.hud_diagnostic_dialogs(hud_aspect);
         let finish_close = self.hud_result_pages(hud_aspect, hud_hover);
         self.hud_multi_time(hud_aspect, layout, time_slide);
         finish_close
@@ -361,8 +360,8 @@ impl App {
         let live = self.hud_keys.live;
         let clock = self.hud_clock();
         let slide = {
-            let (st, stamp) = step_slide(self.tray_slide, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, live);
-            self.tray_slide = (st, stamp);
+            let (st, stamp) = step_slide(self.slides.tray, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, live);
+            self.slides.tray = (st, stamp);
             h.trays_in.set(st == 3);
             let st = if live || st == 2 { st } else { 0 };
             TraySlide { state: st, t: clock.saturating_sub(stamp).min(1 << 20) as i32 }
@@ -378,12 +377,12 @@ impl App {
         let hidden = TraySlide { state: 0, t: 0 };
         let playback = self.playback_running();
         let (tray4, time_slide) = if !playback {
-            self.time_trays = self.tray_slide;
+            self.slides.time = self.slides.tray;
             (slide, slide)
         } else if self.mission.is_some() {
-            let (st, stamp) = step_slide(self.time_trays, clock, false, false, true);
+            let (st, stamp) = step_slide(self.slides.time, clock, false, false, true);
             let t = clock.saturating_sub(stamp).min(1 << 20) as i32;
-            self.time_trays = (st, stamp);
+            self.slides.time = (st, stamp);
             // the rule is each tray's own state-3 test (0x43428D); only these two draw one here
             h.trays_in.set(st == 3);
             (hidden, TraySlide { state: st, t })
@@ -459,8 +458,8 @@ impl App {
         // loop's gates (which do not test `REPLAY`). *(The port tested `Playing` only, so a
         // playback run off its stream's end, `Exhausted` = 3, drew the mirror again.)*
         let mirror_slide = {
-            let (st, stamp) = step_slide(self.mirror_slide, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, self.hud_keys.rearview && live && !playback);
-            self.mirror_slide = (st, stamp);
+            let (st, stamp) = step_slide(self.slides.mirror, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, self.hud_keys.rearview && live && !playback);
+            self.slides.mirror = (st, stamp);
             let drawn = (live || st == 2) && (self.hud_keys.rearview || matches!(st, 1 | 2));
             TraySlide { state: if drawn { st } else { 0 }, t: clock.saturating_sub(stamp).min(1 << 20) as i32 }
         };
@@ -561,8 +560,8 @@ impl App {
         // 0x425E20 only while its slot 10 0x433400 is clear — `MAP != 0 && [0x60C970]`. MAP is
         // the runtime copy F7 / "2" / F5 change (`HudKeys::map`).
         let map_slide = {
-            let (st, stamp) = step_slide(self.map_slide, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, self.hud_keys.map != 0 && live && !playback);
-            self.map_slide = (st, stamp);
+            let (st, stamp) = step_slide(self.slides.map, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, self.hud_keys.map != 0 && live && !playback);
+            self.slides.map = (st, stamp);
             let drawn = (live || st == 2) && (self.hud_keys.map != 0 || matches!(st, 1 | 2));
             TraySlide { state: if drawn { st } else { 0 }, t: clock.saturating_sub(stamp).min(1 << 20) as i32 }
         };
@@ -626,57 +625,6 @@ impl App {
         }
     }
 
-    /// The `NFS_CONGRATS` / `NFS_BILLBOARD` diagnostics' dialogs over the race.
-    fn hud_diagnostic_dialogs(&mut self, hud_aspect: f32) {
-        let Some(h) = &self.hud else { return };
-        // diagnostic: `NFS_CONGRATS=<place>,<tick>,<0|1 tournament>` draws the `HCongrats`
-        // picture at that point of its timeline, for a `--screenshot` without finishing a race
-        if let Some(spec) = nfs_game::config::cfg().nfs_congrats.as_str() {
-            let v: Vec<u64> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            if let [place, t, tour] = v[..] {
-                let mut c = Vec::new();
-                h.congrats_sprites(&mut c, hud_aspect, place as usize, t, tour != 0);
-                self.scene.sprites.extend(c);
-            }
-        }
-        // diagnostic: `NFS_BILLBOARD=pause|mission|yesno|summary|standings` draws that dialog over the race, for a
-        // `--screenshot` of its layout
-        if let Some(which) = nfs_game::config::cfg().nfs_billboard.as_str() {
-            let fe = |id: u32| self.fe.strings.hud(id).unwrap_or_default().to_string();
-            let mut c = Vec::new();
-            match which {
-                "summary" => {
-                    let rows = vec![
-                        SummaryRow { name: self.player_name.clone(), car: self.specs.name.clone(), colour: [0.83, 0.06, 0.06, 1.0], best: Some(3999), total: Some(8100) },
-                        SummaryRow { name: "Stroller".into(), car: "'94 911 Carrera".into(), colour: [0.2, 0.4, 0.8, 1.0], best: None, total: None },
-                    ];
-                    let head = [fe(hud_str::COL_NAME), fe(hud_str::COL_CAR), fe(hud_str::COL_BEST_LAP), fe(hud_str::COL_TIME), fe(hud_str::COL_POINTS)];
-                    let bb = Billboard { left: &fe(Self::summary_title(self.race_fegame_type())), right: &fe(hud_str::TITLE_RACE_SUMMARY), hints: Some((&fe(hud_str::HINT_ESC), Some(&fe(hud_str::HINT_SPACE)))) };
-                    let ord: Vec<String> = (18116..18124).map(fe).collect();
-                    h.results_sprites(&mut c, hud_aspect, &bb, ResultsTable { rows: &rows, player: 0, head: &head, widths: &[30.0, 90.0, 140.0, 100.0, 80.0, 60.0], best_lap: true, points: true, ord: &ord });
-                }
-                // the standings with the pointer on the player's WINNINGS cell, so `HWinnings` shows
-                "standings" => {
-                    let rows = vec![
-                        (self.player_name.clone(), "15".to_string(), "7200".to_string()),
-                        ("Stroller".to_string(), "14".to_string(), "5800".to_string()),
-                    ];
-                    let w = nfs_game::career::Winnings { events: vec![(1, 1000, 400), (2, 800, 0)], tournament_bonus: Some(5000), total: 7200, completed: 2 };
-                    let (x0, x1, y0, y1) = Hud::table_cell(&[40.0, 90.0, 100.0, 100.0], 0, 3);
-                    let bb = Billboard { left: "", right: &fe(hud_str::TITLE_TOURNAMENT_STANDINGS), hints: Some((&fe(hud_str::HINT_ESC), Some(&fe(hud_str::HINT_SPACE)))) };
-                    let ord: Vec<String> = (18116..18124).map(fe).collect();
-                    let panel = (&w, [fe(hud_str::PRIZE_LABEL), fe(hud_str::PRIZE_SAFE_BONUS), fe(hud_str::PRIZE_TOURNAMENT_BONUS), fe(hud_str::PRIZE_TOTAL)], Some(((x0 + x1) / 2.0, (y0 + y1) / 2.0)));
-                    h.standings_sprites(&mut c, hud_aspect, &bb, StandingsTable { rows: &rows, player: Some(0), head: &[fe(hud_str::COL_NAME), fe(hud_str::COL_TOTAL_POINTS), fe(hud_str::COL_WINNINGS)], timed: false, ord: &ord, winnings: Some(panel) });
-                }
-                "yesno" => h.yes_no_sprites(&mut c, hud_aspect, &Billboard { left: "", right: &fe(hud_str::TITLE_YES_NO), hints: None }, YesNoDialog { lines: [&fe(hud_str::QUIT_CONFIRM_LINE), ""], buttons: [&fe(hud_str::YES_NO_YES), &fe(hud_str::YES_NO_NO)], sel: 1, pressed: false }),
-                "pause" => h.pause_sprites(&mut c, hud_aspect, &Billboard { left: "", right: &fe(hud_str::TITLE_PAUSE), hints: None }, &[&fe(hud_str::PAUSE_BUTTON_1), &fe(hud_str::PAUSE_BUTTON_2), &fe(hud_str::PAUSE_BUTTON_3)], 0, false),
-                "mission" => h.mission_summary_sprites(&mut c, hud_aspect, &Billboard { left: &fe(hud_str::TITLE_MISSION_LEFT), right: &fe(hud_str::TITLE_MISSION_RIGHT), hints: Some((&fe(hud_str::HINT_ESC), Some(&fe(hud_str::HINT_SPACE)))) }, MissionSummary { narrator: Some(0), name: &fe(18176), lines: &[fe(18156)], race_again: &fe(hud_str::PAUSE_BUTTON_2), typed: None, button: (false, false) }),
-                _ => {}
-            }
-            self.scene.sprites.extend(c);
-        }
-    }
-
     /// The post-race queue's pages (`HRaceSummary`, `HCongrats`, `HTournamentStandings`, `HInfo`,
     /// `HTrackRecords`, the mission summary); `true` when the page finished shrinking this frame.
     fn hud_result_pages(&mut self, hud_aspect: f32, hud_hover: &mut Option<Option<(u8, usize)>>) -> bool {
@@ -731,7 +679,7 @@ impl App {
             let ordinals: Vec<String> = (18116..18124).map(fe).collect();
             let (esc, space) = (fe(hud_str::HINT_ESC), fe(hud_str::HINT_SPACE));
             let title = fe(Self::summary_title(self.race_fegame_type()));
-            let page = self.result_pages().get(self.results_page as usize).copied().unwrap_or(ResultPage::Closed);
+            let page = self.result_pages().get(self.pages.page as usize).copied().unwrap_or(ResultPage::Closed);
             // the race's own `HCongrats` is the first thing the queue shows (0x426D54), for
             // game types 0…4 (0x426CCD…0x426CEC, and 0x41D080 skips type 5), places 1–3 and in a
             // Quick Knockout only the winner (show 0x41DD40); it closes itself past 0xC0 ticks
@@ -755,15 +703,15 @@ impl App {
             self.results_billboard = None;
             let billboard_up = race_congrats.is_none() && !matches!(page, ResultPage::Closed | ResultPage::TournamentPlace(_));
             if billboard_up {
-                if self.page_seen != Some(self.results_page) {
-                    self.page_seen = Some(self.results_page);
-                    self.page_frames = 0;
-                    self.page_open_tick = Some(self.tick);
+                if self.pages.seen != Some(self.pages.page) {
+                    self.pages.seen = Some(self.pages.page);
+                    self.pages.frames = 0;
+                    self.pages.open_tick = Some(self.tick);
                 } else {
-                    self.page_frames += 1;
+                    self.pages.frames += 1;
                 }
-                let mut height = (40.0 + 65.0 * (self.page_frames as f32 + 1.0)).min(BILLBOARD.3);
-                if let Some(f) = self.page_closing.as_mut() {
+                let mut height = (40.0 + 65.0 * (self.pages.frames as f32 + 1.0)).min(BILLBOARD.3);
+                if let Some(f) = self.pages.closing.as_mut() {
                     *f += 1;
                     height = (BILLBOARD.3 - 65.0 * *f as f32).max(40.0);
                     if height <= 40.0 {
@@ -771,14 +719,14 @@ impl App {
                     }
                 }
                 h.billboard_h.set(height);
-                open_now = self.page_closing.is_none() && height >= BILLBOARD.3;
-                h.billboard_clock.set((self.hud_clock(), self.hud_clock().saturating_sub(self.tick.saturating_sub(self.page_open_tick.unwrap_or(0)))));
-                self.results_billboard = self.page_closing.is_none().then_some(self.results_page as u32);
+                open_now = self.pages.closing.is_none() && height >= BILLBOARD.3;
+                h.billboard_clock.set((self.hud_clock(), self.hud_clock().saturating_sub(self.tick.saturating_sub(self.pages.open_tick.unwrap_or(0)))));
+                self.results_billboard = self.pages.closing.is_none().then_some(self.pages.page as u32);
             } else if let ResultPage::TournamentPlace(_) = page
-                && self.page_seen != Some(self.results_page)
+                && self.pages.seen != Some(self.pages.page)
             {
-                self.page_seen = Some(self.results_page);
-                self.page_open_tick = Some(self.tick);
+                self.pages.seen = Some(self.pages.page);
+                self.pages.open_tick = Some(self.tick);
             }
             if page == ResultPage::Closed {
             } else if page == ResultPage::MissionSummary {
@@ -790,11 +738,11 @@ impl App {
                 // its "race again" button's hover (0x41B340), once the box is open
                 let over = h.billboard_h.get() >= BILLBOARD.3 && Hud::over_button(Hud::mission_button(), self.fe.cursor);
                 *hud_hover = Some(over.then_some((2, 0)));
-                h.mission_summary_sprites(&mut table, hud_aspect, &bb, MissionSummary { narrator, name: &name, lines: &lines, race_again: &fe(hud_str::PAUSE_BUTTON_2), typed: Some(self.page_frames as usize), button: (over, over && self.fe.mouse_down) });
+                h.mission_summary_sprites(&mut table, hud_aspect, &bb, MissionSummary { narrator, name: &name, lines: &lines, race_again: &fe(hud_str::PAUSE_BUTTON_2), typed: Some(self.pages.frames as usize), button: (over, over && self.fe.mouse_down) });
             } else if let Some((place, t)) = race_congrats {
                 h.congrats_sprites(&mut table, hud_aspect, place, t, false);
             } else if let ResultPage::TournamentPlace(rank) = page {
-                h.congrats_sprites(&mut table, hud_aspect, rank, self.tick.saturating_sub(self.results_page_tick), true);
+                h.congrats_sprites(&mut table, hud_aspect, rank, self.tick.saturating_sub(self.pages.tick), true);
             } else if page == ResultPage::Standings
                 && let Some((t, event)) = self.tournament_event()
                 && let Some(c) = self.career.as_ref()
@@ -807,7 +755,7 @@ impl App {
                 // on the last race each place's WINNINGS carries its tournament prize (0x431B80)
                 let racers = self.career_opponents.as_ref().map_or(0, |l| l.len()) + 1;
                 let last = c.career.tournament_flags(&c.tables, &t).0;
-                let st = c.career.standings_page(&t, event, &order, &times, &clean, racers, last);
+                let st = c.career.standings_page(&nfs_game::career::EventFinish { t: &t, event, order: &order, times: &times, clean: &clean }, racers, last);
                 let name = |d: usize| {
                     if d == 0 {
                         self.player_name.clone()
@@ -828,22 +776,8 @@ impl App {
                 // 0x431897: "" left, 18132 right, both hints
                 let bb = Billboard { left: "", right: &fe(hud_str::TITLE_TOURNAMENT_STANDINGS), hints: Some((&esc, Some(&space))) };
                 // `HWinnings`, the player's money, under the pointer (0x431AF6…0x431B70)
-                let winnings = c.career.winnings_after(&t, event, &order, &times, &clean, racers, last);
-                // diagnostic (port-only): `NFS_RESULTS_CURSOR=winnings` parks the pointer on the
-                // middle of the player's WINNINGS cell, `=x,y` at that point of the 640 × 480
-                // HUD space — a scripted run has no pointer, and `NFS_FE_CURSOR` parks the front
-                // end's, not the race's. Unset, the live pointer.
-                let parked = nfs_game::config::cfg().nfs_results_cursor.as_str().and_then(|v| {
-                    if v.trim().eq_ignore_ascii_case("winnings") {
-                        let widths: &[f32] = if !timed { &[40.0, 90.0, 100.0, 100.0] } else { &[40.0, 90.0, 120.0, 100.0] };
-                        let (x0, x1, y0, y1) = Hud::table_cell(widths, player?, 3);
-                        Some(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
-                    } else {
-                        let (x, y) = v.split_once(',')?;
-                        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
-                    }
-                });
-                let panel = (&winnings, [fe(hud_str::PRIZE_LABEL), fe(hud_str::PRIZE_SAFE_BONUS), fe(hud_str::PRIZE_TOURNAMENT_BONUS), fe(hud_str::PRIZE_TOTAL)], parked.or(self.fe.cursor));
+                let winnings = c.career.winnings_after(&nfs_game::career::EventFinish { t: &t, event, order: &order, times: &times, clean: &clean }, racers, last);
+                let panel = (&winnings, [fe(hud_str::PRIZE_LABEL), fe(hud_str::PRIZE_SAFE_BONUS), fe(hud_str::PRIZE_TOURNAMENT_BONUS), fe(hud_str::PRIZE_TOTAL)], self.fe.cursor);
                 h.standings_sprites(&mut table, hud_aspect, &bb, StandingsTable { rows: &rows, player, head: &head, timed, ord: &ordinals, winnings: Some(panel) });
             } else if let ResultPage::Notice(id) = page {
                 // `HInfo` 0x4282F0: the text centred on the 500 × 325 box (`[0x5B2BF0]`/`[0x5B2BF4]`)
@@ -1012,8 +946,12 @@ impl App {
             // `HYesNoOverlay` 0x437440 ("" | 18174) with 0x4376B0(18139, 18140)
             let hover = Hud::yes_no_buttons().iter().position(|b| Hud::over_button(*b, self.fe.cursor));
             *hud_hover = Some(hover.map(|k| (4, k)));
+            // the pick follows the pointer (as the pause menu's) and the pad's d-pad moves it (PAD-END2)
+            if let Some(k) = hover {
+                self.replay_save.sel = k as u8;
+            }
             let bb = Billboard { left: "", right: fe(hud_str::TITLE_YES_NO), hints: None };
-            h.yes_no_sprites(out, aspect, &bb, YesNoDialog { lines: [fe(hud_str::OVERWRITE_LINE_1), fe(hud_str::OVERWRITE_LINE_2)], buttons: [fe(hud_str::YES_NO_YES), fe(hud_str::YES_NO_NO)], sel: hover.unwrap_or(usize::MAX), pressed: pressed && hover.is_some() });
+            h.yes_no_sprites(out, aspect, &bb, YesNoDialog { lines: [fe(hud_str::OVERWRITE_LINE_1), fe(hud_str::OVERWRITE_LINE_2)], buttons: [fe(hud_str::YES_NO_YES), fe(hud_str::YES_NO_NO)], sel: usize::from(self.replay_save.sel), pressed: pressed && hover.is_some() });
         } else {
             let hover = Hud::replay_save_buttons().iter().position(|b| Hud::over_button(*b, self.fe.cursor));
             *hud_hover = Some(hover.map(|k| (3, k)));
@@ -1030,16 +968,20 @@ impl App {
     /// 0x437440, 18174 "Confirmation" with 18171 and 18141 yes / 18142 no. The strings and their
     /// places are the original's (`pause_sprites`, `yes_no_sprites`; hud.md). Sets `hud_hover`.
     pub(super) fn pause_overlay(&mut self, hud_hover: &mut Option<Option<(u8, usize)>>) {
-        if !self.paused {
+        // PORT-DEVIATION D46: no pause menu over the photo mode
+        if !self.paused || self.photo.active {
             return;
         }
+        // PORT-DEVIATION D46: the pause menu's fourth item (photo mode) when it is offered
+        let pause_items = self.pause_items();
+        let photo_label = (pause_items == 4).then(|| self.photo_item_label());
         let Some(h) = self.hud.as_ref().filter(|h| h.font.is_some()) else { return };
         let strings = &self.fe.strings;
         let fe = move |id: u32| strings.hud(id).unwrap_or_default();
         // the pointer over a button: its hover look, and the port's keyboard selection moves
         // there so only one button is lit (the original has no keyboard selection)
         let hover = match self.pause_confirm {
-            None => Hud::pause_buttons().iter().position(|b| Hud::over_button(*b, self.fe.cursor)).map(|k| (0, k)),
+            None => Hud::pause_buttons().iter().take(pause_items).position(|b| Hud::over_button(*b, self.fe.cursor)).map(|k| (0, k)),
             Some(_) => Hud::yes_no_buttons().iter().position(|b| Hud::over_button(*b, self.fe.cursor)).map(|k| (1, k)),
         };
         *hud_hover = Some(hover);
@@ -1058,7 +1000,11 @@ impl App {
                 // 0x42A477: "" left, 18128 right, no hints
                 let bb = Billboard { left: "", right: fe(hud_str::TITLE_PAUSE), hints: None };
                 h.billboard_clock.set((clock, 0));
-                h.pause_sprites(out, aspect, &bb, &[fe(hud_str::PAUSE_BUTTON_1), fe(hud_str::PAUSE_BUTTON_2), fe(hud_str::PAUSE_BUTTON_3)], self.pause_sel as usize, pressed);
+                let mut labels = vec![fe(hud_str::PAUSE_BUTTON_1), fe(hud_str::PAUSE_BUTTON_2), fe(hud_str::PAUSE_BUTTON_3)];
+                if let Some(l) = photo_label.as_deref() {
+                    labels.push(l);
+                }
+                h.pause_sprites(out, aspect, &bb, &labels, self.pause_sel as usize, pressed);
             }
             Some(sel) => {
                 let bb = Billboard { left: "", right: fe(hud_str::TITLE_YES_NO), hints: None };

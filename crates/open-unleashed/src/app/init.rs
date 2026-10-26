@@ -103,6 +103,10 @@ impl App {
             sound_set,
         } = init;
         App {
+            net_launch: Default::default(),
+            slides: Default::default(),
+            pages: Default::default(),
+            scripted_hud: Default::default(),
             fe: FrontEnd {
                 era_music: false,
                 bar_grab: None,
@@ -129,18 +133,13 @@ impl App {
                 owned_seen: None,
                 owned_slots: Vec::new(),
                 resolution_race: None,
-                parts_forced: false,
                 last_hover: None,
                 dialog: None,
-                dialog_forced: false,
                 dialog_answer: None,
                 dialog_input: None,
                 replay_sel: 0,
                 user_sel: None,
-                driver_picture: std::env::var("NFS_FE_DRIVER_PICTURE")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(nfs_game::save::DEFAULT_PICTURE as i32),
+                driver_picture: nfs_game::save::DEFAULT_PICTURE as i32,
                 cd_available: None,
                 cd_selected: None,
                 cd_title: 0,
@@ -240,21 +239,12 @@ impl App {
             pause_offset: 0.0,
             hud_clock_base: 0.0,
             hud_scale: std::cell::Cell::new(1.0),
-            tray_slide: (0, 0),
-            time_trays: (0, 0),
-            map_slide: (0, 0),
-            mirror_slide: (0, 0),
             hud_keys: HudKeys::new(1, false, true),
             replay_bar: nfs_game::replay::BarState::new(),
             bar_press: None,
             hud_key_script: std::env::var("NFS_HUD_KEYS_1").or_else(|_| std::env::var("NFS_HUD_KEYS")).map(|s| parse_hud_keys(&s).into()).unwrap_or_default(),
-            scripted_race_no: 0,
             race_order: Default::default(),
             audio_paused: false,
-            scripted_pause: false,
-            scripted_restart: false,
-            scripted_net_leave: false,
-            scripted_quit: false,
             results_billboard: None,
             billboard_key: 0,
             paused: false,
@@ -262,24 +252,14 @@ impl App {
             opp_cars: Vec::new(),
             knockout_round: false,
             player_grid_override: launch.player_grid,
-            net_fe_txt: Default::default(),
-            net_nocollision: false,
-            net_seat_grids: Vec::new(),
-            net_seat_cars: Vec::new(),
-            net_own_words: Vec::new(),
             exchange_in: None,
             replay_net: None,
             replay_view: 0,
-            net_derby: false,
-            net_flags: None,
-            net_traffic: Vec::new(),
             crt_rand: nfs_game::movie_overlay::CRand::new(1),
             backwards: launch.backwards,
             mirror: launch.mirror,
             quick_knockout: launch.quick_knockout,
             player_eliminated: false,
-            net_time_sent: false,
-            net_pad_buttons: 0,
             records,
             replay: Playback {
                 stream: Some(match &replay_file {
@@ -302,13 +282,8 @@ impl App {
                         paint,
                         laps: num_laps,
                         opponents: num_opponents,
-                        traffic: std::env::var("NFS_TRAFFIC")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(fe.traffic_density as u32),
-                        cops: std::env::var("NFS_COPS")
-                            .map(|v| v != "0")
-                            .unwrap_or(fe.cops),
+                        traffic: env_traffic().unwrap_or(fe.traffic_density as u32),
+                        cops: env_cops().unwrap_or(fe.cops),
                         // `Game.Damage`'s accessor starts on (0x4E55DD's initial 1); `fe.txt` has no key
                         damage: true,
                         backwards,
@@ -342,12 +317,7 @@ impl App {
                     None => bits,
                 }
             },
-            traffic_seed: match (
-                &replay_setup,
-                std::env::var("NFS_TRAFFIC_SEED")
-                    .ok()
-                    .and_then(|v| v.parse().ok()),
-            ) {
+            traffic_seed: match (&replay_setup, env_traffic_seed()) {
                 (Some(r), _) => r.seed,
                 (None, Some(s)) => s,
                 // `fe.txt`'s `rand_seed`, as `start_race` reads it for every live race
@@ -371,11 +341,6 @@ impl App {
                 .unwrap_or_else(|| "DRIVER".to_string()),
             hud_records: None,
             records_spoken: false,
-            results_page: 0,
-            page_seen: None,
-            page_frames: 0,
-            page_open_tick: None,
-            page_closing: None,
             pause_sel: 0,
             pause_confirm: None,
             hud_hover: None,
@@ -405,7 +370,6 @@ impl App {
                 .unwrap_or_default(),
             results: None,
             auto_replay_due: false,
-            results_page_tick: 0,
             mission_result: None,
             cone_flash: 0,
             hud_cones: Default::default(),
@@ -533,6 +497,7 @@ impl App {
             net_dump: None,
             exchange_tick_at: Instant::now(),
             net_notice: None,
+            photo: Default::default(),
             net_notice_space: false,
             net_lag_box: false,
             num_laps: launch.laps,
@@ -610,6 +575,7 @@ impl App {
             sim_name: sim_name.clone(),
             race_skill: launch.skill,
             last_frame: Instant::now(),
+            occluded: false,
             presented: None,
             idle_check: None,
             accumulator: Duration::ZERO,

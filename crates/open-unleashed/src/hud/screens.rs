@@ -461,7 +461,7 @@ impl Hud {
     /// `HPauseMenu` (0x42A440): the billboard titled FE 18128 with three buttons — 18108 continue,
     /// 18109 race again, 18110 quit — at `x = W/2 − 71` and `y = ftol(H/2 − 1.5·step) + k·step`
     /// with `step = 19 · 1.6` (0x42A482…0x42A587, each `ftol`'d from the previous one).
-    pub fn pause_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, labels: &[&str; 3], sel: usize, pressed: bool) {
+    pub fn pause_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, labels: &[&str], sel: usize, pressed: bool) {
         if !self.billboard(out, aspect, bb) {
             return;
         }
@@ -471,13 +471,16 @@ impl Hud {
     }
 
     /// `HPauseMenu`'s three buttons' top-left corners (0x42A482…0x42A587).
-    pub(crate) fn pause_buttons() -> [(f32, f32); 3] {
+    /// PORT-DEVIATION D46: a fourth button, one step under quit, is the photo-mode item (`App::pause_items`);
+    /// the original's three keep their places.
+    pub(crate) fn pause_buttons() -> [(f32, f32); 4] {
         let (bw, bh) = HUD_BUTTON;
         let step = bh * 1.6;
         let y0 = (HUD_REF_H / 2.0 - step * 3.0 * 0.5).trunc();
         let y1 = (y0 + step).trunc();
         let x = HUD_REF_W / 2.0 - bw / 2.0;
-        [(x, y0), (x, y1), (x, (y1 + step).trunc())]
+        let y2 = (y1 + step).trunc();
+        [(x, y0), (x, y1), (x, y2), (x, (y2 + step).trunc())]
     }
 
     /// `HYesNoOverlay`'s yes / no buttons, two `ftol`'d steps under its two text lines (0x437482…

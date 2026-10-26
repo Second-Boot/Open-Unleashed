@@ -37,14 +37,6 @@ impl NetPlay {
     /// screen's 0x4A4A70(−1) every turn (0x48CE27, 0x48CF5F, 0x48D079, 0x48D200), which redraws the
     /// other players' rows while the screen is up. `None` with no player id (nothing to wait for).
     pub fn barrier_begin(&self) -> Option<BarrierRun> {
-        // **TEST GLUE**: `NFS_NET_STALL_MS=<ms>` — a joiner that does not answer for that long before its
-        // first barrier (so the host's wait can be shown to end on ESC)
-        static STALLED: std::sync::Once = std::sync::Once::new();
-        if !self.is_host()
-            && let Some(ms) = nfs_game::config::cfg().nfs_net_stall_ms.as_str().and_then(|v| v.parse::<u64>().ok())
-        {
-            STALLED.call_once(|| std::thread::sleep(Duration::from_millis(ms)));
-        }
         (self.room.me >= 0).then(|| BarrierRun { phase: 0, sent: false, end: Instant::now() + BARRIER_LIMIT, keys: KeyRing::begin() })
     }
 

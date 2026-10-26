@@ -452,12 +452,6 @@ pub struct LayoutScreen {
     /// change ([`eval_memo_clear`](Self::eval_memo_clear)), so a hit returns exactly what the
     /// evaluator would compute now.
     eval_memo: std::cell::RefCell<EvalMemo>,
-    /// How often the **cycle guard** (a chain of part references deeper than five) answered.
-    /// UNREACHABLE by the shipped data — `--layout-sweep` reports it, 0 over all 98 layouts
-    /// (2026-10-02): the original has no recursion at all, its attributes hold the
-    /// values of the last update, so this port's evaluation-by-recursion needs a stop for a
-    /// template that loops, and no shipped template does.
-    guard_hits: std::cell::Cell<u32>,
     /// each `NFS5.AccessorWatch`'s `label.text` as its tick last wrote it (0x4BD32C, 0x526980) —
     /// what the part measures its `size` over (0x4E7160); before the first draw, the template's
     watch_text: std::cell::RefCell<HashMap<usize, String>>,
@@ -1070,16 +1064,7 @@ impl LayoutScreen {
         let controls = Arc::new(load_controls(paths));
         let fe_strings = Arc::new(load_strings(paths));
         let mut screen = Self::load_one(r, paths, name, controls.clone(), fe_strings.clone())?;
-        // `NFS_FE_BG=<layout>` puts a background under a **page** — one of the 28 layouts whose
-        // `screen=` is empty because in the game it is drawn over whatever opened it. Without it
-        // `--fe=<page>` shows the page over black, which is `RE/AUDIT.md` F2.
-        // …and only for the screen being opened: `bottombar` is a page too, and the front end draws
-        // it *after* the screen, so giving it a background put a second copy of that background
-        // over everything. That artefact cost four passes of `RE/AUDIT.md` F2.
-        let forced = crate::config::cfg().nfs_fe_bg.as_str()
-            .filter(|_| !name.eq_ignore_ascii_case("bottombar"))
-            .filter(|_| screen.layout.screen().and_then(|s| s.get("screen")).is_none_or(str::is_empty));
-        if let Some(bg) = forced.or_else(|| screen.layout.screen().and_then(|s| s.get("screen")).and_then(background_layout)) {
+        if let Some(bg) = screen.layout.screen().and_then(|s| s.get("screen")).and_then(background_layout) {
             match Self::load_one(r, paths, bg, controls, fe_strings) {
                 Ok(mut b) => {
                     // a background screen never draws the pointer — the screen in front of it does
@@ -1269,7 +1254,7 @@ impl LayoutScreen {
             inherited: std::cell::Cell::new((false, 0)),
             glints: Default::default(),
             preload_ticks: crate::config::cfg().nfs_fe_clock.as_str().and_then(|v| v.parse::<u64>().ok()).map_or(0, |ms| (ms * 128 / 1000) as i64),
-            watch_text: Default::default(), eval_memo: Default::default(), guard_hits: Default::default(),
+            watch_text: Default::default(), eval_memo: Default::default(),
             last_drawn_state: Default::default(),
             end_of_era: None,
             career_tabs: None,
@@ -1285,13 +1270,10 @@ impl LayoutScreen {
             denied: false,
             narrow_hit: false,
             pointer: None,
-            // `NFS_FE_PRESS=1` holds the button down for a still, the pair of `NFS_FE_CURSOR`
-            pressed: crate::config::cfg().nfs_fe_press.as_str().is_some_and(|v| v != "0"),
+            pressed: false,
             capture: None,
-            // `NFS_FE_OPEN=<index>` drops a combo's list open for a still
-            open_combo: crate::config::cfg().nfs_fe_open.as_str().and_then(|v| v.parse().ok()),
-            // `NFS_FE_PICKER=1` with `NFS_FE_OPEN` raises the latch for a still of the editor
-            picker_latch: crate::config::cfg().nfs_fe_picker.as_str().is_some_and(|v| v != "0"),
+            open_combo: None,
+            picker_latch: false,
             picker_bound: false,
             picker: Picker::default(),
             pads: Vec::new(),
@@ -1782,10 +1764,6 @@ impl LayoutScreen {
         };
         let hit = self.eval_memo.borrow().pair.get(&(i, depth)).and_then(|m| m.get(v)).copied();
         if let Some(r) = hit {
-            // **TEST GLUE** `NFS_EVAL_VERIFY=1`: every hit is re-evaluated and must agree
-            if crate::config::cfg().nfs_eval_verify.is_set() {
-                assert_eq!(r, nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth)), "eval memo stale: {v:?} on element {i} (depth {depth})");
-            }
             return r;
         }
         let r = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth));
@@ -1800,9 +1778,6 @@ impl LayoutScreen {
         };
         let hit = self.eval_memo.borrow().one.get(&(i, depth)).and_then(|m| m.get(v)).copied();
         if let Some(r) = hit {
-            if crate::config::cfg().nfs_eval_verify.is_set() {
-                assert_eq!(r, nfs_formats::ctr::eval(v, &|n| self.reference(e, n, depth)), "eval memo stale: {v:?} on element {i} (depth {depth})");
-            }
             return r;
         }
         let r = nfs_formats::ctr::eval(v, &|n| self.reference(e, n, depth));
@@ -1846,7 +1821,7 @@ impl LayoutScreen {
     /// port still has is the **cycle guard**: the original has no recursion (its attributes hold
     /// the values of the last update), this port evaluates by recursion and stops a chain deeper
     /// than five with the value an attribute has before any update published it — `"0"`. No shipped
-    /// template reaches it (`guard_hits` is 0 over all 98 layouts). Names are
+    /// template reaches it (0 over all 98 layouts). Names are
     /// matched without regard to case; the original's dictionary is
     /// case-sensitive (`std::map` over `memcmp`, 0x4242C0), and every reference in the 72
     /// shipped templates matches its definition exactly, so the two agree on the data.
@@ -1863,7 +1838,6 @@ impl LayoutScreen {
         let Some((head, rest)) = name.split_once('.') else { return Macro::Undefined };
         if head == "control" {
             if depth > 4 {
-                self.guard_hits.set(self.guard_hits.get() + 1);
                 return Macro::Text("0".into());
             }
             let (bw, bh) = self.box_of(e, depth + 1);
@@ -1951,36 +1925,9 @@ impl LayoutScreen {
     /// A part's extent for a `size` reference, behind the cycle guard.
     fn measured(&self, e: &nfs_formats::lay::Element, part: &nfs_formats::ctr::Part, depth: u32) -> Option<(f64, f64)> {
         if depth > 4 {
-            self.guard_hits.set(self.guard_hits.get() + 1);
             return None;
         }
         self.part_extent(e, part, depth)
-    }
-
-    /// Every part expression on this screen whose evaluation reached the **cycle guard**
-    /// (`guard_hits`), as `(class, part, key, expression)` — empty over all
-    /// 98 layouts. (Until 2026-10-02 this listed the names the port could not answer; there are
-    /// none now.) `--layout-sweep` with `NFS_EXPR_SWEEP=1` runs it.
-    pub fn expr_failures(&self) -> Vec<(String, String, String, String)> {
-        let mut out = Vec::new();
-        for e in self.layout.elements.iter() {
-            let Some(c) = self.controls.get(&e.class) else { continue };
-            let state = e.get("state").unwrap_or("normal");
-            for name in c.state_parts(state) {
-                let Some(p) = c.part(name) else { continue };
-                for key in ["pos", "size"] {
-                    // a value with no comma is never evaluated (0x527B80), so it cannot fail
-                    let Some(v) = self.part_attr(e, p, key).filter(|v| v.contains(',')) else { continue };
-                    self.eval_memo_clear();
-                    let before = self.guard_hits.get();
-                    let _ = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0));
-                    if self.guard_hits.get() != before {
-                        out.push((e.class.clone(), name.clone(), key.to_string(), v.to_string()));
-                    }
-                }
-            }
-        }
-        out
     }
 
     /// Every `NFS5.GouraudIndicatorBar` and the source it reads. `FEGouraudIndicatorBar`'s
@@ -2159,11 +2106,6 @@ impl LayoutScreen {
             Some(v) => self.bars.insert(index, v),
             None => self.bars.remove(&index),
         };
-    }
-
-    /// The texture of any font this screen loaded, for the sprite self-test.
-    pub fn a_font_texture(&self) -> Option<TextureId> {
-        self.fonts.values().next().map(|f| f.texture())
     }
 
     /// The 1×1 white texture this screen uploaded, for callers that want to draw a plain quad.
@@ -2393,16 +2335,6 @@ impl LayoutScreen {
         if let Some(z) = zone {
             parts.click(z, now, focused, &mut out);
         }
-        out
-    }
-
-    /// A click on `zone` of 3D car `index` at tick `now`, as `car_click` makes one — for
-    /// `NFS_FE_PARTS`, which opens parts for a still.
-    pub fn car_click_zone(&mut self, index: usize, zone: u32, now: u32) -> Vec<crate::carparts::PartEvent> {
-        let mut out = Vec::new();
-        let parts = self.car_parts.entry(index).or_default();
-        let focused = parts.zoomed;
-        parts.click(zone, now, focused, &mut out);
         out
     }
 
@@ -3187,61 +3119,6 @@ impl LayoutScreen {
         (e.class == "NFS5.CAMERAPICTURE").then(|| self.attr_num(e, "picturenum").unwrap_or(0.0) as i32)
     }
 
-    /// An activate on an input box takes focus, as `FeInputBox`'s slot 9 does:
-    ///
-    /// ```text
-    /// 0x4CCB73  if (!isFocused())            ; 0x4C7DD0, [this+0x10C] & 0x40
-    /// 0x4CCB7E      setFocused()             ; 0x4C7D70 — only when [this+0x110] & 0x40 allows it
-    /// 0x4CCB85      [this+0x148] = 1         ; the editing latch
-    /// 0x4CCB9B  else if (![this+0x148]) clearFocused()   ; 0x4C7DA0
-    /// ```
-    ///
-    /// so the first click focuses the box and it stays focused: the latch is 1 from then on, and
-    /// the `else` arm cannot fire. `NFS5.CHATINPUTBOX` shares that slot, and its own bind
-    /// 0x4C32D3 starts by calling the input box's 0x4CC430, so `data.alwaysfocused` reaches it
-    /// too (§4.109).
-    /// Every class on this screen with the parts its template declares that **no state lists**.
-    ///
-    /// The part walk can never reach one, so only the class's own draw can put it down — and
-    /// `NFS5.CAMERAPICTURE`'s `shp` (§4.129) is exactly that: a part the bind looks up by name.
-    /// A measurement axis for the same kind of gap: a part here that the port draws nowhere is a
-    /// thing the original puts on the screen and this port does not.
-    pub fn unlisted_parts(&self) -> Vec<(String, Vec<String>)> {
-        let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-        for e in &self.layout.elements {
-            let Some(c) = self.controls.get(&e.class) else { continue };
-            let used: std::collections::BTreeSet<&str> = c.states.values().flatten().map(String::as_str).collect();
-            let dead: Vec<String> = c.parts_order.iter().filter(|p| p.as_str() != "data" && !used.contains(p.as_str())).cloned().collect();
-            if !dead.is_empty() {
-                out.insert(e.class.clone(), dead);
-            }
-        }
-        for (_, g) in self.group_spans() {
-            out.extend(g.unlisted_parts());
-        }
-        out.into_iter().collect()
-    }
-
-    /// Every class on this screen with the states its `.ctr` template declares — the very set
-    /// `FeWidget`'s slot 12 (0x4C7760) turns into `[widget+0x110]`, and therefore the complete
-    /// list of looks the original can ever put a widget of that class into (§4.109, §4.110).
-    /// A measurement axis: a state a template declares and this port never returns is a look the
-    /// original has and the port does not, and no blank count can see it.
-    pub fn declared_states(&self) -> Vec<(String, Vec<String>)> {
-        let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-        for e in &self.layout.elements {
-            if let Some(c) = self.controls.get(&e.class) {
-                let mut v: Vec<String> = c.states.keys().cloned().collect();
-                v.sort();
-                out.insert(e.class.clone(), v);
-            }
-        }
-        for (_, g) in self.group_spans() {
-            out.extend(g.declared_states());
-        }
-        out.into_iter().collect()
-    }
-
     /// The flattened indices of the widgets whose `.lay` `name` is one of `names`, with the
     /// position of the name that matched — what 0x50D9A0's `FeScreen::findWidget` does.
     pub fn widgets_named(&self, names: &[&str]) -> Vec<(usize, usize)> {
@@ -3260,7 +3137,6 @@ impl LayoutScreen {
         }
         out
     }
-
 }
 
 /// `FEChronicleMainBoxControl`'s grid, from its slot 8 — **0x508020**:
@@ -3750,9 +3626,6 @@ impl LayoutScreen {
     /// type **4** when the button goes down and **8** when it comes up (0x529806), and
     /// `Control::handleEvent` 0x525F80 sends them to **slot 5** and **slot 9**.
     pub fn set_pressed(&mut self, down: bool) {
-        if crate::config::cfg().nfs_fe_press.as_str().is_some() {
-            return;
-        }
         self.pressed = down;
         // §4.57: a widget that takes focus takes the mouse with it (0x4C8486 → 0x528CB0), and
         // `Window::handleEvent`'s button arm then hands it every button event wherever the pointer
@@ -4023,7 +3896,6 @@ impl LayoutScreen {
         let (pos, size) = self.place(aspect, elapsed as f32, y, aw, ah);
         out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
     }
-
 }
 
 impl LayoutScreen {
@@ -4111,7 +3983,6 @@ impl LayoutScreen {
             // it here would count it once per screen that sits on it
             out.extend(bg.sprites_reporting(aspect, strings, None, accessor, &mut Vec::new()));
         }
-        let bg_end = out.len();
         // `FEEndOfEraCallBackList`'s slot 15 (0x4FF1F0) is the screen's whole draw: it does not
         // call `Window::draw` (0x528760), so neither the fill of section 0 nor any child is painted
         if let Some(e) = &self.end_of_era {
@@ -4151,8 +4022,6 @@ impl LayoutScreen {
             let d = WidgetDraw { i, e, x, y, w, h, talpha, aspect, strings, selected, hovered, accessor };
             match self.classes[i] {
                 WidgetClass::ScreenFill => self.draw_screen_fill(d, &mut out),
-                // `NFS_NO_GOURAUD=1` skips them — the probe for which sprites bury the text
-                WidgetClass::GouraudBox if crate::config::cfg().nfs_no_gouraud.as_str().is_some() => {}
                 WidgetClass::GouraudBox => self.draw_gouraud_box(d, &mut out),
                 WidgetClass::GouraudIndicatorBar => self.draw_gouraud_indicator_bar(d, &mut out),
                 WidgetClass::GlintyRectangle => self.draw_glinty_rectangle(d, &mut out),
@@ -4211,19 +4080,6 @@ impl LayoutScreen {
             // (`REAL.BLACK_640x480`) brings a `color` and a `size` with it. Painting that colour
             // would cover the background layout the same block names, which every screen visibly
             // has, so it is metadata and not counted as undrawn.
-            // `NFS_WIDGET_DUMP=1` prints, per widget, how many sprites it produced, their extent
-            // and the transition alpha they carry — the diagnostic that found the faint-text bug
-            // recorded in `RE/AUDIT.md`
-            if crate::config::cfg().nfs_widget_dump.as_str().is_some() {
-                let n = out.len() - first;
-                let b = out[first..].iter().fold((9.0f32, 9.0f32, -9.0f32, -9.0f32), |a, s| (a.0.min(s.pos[0]), a.1.min(s.pos[1]), a.2.max(s.pos[0]), a.3.max(s.pos[1])));
-                let f0: Vec<(String, [f32; 4])> = { let mut v: Vec<(String, [f32; 4])> = out[first..].iter().map(|s| (format!("{:?}", s.texture), s.color)).collect(); v.dedup(); v.truncate(3); v };
-                let hot = match self.state_for(e, i, selected, hovered) {
-                    "normal" => String::new(),
-                    st => format!(" [{st}]"),
-                };
-                println!("  #{i:3} {:<26} pos=({x:.0},{y:.0}) size=({w:.0}x{h:.0}) sprites={n}{hot} box=({:.3},{:.3})-({:.3},{:.3}) alpha={talpha:.2} first={f0:?}", e.class, b.0, b.1, b.2, b.3);
-            }
             // **`NFS5.3DCAR` is never a sprite, in either build.** Its draw, `FECar3DControl`'s
             // slot 15 = **0x4C0990**, calls none of the painter family: 0x4C09A3 places the car
             // through 0x4C0D10 and the only other thing it can do is 0x4E1E50(7), a sound, when
@@ -4256,9 +4112,6 @@ impl LayoutScreen {
         out.append(&mut overlay);
         // last of all, over the tooltip and the drop-down alike
         self.cursor_sprite(&mut out, aspect, hovered);
-        if crate::config::cfg().nfs_layer_dump.as_str().is_some() {
-            println!("layer: background {} sprites, own {} sprites", bg_end, out.len() - bg_end);
-        }
         out
     }
 }

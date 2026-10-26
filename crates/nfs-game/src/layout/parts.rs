@@ -66,8 +66,7 @@ impl LayoutScreen {
     pub(super) fn part_text(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part, depth: u32) -> String {
         use nfs_formats::ctr::PartKind;
         if depth > 4 {
-            // the cycle guard (`guard_hits`): a text no update has published yet is empty
-            self.guard_hits.set(self.guard_hits.get() + 1);
+            // the cycle guard: a text no update has published yet is empty
             return String::new();
         }
         // 0x526B60's loop, read to the instruction 2026-09-26: the pair finder 0x526DF0 takes the
@@ -215,30 +214,6 @@ impl LayoutScreen {
         self.box_sized(e, 0)
     }
 
-    /// Every **autosizing** widget whose box disagrees with the union of its own parts —
-    /// `box_of` now returns that union unconditionally at depth 0 (§4.62's rule, re-read
-    /// 2026-09-30), so since this walks every autosizing widget rather than only the ones a
-    /// `.lay` block leaves `size=`-less, it should always come back empty; a non-empty result
-    /// means `box_of` and `parts_union` have drifted apart again. `NFS_BOX_SWEEP=1` prints it.
-    pub fn box_disagreements(&self) -> Vec<(String, (f32, f32), (f32, f32))> {
-        let mut out = Vec::new();
-        for e in self.layout.elements.iter().skip(1) {
-            let autosizes = self.controls.get(&e.class).and_then(|c| c.value("autosize")).map(|v| v.trim() != "0").unwrap_or(false);
-            if !autosizes {
-                continue;
-            }
-            let Some(u) = self.parts_union(e) else { continue };
-            let b = self.box_of(e, 0);
-            if (b.0 - u.0).abs() > 1.0 || (b.1 - u.1).abs() > 1.0 {
-                out.push((e.class.clone(), b, u));
-            }
-        }
-        for g in self.groups.values() {
-            out.extend(g.box_disagreements());
-        }
-        out
-    }
-
     /// The box an **autosizing** widget gets: the union of the rects of the parts its state draws,
     /// started at the origin — `Control::computeBox` 0x5253C0, the branch at 0x525446.
     ///
@@ -336,7 +311,6 @@ impl LayoutScreen {
     /// The class template's own `size.value`, evaluated.
     fn box_template(&self, e: &nfs_formats::lay::Element, depth: u32) -> Option<(f32, f32)> {
         if depth > 4 {
-            self.guard_hits.set(self.guard_hits.get() + 1);
             return None;
         }
         let c = self.controls.get(&e.class)?;

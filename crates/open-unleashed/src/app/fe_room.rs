@@ -449,23 +449,6 @@ impl App {
     /// One frame of the parts: the step (0x4C0696…0x4C07CF), then each widget's doors onto its
     /// car's channels 6 and 7 and the lids' easers onto 8 and 9.
     fn fe_car_parts_step(&mut self) {
-        // `NFS_FE_PARTS=1,3` clicks those zones of every 3D car at tick 0, once, so a still taken
-        // with `NFS_FE_CLOCK` shows them open — the way `NFS_FE_DZ` stands in for a dragged bar
-        if !self.fe.parts_forced
-            && let Some(v) = nfs_game::config::cfg().nfs_fe_parts.as_str()
-        {
-            self.fe.parts_forced = true;
-            let widgets: Vec<usize> = self.fe.layout_preview.as_ref().map(|l| l.car_3d().iter().map(|w| w.index).collect()).unwrap_or_default();
-            for w in widgets {
-                for z in v.split(',').filter_map(|z| z.trim().parse::<u32>().ok()) {
-                    let ev = self.fe.layout_preview.as_mut().map(|l| l.car_click_zone(w, z, 0)).unwrap_or_default();
-                    self.fe_car_part_events(w, &ev);
-                    if let Some(k) = self.fe_car_slot_of(w) {
-                        self.fe.cars[k].4.update_lids(1000);
-                    }
-                }
-            }
-        }
         // the widget's tick first looks at `Car.Roof` (0x4C05E7…0x4C063F) — and the roof zone is
         // there only when the car's roof animation has a length (0x438190 at 0x4C0D10)
         let roof_down = self.choice_index(choice::CAR_ROOF).is_some_and(|(i, _)| i == 1);
@@ -731,7 +714,7 @@ impl App {
         };
         // the garage's draw clears the room car's blob-shadow flag (0x4E9D15) and projects `FESH`
         // instead; every other front-end car keeps the flag its constructor set (0x4D138A)
-        let blob = self.fe.blob_shadow.filter(|_| !nfs_game::config::cfg().nfs_no_shadow.is_set());
+        let blob = self.fe.blob_shadow;
         for (slot, _, _, _, car) in &self.fe.cars {
             let widget = widgets.iter().find(|w| w.index == *slot);
             match widget.and_then(|w| w.position().map(|p| (p, w.alpha))) {
@@ -912,7 +895,7 @@ impl App {
         let early_car = [CarPass { lod: 4, mask: 0x30, flag: false }];
         let mut items = Vec::new();
         let car = self.fe.cars.iter().find(|c| c.0 == usize::MAX).map(|c| &c.4);
-        let blob = self.fe.blob_shadow.filter(|_| !nfs_game::config::cfg().nfs_no_shadow.is_set());
+        let blob = self.fe.blob_shadow;
         // the first pass is the **reflection**: 0x4D15F0 queues with `+0x471 = 1`, which sends the
         // draw 0x4432B0 to slot 3 0x443490 (0x4432DD…0x4432F9) — every model mirrored through its
         // own floor (`reflected`), under the turntable and the floor the second pass lays over

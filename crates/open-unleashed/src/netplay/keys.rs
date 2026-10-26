@@ -1,30 +1,20 @@
 //! The keyboard ring the blocking waits read (0x55FF60).
 
-use super::*;
-
 /// **0x55FF60** — the next key of the keyboard ring, which the blocking waits test against ESC (0x1B):
 /// PLAYGAME's wait (0x50CFD7) and the barrier's four (0x48CE6F, 0x48CFA7, 0x48D0C1, 0x48D248). The
 /// original's loops pump its own window's messages; the port's do not run the event loop, so this is
 /// **platform glue**: on macOS the OS key state of Escape (`CGEventSourceKeyState`) — not in a scripted
-/// `NFS_NO_FOCUS` run, which has no user at the keyboard — and, for the tests, **TEST GLUE**
-/// `NFS_NET_ESC_MS=<ms>` (an ESC that arrives that long after the wait began). Elsewhere: never.
+/// `NFS_NO_FOCUS` run, which has no user at the keyboard. Elsewhere: never.
 #[derive(Debug, Clone, Copy)]
-pub struct KeyRing {
-    since: Instant,
-}
+pub struct KeyRing;
 
 impl KeyRing {
     pub fn begin() -> Self {
-        Self { since: Instant::now() }
+        Self
     }
 
     /// Whether the next key is ESC.
     pub fn esc(&self) -> bool {
-        if let Some(ms) = nfs_game::config::cfg().nfs_net_esc_ms.as_str().and_then(|v| v.parse::<u64>().ok())
-            && self.since.elapsed() >= Duration::from_millis(ms)
-        {
-            return true;
-        }
         os_escape_down()
     }
 }

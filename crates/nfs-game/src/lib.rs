@@ -22,6 +22,7 @@ pub mod movie_overlay;
 pub mod netcar;
 pub mod opponents;
 pub mod particles;
+pub mod photo;
 pub mod police;
 pub mod race;
 pub mod race_order;

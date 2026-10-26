@@ -173,16 +173,7 @@ impl App {
         if !std::mem::take(&mut self.knockout_round) {
             return;
         }
-        let (mut order, _) = self.finishing_order();
-        // diagnostic: `NFS_KO_PLACE=<p>` files the player at place `p` (1-based) of the order —
-        // a scripted series (`NFS_FE_KO_SERIES`) cannot drive past anyone, so this is how a still
-        // reaches the rounds after the first and `knockoutraceinfo`
-        if let Some(p) = nfs_game::config::cfg().nfs_ko_place.as_str().and_then(|v| v.trim().parse::<usize>().ok())
-            && let Some(at) = order.iter().position(|d| *d == 0)
-        {
-            let d = order.remove(at);
-            order.insert(p.clamp(1, order.len() + 1) - 1, d);
-        }
+        let (order, _) = self.finishing_order();
         let pos: Vec<i32> = (0..9).map(|d| order.iter().position(|x| *x == d).map_or(99, |p| p as i32 + 1)).collect();
         let Some(k) = self.knockout.as_mut().filter(|k| k.state.active) else { return };
         let before = k.state.race_index;
@@ -442,7 +433,7 @@ impl App {
     /// that state on `App` and resets it in [`App::start_race`] (0x426B20…), save for the
     /// fields only the elements' construction clears: `HButtonVisual +0x100`, the button under the
     /// pointer ([`App::hud_hover`] — a race left by the keyboard kept it), and the page billboard's
-    /// shrink (`HBillBoard` state 2, [`App::page_closing`]) — and the dialog queue itself.
+    /// shrink (`HBillBoard` state 2, [`ResultPages::closing`]) — and the dialog queue itself.
     ///
     /// **The dialog queue `[0x60C9C4]`** is emptied (its end put back to its start, 0x42567B…
     /// 0x4256BC), freed (0x425722) and its pointer zeroed (0x42572A); `[0x60C9F4]`, the other vector,
@@ -462,7 +453,7 @@ impl App {
     /// Being deleted, not closed, the billboard plays no sound 4 (0x41ADD0 is not called).
     fn hud_teardown(&mut self) {
         self.hud_hover = None;
-        self.page_closing = None;
+        self.pages.closing = None;
         self.results_billboard = None;
         self.billboard_key = 0;
     }

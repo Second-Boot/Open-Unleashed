@@ -268,7 +268,7 @@ impl App {
                     self.fe.comms_game_mode = mode;
                     if mode == 0 {
                         // (`update_check_tick`; set by fields: `l` borrows the screen)
-                        let ticks = nfs_game::config::cfg().nfs_update_check_ticks.as_str().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(netlobby::UPDATE_THREAD_TICKS);
+                        let ticks = netlobby::UPDATE_THREAD_TICKS;
                         if self.fe.update_check.is_none() {
                             self.fe.update_check = Some((ticks, true));
                         }

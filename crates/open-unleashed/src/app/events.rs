@@ -64,7 +64,8 @@ impl App {
             },
             MenuKey::Down | MenuKey::Right => match self.pause_confirm.as_mut() {
                 Some(c) => *c = 1,
-                None => self.pause_sel = (self.pause_sel + 1).min(2),
+                // PORT-DEVIATION D46: down to the photo-mode item when the menu has it
+                None => self.pause_sel = (self.pause_sel + 1).min(self.pause_items() as u8 - 1),
             },
             MenuKey::Enter => match (self.pause_confirm, self.pause_sel) {
                 (Some(0), _) => {
@@ -83,10 +84,90 @@ impl App {
                         self.restart_race(event_loop);
                     }
                 }
+                (None, 3) => {
+                    // PORT-DEVIATION D46: the pause menu's photo-mode item
+                    self.photo_enter();
+                }
                 _ => self.pause_confirm = Some(1),
             },
-            _ => {}
+            // PAD-END2 (D10), the pad's B: the quit question's "no", the menu's "continue"
+            MenuKey::Back => match self.pause_confirm {
+                Some(_) => self.pause_confirm = None,
+                None => self.paused = false,
+            },
         }
+    }
+
+    /// **Space on the HUD's dialogs**, one answer per call; `true` when it answered one.
+    /// * Space on the pause action's `HInfo` 18190 (`[0x60C9FC]`, Spacebar byte 1): the billboard's
+    ///   slot 9 answers 0x19 and the notice slides out (0x42A3D0, 0x4261ED).
+    /// * Space closes the page on top and the queue shows the next (0x4272FF): the billboard's
+    ///   input slot 0x42A3D0 answers event 0x19 on the key-down edge of `[0x5DE028 + DIK_SPACE]`
+    ///   while its enable byte is set, and 0x4261ED slides the current page out.
+    /// * Space on the last page closes it and returns to the menu (window and renderer are kept);
+    ///   with no page at all (a test drive) the same key leaves.
+    ///
+    /// PORT-DEVIATION D10 (PAD-END): the original reads only the key-down table here (no pad
+    /// button reaches 0x42A3D0), so the pad's A (`MenuNav::Select`) calls this as Space — the
+    /// pad could not leave a finished race otherwise.
+    pub(crate) fn race_accept(&mut self, _event_loop: &ActiveEventLoop) -> bool {
+        if self.vehicle.is_some() && self.net_notice.is_some() && self.net_notice_space {
+            self.net_notice = None;
+            self.net_notice_space = false;
+            return true;
+        }
+        if self.results.is_some() && (self.pages.page as usize) + 1 < self.result_pages().len() {
+            self.close_results_page();
+            return true;
+        }
+        self.results.is_some() && self.end_finished_race()
+    }
+
+    /// **The pad on the race's dialogs** (PAD-END, PAD-END2; PORT-DEVIATION D10): a standard pad's
+    /// edge-triggered keys (`Gamepads::poll` queues one per button-down, never per frame held) answer
+    /// the dialog that is up, **once per frame** (the first key that answered ends the frame, so one
+    /// press never answers two dialogs; the rest are dropped); `true` when one did. The pause menu
+    /// has its own handler (`pause_menu_key`). The keys apply only while a dialog or the replay bar is
+    /// up — never to the driving, whose pad is the bindings' (D44):
+    /// * the replay-save dialog: A saves (the typed name, else the first free `Replay<n>`), B closes;
+    ///   its overwrite question: d-pad picks, A answers, B is "no";
+    /// * a billboard page or the network notice: A as Space ([`Self::race_accept`]); on the failed
+    ///   mission's summary Y is its "race again" (0x429390);
+    /// * a playback with no page up: the replay bar's cells ([`Self::pad_replay_bar_key`]);
+    /// * a finished race with no page left: A leaves, as Space does.
+    pub(crate) fn pad_race_accept(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let keys = std::mem::take(&mut self.input.pad_menu);
+        keys.into_iter().any(|k| self.pad_race_key(k, event_loop))
+    }
+
+    fn pad_race_key(&mut self, k: nfs_input::MenuNav, event_loop: &ActiveEventLoop) -> bool {
+        use nfs_input::MenuNav as N;
+        if self.paused {
+            return false;
+        }
+        if self.replay_save.up {
+            return if self.replay_save.overwrite { self.pad_overwrite_key(k) } else { self.pad_replay_save_key(k) };
+        }
+        let notice = self.vehicle.is_some() && self.net_notice.is_some() && self.net_notice_space;
+        let page = self.results.is_some() && (self.pages.page as usize) < self.result_pages().len();
+        if notice || page {
+            return match k {
+                N::Select => self.race_accept(event_loop),
+                // `HMissionSummary`'s "race again" (0x429390 → event 3, only for a failed mission, 0x4293BB)
+                N::Alt if page
+                    && self.result_pages().get(self.pages.page as usize) == Some(&ResultPage::MissionSummary)
+                    && self.mission_result.is_some_and(|(passed, _)| !passed) =>
+                {
+                    self.restart_race(event_loop);
+                    true
+                }
+                _ => false,
+            };
+        }
+        if self.playback_running() {
+            return self.pad_replay_bar_key(k, event_loop);
+        }
+        k == N::Select && self.race_accept(event_loop)
     }
 
     /// The interface bits `RaceFrame` reads on the press (0x4138D0, the packer's ring `0x5E954C`):
@@ -105,7 +186,7 @@ impl App {
         // 0x426154 does. *(Until 2026-09-26 the port's pause key backed out of the
         // question or resumed — an approximation of a key the original does not have.)*
         // Once the pages have closed it opens the menu, whose quit leaves
-        let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some());
+        let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.pages.page as usize).is_some());
         if self.vehicle.is_some() && self.fe.race_game_type == Some(game_type::NETWORK) {
             // a network race (`[0x6573E8] == 3`): 0x415110's own rules, not the single-player pause
             if self.input.take_pressed(Action::Pause) {
@@ -195,6 +276,8 @@ impl ApplicationHandler for App {
     /// The process ends inside a leave's wait: finish it here (the original's wait blocks, so nothing ends
     /// before it).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // PORT-DEVIATION D46: a photo-mode still still being written
+        self.photo.finish_writers();
         while !self.net.leaving.is_empty() {
             self.net_leaving_step();
             std::thread::sleep(Duration::from_millis(2));
@@ -215,6 +298,12 @@ impl ApplicationHandler for App {
         if matches!(event, WindowEvent::RedrawRequested) {
             self.sync_gamma();
         }
+        if let WindowEvent::Occluded(o) = event {
+            if o != self.occluded {
+                tracing::info!(occluded = o, "window occlusion changed (race frame cap 30 fps while hidden)");
+            }
+            self.occluded = o;
+        }
         if self.intro.is_some() {
             self.intro_event(event_loop, event);
             return;
@@ -231,6 +320,14 @@ impl ApplicationHandler for App {
         {
             self.fe.main_music_stamp = self.fe_timer_ticks();
         }
+        // PORT-DEVIATION D46: while photo mode is up the mouse (the wheel zooms, the right button looks) is its own
+        if self.photo.active {
+            match &event {
+                WindowEvent::MouseInput { state, button, .. } if self.photo_mouse_button(*button, *state) => return,
+                WindowEvent::MouseWheel { delta, .. } if self.photo_wheel(delta) => return,
+                _ => {}
+            }
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             // Focus lost = the original's WM_ACTIVATE deactivation (0x53B050, registered for message 6 at 0x53AD66):
@@ -239,8 +336,16 @@ impl ApplicationHandler for App {
             // clears nothing (0x53B07F..0x53B0CC only re-hooks the Windows key); the port clears again there
             // because macOS (Cmd+Shift+5 overlay) can hand back a synthetic press for a key whose release was
             // swallowed — PORT-DEVIATION D17 (remainder, FOCUS-INPUT).
-            WindowEvent::Focused(_) => self.input.release_all(),
+            WindowEvent::Focused(_) => {
+                self.input.release_all();
+                // PORT-DEVIATION D46: photo mode's own held keys too
+                self.photo_release_keys();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                // PORT-DEVIATION D46: F11 / K enter photo mode (pause menu, replay), and every key is its own while it is up
+                if self.photo_key_event(&event) {
+                    return;
+                }
                 self.input.key_event(&event);
                 // 0x4D2850: the callback list sees the key, then a screen or the background in
                 // transition, or a busy room, drops it (`fe_input_swallowed`)
@@ -458,47 +563,17 @@ impl ApplicationHandler for App {
                     && event.physical_key
                         == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter)
                     && self.results.is_some()
-                    && self.result_pages().get(self.results_page as usize) == Some(&ResultPage::MissionSummary)
+                    && self.result_pages().get(self.pages.page as usize) == Some(&ResultPage::MissionSummary)
                     && self.mission_result.is_some_and(|(passed, _)| !passed)
                 {
                     self.restart_race(event_loop);
                     self.input.end_tick();
                     return;
                 }
-                // Space on the pause action's `HInfo` 18190 (`[0x60C9FC]`, Spacebar byte 1): the billboard's
-                // slot 9 answers 0x19 and the notice slides out (0x42A3D0, 0x4261ED)
+                // Space answers the HUD's dialogs (the billboard's slot 0x42A3D0): `race_accept`
                 if event.state == winit::event::ElementState::Pressed
                     && event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
-                    && self.vehicle.is_some()
-                    && self.net_notice.is_some()
-                    && self.net_notice_space
-                {
-                    self.net_notice = None;
-                    self.net_notice_space = false;
-                    self.input.end_tick();
-                    return;
-                }
-                // **Space** closes the page on top and the queue shows the next (0x4272FF): the
-                // billboard's input slot 0x42A3D0 answers event 0x19 on the key-down edge of
-                // `[0x5DE028 + DIK_SPACE]` while its enable byte is set, and 0x4261ED slides the
-                // current page out. This port used Enter, which no billboard reads.
-                if event.state == winit::event::ElementState::Pressed
-                    && event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
-                    && self.results.is_some()
-                    && (self.results_page as usize) + 1 < self.result_pages().len()
-                {
-                    self.close_results_page();
-                    self.input.end_tick();
-                    return;
-                }
-                // Space on the last page closes it and returns to the menu (window and renderer are
-                // kept); with no page at all (a test drive) the same key leaves
-                if event.state == winit::event::ElementState::Pressed
-                    && event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
-                    && self.results.is_some()
-                    && self.end_finished_race()
+                    && self.race_accept(event_loop)
                 {
                     self.input.end_tick();
                     return;
@@ -671,7 +746,8 @@ impl ApplicationHandler for App {
                             nfs_input::MenuNav::Right => MenuKey::Right,
                             nfs_input::MenuNav::Select => MenuKey::Enter,
                             nfs_input::MenuNav::Back if text_menu => MenuKey::Back,
-                            nfs_input::MenuNav::Back => return None,
+                            // Y and X are the race's dialog keys (PAD-END2), not the menus'
+                            nfs_input::MenuNav::Back | nfs_input::MenuNav::Alt | nfs_input::MenuNav::Aux => return None,
                         })
                     })
                     .collect();
@@ -725,6 +801,11 @@ impl ApplicationHandler for App {
                 // Enter do (D10); a key that answered starts the next frame afresh, as the
                 // keyboard's handler returns
                 if self.vehicle.is_some() {
+                    // PORT-DEVIATION D46: photo mode reads the pad itself (A shoots, B leaves): its menu keys never reach
+                    // the pause menu hidden under it
+                    if self.photo.active {
+                        self.input.pad_menu.clear();
+                    }
                     if self.paused && !self.input.pad_menu.is_empty() {
                         for k in std::mem::take(&mut self.input.pad_menu) {
                             let key = match k {
@@ -733,7 +814,9 @@ impl ApplicationHandler for App {
                                 nfs_input::MenuNav::Left => MenuKey::Left,
                                 nfs_input::MenuNav::Right => MenuKey::Right,
                                 nfs_input::MenuNav::Select => MenuKey::Enter,
-                                nfs_input::MenuNav::Back => continue,
+                                // B: the question's "no" / the menu's "continue" (PAD-END2, D10)
+                                nfs_input::MenuNav::Back => MenuKey::Back,
+                                nfs_input::MenuNav::Alt | nfs_input::MenuNav::Aux => continue,
                             };
                             self.pause_menu_key(key, event_loop);
                             if !self.paused || self.vehicle.is_none() {
@@ -749,6 +832,14 @@ impl ApplicationHandler for App {
                     }
                     self.race_interface_keys(event_loop);
                 }
+                // PAD-END: A answers the HUD's dialogs as Space does (after the interface keys,
+                // as the keyboard's handler orders them); the frame ends on an answer
+                if self.pad_race_accept(event_loop) {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 if nfs_game::config::cfg().nfs_ff_test.is_set() {
                     self.gamepads.rumble_test_tick();
                 }
@@ -760,7 +851,7 @@ impl ApplicationHandler for App {
                 // 0x41581A…0x415849)
                 // diagnostic `NFS_HUD_KEYS=tick:pause`: the pause menu's continue after 64 pause ticks
                 // (or, `tick:pauserestart`, its restart instead — `replay.md` §18.12)
-                if self.scripted_pause && self.pause_ticks >= 64.0 {
+                if self.scripted_hud.pause && self.pause_ticks >= 64.0 {
                     self.end_scripted_pause(event_loop);
                 }
                 let halted = self.paused || self.replay.frozen;
@@ -812,7 +903,7 @@ impl ApplicationHandler for App {
                     ran += 1;
                     // a scripted pause (`NFS_HUD_KEYS`) taken inside a tick ends the frame's ticks,
                     // as the pause key between two frames does
-                    if self.scripted_pause {
+                    if self.scripted_hud.pause {
                         self.accumulator = Duration::ZERO;
                         break;
                     }

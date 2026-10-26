@@ -814,14 +814,6 @@ impl TrackWorld {
         self.smack_anims.get(k).map(|a| (a.article, a.home, a.position))
     }
 
-    /// Diagnostic: the `k`-th scene instance flare's point and direction in world space, whether it
-    /// runs or not.
-    pub fn instance_flare(&self, k: usize) -> Option<(Vec3, Vec3)> {
-        let (slot, f) = self.instance_flares.get(k)?;
-        let m = self.items.get(self.instance_culls.get(*slot)?.first_item)?.transform;
-        Some((m.transform_point3(f.position), m.transform_vector3(f.direction)))
-    }
-
     /// The flares that run this frame, in world space: the placed articles' ([`Self::flares`],
     /// through [`Self::effect_runs`]) and the `.scn` GEOM instances' — the scene drawer's 0x450380
     /// runs an instance's kind-2 parts only when the walk answers its entry, the LOD's byte `+1` is
@@ -2113,16 +2105,6 @@ impl TrackWorld {
                 env_by_id.get(&u32::from_le_bytes(name)).copied()
             });
         (env_by_id, env_map)
-    }
-
-    /// Diagnostic: the current sphere the walk answers for the `WAnimBundle` article named
-    /// `name` (case-insensitive substring), and the article's name.
-    pub fn anim_article_sphere(&self, name: &str) -> Option<(String, Vec3, f32)> {
-        let name = name.to_lowercase();
-        self.anim_articles.iter().find_map(|a| {
-            let c = self.cull_articles.get(a.article)?.as_ref()?;
-            c.name.to_lowercase().contains(&name).then(|| (c.name.clone(), c.centre, c.radius))
-        })
     }
 
     /// `Graphics.Headlights` below Projected: no item takes the `HEAD` decal (`main.rs`).

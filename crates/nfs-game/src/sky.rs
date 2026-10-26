@@ -640,9 +640,6 @@ impl Lightning {
             // 0x4A8340(0x5CF104[mode], pan): it draws 0x538040 first (the patch `0x3DF + r % 9`)
             let draw = fe.next_u32();
             self.thunder = Some(ThunderCall { lead: THUNDER_LEAD[self.mode.min(2)], pan, draw });
-            if forced_lightning() {
-                tracing::info!(lead = THUNDER_LEAD[self.mode.min(2)], pan, draw, "lightning: thunder called");
-            }
         }
         let clamp = |v: f32| if v >= 15.0 { 15.0 } else if v < 0.0 { 0.0 } else { v };
         self.cell = [clamp((half - s) / self.side * 15.0), clamp((c + half) / self.side * 15.0)];
@@ -724,11 +721,6 @@ fn is_flat(name: &str) -> bool {
 /// block, so the layers are otherwise never seen.
 pub fn forced_level() -> Option<usize> {
     crate::config::cfg().nfs_sky_level.as_str()?.parse().ok()
-}
-
-/// `NFS_LIGHTNING=1`: a port diagnostic that drives the lightning's field value to 1 (mode 2).
-pub fn forced_lightning() -> bool {
-    crate::config::cfg().nfs_lightning.is_set()
 }
 
 /// The 16 × 16 layer grid of 0x460EC0(15, …) / 0x460F40 in metres around the eye, with the base UVs of 0x45EC40 (`j/a`, `i/b`) and the colour stream `colours` (vertex
@@ -1035,13 +1027,7 @@ impl Sky {
         // Industrial are the tracks whose field reaches 0.04
         if let Some(l) = self.lightning.as_mut() {
             let value = l.bin.sample_track_b(6, slice, lap_slices);
-            // port diagnostic: `NFS_LIGHTNING=1` feeds the field's top value on every tick, so a
-            // strike lands within a few ticks for a still (the original has no such switch)
-            let value = if forced_lightning() { 1.0 } else { value };
             l.update(value, ticks_i, fe);
-            if forced_lightning() {
-                tracing::info!("lightning: on={} mode={} cell={:?} time={} end={} grids={} flashes={}", l.on, l.mode, l.cell, l.time, l.end, self.grids.len(), self.grids.iter().filter(|g| g.colours.flash.active).count());
-            }
         }
         // the pass that follows saves its own eye and slice (0x45D562…0x45D598)
         self.eye = eye;

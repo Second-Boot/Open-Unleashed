@@ -26,6 +26,7 @@ mod brand;
 mod career_ui;
 mod cli;
 mod diag;
+mod guard;
 mod hud;
 mod hud_str;
 mod hud_cfg;
@@ -67,13 +68,18 @@ use winit::window::{Window, WindowId};
 
 fn main() {
     diag::init();
-    if let Err(e) = run() {
+    let r = run();
+    // a clean end (or a reported error) is not a crash for the start-up guard
+    guard::end();
+    if let Err(e) = r {
         diag::fatal(&e);
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<()> {
+    // PLATFORM GLUE: the start-up crash guard (`guard.rs`): a start after a crashed one asks for a plain GPU device
+    guard::begin();
     let paths = GamePaths::locate()?;
     tracing::info!(root = %paths.root.display(), "located original game data");
     // the Verok patch's `nfs5.ini` (dll 0x100022B0): `Filtering=0` is the renderer's, before it is made
@@ -501,8 +507,7 @@ fn run() -> Result<()> {
         // the very first frame, before any profile) and again on every `SETTYPEQUICKRACE`/
         // `SETTYPEKNOCKOUT`/`SETTYPEQUICKKNOCKOUT` (`FeCatalogues::reset_track_rows`, ported). So the
         // catalogue always starts on row 0 — the (flag-filtered, sorted) list's first entry —
-        // unless the player has picked something else. `NFS_FE_CAR=<display name substring>` still
-        // overrides it, for stills of the showroom (the same kind of diagnostic as `NFS_MENU_MODE`).
+        // unless the player has picked something else.
         // *(Until 2026-09-29 the no-override default hunted the list for a modern 993 coupe
         // instead — a leftover convenience from the menu's very first cut, never RE-grounded,
         // which left every screen reached before a `SETTYPE*` reset — including this port's own
@@ -513,10 +518,7 @@ fn run() -> Result<()> {
         // [`dealer_flag_admitted`]) moves QuickRace's row 0 to `'59 356 A 1600 Super Convertible D`
         // instead, matching the reference capture's own read of the original's default car, `356 A
         // Convertible`, which `'50 356 1100 Cabriolet` does not.)*
-        let car_idx = std::env::var("NFS_FE_CAR")
-            .ok()
-            .and_then(|want| cars.iter().position(|c| c.display_name.contains(want.as_str())))
-            .unwrap_or(0);
+        let car_idx = 0;
         // [`default_paint_colour`]/[`default_paint_row`]: `GenericCar.Colour` does not start on
         // row 0 of whichever car ends up default — its `FEColourAccessor` ctor (0x4B91F0) reads
         // `nfs5.car`'s own **record 0** once, at registration, and the row shown for the actual
@@ -552,13 +554,8 @@ fn run() -> Result<()> {
             paint_idx: default_paint_idx,
             paint_custom: None,
             laps: num_laps,
-            traffic: std::env::var("NFS_TRAFFIC")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(fe.traffic_density as u32),
-            cops: std::env::var("NFS_COPS")
-                .map(|v| v != "0")
-                .unwrap_or(fe.cops),
+            traffic: env_traffic().unwrap_or(fe.traffic_density as u32),
+            cops: env_cops().unwrap_or(fe.cops),
             backwards,
             mirror: false,
             circuits: records.circuits(),
@@ -574,7 +571,7 @@ fn run() -> Result<()> {
     if let (Some(m), Some(c)) = (&menu, career.as_mut()) {
         c.set_mode(m.mode);
     }
-    let mission_start = career_request.as_ref().and_then(|r| r.mission.clone()).map(cone_limit_diagnostic).or_else(|| {
+    let mission_start = career_request.as_ref().and_then(|r| r.mission.clone()).or_else(|| {
         // a recorded mission's launch words (`Replay_begin` restores the block the HUD reads): the mission they describe
         let rs = replay_setup.as_ref()?;
         let m = career_ui::MissionStart::from_replay_words(&paths, rs.mission.as_ref()?, rs.scene);
@@ -683,17 +680,10 @@ fn run() -> Result<()> {
         traffic_count: TRAFFIC_COUNT[replay_setup
             .as_ref()
             .map(|r| r.traffic as usize)
-            .unwrap_or_else(|| {
-                std::env::var("NFS_TRAFFIC")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(fe.traffic_density as usize)
-            })
+            .unwrap_or_else(|| env_traffic().map_or(fe.traffic_density as usize, |d| d as usize))
             .min(3)],
         traffic_ids: None,
-        cops_enabled: replay_setup.as_ref().map(|r| r.cops).unwrap_or_else(|| {
-            std::env::var("NFS_COPS").map(|v| v != "0").unwrap_or(fe.cops)
-        }),
+        cops_enabled: replay_setup.as_ref().map(|r| r.cops).unwrap_or_else(|| env_cops().unwrap_or(fe.cops)),
         // the recording's `RACE_TYPE` 1 (the cops race) / `FEGAME_TYPE` 9 (a mission's two cops)
         cops_race: replay_setup.as_ref().is_some_and(|r| r.race_type == Some(1)),
         cop_count: if replay_setup.as_ref().is_some_and(|r| r.fegame_type == Some(9)) { 2 } else { 4 },

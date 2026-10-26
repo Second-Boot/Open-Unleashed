@@ -53,18 +53,11 @@ impl App {
         // The career is put into the states the blank count is otherwise waiting on — a car with
         // damage on every part, and a used-car market — so the widgets that need them are
         // measured instead of assumed. It only ever touches the in-memory career of this one
-        // diagnostic run, never the save.
-        //
-        // This is **on by default** since 2026-09-21, and the reason is the same one that made
-        // `coverage.py`'s phantom functions worth recording: a diagnostic that answers with the
-        // starting state of a synthetic career is measuring the harness, not the port. With it
-        // off the headline was 61, of which 42 were `UsedCar.Car` and damage widgets that are
-        // blank only because nothing had been bought, damaged or listed — a parity loop reading
-        // that number chases widgets that are already ported. `NFS_SWEEP_STATE=0` restores the
-        // bare-career count for anyone who wants to see it.
-        if nfs_game::config::cfg().nfs_sweep_state.as_str() != Some("0")
-            && let Some(c) = self.career.as_mut()
-        {
+        // diagnostic run, never the save. (A diagnostic that answers with the starting state of a
+        // synthetic career is measuring the harness, not the port: bare, the headline was 61, of
+        // which 42 were `UsedCar.Car` and damage widgets blank only because nothing had been bought,
+        // damaged or listed.)
+        if let Some(c) = self.career.as_mut() {
             let parts: Vec<(i16, f32)> = {
                 let car = c.career.garage.first().map(|o| o.car_id);
                 let family = car.and_then(|id| c.tables.car(id)).and_then(nfs_game::career::part_family).map(str::to_string);
@@ -109,8 +102,6 @@ impl App {
             .collect();
         names.sort();
         let mut total: std::collections::BTreeMap<(String, String), usize> = Default::default();
-        let mut where_of: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-        let mut expr_fail: std::collections::BTreeMap<(String, String, String, String), usize> = Default::default();
         let mut empty_combos: std::collections::BTreeMap<String, usize> = Default::default();
         let mut mute_combos: std::collections::BTreeMap<String, usize> = Default::default();
         let mut mute_bars: std::collections::BTreeMap<String, usize> = Default::default();
@@ -128,8 +119,7 @@ impl App {
             // the same probe fills the browser with one session, so the four `Comms.*` lists and
             // the watches beside them can be measured too. The record is what a `'d'` answer
             // carries (`nfs_net::comm::Describe`), filled as a two-player game would fill it.
-            if nfs_game::config::cfg().nfs_sweep_state.as_str() != Some("0")
-                && let Some(lobby) = self.net.lobby.as_mut()
+            if let Some(lobby) = self.net.lobby.as_mut()
                 && lobby.found.is_empty()
             {
                 // a game as 0x509B00 / 0x48DD97 describe it: `HANS'S ~3.5`, positional (index 1),
@@ -169,47 +159,6 @@ impl App {
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
-            // `NFS_SWEEP_DUMP=<layout>` prints what every accessor of that one screen resolves to,
-            // and `NFS_SWEEP_DUMP=*` every screen's. The blank count cannot see a widget that draws
-            // the **wrong** thing — `UsedCar.Car` answered every modifier with the car's name for a
-            // long time and counted as drawn — so this is the other half of the measurement.
-            if nfs_game::config::cfg().nfs_sweep_dump.as_str().is_some_and(|v| v == "*" || v == name.as_str())
-                && let Some(l) = self.fe.layout_preview.as_ref()
-            {
-                for e in &l.layout.elements {
-                    if let Some(a) = e.get("accessor").filter(|a| !a.is_empty()) {
-                        println!("  {name:<20} {:<26} {a:<30} -> {:?}", e.class, self.accessor_value(a));
-                    }
-                }
-                // the lists too: a row that says the wrong thing is as invisible to the blank
-                // count as an accessor that does
-                for w in l.list_boxes() {
-                    let Some(a) = w.accessor.as_deref() else { continue };
-                    let rows = self.list_rows(a).map(|(r, cur)| (r.len(), cur, r.into_iter().take(3).map(|r| format!("{r:?}")).collect::<Vec<_>>()));
-                    println!("  {name:<20} {:<26} {a:<30} => {rows:?}", "list");
-                }
-                // and the 3D cars: the sweep has no 3D pass, so they always count as blank. What
-                // can be measured here is whether the port would have a model to put in each one.
-                for w in l.car_3d() {
-                    let model = self.logo_car(w.accessor.as_deref(), w.othersource.as_deref()).map(|c| c.model.clone());
-                    println!("  {name:<20} {:<26} {:<30} ~> {model:?}", "3dcar", w.accessor.clone().unwrap_or_default());
-                }
-            }
-            // Every part expression whose evaluation reached the cycle guard (`guard_hits`; // there is no unanswerable name any more) — none over the 98 shipped layouts.
-            if nfs_game::config::cfg().nfs_expr_sweep.as_str().is_some()
-                && let Some(l) = self.fe.layout_preview.as_ref()
-            {
-                for (class, part, key, expr) in l.expr_failures() {
-                    *expr_fail.entry((class, part, key, expr)).or_insert(0usize) += 1;
-                }
-            }
-            if nfs_game::config::cfg().nfs_box_sweep.as_str().is_some()
-                && let Some(l) = self.fe.layout_preview.as_ref()
-            {
-                for (class, b, u) in l.box_disagreements() {
-                    println!("  box {name:<20} {class:<28} size.value=({:.0}x{:.0}) parts=({:.0}x{:.0})", b.0, b.1, u.0, u.1);
-                }
-            }
             if nfs_game::config::cfg().nfs_hit_sweep.as_str().is_some()
                 && let Some(l) = self.fe.layout_preview.as_mut()
             {
@@ -293,122 +242,7 @@ impl App {
                     *explained.entry(why).or_default() += 1;
                     continue;
                 }
-                where_of.entry(class.clone()).or_default().push(name.clone());
                 *total.entry((class, src)).or_default() += 1;
-            }
-        }
-        if !expr_fail.is_empty() {
-            // Each of these was decomposed on 2026-09-21 (`RE/AUDIT.md` §J) and every one is
-            // either a fault in the shipped data — a name no template declares — or a place the
-            // port follows the **code** rather than the template expression, with the addresses
-            // in the note. They are separated from anything new so this axis reports a small
-            // number the way the others do; a row that is not on this list is the interesting
-            // one. The key is `(class, part.key)`, not the expression, so a template edit cannot
-            // slip past it unnoticed.
-            //
-            // Since the text part's load 0x4E7160 is ported (2026-09-26: a text part's `size` is
-            // its text's truncated 0x536970 measure, `LayoutScreen::part_text`) none of the rows
-            // below fails any more — the sweep counts 0 — and they stay listed only so that a
-            // regression is recognised. They were all a text part's width the port could not
-            // measure at that point. The
-            // three faults in the shipped data that used to be here — `BottomBarButton.ctr`'s
-            // `data.area`, `ChatDisplayBox.ctr`'s `backrect`, the `size=150,` of three
-            // rectangles — resolve now, the way the original resolves them: a name nothing
-            // defines reads 0 (0x530F0A) and an empty half of a pair is 0 (`RE/notes/layouts.md`,
-            // the evaluator section of 2026-09-26).
-            const EXPLAINED: [(&str, &str); 7] = [
-                // the port sets alignment as an anchor in the box, not as this part offset
-                ("NFS5.AccessorWatch", "label.pos"),
-                ("REAL.LABEL", "label.pos"),
-                // the caption runs from 0x4C6054 / 0x4C6237, not from the template (§4.14)
-                ("NFS5.ComboBoxSlider", "label.pos"),
-                // the text comes from an accessor and is drawn from the code path
-                ("NFS5.INPUTBOX", "untext.pos"),
-                ("NFS5.CHARVECTACCESSORINPUTBOX", "untext.pos"),
-                // a button whose own string is empty — AUDIT §F's five
-                ("NFS5.GOTOBUTTON", "mediumlabel.pos"),
-                ("NFS5.GOTOBUTTON", "smalllabel.pos"),
-            ];
-            let mut ks: Vec<_> = expr_fail.iter().collect();
-            ks.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
-            let mut news = 0usize;
-            let mut known = 0usize;
-            for ((class, part, key, expr), n) in &ks {
-                let site = format!("{part}.{key}");
-                if EXPLAINED.iter().any(|(c, s)| c == class && *s == site) {
-                    known += **n;
-                    continue;
-                }
-                if news == 0 {
-                    println!("part expressions that do not resolve and are NOT accounted for:");
-                }
-                news += **n;
-                println!("  {n:5}  {class:<28} {site} = {expr}");
-            }
-            println!("part expressions that do not resolve: {news} unaccounted, {known} decomposed in AUDIT.md §J");
-        }
-        // which screen each blank is on — `NFS_SWEEP_WHERE=1` prints it. A count by class says
-        // what is missing, not where to look for it, and every blank that turned out to be a real
-        // gap was found by opening the screen it is on.
-        // **A state a template declares and this port never returns is a look the original has
-        // and the port does not** — and no blank count can see it, because the widget draws its
-        // other states perfectly well. `NFS_SWEEP_STATES=1` lists them. The set the port can
-        // return is `state_for`'s own: the `.lay`'s `state=`, `normal`, `hover`, `focused`,
-        // `focusedhover`, `selected`, `selectedhover` and `NFS5.CAMERASELECT`'s `highlighty`.
-        // §4.112.
-        //
-        // **`hidden` and `disabled` belong in that set and were missing from it until
-        // 2026-09-21**, which made this axis report 58 classes "never hidden" and 11 "never
-        // disabled" — 69 phantom gaps. The port does both: a hidden widget is skipped at the
-        // draw (`layout.rs`'s `hidden_flags`, set by name the way 0x50D910 does at its fifty-one
-        // call sites) and `state_for`'s **first** arm returns `disabled` off `disabled_flags`.
-        // A list of gaps that names things already done is the same failure as the blank count
-        // reading an empty career, and it hid a real one underneath: `state_hidden_or_disabled`
-        // was reading only the `.lay` attribute, so a widget hidden at run time stayed pressable.
-        if nfs_game::config::cfg().nfs_sweep_states.as_str().is_some() {
-            const KNOWN: [&str; 9] =
-                ["normal", "hover", "focused", "focusedhover", "selected", "selectedhover", "highlighty", "hidden", "disabled"];
-            let mut miss: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
-            for name in &names {
-                self.open_layout(name);
-                let Some(l) = self.fe.layout_preview.as_ref() else { continue };
-                for (class, states) in l.declared_states() {
-                    for st in states {
-                        if !KNOWN.contains(&st.as_str()) {
-                            miss.entry(class.clone()).or_default().insert(st);
-                        }
-                    }
-                }
-            }
-            // and the parts no state lists — only a class's own draw can reach one (§4.130)
-            let mut unlisted: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-            for name in &names {
-                self.open_layout(name);
-                if let Some(l) = self.fe.layout_preview.as_ref() {
-                    unlisted.extend(l.unlisted_parts());
-                }
-            }
-            println!("template parts no state lists:");
-            for (class, parts) in &unlisted {
-                println!("  {class:<32} {}", parts.join(", "));
-            }
-            println!("the chronicle index for group {} (§4.118): {:?}", self.fe.chronicle_group, self.chronicle_index());
-            println!("template states this port never returns:");
-            for (class, states) in &miss {
-                println!("  {class:<32} {}", states.iter().cloned().collect::<Vec<_>>().join(", "));
-            }
-        }
-        if nfs_game::config::cfg().nfs_sweep_where.as_str().is_some() {
-            println!("blank widgets by screen:");
-            let mut ks: Vec<&String> = where_of.keys().collect();
-            ks.sort();
-            for c in ks {
-                let mut per: std::collections::BTreeMap<&str, usize> = Default::default();
-                for s in &where_of[c] {
-                    *per.entry(s.as_str()).or_default() += 1;
-                }
-                let list: Vec<String> = per.iter().map(|(s, n)| if *n > 1 { format!("{s} x{n}") } else { (*s).to_string() }).collect();
-                println!("  {c:<32} {}", list.join(", "));
             }
         }
         let mut by_class: std::collections::BTreeMap<String, usize> = Default::default();
@@ -558,6 +392,22 @@ pub(crate) static NO_FOCUS: std::sync::atomic::AtomicBool = std::sync::atomic::A
 /// (the same key path a player's skip takes) so the walk does not sit through the whole movie.
 pub(crate) static PLAY_INTRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `NFS_TRAFFIC=0..3`: the traffic density of a menu-less start (the one place the variable is read; the registry's
+/// `traffic_density` otherwise).
+pub(crate) fn env_traffic() -> Option<u32> {
+    std::env::var("NFS_TRAFFIC").ok().and_then(|v| v.parse().ok())
+}
+
+/// `NFS_TRAFFIC_SEED=<n>`: pins the traffic / police seed (a repeatable run; the original seeds from `fe.txt`'s `rand_seed`).
+pub(crate) fn env_traffic_seed() -> Option<u32> {
+    nfs_game::config::cfg().nfs_traffic_seed.as_str().and_then(|v| v.parse().ok())
+}
+
+/// `NFS_COPS=0|1`: the cops of a menu-less start (`0` off, anything else on; the registry's `cops` otherwise).
+pub(crate) fn env_cops() -> Option<bool> {
+    std::env::var("NFS_COPS").ok().map(|v| v != "0")
+}
+
 /// **TEST GLUE** (not in the original): the still's geometry — `NFS_SHOT_SIZE=WxH` physical pixels
 /// (default 1280x800, the goldens' size) and `NFS_SHOT_SCALE=<s>` (default 1, the HiDPI factor the
 /// HUD's logical resolution is taken with, see [`App::hud_geometry`]).
@@ -571,15 +421,6 @@ pub(crate) fn shot_geometry() -> (u32, u32, f32) {
         .unwrap_or((1280, 800));
     let s = nfs_game::config::cfg().nfs_shot_scale.as_str().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s >= 1.0).unwrap_or(1.0);
     (w, h, s)
-}
-
-/// diagnostic: `NFS_CONE_LIMIT=n` gives the mission a cone **limit** of `n` (rule kind 0, which no
-/// shipped mission uses) — so `CONEPENALTY` is −1 and `HTime`'s sum can go below 0
-pub(crate) fn cone_limit_diagnostic(mut ms: career_ui::MissionStart) -> career_ui::MissionStart {
-    if let Some(n) = nfs_game::config::cfg().nfs_cone_limit.as_str().and_then(|v| v.trim().parse::<u16>().ok()) {
-        ms.mission.cone_rule = Some(nfs_formats::career::ConeRule::Limit(n));
-    }
-    ms
 }
 
 /// diagnostic (port-only): `NFS_RACE_PLACE=<p>` — the place (1-based) the player finishes at, in
@@ -643,27 +484,13 @@ pub(crate) enum ScriptedHudKey {
 }
 
 impl App {
-    /// **TEST GLUE, the start of a tick's car work**: the diagnostic placements `NFS_SMACK_DRIVE`,
-    /// `NFS_PHANTOM_DRIVE`, `NFS_CONE_DRIVE`, `NFS_NET_RAM` and `NFS_NET_RAM_PROP`, which set a car
-    /// down short of a prop, a point, a cone or a traffic car. Moved out of [`Self::simulate`] verbatim:
+    /// **TEST GLUE, the start of a tick's car work**: the diagnostic placement `NFS_SMACK_RAM`, which sets a
+    /// smackable down ahead of the car. Moved out of [`Self::simulate`] verbatim:
     /// it runs between the same two statements (after the exchange registration, before the 32 Hz
     /// block's `v.race_started = …`), and `simulate` borrows the car and the world only after it.
-    pub(crate) fn apply_tick_glue(&mut self, exchange_in: Option<&ExchangeIn>) {
+    pub(crate) fn apply_tick_glue(&mut self) {
         let Some(v) = self.vehicle.as_mut() else { return };
         let Some(w) = self.world.as_ref() else { return };
-        // diagnostic: `NFS_SMACK_DRIVE=k` sets the player's car down 6 m short of the track's k-th
-        // smackable (`TrackWorld::track_smackable`, `[WTrack+0x34]` order less the mission's) on
-        // game tick 600, heading at it at 12 m/s — to see a hit, its player's start and its burst
-        // (`RUST_LOG=nfs_game=debug`); with `NFS_SMACK_VIEW=k` the camera watches the prop
-        if self.tick == 600
-            && let Some(k) = nfs_game::config::cfg().nfs_smack_drive.as_str().and_then(|v| v.parse::<usize>().ok())
-            && let Some((article, pos, _)) = w.track_smackable(k)
-        {
-            let to = Vec3::new(pos.x - v.position.x, 0.0, pos.z - v.position.z).normalize_or(Vec3::Z);
-            v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
-            v.velocity = to * 12.0;
-            tracing::info!(target: "open_unleashed::app::simulate", k, article, ?pos, "NFS_SMACK_DRIVE: the car set at the smackable");
-        }
         // **TEST GLUE** `NFS_SMACK_RAM=k@t:deg`: on game tick `t` the player's car is sent along its own
         // heading at 12 m/s and the track's k-th smackable is set down 6 m ahead of it, on the car's
         // ground, its face turned `deg` degrees off head-on — the same scenario the reference run
@@ -689,131 +516,19 @@ impl App {
             v.velocity = Vec3::new(h.x * 12.0, v.velocity.y, h.z * 12.0);
             tracing::info!(target: "open_unleashed::app::simulate", k, ?at, ?h, "NFS_SMACK_RAM: the smackable set ahead of the car");
         }
-        // diagnostic: `NFS_PHANTOM_DRIVE=x,y,z,hx,hz[@t]` sets the player's car down 8 m short of the
-        // world point (x, y, z), heading (hx, hz) at 12 m/s on game tick `t` (default 600) — to drive
-        // into a place whose collision geometry is in question (the `--record` csv shows a stop)
-        if let Some((p, t)) = nfs_game::config::cfg().nfs_phantom_drive.as_str().and_then(|s| {
-            let (list, t) = match s.split_once('@') {
-                Some((l, t)) => (l, t.trim().parse::<u64>().ok()?),
-                None => (s, 600),
-            };
-            let n: Vec<f32> = list.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            (n.len() == 5).then_some((n, t))
-        }) && self.tick == t
-        {
-            let to = Vec3::new(p[3], 0.0, p[4]).normalize_or(Vec3::Z);
-            let at = Vec3::new(p[0], p[1], p[2]);
-            v.place_at_trigger(&w.collision, &self.specs, at - to * 8.0 + Vec3::Y * 0.5, to);
-            v.velocity = to * 12.0;
-            tracing::info!(target: "open_unleashed::app::simulate", ?at, ?to, "NFS_PHANTOM_DRIVE: the car set short of the point");
-        }
-        // diagnostic: `NFS_CONE_DRIVE=k` does the same with the mission scene's k-th cone, to see
-        // the HUD's cone count move (the scripted run then draws a frame every other tick);
-        // `k@t` on game tick `t` instead of 600
-        let cone_drive = nfs_game::config::cfg().nfs_cone_drive.as_str().and_then(|v| match v.split_once('@') {
-            Some((k, t)) => Some((k.trim().parse::<usize>().ok()?, t.trim().parse::<u64>().ok()?)),
-            None => Some((v.trim().parse::<usize>().ok()?, 600)),
-        });
-        if let Some((k, at)) = cone_drive
-            && self.tick == at
-            && let Some(pos) = self.skill.as_ref().and_then(|sk| sk.cones.get(k)).map(|c| c.position)
-        {
-            let to = Vec3::new(pos.x - v.position.x, 0.0, pos.z - v.position.z).normalize_or(Vec3::Z);
-            v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
-            v.velocity = to * 12.0;
-            tracing::info!(target: "open_unleashed::app::simulate", k, ?pos, "NFS_CONE_DRIVE: the car set at the cone");
-        }
-        // **Test glue** (`NFS_NET_RAM=<race index>@<tick>[,…]`, set on every machine, an even tick): in an
-        // input-exchange race that human car is set down 6 m behind the traffic car nearest to it, on that
-        // car's heading, closing at 15 m/s over its speed — a contact with the traffic car the two-instance
-        // runs would not otherwise reach (`network.md` §11.20). Every machine does it to the same car on
-        // the same tick from the same (shared) traffic state, so the runs' dumps stay comparable.
-        if self.tick % 2 == 0
-            && let Some(x) = exchange_in.as_ref()
-            && let Some(list) = nfs_game::config::cfg().nfs_net_ram.as_str()
-            && let Some(t) = self.road.traffic.as_ref()
-        {
-            for (idx, at) in list.split(',').filter_map(|e| e.split_once('@').and_then(|(i, t)| Some((i.trim().parse::<u32>().ok()?, t.trim().parse::<u64>().ok()?)))) {
-                if at != self.tick {
-                    continue;
-                }
-                let (from, seat) = if idx == x.local_index {
-                    (v.position, None)
-                } else if let Some(e) = x.seats.iter().find(|e| e.1 == idx) {
-                    (self.road.opponents.get(e.0).map_or(v.position, |o| o.vehicle.position), Some(e.0))
-                } else {
-                    continue;
-                };
-                let Some(c) = t.cars.iter().filter(|c| c.active).min_by(|a, b| a.position.distance(from).total_cmp(&b.position.distance(from))) else { continue };
-                let dir = Vec3::new(c.velocity.x, 0.0, c.velocity.z).try_normalize().unwrap_or_else(|| Vec3::new(c.orientation.z_axis.x, 0.0, c.orientation.z_axis.z).normalize_or(Vec3::Z));
-                let at_pos = c.position - dir * 6.0 + Vec3::Y * 0.5;
-                let speed = c.velocity.length() + 15.0;
-                match seat {
-                    None => {
-                        v.place_at_trigger(&w.collision, &self.specs, at_pos, dir);
-                        v.velocity = dir * speed;
-                    }
-                    Some(k) => {
-                        if let Some(o) = self.road.opponents.get_mut(k) {
-                            o.vehicle.place_at_trigger(&w.collision, &o.specs, at_pos, dir);
-                            o.vehicle.velocity = dir * speed;
-                        }
-                    }
-                }
-                tracing::info!(target: "netplay", race_index = idx, tick = self.tick, traffic_at = ?c.position, "NFS_NET_RAM: the human car set behind the traffic car");
-            }
-        }
-        // **Test glue** (`NFS_NET_RAM_PROP=<race index>@<tick>:<k>[,…]`, every machine, an even tick): the same
-        // for the track's k-th smackable — that human car set down 6 m short of it, heading at it at 12 m/s
-        // (`NFS_SMACK_DRIVE`'s placement, for any car of an exchange race), so that two cars can reach one
-        // prop on one tick and the smackables' walk order (0x4A17F0, race-index order) shows
-        if self.tick % 2 == 0
-            && let Some(x) = exchange_in.as_ref()
-            && let Some(list) = nfs_game::config::cfg().nfs_net_ram_prop.as_str()
-        {
-            for (idx, at, k) in list.split(',').filter_map(|e| {
-                let (i, rest) = e.split_once('@')?;
-                let (t, k) = rest.split_once(':')?;
-                Some((i.trim().parse::<u32>().ok()?, t.trim().parse::<u64>().ok()?, k.trim().parse::<usize>().ok()?))
-            }) {
-                let Some((article, pos, _)) = w.track_smackable(k) else { continue };
-                if at != self.tick {
-                    continue;
-                }
-                let seat = if idx == x.local_index { None } else if let Some(e) = x.seats.iter().find(|e| e.1 == idx) { Some(e.0) } else { continue };
-                let from = seat.and_then(|k| self.road.opponents.get(k)).map_or(v.position, |o| o.vehicle.position);
-                let to = Vec3::new(pos.x - from.x, 0.0, pos.z - from.z).normalize_or(Vec3::Z);
-                match seat {
-                    None => {
-                        v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
-                        v.velocity = to * 12.0;
-                    }
-                    Some(k) => {
-                        if let Some(o) = self.road.opponents.get_mut(k) {
-                            o.vehicle.place_at_trigger(&w.collision, &o.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
-                            o.vehicle.velocity = to * 12.0;
-                        }
-                    }
-                }
-                tracing::info!(target: "netplay", race_index = idx, tick = self.tick, article, ?pos, "NFS_NET_RAM_PROP: the human car set at the smackable");
-            }
-        }
     }
 
     /// **The scripted run** (`--autotest <secs>`, the diagnostic runs and the fixtures' races): the race run in a loop of
     /// one-tick iterations instead of the window's frames, with the `NFS_*` test glue the windowed frame does not have
-    /// (the held scripted pause, the network leave, the pace, the drawn frames of `NFS_SMACK_DRIVE`, the stops, the
+    /// (the held scripted pause, the network leave, the pace, the drawn frames of `NFS_FX_FRAMES`, the stops, the
     /// traces), then the race's end as the interactive path files it. Moved out of `start_race` unchanged; the end of
     /// each iteration is [`Self::race_frame_epilogue`], the windowed frame's own. `true` when `start_race` must return
     /// (the run ended the program, left for the front end or started another race), `false` to go on to the screenshot.
     pub(crate) fn run_scripted_race(&mut self, secs: f32, event_loop: &ActiveEventLoop) -> bool {
         let ticks = (secs * TICKS_PER_SEC_F32) as u32;
-        // diagnostic: with `NFS_SMACK_DRIVE` the scripted run draws a frame every other tick,
-        // so the draw's side of a struck smackable (its player's sample, its record's `+8`,
-        // the burst) runs as in a windowed race
-        // — and with `NFS_FX_FRAMES`, so the cars' effects (driven by each drawn frame,
-        // `nfs_game::car_effects`) run as in a windowed race
-        let smack_frames = nfs_game::config::cfg().nfs_smack_drive.is_set() || nfs_game::config::cfg().nfs_cone_drive.is_set() || nfs_game::config::cfg().nfs_fx_frames.is_set();
+        // diagnostic: with `NFS_FX_FRAMES` the scripted run draws a frame every other tick, so the cars' effects
+        // (driven by each drawn frame, `nfs_game::car_effects`) run as in a windowed race
+        let smack_frames = nfs_game::config::cfg().nfs_fx_frames.is_set();
         let mut pause_hold = 0;
         // **TEST GLUE** (not in the original): `NFS_NET_PACE=1` holds a scripted network race to
         // the game's own 64 Hz, so the two machines' tick counters stay comparable — the link
@@ -838,21 +553,16 @@ impl App {
                 std::thread::sleep(wait);
             }
             // diagnostic `NFS_HUD_KEYS=tick:pause` in a network race: the press has asked to leave
-            if std::mem::take(&mut self.scripted_net_leave) {
+            if std::mem::take(&mut self.scripted_hud.net_leave) {
                 if !self.leave_race_as(false) {
                     tracing::info!(target: "open_unleashed::app::race_start", "network race left by a scripted pause press: no front end to return to");
-                } else if self.fe_sequence_in("NFS_NET_LEAVE_SEQ", event_loop) {
-                    // **TEST GLUE** `NFS_NET_LEAVE_SEQ=<dir>`: the lobby after the return stays up
-                    // and is drawn (`NFS_FE_SEQ_SCRIPT` tokens, e.g. `wait:` to tick the room);
-                    // the sequence ends the run
-                    return true;
                 }
                 event_loop.exit();
                 return true;
             }
             // diagnostic `NFS_HUD_KEYS=tick:pause`: the headless run holds the pause for 64 of
             // its iterations (no tick runs), the audio paused and resumed as a frame would
-            if self.scripted_pause {
+            if self.scripted_hud.pause {
                 self.sync_audio_pause();
                 pause_hold += 1;
                 if pause_hold >= 64 {
@@ -876,7 +586,7 @@ impl App {
                     // **TEST GLUE** `NFS_HUD_KEYS=tick:pausequit` — the pause menu's quit (its question
                     // answered yes): the race left for the front end (`leave_race`), then, in a
                     // scripted session (`NFS_AUTOTEST_RACES`), `PLAYGAME` again for the next race
-                    if std::mem::take(&mut self.scripted_quit) {
+                    if std::mem::take(&mut self.scripted_hud.quit) {
                         let game_type = self.fe.race_game_type.unwrap_or(self.fe.game_type);
                         if self.leave_race() && self.session_races > 1 {
                             self.session_races -= 1;
@@ -914,15 +624,6 @@ impl App {
             }
             self.simulate();
             self.start_auto_replay_if_due(event_loop);
-            // diagnostic: `NFS_REPLAY_STOP_EXHAUSTED=1` stops a scripted playback on the first
-            // tick its stream has run out (`[0x5E99F4] == 3`), before the frame's end test, so
-            // `--screenshot` shows the frame the original draws last before it leaves
-            if nfs_game::config::cfg().nfs_replay_stop_exhausted.is_set()
-                && self.replay.stream.as_ref().is_some_and(|r| r.mode == nfs_game::replay::Mode::Exhausted)
-            {
-                tracing::info!(target: "open_unleashed::app::race_start", tick = self.tick, "diagnostic: the scripted run stops at the stream's end");
-                break;
-            }
             // diagnostic: `NFS_RESULTS_STOP=<n>[:<ticks>]` stops a scripted run `ticks` (96)
             // after the n-th result page of the queue (0-based) was first drawn, its slide-in
             // over, so `--screenshot` shows it (with `NFS_FX_FRAMES`, which draws the frames
@@ -931,9 +632,9 @@ impl App {
                 let (n, w) = v.split_once(':').map_or((v, "96"), |(n, w)| (n, w));
                 Some((n.trim().parse::<u8>().ok()?, w.trim().parse::<u64>().unwrap_or(96)))
             }) && self.results.is_some()
-                && self.results_page == n
-                && self.page_seen == Some(n)
-                && self.page_open_tick.is_some_and(|t0| self.tick >= t0 + wait)
+                && self.pages.page == n
+                && self.pages.seen == Some(n)
+                && self.pages.open_tick.is_some_and(|t0| self.tick >= t0 + wait)
             {
                 tracing::info!(target: "open_unleashed::app::race_start", tick = self.tick, page = ?self.result_pages().get(n as usize), "diagnostic: the scripted run stops on the result page");
                 break;
@@ -1016,15 +717,6 @@ impl App {
             self.stop_race_audio();
             self.fe.menu = Some(menu);
             self.fe_after_race(false);
-            // diagnostic: `NFS_FE_KO_SERIES=1` keeps pressing `PLAYGAME` while the knockout
-            // series runs, each round another `--autotest` race of the same length, so a
-            // scripted run drives a whole series and the log carries every 0x4DE060
-            if nfs_game::config::cfg().nfs_fe_ko_series.is_set() && self.knockout.as_ref().is_some_and(|k| k.state.active) {
-                self.autotest = Some(secs);
-                self.fe.game_type = game_type::KNOCKOUT;
-                self.start_from_layout(event_loop);
-                return true;
-            }
         }
         if self.screenshot.is_none() {
             // The original saves the replay from the race de-init chain after *every* race,
@@ -1038,7 +730,7 @@ impl App {
 
     /// **The still of `--screenshot`** (a scripted run's last step): the mirror's texture, the renderer's per-frame
     /// state the scripted loop never sets, the lens-flare warm-up, the offscreen render to `path` and the
-    /// `NFS_SHOT_SEQ` / `NFS_MIRROR_DUMP` extras; then the program ends. Moved out of `start_race` unchanged.
+    /// `NFS_SHOT_SEQ` extra; then the program ends. Moved out of `start_race` unchanged.
     pub(crate) fn take_screenshot(&mut self, path: String, event_loop: &ActiveEventLoop) {
         // a scripted run seldom redraws, so the mirror may not have a texture yet: render it,
         // and rebuild the scene once more so the HUD carries it
@@ -1073,6 +765,12 @@ impl App {
             }
             self.rebuild_scene();
         }
+        // **TEST GLUE** (PORT-DEVIATION D46): `NFS_RACE_KEYS=<keys>` feeds keys through photo mode's and the pause menu's
+        // handlers, `NFS_PHOTO=<ops>` enters photo mode and moves its camera before the still (and may save stills of
+        // its own), see `photo.rs`
+        if self.race_keys_script(event_loop) | self.photo_script() {
+            self.rebuild_scene();
+        }
         self.sync_gamma();
         let rgba = self
             .renderer
@@ -1094,23 +792,8 @@ impl App {
                 let rgba = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1).expect("offscreen render");
                 let sp = format!("{}.seq{k}.png", path.trim_end_matches(".png"));
                 image::save_buffer(&sp, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8).expect("write png");
-                if nfs_game::config::cfg().nfs_mirror_dump.as_str().is_some()
-                    && let (Some(tex), Some(r)) = (self.mirror_tex, self.renderer.as_mut())
-                    && let Ok((w, h, px)) = r.read_texture(tex)
-                {
-                    image::save_buffer(format!("{}.mirror.png", sp.trim_end_matches(".png")), &px, w, h, image::ColorType::Rgba8).expect("write mirror png");
-                }
             }
             self.test_alpha = None;
-        }
-        // diagnostic: `NFS_MIRROR_DUMP=1` writes the mirror's own texture next to the screenshot
-        if nfs_game::config::cfg().nfs_mirror_dump.as_str().is_some()
-            && let (Some(tex), Some(r)) = (self.mirror_tex, self.renderer.as_mut())
-            && let Ok((w, h, px)) = r.read_texture(tex)
-        {
-            let mp = format!("{}.mirror.png", path.trim_end_matches(".png"));
-            image::save_buffer(&mp, &px, w, h, image::ColorType::Rgba8).expect("write mirror png");
-            tracing::info!(target: "open_unleashed::app::race_start", path = mp, w, h, "mirror texture written");
         }
         event_loop.exit();
     }
@@ -1121,9 +804,9 @@ impl App {
     /// behind. The windowed frame lets go after 64 pause ticks of its clock, a scripted run's loop after 64
     /// iterations.
     pub(crate) fn end_scripted_pause(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        self.scripted_pause = false;
+        self.scripted_hud.pause = false;
         self.paused = false;
-        if std::mem::take(&mut self.scripted_restart) {
+        if std::mem::take(&mut self.scripted_hud.restart) {
             self.restart_race(event_loop);
             return true;
         }
@@ -1142,15 +825,6 @@ impl App {
             return;
         }
         let out = format!("{path}.t{}.png", self.tick);
-        // **TEST GLUE** `NFS_TEST_SPOILER=1`: the player's pop-up wing (animation 2, 993 `SpoilerW`) at its last frame for the
-        // still. A scripted run draws no frames between its shots, so the wing's 2000 ms easer (one step per drawn frame,
-        // `CarModel::update_animation`, gate 22.222 m/s) never runs; this writes the end of its travel directly. Unset = the
-        // original's path; the simulation is not touched.
-        if nfs_game::config::cfg().nfs_test_spoiler.is_set()
-            && let (Some(c), Some(r)) = (self.car_model.as_mut(), self.renderer.as_mut())
-        {
-            c.set_anim(r, 2, c.anim_length(2) as f32);
-        }
         // **TEST GLUE**: a scripted run draws no frames, and the mirror's texture is made by the frame's
         // pass (`render_mirror`, before the main view) — without it the still carried the empty tray. The
         // first still makes the texture and rebuilds the scene so the HUD holds it; later ones refresh it
@@ -1185,7 +859,7 @@ pub(crate) fn parse_hud_keys(s: &str) -> Vec<(u64, ScriptedHudKey)> {
                 "F8" | "f8" => ScriptedHudKey::Toggle(nfs_input::Action::HudTransparency),
                 "2" => ScriptedHudKey::Toggle(nfs_input::Action::CycleMap),
                 // port diagnostic: the pause key, the menu left through its continue
-                // after 64 pause ticks (`App::scripted_pause`)
+                // after 64 pause ticks (`ScriptedHud::pause`)
                 "pause" | "P" => ScriptedHudKey::Pause,
                 // port diagnostic: the pause key, the menu left through its restart
                 // (command 3, 0x415721) instead — `replay.md` §18.12

@@ -156,36 +156,6 @@ impl App {
         }
     }
 
-    /// **The chronicle's entry index**, as 0x506FE0 builds it.
-    ///
-    /// The index is a flat table of 5 × 53 × 3 × 5 × 2 dwords at **0x692038** — group, year − 48,
-    /// kind, variant, and a flag — and 0x507340 reads it with
-    /// `[0x692038 + (2*(5*(3*(53*group + year − 48) + kind) + variant) + (flag != 0)) * 4]`.
-    /// 0x507065's `rep stosd` of **0x1F0E** dwords is 7950, which is that product exactly.
-    ///
-    /// It is built from the **five icon packs**, not from the picture files: 0x50701E formats
-    /// `"%s%s.fsh"` over the names at 0x5B8AB4, stepping 0x14 up to 0x5B8B18 — `iconsrace`,
-    /// `icons911`, `icons356`, `icons924`, `icons914`, which is group order and agrees with both
-    /// `"CBADE"` (§4.107) and the five buttons (§4.111). For each entry 0x537F60 hands back the
-    /// four-character directory tag and 0x5070CF…0x5070FB parses it:
-    ///
-    /// ```text
-    /// 0x5070FB  year = 10*tag[0] + tag[1] - 0x210     ; two ASCII digits; "00" becomes 100
-    /// 0x5070CA  kind = table[tag[2] - 0x4D]           ; 0x507234 -> the jump table 0x507224
-    ///                'p' -> 0, 'm' -> 1, 'v' -> 2, anything else -> 0
-    /// 0x507132  the slot is found by **linear probing along the flat table** from
-    ///           (group, year, kind, 0, 0): 0x50714C walks `eax += 4` while the dword is
-    ///           taken, counting in `ebx`, and gives up at ten — which is the product of the
-    ///           two fastest dimensions, 5 variants x 2 flags. So the k-th entry with the same
-    ///           (group, year, kind) lands at `variant = k / 2`, `flag = k % 2`, and the pairs
-    ///           are exactly §4.107's two frames, the resting one and the hovered one.
-    /// ```
-    ///
-    /// so `icons356.fsh`'s `"48p "` is the 1948 picture of the 356 line. §4.118.
-    pub(crate) fn chronicle_index(&self) -> Vec<(u32, usize, usize)> {
-        self.chronicle_entries().into_iter().map(|(y, k, v, _)| (y, k, v)).collect()
-    }
-
     /// The same walk, keeping the **pack entry number** each slot holds — which is what
     /// 0x507340 returns and what the timeline's icons are (§4.123). The two slots of a
     /// (year, kind, variant) are the resting frame and the hovered one (§4.121).

@@ -24,15 +24,7 @@ impl LayoutScreen {
     /// Make this the end-of-era screen: the show `show` (built by `EndOfEra::build`), the packs
     /// the constructor loads (0x4FE4D8…0x4FECDD), `Univers20b.ffn` (0x4FD5B7) and the era's movie
     /// (0x4FEC50), which runs once the show starts it.
-    pub fn set_end_of_era(&mut self, r: &mut Renderer, paths: &GamePaths, mut show: EndOfEra) {
-        // `NFS_EOE_STEPS=n` runs the show n steps ahead before the first frame — a still of the
-        // middle of it, the way `NFS_FE_CLOCK` parks the other clocks
-        if let Some(n) = crate::config::cfg().nfs_eoe_steps.as_str().and_then(|v| v.parse::<i64>().ok()) {
-            let base = self.end_of_era_now() - n * eoe::STEP_TICKS - 1;
-            for k in 0..=n {
-                show.frame(base + k * eoe::STEP_TICKS);
-            }
-        }
+    pub fn set_end_of_era(&mut self, r: &mut Renderer, paths: &GamePaths, show: EndOfEra) {
         let dir = paths.fe_data().join("Art");
         let mut art = HashMap::new();
         let mut packs: Vec<&'static str> = vec![eoe::OVAL, eoe::NUMBERS, eoe::CURVES, eoe::CURVES2, eoe::LINE];

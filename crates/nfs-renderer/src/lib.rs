@@ -23,10 +23,11 @@ pub(crate) fn point_filter() -> bool {
 mod camera;
 mod front;
 mod gpu;
+mod prof;
 
 pub use camera::Camera;
 pub use front::Renderer;
-pub use gpu::{MaterialId, MeshId, TextureId, VIEW_FAR};
+pub use gpu::{MaterialId, MeshId, STILL_MAX_PIXELS, TextureId, VIEW_FAR, still_size};
 
 use glam::{Mat4, Vec3};
 

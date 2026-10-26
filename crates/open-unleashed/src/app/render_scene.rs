@@ -15,14 +15,9 @@ impl App {
     /// takes it — the player (the car the camera follows) and each opponent; the traffic and the
     /// cops share one model per type and keep their pages clean (gap: the original's are per car).
     pub(crate) fn update_damage_decals(&mut self) {
-        let Some(mut damage) = self.vehicle.as_ref().map(|v| v.damage) else {
+        let Some(damage) = self.vehicle.as_ref().map(|v| v.damage) else {
             return;
         };
-        // diagnostic: `NFS_DAMAGE=<per cent>` puts that much damage on every zone
-        let forced = nfs_game::config::cfg().nfs_damage.as_str().map(|v| v.parse::<f32>().unwrap_or(0.0));
-        if let Some(d) = forced {
-            damage = [d; 10];
-        }
         // `CARDETAIL` `[0x6197C4]`: the crush 0x43E390 needs it above 0
         let detail = self.choice_index(choice::GRAPHICS_CAR_DETAIL).map_or(0, |(i, _)| i as u8);
         // 0x4382EC: the zone caps of the car the model's arms follow (0x465D80(0))
@@ -33,7 +28,7 @@ impl App {
         if let Some(r) = self.renderer.as_mut() {
             for (i, o) in self.road.opponents.iter().enumerate() {
                 if let Some(m) = self.road.opponent_models.get_mut(o.model) {
-                    m.update_damage(r, &forced.map_or(o.vehicle.damage, |d| [d; 10]), followed == Some(i), detail);
+                    m.update_damage(r, &o.vehicle.damage, followed == Some(i), detail);
                 }
             }
         }
@@ -153,16 +148,6 @@ impl App {
         // (`race_passes`). *(Until 2026-09-26 every car was LOD 1 at every distance, every part
         // of it drawn.)* The mirror's pass asks again for its own view (`Self::render_mirror`).
         let detail = self.choice_index(choice::GRAPHICS_CAR_DETAIL).map_or(0, |(i, _)| i as u8);
-        // diagnostic: `NFS_DAMAGE=<per cent>` (`update_damage_decals`'s own forcing of the
-        // player's and the opponents' zones) also puts that much damage on every traffic and cop
-        // car drawn below, for a screenshot check of their per-car decals/crush. Port-only
-        // extension, `car-model.md` §13.1: a comma list, `NFS_DAMAGE=<a>,<b>,…`, is cycled by each
-        // traffic/cop car's own draw position, so two cars sharing one catalogue model can be
-        // told apart — a screenshot check that the shared-model aliasing fix actually holds.
-        let forced_damage: Vec<f32> = nfs_game::config::cfg().nfs_damage.as_str()
-            .map(|v| v.split(',').filter_map(|s| s.trim().parse::<f32>().ok()).collect())
-            .unwrap_or_default();
-        let forced_damage_at = |i: usize| -> Option<f32> { (!forced_damage.is_empty()).then(|| forced_damage[i % forced_damage.len()]) };
         let replaying = self.replay_view().is_some();
         // the pick's screen: the view's own viewport (the mirror's tray, 0x539700 through its
         // camera), the size scaled to the virtual reference width (640 at 4:3) by the render width `[0x657A48]`
@@ -177,7 +162,7 @@ impl App {
         // **0x465D80(0)**: the car the model's "followed car" arms follow (`None` = the local car)
         let followed = self.followed_seat();
         let own_view = self.camera_view();
-        let looking = (self.input.held(Action::RearView) || nfs_game::config::cfg().nfs_lookback.as_str().is_some()) && self.vehicle.is_some();
+        let looking = self.input.held(Action::RearView) && self.vehicle.is_some();
         // a mirrored race turns every car model back across its x (0x4433A1…0x4433BC)
         for m in self.car_model.iter_mut().chain(self.road.opponent_models.iter_mut()).chain(self.road.traffic_models.iter_mut()).chain(self.road.police_models.iter_mut()) {
             m.mirror = mirror;
@@ -192,8 +177,7 @@ impl App {
         let (mut lamp_used, mut shadow_used) = (pools.lamp, pools.shadow);
         // every car drops a blob shadow on the ground under it (0x43B820), off `car+0x330` and cut
         // to `car+0x3A8…` like every car's (0x43B220)
-        // **TEST GLUE** (not in the original): `NFS_NO_SHADOW=1` leaves the blob shadows out, for a with / without difference
-        let shadow_material = self.shadow_draw.map(|(_, m)| m).filter(|_| !nfs_game::config::cfg().nfs_no_shadow.is_set());
+        let shadow_material = self.shadow_draw.map(|(_, m)| m);
         let counts = (self.road.traffic.as_ref().map_or(0, |t| t.cars.len()), self.road.police.as_ref().map_or(0, |p| p.cars.len()), self.road.opponents.len());
         self.road.traffic_lods.resize(counts.0, Default::default());
         self.road.police_lods.resize(counts.1, Default::default());
@@ -241,7 +225,7 @@ impl App {
                 // and, when they are simultaneously visible, each into its own instantiated copy
                 // of the shared model's mesh/texture/material ids (`car-model.md` §13.1's residual
                 // gap), so this port's batched `render()` does not alias one onto the other.
-                let dmg = forced_damage_at(i).map_or_else(|| tr.bodies.get(i).map_or([0.0; 10], |b| b.damage), |d| [d; 10]);
+                let dmg = tr.bodies.get(i).map_or([0.0; 10], |b| b.damage);
                 if let (Some(m), Some(rr)) = (self.road.traffic_models.get_mut(c.model), self.renderer.as_mut()) {
                     m.update_damage(rr, &dmg, false, detail);
                 }
@@ -293,7 +277,7 @@ impl App {
                 // as the traffic's above: this cop's own damage baked into its own instantiated
                 // copy of the shared per-type model right before its own draw
                 if let (Some(m), Some(rr)) = (self.road.police_models.get_mut(c.model), self.renderer.as_mut()) {
-                    m.update_damage(rr, &forced_damage_at(i).map_or(c.body.damage, |d| [d; 10]), false, detail);
+                    m.update_damage(rr, &c.body.damage, false, detail);
                 }
                 let model = &self.road.police_models[c.model];
                 // a cop is `car+0x52C & 0x20`, neither the opponent nor the traffic bit
@@ -501,22 +485,14 @@ impl App {
                 // of a cell carries the cell's key here, in that order
                 // the walk's gates for a cell (node pass, frustum, `Vis `, `s² < far²`) with
                 // the pass's own view — the main one's, or the mirror's
-                // (**TEST GLUE**: `NFS_SKID_NOWALK=1` queues every cell as before, for a with / without still)
-                let cells: Vec<(u32, Vec<&nfs_game::skidmarks::Strip>)> = match (self.world.as_ref(), p.cull.as_ref().filter(|_| !nfs_game::config::cfg().nfs_skid_nowalk.is_set())) {
+                let cells: Vec<(u32, &nfs_game::skidmarks::Strip)> = match (self.world.as_ref(), p.cull.as_ref()) {
                     (Some(w), Some(cv)) => {
                         let walk = w.cell_walk(cv);
                         self.skid.cells_walked(|cx, cy, cz, r, nodes| walk.visit(cx, cy, cz, r, nodes))
                     }
-                    _ => self.skid.cells(cam).collect(),
+                    _ => self.skid.cells(cam).flat_map(|(k, strips)| strips.into_iter().map(move |s| (k, s))).collect(),
                 };
-                // **TEST GLUE**: `NFS_SKID_STATS=1` logs, per pass, the strips within 100 m of the eye
-                // before and after the walk's gates
-                if nfs_game::config::cfg().nfs_skid_stats.is_set() {
-                    let within = |cs: &[(u32, Vec<&nfs_game::skidmarks::Strip>)]| cs.iter().flat_map(|(_, v)| v.iter()).filter(|s| s.points.first().zip(s.points.last()).is_some_and(|(&a, &b)| near(a) && near(b))).count();
-                    let all: Vec<_> = self.skid.cells(cam).collect();
-                    tracing::info!(mirror = p.mirror_pass, all = within(&all), walked = within(&cells), "skid strips in range");
-                }
-                for (key, strip) in cells.into_iter().flat_map(|(k, strips)| strips.into_iter().map(move |s| (k, s))) {
+                for (key, strip) in cells {
                     let (Some(&first), Some(&last)) = (strip.points.first(), strip.points.last()) else { continue };
                     if !near(first) || !near(last) {
                         continue;
@@ -677,6 +653,8 @@ impl App {
     }
 
     pub(crate) fn rebuild_scene(&mut self) {
+        // PORT-DEVIATION D46: the camera slot's camera and slice as its own last pass left them (see `photo.rs`)
+        self.photo_frame_begin();
         let (lw, lh) = self.hud_logical();
         Hud::set_screen(lw, lh);
         self.hud_stored_sync(lw, lh); // N01a: an existing HUD record is used as stored
@@ -773,11 +751,9 @@ impl App {
         let (hud_sprites_from, mut hud_hover) = self.hud_pass();
         // render pose = previous tick → current tick, by the accumulator fraction
         let mut alpha = (self.accumulator.as_secs_f32() / GAME_TICK.as_secs_f32()).clamp(0.0, 1.0);
-        // **TEST GLUE** (not in the original): `NFS_ALPHA=<0…1>` fixes the interpolation fraction, so
-        // a scripted run (one frame per tick, where the accumulator reads 0) can draw the frames a
-        // windowed run draws between two ticks — `--autotest 20` with `NFS_ALPHA` 0, 0.25, 0.5, …
-        // are the sub-tick frames of one tick
-        if let Some(a) = self.test_alpha.or_else(|| nfs_game::config::cfg().nfs_alpha.as_str().and_then(|v| v.parse::<f32>().ok())) {
+        // **TEST GLUE** (not in the original): `test_alpha` fixes the interpolation fraction, so a scripted run (one frame per tick,
+        // where the accumulator reads 0) can draw the frames a windowed run draws between two ticks
+        if let Some(a) = self.test_alpha {
             alpha = a.clamp(0.0, 1.0);
         }
         // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: every moving thing is drawn at `lerp(previous
@@ -821,8 +797,7 @@ impl App {
                 * Mat4::from_rotation_translation(car_rot, car_pos).inverse()
         });
         let fwd = car_rot * Vec3::Z;
-        // diagnostic: `NFS_LOOKBACK=1` holds look-back (`I_LOOKBEHIND`) for a `--screenshot`
-        let rear_view = (self.input.held(Action::RearView) || nfs_game::config::cfg().nfs_lookback.as_str().is_some())
+        let rear_view = self.input.held(Action::RearView)
             && self.vehicle.is_some();
         // **The rear-view mirror** (AUDIT §O): the pass 0x468CA0 renders the view 0x4691D0 made — near
         // 1, far 65000 (the projection; the scene stops at the cull distance below), cleared 0xFF77BBFF — with camera slot 0 in its type-1 form (0x464F80's branch at
@@ -850,7 +825,7 @@ impl App {
         // player's finish, which nothing in the pass or its gates does.)*
         let playback_now = self.playback_running();
         self.rear_mirror = (self.hud_keys.live
-            && self.mirror_slide.0 == 3
+            && self.slides.mirror.0 == 3
             && self.vehicle.is_some()
             && !playback_now
             && self.race.is_some())
@@ -871,12 +846,13 @@ impl App {
         // the horn is 0x4A7660's (0x4A7CBF / 0x4A7CE6), part of the audio update that does not run
         // while paused: a held horn is not released by the pause but silenced with the voice table
         // (0x4AB150), and plays on at volume 0 after the resume until it is let go
+        let horn_now = self.live_horn();
         if let (Some(a), Some(e)) = (&self.snd.audio, self.snd.engine_sound.as_mut())
             && !(self.paused || self.replay.frozen)
         {
             e.horn(
                 a,
-                self.input.held(Action::Horn) && self.vehicle.is_some(),
+                horn_now && self.vehicle.is_some(),
                 horn_view,
                 horn_dist,
                 horn_pan,
@@ -890,9 +866,11 @@ impl App {
         // every string still pending is an unanchored element's: its pen is its own pixel
         Hud::resolve_text(&mut self.scene.sprites[hud_sprites_from..], (0.0, 0.0));
         PENDING_TEXT.with(|p| p.borrow_mut().clear());
-        if self.hud_hidden {
+        if self.hud_hidden || self.photo.hides_hud() {
             self.scene.sprites.truncate(hud_sprites_from);
         }
+        // PORT-DEVIATION D46: photo mode's hint, and the pointer to it on the pause menu / in a replay
+        self.photo_hint();
         // `+0x100` for the next release, and sound 9 when the pointer crosses into a button
         // (0x41B3BA…0x41B3C6)
         let hover = hud_hover.flatten();
@@ -901,6 +879,8 @@ impl App {
         }
         self.hud_hover = hover;
         let (view, slot_near) = self.camera_pass(car_pos, car_rot, rear_view, false);
+        // PORT-DEVIATION D46: the free camera draws instead of the slot's (which is kept for the next pass)
+        self.photo_apply();
         // draw distance from `<track>_{forward,backwards}.key` for the camera's slice, scaled by the
         // detail setting (0x44F1A0: `value × {0.5, 0.67, 0.83, 1.0}`, at least 50 m). The sky is drawn
         // around the camera, so distant terrain simply stops at this range as in the original.
@@ -911,16 +891,6 @@ impl App {
         };
         // 0x4689C0 keys on the camera slot's own tracker slice `[0x627F5C]`, which the dispatcher moves
         // with the eye every update (0x474440 at 0x463C61, except in SplineCam, which runs it itself)
-        // diagnostic, no original counterpart: `NFS_WEATHER_VIEW=<slice>` puts the camera 1.5 m over
-        // that slice's centre looking down the road, and `weather_items` then runs the weather 40
-        // frames of a tick each, so a still shows it built up
-        if let Some(k) = nfs_game::config::cfg().nfs_weather_view.as_str().and_then(|v| v.parse::<usize>().ok())
-            && let Some(sl) = self.slices.as_ref().and_then(|t| t.slices.get(k))
-        {
-            self.camera.position = sl.centre + sl.up * 1.5;
-            self.camera.target = self.camera.position + sl.forward;
-            self.cam_slice = Some(k);
-        }
         let car_slice = self.race.as_ref().map(|r| r.slice).unwrap_or(0);
         let cam_slice = match self.slices.as_ref() {
             Some(t) if !t.slices.is_empty() => t.find_slice(self.camera.position, self.cam_slice.unwrap_or(car_slice)),
@@ -942,7 +912,6 @@ impl App {
         let factor = if self.replay_zoom() == Some(true) { 1.0 } else { self.detail };
         self.draw_distance = keys.far_distance(cam_slice, factor);
         self.camera.far = if self.vehicle.is_some() { nfs_renderer::VIEW_FAR } else { 20000.0 };
-        self.sun_view_diagnostic();
         self.main_sky_items(cam_slice);
         self.camera_diagnostics();
         self.track_walk(alpha);
@@ -985,49 +954,9 @@ impl App {
         self.registry.u32("skyoff", 0) != 0
     }
 
-    /// The port's `NFS_SUN_VIEW` camera diagnostic (no original counterpart), run before the sky's
-    /// items are laid out so that the sun is placed for the turned camera.
-    fn sun_view_diagnostic(&mut self) {
-        // diagnostic: `NFS_SUN_VIEW=down,yaw` (degrees, the yaw optional) turns the camera, where it
-        // stands, to the sun (`SkyBin::sun_position`, around the eye) lowered by `down` and turned
-        // about the vertical by `yaw`, so a still has the sun in front of it — and the lens flare,
-        // whose elements lie on the line from the screen's centre through the sun, off the centre
-        if let Some((deg, yaw)) = nfs_game::config::cfg().nfs_sun_view.as_str().and_then(|v| {
-            let mut it = v.split(',').map(|x| x.trim().parse::<f32>().ok());
-            Some((it.next()??, it.next().flatten().unwrap_or(0.0)))
-        }) && let Some(bin) = self.track.sky_bin.as_ref()
-        {
-            let d = Vec3::from(bin.sun_position()).normalize_or_zero();
-            let aim = Quat::from_rotation_y(yaw.to_radians()) * (d - Vec3::Y * deg.to_radians().tan()).normalize_or_zero();
-            if aim != Vec3::ZERO {
-                self.camera.target = self.camera.position + aim * 10.0;
-            }
-        }
-    }
-
-    /// The port's `NFS_*` camera diagnostics (no original counterpart): each moves the camera before
+    /// The port's `NFS_CAM_AT` camera diagnostic (no original counterpart): it moves the camera before
     /// the track walk culls from it.
     fn camera_diagnostics(&mut self) {
-        // diagnostic: `NFS_EMITTER_VIEW=k` puts the camera 6 m off the track's k-th particle
-        // emitter, looking at it (before the track walk below, which culls from it)
-        if let Some(k) = nfs_game::config::cfg().nfs_emitter_view.as_str().and_then(|v| v.parse::<usize>().ok())
-            && let Some(e) = self.world.as_ref().and_then(|w| w.emitters.get(k))
-        {
-            self.camera.target = e.position;
-            self.camera.position = e.position + e.dir_a * 6.0 + Vec3::Y * 1.5;
-        }
-        // diagnostic: `NFS_ANIM_VIEW=<metres>` puts the camera that far off the track's
-        // SoundDef-animated object (autobahn's Locomotive, `world.animated_sound`), 8 m up,
-        // looking at where its own path puts it this tick
-        if let Some(d) = nfs_game::config::cfg().nfs_anim_view.as_str().and_then(|v| v.parse::<f32>().ok())
-            && !nfs_game::config::cfg().nfs_anim_article.is_set()
-            && let Some(s) = self.world.as_ref().and_then(|w| w.animated_sound.as_ref())
-        {
-            let (p1, _) = s.eval_pair(self.tick);
-            let p = Vec3::from(p1);
-            self.camera.target = p;
-            self.camera.position = p + Vec3::new(d, 8.0, d * 0.5);
-        }
         // diagnostic: `NFS_CAM_AT=px,py,pz,tx,ty,tz` puts the camera at a world point looking at
         // another (before / after comparisons at a fixed place)
         if let Some(v) = nfs_game::config::cfg().nfs_cam_at.as_str() {
@@ -1036,46 +965,6 @@ impl App {
                 self.camera.position = Vec3::new(n[0], n[1], n[2]);
                 self.camera.target = Vec3::new(n[3], n[4], n[5]);
             }
-        }
-        // diagnostic: `NFS_ANIM_ARTICLE=<name>` (with `NFS_ANIM_VIEW=<metres>`, default 2.5 radii)
-        // puts the camera off the named `WAnimBundle` article's current sphere (0x477DB0), looking
-        // at it — any article of any track, `world.anim_article_sphere`
-        if let Some(name) = nfs_game::config::cfg().nfs_anim_article.as_str()
-            && let Some((_, c, r)) = self.world.as_ref().and_then(|w| w.anim_article_sphere(&name))
-        {
-            let d = nfs_game::config::cfg().nfs_anim_view.as_str().and_then(|v| v.parse::<f32>().ok()).unwrap_or(2.5 * r);
-            self.camera.target = c;
-            self.camera.position = c + Vec3::new(d, d * 0.4, d * 0.5);
-        }
-        // diagnostic: `NFS_SMACK_VIEW=k` puts the camera 8 m off the track's k-th smackable's
-        // place, looking at it (its burst stays there: 0x450980 re-seats its system at the
-        // placement every drawn frame, slot 4 0x4550B0)
-        if let Some(k) = nfs_game::config::cfg().nfs_smack_view.as_str().and_then(|v| v.parse::<usize>().ok())
-            && let Some((_, home, _)) = self.world.as_ref().and_then(|w| w.track_smackable(k))
-        {
-            self.camera.target = home + Vec3::Y * 1.0;
-            self.camera.position = home + Vec3::new(6.0, 2.5, 5.0);
-        }
-        // **TEST GLUE** (not in the original) `NFS_TRAFFIC_VIEW=k[,d]`: the camera `d` m (default 7) off the k-th active
-        // traffic car's body, looking at it — close stills of the traffic's ride height
-        if let Some(v) = nfs_game::config::cfg().nfs_traffic_view.as_str() {
-            let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            let k = n.first().copied().unwrap_or(0.0) as usize;
-            let d = n.get(1).copied().unwrap_or(7.0);
-            if let Some(c) = self.road.traffic.as_ref().and_then(|t| t.cars.iter().filter(|c| c.active).nth(k)) {
-                let o = c.draw_origin();
-                self.camera.target = o + Vec3::Y * 0.5;
-                self.camera.position = o + c.orientation.row(0) * d + Vec3::Y * 1.0;
-            }
-        }
-        // diagnostic: `NFS_FLARE_VIEW=k` puts the camera 8 m off the k-th `.scn` instance flare,
-        // looking at it
-        if let Some(k) = nfs_game::config::cfg().nfs_flare_view.as_str().and_then(|v| v.parse::<usize>().ok())
-            && let Some((p, d)) = self.world.as_ref().and_then(|w| w.instance_flare(k))
-        {
-            let back = if d.length_squared() > 1e-6 { d.normalize() } else { Vec3::X };
-            self.camera.target = p;
-            self.camera.position = p + back * 8.0 + Vec3::Y * 1.5;
         }
     }
 
@@ -1434,9 +1323,7 @@ impl App {
                 && let (Some(v), Some(t)) = (cam_car, self.slices.as_ref())
                 && let Some(sl) = t.slices.get(v.slice)
             {
-                // diagnostic, no original counterpart: `NFS_FLIP_VIEW=1` takes the roll-over camera on
-                // an upright car, for a `--screenshot` without a crash
-                if v.cos_tilt < 0.5 || nfs_game::config::cfg().nfs_flip_view.is_set() {
+                if v.cos_tilt < 0.5 {
                     let side = *self.flip_side.get_or_insert(prev_fwd.dot(sl.forward) < 0.0);
                     Some(sl.up * 3.0 + sl.forward * if side { 10.0 } else { -10.0 })
                 } else {
@@ -2040,21 +1927,6 @@ impl App {
         // diagnostic (`RUST_LOG=camslot=debug`): the view the build hands out — the orbit, the pushes,
         // the clamp and the aim applied
         tracing::debug!(target: "camslot", tick = self.tick, view, eye = ?self.camera.position, at = ?self.camera.target, up = ?self.camera.up, dialog = self.hud_dialog_up(), "camera built");
-        // diagnostic, no original counterpart: `NFS_COP_VIEW=1` looks at the active cop nearest
-        // the player from 7 m off its front quarter, 2 m up — the only way to see where a cop
-        // sits on the road without a pursuit in front of the chase view
-        if nfs_game::config::cfg().nfs_cop_view.as_str().is_some()
-            && let Some(c) = self.road.police.as_ref().and_then(|p| {
-                p.cars.iter().filter(|c| c.active).min_by(|a, b| {
-                    a.position.distance_squared(car_pos).partial_cmp(&b.position.distance_squared(car_pos)).unwrap()
-                })
-            })
-        {
-            let (right, fwd) = (c.orientation.row(0), c.orientation.row(2));
-            self.camera.position = c.position + (fwd + right).normalize_or_zero() * 7.0 + Vec3::Y * 2.0;
-            self.camera.target = c.position;
-            self.camera.up = Vec3::Y;
-        }
         // **The police beacon's projector** 0x4526C0's second half: on a night track
         // (`word [0x628A28] != 0`) it walks the car list and keeps the live car whose `car+0xECC & 2`
         // (lights on) is set and whose octagonal distance to the camera in the xz plane,
@@ -2067,13 +1939,6 @@ impl App {
         // (the render's pass alone sets the scene's beacon)
         let beacon = self.track.is_night().then(|| {
             let cam = self.camera.position;
-            // diagnostic: `NFS_BEACON_VIEW=1` spins the beacon on the player's own car, the only
-            // way to watch the sweep without a pursuit
-            if nfs_game::config::cfg().nfs_beacon_view.as_str().is_some() {
-                let turns = (self.tick * 2) as f32 * 0.02;
-                let rot = car_rot * Quat::from_rotation_y(turns * std::f32::consts::TAU);
-                return Some(Mat4::from_rotation_translation(rot, car_pos).inverse());
-            }
             let pol = self.road.police.as_ref()?;
             let (car, _) = pol
                 .cars
@@ -2163,7 +2028,7 @@ impl App {
             Some(s) => s,
             None => Box::new(self.cam_slot_state()),
         };
-        let rear_view = (self.input.held(Action::RearView) || nfs_game::config::cfg().nfs_lookback.as_str().is_some()) && self.vehicle.is_some();
+        let rear_view = self.input.held(Action::RearView) && self.vehicle.is_some();
         self.swap_cam_slot(&mut slot);
         // `camera_pass` counts the ticks done: the update of this tick is the one that brings the count to `tick + 1`
         self.tick += 1;

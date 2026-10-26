@@ -6,7 +6,7 @@
 use glam::Vec3;
 use nfs_assets::{track::TrackAssets, GamePaths};
 use nfs_game::fitted_tree::FittedTree;
-use nfs_game::skidmarks::SkidMarks;
+use nfs_game::skidmarks::{SkidMarks, WheelMark};
 use nfs_game::world::{build_article_nodes, cull_articles, tree_population, ArticleDrawer};
 use std::sync::Arc;
 
@@ -52,7 +52,7 @@ fn alps_tree_registration_and_skid_cells() {
     let mut last = Vec3::ZERO;
     for p in line.points.iter().take(400) {
         let at = Vec3::new(p[0], 0.5, p[1]);
-        marks.emit(0, at, 1.0, 1, Vec3::X, 0.5, 2.0);
+        marks.emit(0, &WheelMark { ground: at, strength: 1.0, kind: 1, dir: Vec3::X, a: 0.5, b: 2.0 });
         last = at;
     }
     let cells: Vec<_> = marks.cells(last).collect();

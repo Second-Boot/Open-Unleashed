@@ -717,6 +717,17 @@ pub fn installed_parts_for(tables: &CareerTables, owned: &OwnedCar) -> Vec<nfs_p
 ///   0x431B80;
 /// * `TOURNAMENTNUMRACESCOMPLETED [0x6577D4]` (0xF3): the front end's count of events done
 ///   (0x503370 − 0x504300, 0x4ECAAE…0x4ECAC5), raised by one at the race end (0x427660).
+/// One event's finish as the tally 0x503960 reads it: the tournament and event, the finishing order, each driver's
+/// time and whether the driver's race was clean ([`Career::standings_page`], [`Career::winnings_after`]).
+#[derive(Debug, Clone, Copy)]
+pub struct EventFinish<'a> {
+    pub t: &'a Tournament,
+    pub event: usize,
+    pub order: &'a [usize],
+    pub times: &'a [i32; 8],
+    pub clean: &'a [bool; 8],
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Winnings {
     /// `(event number, prize, safe bonus)`
@@ -1735,7 +1746,6 @@ impl Career {
     /// (0 = did not finish). `clean[driver]` = the car took no new body damage in the race
     /// ([`clean_race`]) — the event bonus is paid only then. `garage_idx` = the player's car
     /// (mileage / wins).
-    #[allow(clippy::too_many_arguments)]
     /// `0x503960` for every racer of one event: points `9 − pos`, prize by position, and the
     /// bonus for a clean top three. Returns the record the event is stored as.
     fn event_result(t: &Tournament, event: usize, order: &[usize], times: &[i32; 8], clean: &[bool; 8]) -> EventResult {
@@ -1808,9 +1818,9 @@ impl Career {
     /// 1)` = `t.prize[k]`) to the earnings `[0x657740 + 4·driver]` of the driver in place `k`
     /// (0x431BF9…0x431C16) — the column the WINNINGS cells print (0x431DF4). The order is the
     /// one before the prize.
-    #[allow(clippy::too_many_arguments)]
-    pub fn standings_page(&self, t: &Tournament, event: usize, order: &[usize], times: &[i32; 8], clean: &[bool; 8], racers: usize, last: bool) -> Vec<(usize, u32, u32, i32)> {
-        let mut rows: Vec<_> = self.standings_after(t, event, order, times, clean).into_iter().filter(|(d, ..)| *d < racers.max(1)).collect();
+    pub fn standings_page(&self, f: &EventFinish, racers: usize, last: bool) -> Vec<(usize, u32, u32, i32)> {
+        let t = f.t;
+        let mut rows: Vec<_> = self.standings_after(t, f.event, f.order, f.times, f.clean).into_iter().filter(|(d, ..)| *d < racers.max(1)).collect();
         if last {
             for (k, row) in rows.iter_mut().enumerate() {
                 row.2 += t.prize.get(k).copied().unwrap_or(0);
@@ -1822,14 +1832,14 @@ impl Career {
     /// What **`HWinnings`** (ctor 0x436860, draw 0x436990) lists for the player once this event is
     /// in: the race options it reads, as the front end sets them at launch (0x4EC93F…0x4ECAC5) and
     /// the race end then updates (0x427660, 0x431B80). See [`Winnings`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn winnings_after(&self, t: &Tournament, event: usize, order: &[usize], times: &[i32; 8], clean: &[bool; 8], racers: usize, last: bool) -> Winnings {
+    pub fn winnings_after(&self, f: &EventFinish, racers: usize, last: bool) -> Winnings {
+        let EventFinish { t, event, order, times, clean } = *f;
         let st = self.state(t.id);
         // each result in its own event record's slot, this race's in `event`'s
         let mut slots: Vec<(usize, EventResult)> = st.done_events().into_iter().zip(st.events.iter().cloned()).filter(|(k, _)| *k != event).collect();
         slots.push((event, Self::event_result(t, event, order, times, clean)));
         slots.sort_by_key(|(k, _)| *k);
-        let page = self.standings_page(t, event, order, times, clean, racers, last);
+        let page = self.standings_page(f, racers, last);
         let row = page.iter().position(|(d, ..)| *d == 0).unwrap_or(0);
         Winnings {
             // `[esp+0x14]` starts at 1 and steps only on a listed row (0x4369A2, 0x436B9F)
@@ -2400,14 +2410,14 @@ mod tests {
         let t = tournament(1, 2, false);
         let mut c = Career::default();
         let order = [2, 0, 1, 3, 4, 5, 6, 7];
-        let w = c.winnings_after(&t, 0, &order, &[6400; 8], &[true; 8], 8, false);
+        let w = c.winnings_after(&EventFinish { t: &t, event: 0, order: &order, times: &[6400; 8], clean: &[true; 8] }, 8, false);
         assert_eq!(w, Winnings { events: vec![(1, 800, 200)], tournament_bonus: None, total: 1000, completed: 1 });
         let r = Career::event_result(&t, 0, &order, &[6400; 8], &[true; 8]);
         c.tournaments.entry(1).or_default().events.push(r);
         let mut dirty = [true; 8];
         dirty[0] = false;
-        let w = c.winnings_after(&t, 1, &[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8], &dirty, 8, true);
-        let page = c.standings_page(&t, 1, &[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8], &dirty, 8, true);
+        let w = c.winnings_after(&EventFinish { t: &t, event: 1, order: &[0, 1, 2, 3, 4, 5, 6, 7], times: &[6400; 8], clean: &dirty }, 8, true);
+        let page = c.standings_page(&EventFinish { t: &t, event: 1, order: &[0, 1, 2, 3, 4, 5, 6, 7], times: &[6400; 8], clean: &dirty }, 8, true);
         let row = page.iter().position(|(d, ..)| *d == 0).unwrap();
         assert_eq!(w.events, vec![(1, 800, 200), (2, 1000, 0)], "a dirty win keeps no bonus");
         assert_eq!(w.tournament_bonus, Some(t.prize[row]));
@@ -2418,7 +2428,7 @@ mod tests {
         let mut c = Career::default();
         let last = [1, 2, 3, 4, 5, 6, 7, 0];
         c.tournaments.entry(1).or_default().events.push(Career::event_result(&t, 0, &last, &[6400; 8], &[true; 8]));
-        let w = c.winnings_after(&t, 1, &order, &[6400; 8], &[true; 8], 8, true);
+        let w = c.winnings_after(&EventFinish { t: &t, event: 1, order: &order, times: &[6400; 8], clean: &[true; 8] }, 8, true);
         assert_eq!(w.events, vec![(1, 800, 200)], "an 8th place with no prize lists no row");
     }
 
@@ -2429,9 +2439,9 @@ mod tests {
         let t = tournament(1, 2, false);
         let c = Career::default();
         let order = [2, 0, 1];
-        let before = c.standings_page(&t, 0, &order, &[6400; 8], &[true; 8], 3, false);
+        let before = c.standings_page(&EventFinish { t: &t, event: 0, order: &order, times: &[6400; 8], clean: &[true; 8] }, 3, false);
         assert_eq!(before.len(), 3, "drivers 0..3 only");
-        let after = c.standings_page(&t, 0, &order, &[6400; 8], &[true; 8], 3, true);
+        let after = c.standings_page(&EventFinish { t: &t, event: 0, order: &order, times: &[6400; 8], clean: &[true; 8] }, 3, true);
         for (k, (a, b)) in before.iter().zip(&after).enumerate() {
             assert_eq!(a.0, b.0, "same order");
             assert_eq!(b.2, a.2 + t.prize[k]);
@@ -2826,7 +2836,7 @@ mod tests {
         let money = c.money;
         assert_eq!(c.enter_event(&tables, &t, 1).unwrap(), 1);
         assert_eq!(c.money, money, "no fee once an event is done");
-        let w = c.winnings_after(&t, 1, &[0, 1, 2, 3, 4, 5, 6, 7], &times, &[true; 8], 8, false);
+        let w = c.winnings_after(&EventFinish { t: &t, event: 1, order: &[0, 1, 2, 3, 4, 5, 6, 7], times: &times, clean: &[true; 8] }, 8, false);
         // each result sits in its own record's slot (1 and 2 here); slot 0 is empty, so it is
         // skipped and the rows are numbered as listed (0x436BA8)
         assert_eq!(w.events, vec![(1, 1000, 400), (2, 1000, 400)], "listed in slot order, numbered 1, 2");

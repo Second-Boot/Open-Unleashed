@@ -14,7 +14,7 @@
 //! What the callers read back — the ids they are handed, [`Renderer::mesh_writes`],
 //! [`Renderer::material_texture`], the size — is answered from a small mirror of the core's tables
 //! kept here, so no query waits for the thread. The bulk loaders (`upload_mesh`, `upload_texture*`)
-//! and the read-backs (`render_to_image`, `read_texture`) are the one thing that does: they need
+//! and the read-backs (`render_to_image`) are the one thing that does: they need
 //! the core in hand, so they first take it back (waiting for the frame in flight) and run the list.
 
 use crate::gpu::{Core, MaterialId, MeshId, TextureId};
@@ -474,10 +474,12 @@ impl Renderer {
         self.home().render_to_image(scene, camera, width, height)
     }
 
-    /// An offscreen texture's pixels as RGBA8 rows (diagnostics: `NFS_MIRROR_DUMP`).
-    pub fn read_texture(&mut self, id: TextureId) -> Result<(u32, u32, Vec<u8>)> {
-        self.home().read_texture(id)
+    /// PORT-DEVIATION D46 (photo mode): a still of the scene (`Core::render_still`) at about `width x height`, the
+    /// size it really got and RGBA8 rows.
+    pub fn render_still(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<(u32, u32, Vec<u8>)> {
+        self.home().render_still(scene, camera, width, height)
     }
+
 }
 
 impl Drop for Renderer {

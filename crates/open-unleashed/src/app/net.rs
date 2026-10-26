@@ -127,7 +127,7 @@ impl App {
     /// files nothing (`network.md` §11.21 item 8).
     pub(crate) fn net_pause_press(&mut self) -> bool {
         let live = self.net.session.as_ref().is_some_and(|n| n.established());
-        let page_up = self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some();
+        let page_up = self.results.is_some() && self.result_pages().get(self.pages.page as usize).is_some();
         // the first arm: `[0x5E99F4] < 2`, `[0x606A88] == 0`, `[0x606AC4] > 0x20` and no live link
         let first_arm = !live && self.tick > 0x20;
         let queue = self.paused || self.net_notice.is_some() || page_up;
@@ -455,13 +455,13 @@ impl App {
             // connection up (`net+8`, `+0xBF == 0`) `0x48DA60(tick − 0x1C0, best of its lap times)` sends
             // `0xB7`: the finish time (`car+0xB24` after its `−= 0x1C0`, 0x416840) and the smallest of
             // `car+0xB28 …` over the race's laps (0x416883…0x41689F). Not for a car retired to state 3.
-            if !self.net_time_sent
-                && !self.net_derby
+            if !self.net_launch.time_sent
+                && !self.net_launch.derby
                 && !self.player_eliminated
                 && let Some(r) = self.race.as_ref()
                 && r.finished
             {
-                self.net_time_sent = true;
+                self.net_launch.time_sent = true;
                 // `[0x606AC4] − 0x1C0` (0x4168A1 `add ebx, -0x1C0`: the finish tick less the 448-tick
                 // countdown — `car+0xB24`, which 0x416840 has just taken the same amount off) and the
                 // smallest of the first `NUM_LAPS` lap times (`FinalizeIn::from_progress` keeps the same
@@ -476,7 +476,7 @@ impl App {
         // `(gGameTick & 7) == 7`, which is always an odd tick — so this cannot sit inside the
         // port's nested 32 Hz force step, or it would never fire.
         if let (Some(n), Some(v)) = (net.as_mut(), self.vehicle.as_ref()) {
-            n.send(tick, v, self.net_pad_buttons);
+            n.send(tick, v, self.net_launch.pad_buttons);
         }
         self.net.session = net;
         seats
@@ -490,22 +490,22 @@ impl App {
         let n = self.net.session.as_ref().filter(|n| !n.positional && n.in_race != 0)?;
         let local_index = n.local_race_index()?;
         let names: Vec<String> = n.remote_players().into_iter().map(|p| p.1).collect();
-        let seats = (0..(self.num_opponents as usize).max(self.net_seat_cars.len()))
+        let seats = (0..(self.num_opponents as usize).max(self.net_launch.seat_cars.len()))
             .map(|k| nfs_game::replay::NetSeat {
                 race_index: n.seat_race_index(k).unwrap_or(u32::MAX),
                 name: names.get(k).cloned().unwrap_or_default(),
-                grid: self.net_seat_grids.get(k).copied().flatten(),
-                words: self.net_seat_cars.get(k).map(|c| c.words.iter().map(|(i, w)| (*i, w.clone())).collect()).unwrap_or_default(),
+                grid: self.net_launch.seat_grids.get(k).copied().flatten(),
+                words: self.net_launch.seat_cars.get(k).map(|c| c.words.iter().map(|(i, w)| (*i, w.clone())).collect()).unwrap_or_default(),
             })
             .collect();
         Some(nfs_game::replay::NetSetup {
             local_index,
             grid: self.player_grid_override,
             seats,
-            traffic: self.net_traffic.iter().map(|t| nfs_game::replay::NetTraffic { model: t.model.clone(), name: t.name.clone(), colour: t.colour }).collect(),
+            traffic: self.net_launch.traffic.iter().map(|t| nfs_game::replay::NetTraffic { model: t.model.clone(), name: t.name.clone(), colour: t.colour }).collect(),
             camera0: (!self.camera_cycle.is_empty()).then(|| self.camera_cycle.iter().map(|&c| u32::from(c)).collect()),
-            own_words: self.net_own_words.clone(),
-            fe_txt: ["weather", "time", "fog"].into_iter().filter_map(|k| self.net_fe_txt.get(k).map(|v| (k.to_string(), *v))).collect(),
+            own_words: self.net_launch.own_words.clone(),
+            fe_txt: ["weather", "time", "fog"].into_iter().filter_map(|k| self.net_launch.fe_txt.get(k).map(|v| (k.to_string(), *v))).collect(),
         })
     }
 
@@ -514,25 +514,25 @@ impl App {
     /// the setup carries none — and then nothing of an earlier network race stays.
     pub(crate) fn apply_replay_net(&mut self) {
         self.replay_net = None;
-        self.net_seat_cars.clear();
-        self.net_own_words.clear();
-        self.net_fe_txt.clear();
-        self.net_seat_grids.clear();
-        self.net_traffic.clear();
+        self.net_launch.seat_cars.clear();
+        self.net_launch.own_words.clear();
+        self.net_launch.fe_txt.clear();
+        self.net_launch.seat_grids.clear();
+        self.net_launch.traffic.clear();
         self.player_grid_override = None;
         let Some(net) = self.replay.setup.net.clone() else { return };
-        self.net_own_words = net.own_words.clone();
+        self.net_launch.own_words = net.own_words.clone();
         // the host's `TIME` / `WEATHER` / `FOG` the recorded race ran on (the snapshot's own words)
-        self.net_fe_txt = net.fe_txt.iter().filter_map(|(k, v)| Some((["weather", "time", "fog"].into_iter().find(|n| *n == k)?, *v))).collect();
-        self.net_seat_cars = net
+        self.net_launch.fe_txt = net.fe_txt.iter().filter_map(|(k, v)| Some((["weather", "time", "fog"].into_iter().find(|n| *n == k)?, *v))).collect();
+        self.net_launch.seat_cars = net
             .seats
             .iter()
             .map(|s| nfs_net::launchcar::CarSlot { words: s.words.iter().cloned().collect() })
             .collect();
-        self.net_seat_grids = net.seats.iter().map(|s| s.grid).collect();
+        self.net_launch.seat_grids = net.seats.iter().map(|s| s.grid).collect();
         self.player_grid_override = net.grid;
         self.num_opponents = net.seats.len() as u32;
-        self.net_traffic = net
+        self.net_launch.traffic = net
             .traffic
             .iter()
             .map(|t| nfs_net::options::TrafficCar { model: t.model.clone(), name: t.name.clone(), colour: t.colour })
@@ -540,10 +540,10 @@ impl App {
         // the traffic cars' models and colours, as `net_race_apply` resolves the records
         self.road.traffic_ids = None;
         self.road.traffic_colours.clear();
-        if !self.net_traffic.is_empty() {
+        if !self.net_launch.traffic.is_empty() {
             let catalog = self.fe_car_catalog();
             let (mut ids, mut colours) = (Vec::new(), Vec::new());
-            for c in &self.net_traffic {
+            for c in &self.net_launch.traffic {
                 let Some(e) = catalog.iter().find(|e| e.model.eq_ignore_ascii_case(&c.model)) else { continue };
                 let own = e.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x8C, 0x8C, 0x90]);
                 let got = [(c.colour >> 16) as u8, (c.colour >> 8) as u8, c.colour as u8];
@@ -555,7 +555,7 @@ impl App {
                 self.road.traffic_colours = colours;
             }
         }
-        self.road.traffic_count = self.net_traffic.len() as u32;
+        self.road.traffic_count = self.net_launch.traffic.len() as u32;
         if let Some(list) = net.camera0.as_ref().filter(|l| !l.is_empty()) {
             self.camera_cycle = list.iter().map(|&v| v as u16).collect();
         }
@@ -588,10 +588,10 @@ impl App {
     /// `0xB7` has gone out: this machine's car has finished), else **`[0x65741C]`, the recorded machine's own
     /// car** - so a network replay played from a file (no session) views a remote car with the arms still on
     /// the local one. `None` = the local car, `Some(k)` = seat `k`. A session and a replay never meet in the
-    /// port (a replay is a file), so the `Some` arm runs only under the test glue `NFS_FOLLOW_VIEWED`.
+    /// port (a replay is a file), so the `Some` arm is not reached today.
     pub(crate) fn followed_seat(&self) -> Option<usize> {
         let viewed = Self::viewed_seat_of(self.replay_net.as_ref(), self.replay_view)?;
-        let live = self.net.session.as_ref().is_some_and(|n| n.link_up() && n.finish_sent()) || nfs_game::config::cfg().nfs_follow_viewed.is_set();
+        let live = self.net.session.as_ref().is_some_and(|n| n.link_up() && n.finish_sent());
         live.then_some(viewed)
     }
 
@@ -664,7 +664,7 @@ impl App {
     /// the mirroring [`App::controller_sample`] applied on the way in).
     fn exchange_sample_bytes(&mut self) -> Option<nfs_net::exchange::Sample> {
         let v = self.vehicle.as_ref()?;
-        let c = Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v, true);
+        let c = Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v);
         // TEST GLUE `NFS_PA_INPUT`: the scripted pad is what the exchange sends too (not the original's)
         let c = super::pa_trace::input(self.tick, c);
         let mut c = c;
@@ -673,7 +673,7 @@ impl App {
         }
         let p = nfs_game::replay::Packet::from_controls(&c);
         // bit 1 is the horn, the second held button (`car+0xD86`, `controls.md`)
-        let horn = u8::from(self.input.held(Action::Horn)) << 1;
+        let horn = u8::from(self.live_horn()) << 1;
         Some([p.buttons | horn, p.steer as u8, p.throttle, p.brake])
     }
 
@@ -941,14 +941,14 @@ impl App {
         self.replay_net = None;
         let Some(r) = self.net.race.take() else {
             // every session re-reads `fe.txt` (0x4B6C1C): nothing a network launch wrote stays
-            self.net_traffic.clear();
-            self.net_derby = false;
-            self.net_flags = None;
-            self.net_fe_txt.clear();
-            self.net_nocollision = false;
-            self.net_seat_grids.clear();
-            self.net_seat_cars.clear();
-            self.net_own_words.clear();
+            self.net_launch.traffic.clear();
+            self.net_launch.derby = false;
+            self.net_launch.flags = None;
+            self.net_launch.fe_txt.clear();
+            self.net_launch.nocollision = false;
+            self.net_launch.seat_grids.clear();
+            self.net_launch.seat_cars.clear();
+            self.net_launch.own_words.clear();
             self.derby_hud_laps = None;
             return track;
         };
@@ -1000,12 +1000,12 @@ impl App {
         if let Some(list) = r.camera0.as_ref().filter(|l| !l.is_empty()) {
             self.camera_cycle = list.iter().map(|&v| v as u16).collect();
         }
-        self.net_seat_grids = r.seat_grids.clone();
-        self.net_seat_cars = r.seat_cars.clone();
-        self.net_own_words = r.own_words.clone();
-        self.net_traffic = r.traffic.clone();
-        self.net_derby = r.derby;
-        self.net_flags = Some((r.rally, r.heavy, r.derby));
+        self.net_launch.seat_grids = r.seat_grids.clone();
+        self.net_launch.seat_cars = r.seat_cars.clone();
+        self.net_launch.own_words = r.own_words.clone();
+        self.net_launch.traffic = r.traffic.clone();
+        self.net_launch.derby = r.derby;
+        self.net_launch.flags = Some((r.rally, r.heavy, r.derby));
         if let Some(n) = self.net.session.as_mut() {
             n.positional = r.positional;
         }
@@ -1016,8 +1016,8 @@ impl App {
         }
         // 0x4B4B80 wrote the host's `fe.txt` records into the option table: what this machine's own
         // file said is replaced for the ids the stream carried (a host's own values are its file's)
-        self.net_fe_txt = r.fe_txt.iter().copied().collect();
-        self.net_nocollision = r.positional && r.nocollision;
+        self.net_launch.fe_txt = r.fe_txt.iter().copied().collect();
+        self.net_launch.nocollision = r.positional && r.nocollision;
         // NOCOLLISION (0x65740C) and COMMSPOSITIONAL (0x657408): 0x498FF0's car-car half is skipped
         // while both are set (`net_nocollision`, read by the collision pass)
         tracing::info!(
@@ -1292,10 +1292,10 @@ impl App {
                 let order = order_of(&racers);
                 tracing::info!(target: "netplay", places = ?racers.iter().map(|r| r.place).collect::<Vec<_>>(), times = ?racers.iter().map(|r| r.time).collect::<Vec<_>>(), "network race: the local car has a rank — 0x426A80(1) builds the pages (0x415D08)");
                 self.results = Some(RaceResults { racers, order, clean: [true; 8], mission: None, opened: self.tick, congrats: true });
-                self.results_page = 0;
-                self.page_seen = None;
-                self.page_open_tick = None;
-                self.page_closing = None;
+                self.pages.page = 0;
+                self.pages.seen = None;
+                self.pages.open_tick = None;
+                self.pages.closing = None;
                 self.open_result_pages();
             }
             Some(res) => {

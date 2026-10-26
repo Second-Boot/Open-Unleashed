@@ -425,16 +425,6 @@ impl TrackParticles {
         self.systems.iter().filter(|s| s.drawn_now()).any(|s| s.holds_particles())
     }
 
-    /// Diagnostic (`NFS_SKID_STATS`): the billboards of the live systems 0x455260 does **not** draw
-    /// in this frame — what the port drew before that change.
-    pub fn undrawn_sprites(&self) -> usize {
-        let (mut out, mut streaks) = (Vec::new(), Vec::new());
-        for s in self.systems.iter().filter(|s| s.live && s.countdown != 100) {
-            s.draw_into(&self.defs, Vec3::ZERO, &mut out, &mut streaks);
-        }
-        out.len()
-    }
-
     /// 0x454430's billboards for every particle of the systems 0x455260 draws: it walks the draw
     /// set and calls slot 1 only for a system whose `+8` is exactly 100 (0x455281, `cmp [ecx+8],
     /// 0x64`) — one a walk refreshed (0x455150) since the last 0x4551E0 step took it to 99…1. A

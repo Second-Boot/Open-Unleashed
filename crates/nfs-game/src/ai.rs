@@ -579,8 +579,7 @@ impl AiDriver {
         target *= 0.25;
         // avoidance (§10.2, CONFIRMED): racing cars stand off `t` metres from the centre of a car
         // beside or shortly ahead; the car two ahead is processed first, the car directly ahead last
-        let no_avoid = crate::config::cfg().nfs_ai_noavoid.is_set();
-        for &AheadCar { position: opos, v_long: ovlong, half_width: ohalf, .. } in ahead.iter().take(if no_avoid { 0 } else { 2 }).rev() {
+        for &AheadCar { position: opos, v_long: ovlong, half_width: ohalf, .. } in ahead.iter().take(2).rev() {
             let dir = (target - v.position).normalize_or_zero();
             let d1 = opos - v.position;
             let along = d1.dot(dir);
@@ -616,7 +615,6 @@ impl AiDriver {
             let sl = &table.slices[ts];
             self.dbg_offset = (target - sl.centre).dot(sl.lateral);
         }
-        let steer = if crate::config::cfg().nfs_ai_flip.is_set() { -steer } else { steer };
         // the stuck counter `car+0xEA4` (0x40C934): one tick per control tick under 2 m/s once the
         // race has started, cleared otherwise — and cleared for a racing car (`car+0x52C & 1`,
         // every opponent) that has finished or is out, `car+0xB50 >= 2` (0x40C922…0x40C932).
@@ -712,11 +710,6 @@ impl AiDriver {
     }
 
     pub fn wants_reset(&mut self) -> bool {
-        if crate::config::cfg().nfs_no_aireset.is_set() {
-            self.stuck_ticks = 0;
-            self.wrong_way = false;
-            return false;
-        }
         if self.wrong_way {
             // `car+0xD8B = 0` at the next pass (0x40C946…0x40C952); the counter is not touched
             // here — only the stuck arm clears it (0x40C9F1). (history: `game-history.md` §3.3)

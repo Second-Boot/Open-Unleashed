@@ -159,7 +159,6 @@ impl Hud {
             map_scratch: std::cell::RefCell::new(Vec::new()),
             text_runs: Default::default(),
             map_grid: std::cell::OnceCell::new(),
-            map_check: std::cell::RefCell::new(None),
             map_tex: std::cell::RefCell::new(None),
             replay_glyphs: std::array::from_fn(|i| load_idx(r, "replay.fsh", Some(i), None)),
             congrats: CongratsTex {
@@ -275,10 +274,6 @@ impl Hud {
             (a.0 as i32, a.1 as i32)
         }));
         if self.map_drawn.borrow().as_ref() == Some(&now) {
-            // **TEST GLUE** `NFS_MAP_VERIFY=1`: the skipped redraw must equal what the texture holds
-            if nfs_game::config::cfg().nfs_map_verify.is_set() {
-                assert!(self.map_check.borrow().as_deref() == Some(self.map_image(&now).as_slice()), "map redraw skipped but its picture changed");
-            }
             *self.map_scratch.borrow_mut() = now;
             return;
         }
@@ -286,9 +281,6 @@ impl Hud {
         // new allocation per redraw
         let mut td = self.map_tex.borrow_mut().take().unwrap_or_else(|| TextureData::single(MAP_PX, MAP_PX, Vec::new()));
         self.map_image_into(&now, &mut td.mips[0]);
-        if nfs_game::config::cfg().nfs_map_verify.is_set() {
-            *self.map_check.borrow_mut() = Some(td.mips[0].clone());
-        }
         r.update_texture(tex, &td);
         *self.map_tex.borrow_mut() = Some(td);
         // what was drawn becomes the key; the old key's buffer is the next frame's scratch
@@ -296,16 +288,9 @@ impl Hud {
         *self.map_scratch.borrow_mut() = old.unwrap_or_default();
     }
 
-    /// The map picture for the route's pixel endpoints `px` (empty when the route is not drawn):
-    /// the grid (0x432C5F…0x432D7D), then the route line. A pure function of `px` and the grid —
-    /// which is what lets [`Hud::map_update`] skip an unchanged redraw.
-    fn map_image(&self, px: &[(i32, i32)]) -> Vec<u8> {
-        let mut img = Vec::new();
-        self.map_image_into(px, &mut img);
-        img
-    }
-
-    /// [`Hud::map_image`] into `img` (its old contents are replaced; its capacity is kept).
+    /// The map picture for the route's pixel endpoints `px` (empty when the route is not drawn) drawn into `img` (its old
+    /// contents are replaced; its capacity is kept): the grid (0x432C5F…0x432D7D), then the route line. A pure function of
+    /// `px` and the grid — which is what lets [`Hud::map_update`] skip an unchanged redraw.
     fn map_image_into(&self, px: &[(i32, i32)], img: &mut Vec<u8>) {
         // the grid, before the route (0x432C5F…0x432D7D, every mode and zoom): `w / 20` cells
         // (`w` = cfg1 `+0xE4` = 120, 20 = cfg1 `+0x10C` through 0x420470), so five lines each way,
@@ -749,12 +734,6 @@ impl Hud {
         let (xi, yi, wi, hi, t) = ((ax + ox) as i32, (ay + oy) as i32, w as i32, h as i32, s.t);
         let (sw, sh) = HUD_PX.with(|c| c.get());
         let (sw, sh) = (sw as i32, sh as i32);
-        // **TEST GLUE** (not in the original): `NFS_HUD_BOXES=1` prints each anchored element's
-        // pixel box (logical pixels) — the measurement of `hud.md` §2.2's rule at a resolution
-        static BOXES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BOXES.get_or_init(|| nfs_game::config::cfg().nfs_hud_boxes.is_set()) {
-            eprintln!("HUDBOX design=({x},{y},{w},{h}) screen={sw}x{sh} box=({xi},{yi},{wi},{hi})");
-        }
         let (right, bottom) = (xi >= sw / 2, yi >= sh / 2);
         let across = !right && xi + wi > sw / 2;
         let (dx, dy) = match s.state {

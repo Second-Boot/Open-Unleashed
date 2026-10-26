@@ -772,7 +772,7 @@ pub struct TrafficSet {
     pub lane_cap: f32,
     /// What the race-init placement ([`Self::place_at_race_init`]) needs and the grid stage knows:
     /// the start slice, the racers `[0x5E8AE8]`, the grid rule and each car's slot `.STARTINGPOS`.
-    pub grid_init: Option<(usize, u32, crate::race::GridRule, Vec<i32>)>,
+    pub grid_init: Option<crate::race::GridInit>,
 }
 
 /// The spawn gate `0x40E060`'s track windows (0x40E0AD…0x40E134): `TRACK_NAME [0x657444]`'s first
@@ -934,8 +934,8 @@ impl TrafficSet {
     /// 0x4ECF00 never wrote holds), `n` the racers `[0x5E8AE8]`, `start` the grid's start slice. The
     /// pose is thrown away by the first AI pass (the purgatory park, 0x40DE10) and the respawn
     /// (0x49E220), so only the draws and the wheels' state survive.
-    #[allow(clippy::too_many_arguments)]
-    pub fn place_at_race_init(&mut self, table: &SliceTable, grid: &nfs_physics::collision::TriangleGrid, start: usize, n: u32, rule: &crate::race::GridRule, startingpos: &[i32], tick: u64) {
+    pub fn place_at_race_init(&mut self, table: &SliceTable, grid: &nfs_physics::collision::TriangleGrid, init: &crate::race::GridInit, tick: u64) {
+        let crate::race::GridInit { start, n, ref rule, ref startingpos } = *init;
         for i in 0..self.cars.len().min(self.bodies.len()) {
             let g = startingpos.get(i).copied().unwrap_or(0);
             let (slice, off) = crate::race::grid_slot_by(table, start, (g - 1) as u32, n, rule, |s, d| self.add_slices(table, s, d));

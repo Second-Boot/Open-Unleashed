@@ -140,21 +140,21 @@ fn a_spawn_point_is_taken_once_the_marker_sweeps_past_it() {
     let t = ring(400);
     let mut m = mgr(&[100, 200, 300], true);
     // the first query only arms the cursor: the marker sits 31 slices ahead, so at slice 91
-    assert_eq!(m.find_spawn(&t, 60, 20.0, 5000, 0.0, false, 0, &[], 1, true), None);
+    assert_eq!(m.find_spawn(&t, 60, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None);
     // a five-slice step sweeps 92..96 — nothing there
-    assert_eq!(m.find_spawn(&t, 65, 20.0, 5000, 0.0, false, 0, &[], 1, true), None);
+    assert_eq!(m.find_spawn(&t, 65, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None);
     // the next one sweeps 97..101 and passes the record at 100
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 1, true), Some(0));
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), Some(0));
     // the record is then on a 40 s cooldown, so sweeping it again finds nothing
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 1, true), None);
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None);
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000 + SPAWN_COOLDOWN, 0.0, false, 0, &[], 1, true), None, "`<= 0xA00` still holds 2560 ticks on");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000 + SPAWN_COOLDOWN, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None, "`<= 0xA00` still holds 2560 ticks on");
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5001 + SPAWN_COOLDOWN, 0.0, false, 0, &[], 1, true), Some(0), "and is free again the tick after");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5001 + SPAWN_COOLDOWN, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), Some(0), "and is free again the tick after");
     // a jump of six slices or more is too big a sweep to search
     m.cursors = vec![Some(90)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 9000 + SPAWN_COOLDOWN, 0.0, false, 0, &[], 1, true), None);
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 9000 + SPAWN_COOLDOWN, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None);
 }
 
 /// 0x40E3B0 starts every `lastUse` at −2560, so `gGameTick − lastUse <= 0xA00` holds at tick 0
@@ -164,9 +164,9 @@ fn the_initial_cooldown_covers_tick_zero_only() {
     let t = ring(400);
     let mut m = mgr(&[100], true);
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 0, 0.0, false, 0, &[], 1, true), None, "tick 0: 0 + 2560 <= 2560");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 0, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None, "tick 0: 0 + 2560 <= 2560");
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 1, 0.0, false, 0, &[], 1, true), Some(0), "tick 1: 2561 > 2560");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 1, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), Some(0), "tick 1: 2561 > 2560");
 }
 
 /// §25.5's `if seen >= lim: continue`, with the pinned heat record's `lim[0] = 2`.
@@ -176,19 +176,19 @@ fn only_two_cops_are_ever_assigned_to_a_wanted_perp() {
     // records at 100 and 105; the marker runs 31 slices ahead of the perp
     let mut m = mgr(&[100, 105], true);
     // wanted: the first comes out on the roll, the second free of it (`seen != 0`), a third never
-    assert_eq!(m.find_spawn(&t, 65, 20.0, 5000, 0.0, false, 0, &[], 0, false), None, "arms the cursor at 96");
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 0, false), Some(0), "sweeps 97..101");
-    assert_eq!(m.find_spawn(&t, 75, 20.0, 5000, 1.0, false, 0, &[], 1, true), Some(1), "a reinforcement skips the roll");
+    assert_eq!(m.find_spawn(&t, 65, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 0, cop_near: false }), None, "arms the cursor at 96");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 0, cop_near: false }), Some(0), "sweeps 97..101");
+    assert_eq!(m.find_spawn(&t, 75, 20.0, 1.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), Some(1), "a reinforcement skips the roll");
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 2, true), None, "lim[0] is 2");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 2, cop_near: true }), None, "lim[0] is 2");
     // clean: one, and only while no cop is inside 500 m (0x403120)
     let mut m = mgr(&[100], true);
-    assert_eq!(m.find_spawn(&t, 65, 20.0, 5000, 0.0, true, 0, &[], 0, false), None, "arms the cursor");
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, true, 0, &[], 0, true), None, "a cop is already close by");
+    assert_eq!(m.find_spawn(&t, 65, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: true, skill: 0, humans: &[], seen: 0, cop_near: false }), None, "arms the cursor");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: true, skill: 0, humans: &[], seen: 0, cop_near: true }), None, "a cop is already close by");
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, true, 0, &[], 0, false), Some(0));
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: true, skill: 0, humans: &[], seen: 0, cop_near: false }), Some(0));
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000 + SPAWN_COOLDOWN, 0.0, true, 0, &[], 1, false), None, "lim is 1 for a clean perp (a clean perp is never claimed in practice: the 500 m test is the cap)");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000 + SPAWN_COOLDOWN, clean: true, skill: 0, humans: &[], seen: 1, cop_near: false }), None, "lim is 1 for a clean perp (a clean perp is never claimed in practice: the 500 m test is the cap)");
 }
 
 #[test]
@@ -197,10 +197,10 @@ fn a_human_next_to_the_point_vetoes_it() {
     let mut m = mgr(&[100], true);
     m.cursors = vec![Some(96)];
     // a human 20 slices (120 m) from slice 100 is inside the 172 m veto
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[120], 1, true), None);
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[120], seen: 1, cop_near: true }), None);
     // 40 slices (240 m) away is outside it
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[140], 1, true), Some(0));
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[140], seen: 1, cop_near: true }), Some(0));
 }
 
 #[test]
@@ -1105,24 +1105,24 @@ fn the_record_cursor_sees_one_record_per_slice() {
     let t = ring(400);
     let mut m = mgr(&[100, 100, 200], true);
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 1, true), Some(0));
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), Some(0));
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5002, 0.0, false, 0, &[], 1, true), None, "record 1 is behind record 0");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5002, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None, "record 1 is behind record 0");
     // the record cursor walks up to record 2 for the one at 200
     m.cursors = vec![Some(196)];
-    assert_eq!(m.find_spawn(&t, 170, 20.0, 5004, 0.0, false, 0, &[], 1, true), Some(2));
+    assert_eq!(m.find_spawn(&t, 170, 20.0, 0.0, &SpawnQuery { tick: 5004, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), Some(2));
     // a sweep that starts below 100 walks past both 100s down to record 0 (still cooling)…
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5006, 0.0, false, 0, &[], 1, true), None);
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5006, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None);
     // …but one whose first slice is 100 stops on the first record at or below it: record 1
     m.rec_cursors = vec![2];
     m.cursors = vec![Some(100)];
-    assert_eq!(m.find_spawn(&t, 74, 20.0, 5008, 0.0, false, 0, &[], 1, true), Some(1), "from above the walk stops on record 1");
+    assert_eq!(m.find_spawn(&t, 74, 20.0, 0.0, &SpawnQuery { tick: 5008, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), Some(1), "from above the walk stops on record 1");
     // and a sweep scans `lo … hi − 1` (0x40558E): the marker's own slice waits for the next query
     let mut m = mgr(&[101], true);
     m.cursors = vec![Some(96)];
-    assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 1, true), None, "96..100");
-    assert_eq!(m.find_spawn(&t, 71, 20.0, 5000, 0.0, false, 0, &[], 1, true), Some(0), "101");
+    assert_eq!(m.find_spawn(&t, 70, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), None, "96..100");
+    assert_eq!(m.find_spawn(&t, 71, 20.0, 0.0, &SpawnQuery { tick: 5000, clean: false, skill: 0, humans: &[], seen: 1, cop_near: true }), Some(0), "101");
 }
 
 /// `0x417710`: the reference car is the top of `0x5E8B88`, sorted by `car+0xAF8 − car+0xB20`

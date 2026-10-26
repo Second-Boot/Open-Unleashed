@@ -220,26 +220,7 @@ impl App {
                 }
                 self.fe_select_name();
             }
-            // diagnostic: `NFS_FE_AFTER_RACE=<Game.GameType>[:aborted]` runs the front end's way
-            // back from a race of that type (`fe_after_race`) on start-up, so a still shows the
-            // screen 0x4D3420 would open and the log the stack under it
-            if self.fe.layout_preview.is_some()
-                && let Some(spec) = nfs_game::config::cfg().nfs_fe_after_race.as_str()
-                && let Some(t) = spec.split(':').next().and_then(|t| t.trim().parse::<u8>().ok())
-            {
-                self.fe.race_game_type = Some(t);
-                self.fe_after_race(spec.ends_with(":aborted"));
-            }
-            // diagnostic: `NFS_FE_CALLBACK=<name>` presses the first control whose `callback` is
-            // `name` on start-up, as ENTER on it would (`layout_key`)
-            if let Some(cb) = nfs_game::config::cfg().nfs_fe_callback.as_str()
-                && let Some(i) = self.fe.layout_preview.as_ref().and_then(|l| l.controls().iter().position(|c| c.callback.as_deref() == Some(cb)))
-            {
-                self.fe.layout_sel = i;
-                self.layout_key(MenuKey::Enter, event_loop);
-                tracing::info!(callback = cb, screen = ?self.fe.layout_name, nav = self.fe.nav.describe(), "front end: NFS_FE_CALLBACK");
-            }
-            // diagnostic: `NFS_FE_KEYS=<k>[,…]` presses keys on start-up, after `NFS_FE_CALLBACK`:
+            // diagnostic: `NFS_FE_KEYS=<k>[,…]` presses keys on start-up:
             // `b` and `esc` through the front end's key path (`fe_key_code`), `goto:<n>` presses
             // the n-th control as ENTER would, `open:<name>:<offset>` runs 0x4D2100 directly,
             // `pick:<widget>:<row>` commits a drop-down row as a release on it does,
@@ -252,22 +233,6 @@ impl App {
                 for k in spec.split(',').map(str::trim) {
                     self.fe_scripted_key(k, event_loop);
                 }
-            }
-            // diagnostic: `NFS_FE_STEP=<accessor>:<delta>[,…]` steps accessors on start-up as a
-            // combo slider's arrows do (`set_accessor`), e.g. `Tournament.Tournament:1`
-            if self.fe.layout_preview.is_some()
-                && let Some(spec) = nfs_game::config::cfg().nfs_fe_step.as_str()
-            {
-                for (name, d) in spec.split(',').filter_map(|s| s.rsplit_once(':')) {
-                    if let Ok(d) = d.trim().parse::<i32>() {
-                        self.set_accessor(name.trim(), d);
-                    }
-                }
-                // was `bind_lists()` alone; a combo slider's own arrows run the full
-                // `bind_after_accessor()` (this diagnostic's own doc comment above says it steps
-                // "as a combo slider's arrows do") — same audit as the CARSETTINGBUTTON/track-
-                // arrow/dealer-arrow fixes
-                self.bind_after_accessor();
             }
             // diagnostic: `NFS_FE_PLAYGAME=<Game.GameType>` sets the type and presses `PLAYGAME` on
             // start-up — with `--autotest N` the race runs headless and the log shows where the
@@ -306,69 +271,6 @@ impl App {
                 for (c, src) in l.unrendered_sources() {
                     tracing::info!(class = c, source = src, "unbound widget source");
                 }
-            }
-            // `--sprite-selftest`: draw three quads through the real sprite path — a grey ground,
-            // a black square and a white square — and print what came back. The smallest case that
-            // can show the fault in `RE/AUDIT.md` F2, using the pipeline the front end uses.
-            if nfs_game::config::cfg().nfs_sprite_selftest.as_str().is_some() {
-                let white = self.fe.layout_preview.as_ref().map(|l| l.white_texture());
-                let atlas = self.fe.layout_preview.as_ref().and_then(|l| l.a_font_texture());
-                if let (Some(tex), Some(r)) = (white, self.renderer.as_mut()) {
-                    let q = |x: f32, c: [f32; 4]| nfs_renderer::Sprite {
-                        texture: tex,
-                        pos: [x, 0.25],
-                        size: [0.2, 0.2],
-                        uv_min: [0.0, 0.0],
-                        uv_max: [1.0, 1.0],
-                        color: c,
-                        rotation: 0.0,
-                        pivot: [0.0, 0.0],
-                        tri: None, corner_colors: None,
-                        depth: None,
-                    };
-                    let mut scene = nfs_renderer::Scene::default();
-                    let _ = &atlas;
-                    scene.sprites = vec![
-                        nfs_renderer::Sprite { pos: [0.0, 0.0], size: [1.0, 1.0], ..q(0.0, [0.5, 0.5, 0.5, 1.0]) },
-                        q(0.1, [0.0, 0.0, 0.0, 1.0]),
-                        q(0.4, [1.0, 1.0, 1.0, 1.0]),
-                        q(0.7, [1.0, 0.0, 0.0, 1.0]),
-                        // the same three at the size a glyph is actually drawn
-                        nfs_renderer::Sprite { pos: [0.15, 0.6], size: [0.01875, 0.01875], ..q(0.0, [0.0, 0.0, 0.0, 1.0]) },
-                        nfs_renderer::Sprite { pos: [0.45, 0.6], size: [0.01875, 0.01875], ..q(0.0, [1.0, 1.0, 1.0, 1.0]) },
-                        nfs_renderer::Sprite { pos: [0.75, 0.6], size: [0.01875, 0.01875], ..q(0.0, [1.0, 0.0, 0.0, 1.0]) },
-                    ];
-                    // and the same three with the font atlas, sampling one texel that the ASCII
-                    // dump of `Univers8b` shows solid inside 'A' (atlas 240×61, glyph at 26,32)
-                    if let Some(atlas) = atlas {
-                        let uv = [28.5 / 240.0, 37.5 / 61.0];
-                        let a = |x: f32, c: [f32; 4]| nfs_renderer::Sprite {
-                            texture: atlas,
-                            pos: [x, 0.8],
-                            size: [0.01875, 0.01875],
-                            uv_min: [uv[0] - 0.0005, uv[1] - 0.0005],
-                            uv_max: [uv[0] + 0.0005, uv[1] + 0.0005],
-                            color: c,
-                            rotation: 0.0,
-                            pivot: [0.0, 0.0],
-                            tri: None, corner_colors: None,
-                            depth: None,
-                        };
-                        scene.sprites.push(a(0.15, [0.0, 0.0, 0.0, 1.0]));
-                        scene.sprites.push(a(0.45, [1.0, 1.0, 1.0, 1.0]));
-                        scene.sprites.push(a(0.75, [1.0, 0.0, 0.0, 1.0]));
-                    }
-                    let rgba = r.render_to_image(&scene, &self.camera, 200, 100).expect("render");
-                    let at = |x: usize, y: usize| {
-                        let i = (y * 200 + x) * 4;
-                        (rgba[i], rgba[i + 1], rgba[i + 2])
-                    };
-                    println!("big:   ground {:?}  black {:?}  white {:?}  red {:?}", at(5, 50), at(30, 30), at(90, 30), at(150, 30));
-                    println!("glyph: black {:?}  white {:?}  red {:?}", at(31, 61), at(91, 61), at(151, 61));
-                    println!("atlas: black {:?}  white {:?}  red {:?}", at(31, 81), at(91, 81), at(151, 81));
-                }
-                event_loop.exit();
-                return;
             }
             if self.layout_sweep {
                 self.layout_sweep = false;
@@ -531,10 +433,8 @@ impl App {
                     self.bind_lists();
                     self.bind_checks();
                 }
-                // `NFS_FE_DIALOG` raises its dialog in the dialog step, which a still otherwise
-                // never reaches
-                // (and a dialog a scripted network run raised: `comm_tick`'s notices)
-                if nfs_game::config::cfg().nfs_fe_dialog.as_str().is_some() || self.fe.dialog.is_some() {
+                // a dialog a scripted network run raised (`comm_tick`'s notices) is stepped here, which a still otherwise never reaches
+                if self.fe.dialog.is_some() {
                     self.fe_dialog_step();
                 }
                 // **TEST GLUE** `NFS_FE_SEQ`: consecutive frames instead of the one still (`fe_seq.rs`)
@@ -543,14 +443,7 @@ impl App {
                 }
                 // the same scene the front end draws every frame, so a screenshot shows the 3D room too
                 self.rebuild_scene();
-                let mut scene = self.scene.clone();
-                // `NFS_FE_KEEP=<n>` renders only the first n sprites of the front end's own list —
-                // the bisect for `RE/AUDIT.md` F2
-                if let Some(n) = nfs_game::config::cfg().nfs_fe_keep.as_str().map(|v| v.parse::<usize>().unwrap_or(usize::MAX)) {
-                    println!("fe sprites: {}, keeping {}", scene.sprites.len(), n.min(scene.sprites.len()));
-                    scene.sprites.truncate(n);
-                }
-                let scene = scene;
+                let scene = self.scene.clone();
                 self.sync_gamma();
                 let rgba = self
                     .renderer
@@ -582,7 +475,7 @@ impl App {
     /// its `NFS_FE_KEYS` tokens there — a player's way through the menus, ending in `playgame`
     /// (the bottom bar's button); without it `PLAYGAME` is pressed again for the same game type.
     pub(crate) fn session_next_from_fe(&mut self, game_type: u8, event_loop: &ActiveEventLoop) {
-        let k = self.scripted_race_no + 1;
+        let k = self.scripted_hud.race_no + 1;
         if let Ok(spec) = std::env::var(format!("NFS_SESSION_FE_KEYS_{k}")) {
             for t in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                 self.fe_scripted_key(t, event_loop);

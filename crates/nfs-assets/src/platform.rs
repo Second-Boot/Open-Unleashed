@@ -73,3 +73,61 @@ pub fn dev_game_root() -> Option<PathBuf> {
     let home = home_dir()?;
     ["Games/NFS-Porsche-Unleashed/game_info/data", "Games/NFS-Porsche-Unleashed"].iter().map(|r| home.join(r)).find(|p| p.join("GameData").is_dir())
 }
+
+/// PORT-DEVIATION D46 (photo mode): the folder the stills go to, `<the user's Pictures>/PorscheUnleashed`.
+///
+/// * macOS: `~/Pictures`
+/// * Windows: `%USERPROFILE%\Pictures`, or `%OneDrive%\Pictures` when that is where the user's Pictures live
+///   (it exists and the plain one does not)
+/// * Linux and the rest: `XDG_PICTURES_DIR` of `~/.config/user-dirs.dirs` (`$XDG_CONFIG_HOME`), else `~/Pictures`
+///
+/// Falls back to `./PorscheUnleashed` with no home. The folder is made by the caller. `NFS_PHOTO_DIR` (tests)
+/// names the folder itself.
+pub fn photo_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("NFS_PHOTO_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(d);
+    }
+    let Some(home) = home_dir() else { return PathBuf::from("PorscheUnleashed") };
+    let pictures = if cfg!(windows) {
+        let plain = home.join("Pictures");
+        let one = std::env::var_os("OneDrive").filter(|v| !v.is_empty()).map(|v| PathBuf::from(v).join("Pictures"));
+        match one {
+            Some(o) if !plain.is_dir() && o.is_dir() => o,
+            _ => plain,
+        }
+    } else if cfg!(target_os = "macos") {
+        home.join("Pictures")
+    } else {
+        let conf = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+        std::fs::read_to_string(conf.join("user-dirs.dirs")).ok().and_then(|t| xdg_pictures_dir(&t, &home)).unwrap_or_else(|| home.join("Pictures"))
+    };
+    pictures.join("PorscheUnleashed")
+}
+
+/// `XDG_PICTURES_DIR="$HOME/Pictures"` of a `user-dirs.dirs` text, with `$HOME` / `${HOME}` taken for `home`;
+/// `None` when the line is missing or names a relative path.
+pub fn xdg_pictures_dir(text: &str, home: &std::path::Path) -> Option<PathBuf> {
+    let line = text.lines().map(str::trim).find(|l| l.starts_with("XDG_PICTURES_DIR"))?;
+    let v = line.split_once('=')?.1.trim().trim_matches('"');
+    let h = home.to_string_lossy();
+    let v = v.replace("${HOME}", &h).replace("$HOME", &h);
+    let p = PathBuf::from(v);
+    p.is_absolute().then_some(p)
+}
+
+#[cfg(test)]
+mod photo_dir_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn the_xdg_pictures_line() {
+        let home = Path::new("/home/a");
+        let t = "# comment\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_PICTURES_DIR=\"$HOME/Fotos\"\n";
+        assert_eq!(xdg_pictures_dir(t, home), Some(PathBuf::from("/home/a/Fotos")));
+        assert_eq!(xdg_pictures_dir("XDG_PICTURES_DIR=\"/mnt/pics\"", home), Some(PathBuf::from("/mnt/pics")));
+        assert_eq!(xdg_pictures_dir("XDG_PICTURES_DIR=\"${HOME}/P\"", home), Some(PathBuf::from("/home/a/P")));
+        assert_eq!(xdg_pictures_dir("XDG_PICTURES_DIR=\"rel\"", home), None);
+        assert_eq!(xdg_pictures_dir("XDG_MUSIC_DIR=\"$HOME/M\"", home), None);
+    }
+}

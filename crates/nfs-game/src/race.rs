@@ -765,6 +765,16 @@ pub fn finish_slice(table: &SliceTable, start_scene: Option<&Scene>) -> Option<u
         .map(|e| table.find_slice(Vec3::from(e.position), 0))
 }
 
+/// What the race-init placement of the traffic and the cops needs and the grid stage knows: the start slice, the
+/// racers `[0x5E8AE8]`, the grid rule and each car's slot `.STARTINGPOS`.
+#[derive(Debug, Clone)]
+pub struct GridInit {
+    pub start: usize,
+    pub n: u32,
+    pub rule: GridRule,
+    pub startingpos: Vec<i32>,
+}
+
 /// What `Grid_slot` 0x410580 and `Car_raceInit` 0x410730 read besides the table and the scene.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GridRule {

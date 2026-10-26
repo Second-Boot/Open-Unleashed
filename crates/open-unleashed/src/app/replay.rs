@@ -163,6 +163,18 @@ impl App {
         self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted))
     }
 
+    /// The horn button as the car reads it (`human+0xD86`, bit 1 of the packet `[0x5E9664]`,
+    /// copied by 0x4991E0 and read by the horn sound 0x4A7660 / 0x4A7080): in a playback the
+    /// packet is the stream's (`Replay_playbackInput` 0x4144B0 overwrites it), so the key held
+    /// now is not read — PAD-END; the stream's own horn bit is (PAD-END2: the port's streams carry it
+    /// since the recorder stores the whole byte as 0x4143F0 does; an older stream has none).
+    pub(crate) fn live_horn(&self) -> bool {
+        if self.playback_running() {
+            return self.replay.stream.as_ref().is_some_and(|r| r.horn);
+        }
+        self.input.held(Action::Horn)
+    }
+
     /// **`STARTREPLAY`** (slot 51, 0x50D390): `[0x699FC9] = 1` — "this is a replay playback" —
     /// then `PLAYGAME`. The launch (0x4D5372…0x4D5425) sends option 0x97 = 2 and 0x110 =
     /// `"%s.rpl"` over `Replay.List`'s current name, and the start check 0x4D5730 skips the
@@ -303,10 +315,10 @@ impl App {
         if let Some(d) = setup.derby {
             let live = *self.cheat_bits_live.get_or_insert(self.cheat_bits);
             self.cheat_bits = if d { live | CHEAT_DERBY } else { live & !CHEAT_DERBY };
-            self.net_derby = d && setup.net.is_some();
+            self.net_launch.derby = d && setup.net.is_some();
         }
         if let Some(nc) = setup.nocollision {
-            self.net_nocollision = nc && setup.net.is_some();
+            self.net_launch.nocollision = nc && setup.net.is_some();
         }
         if setup.race_type.is_none() || setup.fegame_type.is_none() {
             tracing::info!(race_type = ?setup.race_type, fegame_type = ?setup.fegame_type, "replay: no RACE_TYPE / FEGAME_TYPE in the setup, a single race under the current Game.GameType (APPROXIMATION)");
@@ -382,13 +394,95 @@ impl App {
     /// Not carried: the network variant (`+0x198`). *(The tooltips 0x42DD10 and the auto-hide
     /// `+0x124` are ported since 2026-09-27: `Hud::replay_bar`, `App::replay_bar_frame`.)*
     fn replay_bar_apply_press(&mut self, cx: f32, cy: f32, event_loop: &ActiveEventLoop) -> bool {
-        use nfs_game::replay::{bar_cell_at, bar_event, BarEvent};
+        use nfs_game::replay::bar_cell_at;
         if !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)) || self.hud.is_none() {
             return false;
         }
         let (cells, _) = Hud::bar_geometry();
         let Some(cell) = bar_cell_at(&cells, cx.floor() as i32, cy.floor() as i32) else { return false };
+        self.replay_bar_cell(cell, 1, event_loop)
+    }
+
+    /// **A pad key on the replay bar** (PAD-END2, PORT-DEVIATION D10: the original's bar is the pointer's
+    /// alone, `replay_bar_apply_press`): the key presses the cell its meaning is, as a click would, and
+    /// the bar is shown (`away` = 0, 0x42D8A0). A play / pause, d-pad right / left the speed step up / down,
+    /// d-pad up the result pages again, d-pad down the restart (a network replay's previous car), X the
+    /// save dialog, B quit; Y is the camera already (the bindings' `CameraView`, D44). `true` when the key
+    /// pressed a cell.
+    pub(crate) fn pad_replay_bar_key(&mut self, k: nfs_input::MenuNav, event_loop: &ActiveEventLoop) -> bool {
+        use nfs_input::MenuNav as N;
+        // the bar's cells (`BAR` order): 1 rest, 2 paus / next car, 3 quit, 4 speed, 5 Irac, 6 save; the
+        // speed cell steps up (`+0x174` 5 → 6 → 7 → 8 → 5), so "down" is three steps and the last answers
+        let (cell, presses) = match k {
+            N::Select => (2, 1),
+            N::Right => (4, 1),
+            N::Left => (4, 3),
+            N::Up => (5, 1),
+            N::Down => (1, 1),
+            N::Aux => (6, 1),
+            N::Back => (3, 1),
+            N::Alt => return false,
+        };
+        if !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)) || self.hud.is_none() {
+            return false;
+        }
+        self.replay_bar.away = 0;
+        self.replay_bar_cell(cell, presses, event_loop)
+    }
+
+    /// The replay-save dialog's pad keys (PAD-END2, D10): A saves — under the name typed, else the first
+    /// free default (the original's field starts empty, 0x42E040; the pad cannot type) — and B closes it
+    /// (the second button, 0x12). Both go through the click's path (`replay_save_click`).
+    pub(crate) fn pad_replay_save_key(&mut self, k: nfs_input::MenuNav) -> bool {
+        use nfs_input::MenuNav as N;
+        match k {
+            N::Select => {
+                if self.replay_save.name.is_empty() {
+                    self.replay_save.name = self.default_replay_name();
+                }
+                self.replay_save_click(0);
+                true
+            }
+            N::Back => {
+                self.replay_save_click(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The overwrite question's pad keys (PAD-END2, D10): the d-pad picks yes / no (the question opens on
+    /// "no"), A answers the pick, B is "no" (`replay_overwrite_click`).
+    pub(crate) fn pad_overwrite_key(&mut self, k: nfs_input::MenuNav) -> bool {
+        use nfs_input::MenuNav as N;
+        match k {
+            N::Up | N::Left => self.replay_save.sel = 0,
+            N::Down | N::Right => self.replay_save.sel = 1,
+            N::Select => self.replay_overwrite_click(usize::from(self.replay_save.sel)),
+            N::Back => self.replay_overwrite_click(1),
+            _ => return false,
+        }
+        true
+    }
+
+    /// The first free `Replay<n>` (n from 1) among the saved replays: the pad's save name when the field
+    /// is empty. A port-side name (the original pre-fills nothing; its own default is `replay.rpl`, the
+    /// automatic save of every race, which a manual save must not overwrite unasked).
+    fn default_replay_name(&self) -> String {
+        (1..)
+            .map(|n| format!("Replay{n}"))
+            .find(|name| !self.replay_file(name).exists() && !self.replay_file(name).with_extension("rpl").exists())
+            .unwrap_or_default()
+    }
+
+    /// A press on bar cell `cell` (0x42D880's answer): `presses` > 1 steps the speed cell's counter that
+    /// many times and answers the last (a pad's "slower" is three steps of the cycle).
+    fn replay_bar_cell(&mut self, cell: usize, presses: usize, event_loop: &ActiveEventLoop) -> bool {
+        use nfs_game::replay::{bar_event, BarEvent};
         // `+0x198`, built for `FEGAME_TYPE 3` only (0x424F7B): a network race's replay has the network bar
+        for _ in 1..presses {
+            let _ = bar_event(cell, &mut self.replay_bar, self.replay_net.is_some());
+        }
         let Some(ev) = bar_event(cell, &mut self.replay_bar, self.replay_net.is_some()) else { return false };
         tracing::info!(tick = self.tick, cell, event = ev.code(), "replay bar (0x42D880)");
         match ev {
@@ -435,11 +529,11 @@ impl App {
                 {
                     // `0x426C90(1)`: the queue from its start, no `HCongrats`
                     r.congrats = false;
-                    self.results_page = 0;
-                    self.results_page_tick = self.tick;
-                    self.page_seen = None;
-                    self.page_open_tick = None;
-                    self.page_closing = None;
+                    self.pages.page = 0;
+                    self.pages.tick = self.tick;
+                    self.pages.seen = None;
+                    self.pages.open_tick = None;
+                    self.pages.closing = None;
                 }
             }
             BarEvent::Save => self.open_replay_save(),
@@ -477,7 +571,7 @@ impl App {
         self.replay_bar.count(&cells, frame, pointer, self.replay_net.is_some());
         let clock = self.hud_clock();
         self.replay_bar.transition(clock);
-        let page_up = self.results.is_some() && usize::from(self.results_page) < self.result_pages().len();
+        let page_up = self.results.is_some() && usize::from(self.pages.page) < self.result_pages().len();
         let queued = self.paused || self.replay_save.up || self.replay_save.overwrite || page_up;
         self.replay_bar.pin(queued);
     }
@@ -490,7 +584,7 @@ impl App {
     fn open_replay_save(&mut self) {
         self.paused = false;
         self.pause_confirm = None;
-        self.results_page = self.result_pages().len() as u8;
+        self.pages.page = self.result_pages().len() as u8;
         self.replay_save.up = true;
         self.replay_save.overwrite = false;
         self.replay_save.opened = Some(Instant::now());
@@ -515,6 +609,7 @@ impl App {
                 if self.replay_file(&self.replay_save.name).with_extension("rpl").exists() {
                     tracing::info!(name = %self.replay_save.name, "replay save: the file exists (0x11)");
                     self.replay_save.overwrite = true;
+                    self.replay_save.sel = 1;
                 } else {
                     self.replay_save_as(&self.replay_save.name.clone());
                     self.close_replay_save();
@@ -627,7 +722,7 @@ impl App {
             self.open_result_pages();
         } else {
             // `[0x60CA10]`: nothing queued (0x426C1C), the flag cleared (0x426C6C)
-            self.results_page = self.result_pages().len() as u8;
+            self.pages.page = self.result_pages().len() as u8;
         }
         tracing::info!(pages = ?self.result_pages(), queued = pages, "result pages over the replay (0x426A80(1))");
     }
@@ -643,6 +738,9 @@ pub(crate) struct ReplaySave {
     /// the overwrite question: `HYesNoOverlay` `[0x60C9AC]` with 18139 / 18140 (0x4263D1…0x42643D)
     /// and `[0x60CA9D] = 1`, raised in the dialog's place when the name exists
     pub(crate) overwrite: bool,
+    /// the overwrite question's picked button, 0 yes / 1 no (the port's own, like the pause menu's
+    /// `pause_confirm`: the pointer moves it, the pad's d-pad too; PAD-END2)
+    pub(crate) sel: u8,
     /// when the dialog opened, for the caret's blink (`[0x606AC8]` runs on through the pause)
     pub(crate) opened: Option<Instant>,
 }

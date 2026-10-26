@@ -230,6 +230,11 @@ pub enum MenuNav {
     Right,
     Select,
     Back,
+    /// the standard pad's Y (the port's third face button, `face[2]`): the in-race dialogs' second answer
+    /// (PAD-END2, D10) — the failed mission summary's "race again"
+    Alt,
+    /// the standard pad's X (`face[3]`): the replay bar's "save" (PAD-END2, D10)
+    Aux,
 }
 
 /// Current logical input state, updated from window events and sampled once per tick.

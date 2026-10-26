@@ -126,14 +126,14 @@ impl App {
                     k.map_at_hide = k.map != 0;
                     if k.map_at_hide {
                         k.suspend_map();
-                        self.map_slide = (2, clock);
+                        self.slides.map = (2, clock);
                     }
                     k.mirror_at_hide = k.rearview;
                     if k.mirror_at_hide {
                         k.rearview = false;
-                        self.mirror_slide = (2, clock);
+                        self.slides.mirror = (2, clock);
                     }
-                    for s in [&mut self.tray_slide, &mut self.time_trays] {
+                    for s in [&mut self.slides.tray, &mut self.slides.time] {
                         if s.0 != 2 {
                             *s = (2, clock);
                         }
@@ -142,32 +142,32 @@ impl App {
                     k.live = true;
                     if k.map_at_hide {
                         k.restore_map();
-                        self.map_slide = (1, clock);
+                        self.slides.map = (1, clock);
                     }
                     if k.mirror_at_hide {
                         k.rearview = true;
-                        self.mirror_slide = (1, clock);
+                        self.slides.mirror = (1, clock);
                     }
-                    self.tray_slide = (1, clock);
-                    self.time_trays = (1, clock);
+                    self.slides.tray = (1, clock);
+                    self.slides.time = (1, clock);
                 }
             }
             Action::ToggleRearView => {
                 if k.rearview {
                     k.rearview = false;
-                    self.mirror_slide = (2, clock);
+                    self.slides.mirror = (2, clock);
                 } else if k.live {
                     k.rearview = true;
-                    self.mirror_slide = (1, clock);
+                    self.slides.mirror = (1, clock);
                 }
             }
             Action::ToggleMap => {
                 if k.map != 0 {
                     k.suspend_map();
-                    self.map_slide = (2, clock);
+                    self.slides.map = (2, clock);
                 } else if k.live {
                     k.restore_map();
-                    self.map_slide = (1, clock);
+                    self.slides.map = (1, clock);
                 }
             }
             Action::CycleMap => {
@@ -203,7 +203,7 @@ impl App {
             || self.net_notice.is_some()
             || self.replay_save.up
             || self.billboard_key != 0
-            || (self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some())
+            || (self.results.is_some() && self.result_pages().get(self.pages.page as usize).is_some())
     }
 
     /// The post-race pages this race queues, in order.
@@ -286,25 +286,25 @@ impl App {
     /// frame down to the 40-px floor, then state 0), and only then does the queue show the next
     /// page ([`App::advance_results_page`]). The tournament `HCongrats` just goes.
     pub(crate) fn close_results_page(&mut self) {
-        let page = self.result_pages().get(self.results_page as usize).copied();
+        let page = self.result_pages().get(self.pages.page as usize).copied();
         if matches!(page, Some(ResultPage::TournamentPlace(_)) | None) {
             self.advance_results_page();
-        } else if self.page_closing.is_none() {
-            self.page_closing = Some(0);
+        } else if self.pages.closing.is_none() {
+            self.pages.closing = Some(0);
         }
     }
 
     pub(crate) fn advance_results_page(&mut self) {
-        self.page_closing = None;
-        self.results_page += 1;
-        self.results_page_tick = self.tick;
-        match self.result_pages().get(self.results_page as usize) {
+        self.pages.closing = None;
+        self.pages.page += 1;
+        self.pages.tick = self.tick;
+        match self.result_pages().get(self.pages.page as usize) {
             // the tournament `HCongrats` speaks as it opens; with no top-three page the
             // standings may say "tournament leader"
             Some(ResultPage::TournamentPlace(_)) => self.tournament_speech(),
             Some(ResultPage::Standings)
                 if !matches!(
-                    self.result_pages().get(self.results_page as usize - 1),
+                    self.result_pages().get(self.pages.page as usize - 1),
                     Some(ResultPage::TournamentPlace(_))
                 ) =>
             {
@@ -385,6 +385,10 @@ impl App {
                             self.restart_race(event_loop);
                         }
                     }
+                    // PORT-DEVIATION D46: the photo-mode item
+                    3 => {
+                        self.photo_enter();
+                    }
                     _ => self.pause_confirm = Some(1),
                 }
             }
@@ -410,7 +414,7 @@ impl App {
             }
             2 if !self.paused
                 && self.results.is_some()
-                && self.result_pages().get(self.results_page as usize) == Some(&ResultPage::MissionSummary) =>
+                && self.result_pages().get(self.pages.page as usize) == Some(&ResultPage::MissionSummary) =>
             {
                 self.fe_sound(9);
                 if self.mission_result.is_some_and(|(passed, _)| !passed) {

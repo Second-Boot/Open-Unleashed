@@ -252,7 +252,7 @@ impl App {
         // used to linger here)
         self.player_car_id = Some(req.car.id);
         let car = self.cheat_993(req.car.clone());
-        self.mission = req.mission.clone().map(cone_limit_diagnostic);
+        self.mission = req.mission.clone();
         self.skill = None;
         let overlay = req.parts.iter().flat_map(|p| p.geometry_swaps.iter().copied()).collect();
         let asset_req = AssetRequest { track: &req.track_file, derby: true, model: &car.model, style: Some((car.variant, car.cabrio, overlay)), sim: &car.sim, sim_default: false, failed: "career event load failed" };
@@ -788,8 +788,8 @@ impl App {
                 self.choice_index(choice::DISPLAY_REAR_VIEW).is_some_and(|(i, _)| i != 0),
                 self.choice_index(choice::DISPLAY_TRANSLUCENCY).is_none_or(|(i, _)| i == 0),
             );
-            self.map_slide = (0, 0);
-            self.mirror_slide = (0, 0);
+            self.slides.map = (0, 0);
+            self.slides.mirror = (0, 0);
             // `HReplay` 0x42C910, built by the same factory (0x424F90 / 0x424FA6)
             self.replay_bar = nfs_game::replay::BarState::new();
             self.hud_clock_base = -(self.pause_offset + self.pause_ticks);
@@ -819,9 +819,8 @@ impl App {
             // 0x4B6C83) — or a loaded replay's block (0x413CF0). Every live race of every session
             // draws the same stream. *(Until 2026-09-26 the port seeded each race from the clock.)*
             // `NFS_TRAFFIC_SEED` pins another value (diagnostic).
-            self.traffic_seed = nfs_game::config::cfg().nfs_traffic_seed.as_str()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| self.net_fe_txt.get("rand_seed").copied().unwrap_or_else(|| self.registry.u32("rand_seed", 0)));
+            self.traffic_seed = env_traffic_seed()
+                .unwrap_or_else(|| self.net_launch.fe_txt.get("rand_seed").copied().unwrap_or_else(|| self.registry.u32("rand_seed", 0)));
             self.replay.setup = nfs_game::replay::ReplaySetup {
                 track: self.track.name.clone(),
                 car: self.car.model.clone(),
@@ -858,8 +857,8 @@ impl App {
                 opponent_cars: None,
                 // `SCENENUMBER` 0x1C (`fac+0x24`, 0 outside a skill test), `DERBY` 0x1B, `NOCOLLISION` 0x29
                 scene: Some(self.mission.as_ref().map_or(0, |m| m.mission.scene)),
-                derby: Some(self.cheat_bits & CHEAT_DERBY != 0 || self.net_derby),
-                nocollision: Some(self.net_nocollision),
+                derby: Some(self.cheat_bits & CHEAT_DERBY != 0 || self.net_launch.derby),
+                nocollision: Some(self.net_launch.nocollision),
                 // `.TRANSMISSION` 0x221 (`carinfo+0xC`), the word the car is built with: a playback restores it
                 transmission: Some(self.player_automatic()),
                 opponent_transmission: Some(self.option_automatic()),
@@ -883,8 +882,8 @@ impl App {
             opponents = self.num_opponents,
             career_opponents = ?self.career_opponents.as_ref().map(|o| o.len()),
             career_opponent_cars = ?self.career_opponents.as_ref().map(|o| o.iter().map(|o| (o.name.as_str(), o.car.display_name.as_str(), o.grid)).collect::<Vec<_>>()),
-            net_seat_grids = ?self.net_seat_grids,
-            net_traffic = self.net_traffic.len(),
+            net_seat_grids = ?self.net_launch.seat_grids,
+            net_traffic = self.net_launch.traffic.len(),
             grid = ?self.player_grid_override,
             backwards = self.backwards,
             mirror = self.mirror,
@@ -909,8 +908,8 @@ impl App {
         // runtime's state for everything up to the next race load
         self.crt_rand = nfs_game::movie_overlay::CRand::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
         if self.net.session.is_some() {
-            let time = self.net_fe_txt.get("time").copied().unwrap_or_else(|| self.registry.u32("time", 0));
-            tracing::info!(target: "netplay", rand_seed = self.traffic_seed, time, weather = 0, car_car_pass_skipped = self.net_nocollision, "network race: the option values in force (0x414EE9 RAND_SEED, TIME; WEATHER is stored 0 by 0x414DF9; 0x498FF0's car-car half skipped when COMMSPOSITIONAL && NOCOLLISION)");
+            let time = self.net_launch.fe_txt.get("time").copied().unwrap_or_else(|| self.registry.u32("time", 0));
+            tracing::info!(target: "netplay", rand_seed = self.traffic_seed, time, weather = 0, car_car_pass_skipped = self.net_launch.nocollision, "network race: the option values in force (0x414EE9 RAND_SEED, TIME; WEATHER is stored 0 by 0x414DF9; 0x498FF0's car-car half skipped when COMMSPOSITIONAL && NOCOLLISION)");
         }
         self.replay.saved = false;
         self.replay.loop_count = 0;
@@ -1257,20 +1256,15 @@ impl App {
             pol.place_at_race_init(t, &world.collision, self.tick);
         }
         if let (Some(tr), Some(t)) = (self.road.traffic.as_mut(), &self.slices)
-            && let Some((start, n, rule, startingpos)) = tr.grid_init.clone()
+            && let Some(init) = tr.grid_init.clone()
         {
-            tr.place_at_race_init(t, &world.collision, start, n, &rule, &startingpos, self.tick);
+            tr.place_at_race_init(t, &world.collision, &init, self.tick);
         }
         self.vehicle = Some(vehicle);
         self.ff_arm();
         // `Car_init` 0x410C74: the lamp byte `car+0xD87` starts at 3 (the headlights) on a night
         // track, else 0; the headlights' ramp starts clear (`HeadRamp`)
         self.lamp_bits = if self.track.is_night() { 3 } else { 0 };
-        // **TEST GLUE** `NFS_LAMPS=toggle`: start with the lamp byte XORed by the lights key's toggle
-        // (`lamp_command` code 13, `car+0xD87 ^= 3`, 0x49941D) — stills of a daytime race with the lamps on
-        if std::env::var("NFS_LAMPS").is_ok_and(|v| v == "toggle") {
-            self.lamp_bits = lamp_command(self.lamp_bits, 13);
-        }
         self.head_ramp = HeadRamp::default();
         self.hud_hidden = false;
         tracing::info!(pos = ?self.car_pos, "car placed");
@@ -1332,17 +1326,6 @@ impl App {
             renderer.set_headlight_map(&m);
         }
         self.world = Some(world);
-        // diagnostic: `NFS_PROJECTOR_VIEW=k` sets the car down on the track's k-th shadow projector
-        if let Some(k) = nfs_game::config::cfg().nfs_projector_view.as_str().and_then(|v| v.parse::<usize>().ok())
-            && let Some(q) = self.world.as_ref().and_then(|w| w.projectors.get(k)).cloned()
-        {
-            let ground = self.world.as_ref().and_then(|w| w.collision.ground(q.point.x, q.point.y + 50.0, q.point.z, 200.0)).map(|h| h.point.y).unwrap_or(q.point.y);
-            if let Some(v) = self.vehicle.as_mut() {
-                // diagnostic pose, no original counterpart: the origin half the model box up
-                v.position = Vec3::new(q.point.x, ground + v.body_lift, q.point.z);
-                self.car_pos = v.draw_origin();
-            }
-        }
         let mut car = car;
         // `.TINYCAR`: the model at 0.4 (0x4433D2)
         if self.cheat_bits & CHEAT_TINY != 0 {
@@ -1422,8 +1405,8 @@ impl App {
     /// of a scripted session (`NFS_AUTOTEST_RACES`) — from `NFS_HUD_KEYS_<k>` for race `k`
     /// (1-based) when set, else `NFS_HUD_KEYS` again — so every race of the session is driven alike.
     pub(crate) fn rearm_hud_keys(&mut self) {
-        self.scripted_race_no += 1;
-        let k = self.scripted_race_no + 1;
+        self.scripted_hud.race_no += 1;
+        let k = self.scripted_hud.race_no + 1;
         // (`NFS_HUD_KEYS_<k>` is a per-race name, read here; the plain `NFS_HUD_KEYS` is the snapshot's)
         self.hud_key_script = std::env::var(format!("NFS_HUD_KEYS_{k}"))
             .ok()

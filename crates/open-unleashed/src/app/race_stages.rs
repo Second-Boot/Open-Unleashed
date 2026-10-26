@@ -162,8 +162,8 @@ impl App {
             self.track.start_forward.as_ref()
         };
         self.player_eliminated = false;
-        self.net_time_sent = false;
-        self.net_pad_buttons = 0;
+        self.net_launch.time_sent = false;
+        self.net_launch.pad_buttons = 0;
         // the port's own counters for the autotest log (the opponents' start at 0 with their cars)
         // and the autotest bot's stuck count
         self.wall_hits = 0;
@@ -172,9 +172,9 @@ impl App {
         // the HUD's init builds `HReplaySave` afresh (0x424EA4)
         self.replay_save = ReplaySave::default();
         self.hud_records = None;
-        self.results_page = 0;
-        self.page_seen = None;
-        self.page_open_tick = None;
+        self.pages.page = 0;
+        self.pages.seen = None;
+        self.pages.open_tick = None;
         self.results = None;
         self.mission_result = None;
         // 0x426B20…0x426B3B: `[0x60CA04] = 0`, `HTime` reset (0x431850), `HMissionSummary+0x140 = 0`
@@ -205,7 +205,7 @@ impl App {
         // `Grid_slot` 0x410580's globals: `LINEAR_TRACK`, and the network smash-up's spacing
         // (`FEGAME_TYPE == 3 && DERBY`, the stream's `DERBY`)
         // (`NUMCARS` at the grid is the players and the kept traffic, 0x4B5079's fix-up on the launch's 8 + traffic)
-        let grid_rule = nfs_game::race::GridRule { linear: self.linear_track(), derby_cars: self.net_derby.then(|| n_cars + self.road.traffic_count) };
+        let grid_rule = nfs_game::race::GridRule { linear: self.linear_track(), derby_cars: self.net_launch.derby.then(|| n_cars + self.road.traffic_count) };
         // the player's `Grid_slot` slice and pose, for `Car_placeAtSlice` below
         let mut grid_place: Option<(usize, Vec3)> = None;
         // the opponents' `Grid_slot` slices and poses (opponent index, slice, pose), placed after the
@@ -366,7 +366,7 @@ impl App {
                 };
                 if let Some(room_names) = net_names {
                     use nfs_net::launchcar::id as cid;
-                    for (k, rec) in self.net_seat_cars.iter().enumerate() {
+                    for (k, rec) in self.net_launch.seat_cars.iter().enumerate() {
                         let Some(p) = plan.get_mut(k) else { break };
                         let text = |i: u32| rec.text(i).map(|b| b.iter().map(|&c| nfs_formats::locale::cp1252(c)).collect::<String>());
                         let Some(file) = text(cid::FILENAME).filter(|f| !f.is_empty()) else {
@@ -403,7 +403,7 @@ impl App {
                             *l = None;
                         }
                         p.2 = text(cid::LICENSE).filter(|l| !l.is_empty()).or_else(|| room_names.get(k).cloned()).unwrap_or_default();
-                        if let Some(g) = self.net_seat_grids.get(k).copied().flatten() {
+                        if let Some(g) = self.net_launch.seat_grids.get(k).copied().flatten() {
                             p.4 = Some(g);
                         }
                         if let Some(r) = rec.num(cid::RACENUMBER) {
@@ -411,7 +411,7 @@ impl App {
                         }
                         tracing::info!(
                             seat = k, car = %e.display_name, model = %e.model, sim = %e.sim, colour = format_args!("{:02X}{:02X}{:02X}", colour[0], colour[1], colour[2]),
-                            plate = %p.2, grid = g_log(self.net_seat_grids.get(k).copied().flatten()),
+                            plate = %p.2, grid = g_log(self.net_launch.seat_grids.get(k).copied().flatten()),
                             "network opponent's car (0x4EEDA0 record: .FILENAME / .SPECNAME / .COLOUR / .LICENSE)"
                         );
                         seat_recs[k] = Some(rec.clone());
@@ -641,7 +641,6 @@ impl App {
                         wall_hits: 0,
                         resets: 0,
                         eliminated: false,
-                        off_surface: false,
                         // `Car_init` 0x410C74: the night flag
                         lamp_bits: if self.track.is_night() { 3 } else { 0 },
                         tiny: car_tiny,
@@ -863,7 +862,7 @@ impl App {
                         // §33.3) gates the human-honk trigger (0x40172E). Only `fe.txt` sets it —
                         // no race-setup message carries id 0x21 and the track spec `Tr00.bin` that
                         // 0x475C80 would overwrite it from is not shipped
-                        set.time_mode = self.net_fe_txt.get("time").copied().unwrap_or_else(|| self.registry.u32("time", 0)) != 0;
+                        set.time_mode = self.net_launch.fe_txt.get("time").copied().unwrap_or_else(|| self.registry.u32("time", 0)) != 0;
                         // `scripts.bin` drives the reactions of `traffic.md` §12.3 / §12.9 / §30
                         if let Some(p) = GamePaths::find_file(
                             &self.paths.game_data().join("Simulation").join("AI"),
@@ -880,7 +879,7 @@ impl App {
                         // slot 0x4ECF00 never wrote holds: 0 (a fresh process; an `fe = 0` race reads `fe.txt`)
                         let first_slot = 1 + self.num_opponents as usize + cops as usize;
                         let startingpos: Vec<i32> = (0..plan.len()).map(|k| if fe0 { super::pa_trace::fe0_startingpos(&self.paths.root, first_slot + k) } else { 0 }).collect();
-                        set.grid_init = Some((nfs_game::race::start_slice(t, start_scene, grid_rule.linear), n_cars, grid_rule, startingpos));
+                        set.grid_init = Some(nfs_game::race::GridInit { start: nfs_game::race::start_slice(t, start_scene, grid_rule.linear), n: n_cars, rule: grid_rule, startingpos });
                         self.road.traffic = Some(set);
                         for sp in &plan {
                             tracing::debug!(model = sp.model, bus = sp.bus, half = ?sp.half_extents, mass = sp.mass(), "traffic body");
@@ -1070,7 +1069,7 @@ impl App {
                             // `Police::place_at_race_init`; `.STARTINGPOS` of a cop slot = `fe.txt`'s key in an `fe = 0` race
                             // (TEST GLUE), else what 0x4ECF00 left (0)
                             let startingpos: Vec<i32> = (0..pol.cars.len()).map(|k| if fe0 { fe0_cops.get(k).map_or(0, |&(slot, _)| super::pa_trace::fe0_startingpos(&self.paths.root, slot)) } else { 0 }).collect();
-                            pol.grid_init = Some((nfs_game::race::start_slice(t, start_scene, grid_rule.linear), n_cars, grid_rule, startingpos));
+                            pol.grid_init = Some(nfs_game::race::GridInit { start: nfs_game::race::start_slice(t, start_scene, grid_rule.linear), n: n_cars, rule: grid_rule, startingpos });
                             pol.linear = grid_rule.linear;
                             pol.slot_base = 1 + self.num_opponents as usize;
                             pol.slot_personalities = if fe0 {

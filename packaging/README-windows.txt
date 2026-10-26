@@ -11,6 +11,9 @@ Game data: copy GameData and FEData of your installed game into the "game" folde
 Start: @APP@.exe
 Requirements: Windows 10 or newer, a GPU driver with DirectX 12 or Vulkan.
 The first start may show a Windows Firewall prompt: network races use UDP port 9442 - allow private networks.
+dxcompiler.dll and dxil.dll beside the executable are the official DirectX Shader Compiler (licences in licenses\dxc):
+the DirectX 12 backend compiles shaders with them much faster; without them the game still runs. An Intel integrated
+GPU uses DirectX 12 by default; set WGPU_BACKEND=vulkan (or dx12 / gl) to choose the backend by hand.
 Saves, settings and open-unleashed.log: %APPDATA%\PorscheUnleashed (NFS5_SAVE_DIR overrides).
 More: docs/en/install.md in the source repository.
 
@@ -28,5 +31,8 @@ More: docs/en/install.md in the source repository.
 Запуск: @APP@.exe
 Требования: Windows 10 или новее, драйвер видеокарты с DirectX 12 или Vulkan.
 При первом запуске может появиться запрос брандмауэра: сетевые гонки идут через UDP-порт 9442 - разрешите частные сети.
+dxcompiler.dll и dxil.dll рядом с программой - официальный DirectX Shader Compiler (лицензии в licenses\dxc):
+с ними DirectX 12 компилирует шейдеры намного быстрее; без них игра всё равно работает. Встроенная видеокарта Intel
+по умолчанию работает через DirectX 12; WGPU_BACKEND=vulkan (или dx12 / gl) выбирает API вручную.
 Сохранения, настройки и open-unleashed.log: %APPDATA%\PorscheUnleashed (NFS5_SAVE_DIR меняет папку).
 Подробнее: docs/ru/install.md в репозитории с исходниками.

@@ -247,8 +247,6 @@ pub(crate) struct Core {
     lens_done: Vec<LensRead>,
     /// blocks copied into the frame being encoded, mapped after its submit
     lens_staged: Vec<(wgpu::Buffer, bool)>,
-    /// `NFS_SPRITE_LOG`, read once
-    sprite_log: bool,
     /// the objects and the sprite vertices of the pass being encoded, built here and copied into
     /// the belt (wgpu's mapped views are write-only), kept between frames
     object_scratch: Vec<ObjectUniform>,
@@ -349,10 +347,68 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MAX_OBJECTS: u64 = 8192;
 /// The staging belt's chunk: larger than the biggest single frame upload of an ordinary scene.
 const BELT_CHUNK: u64 = 1 << 22;
+/// PORT-DEVIATION D46 (photo mode): the most pixels a still has (an 8-bit target, its depth and the read-back buffer of
+/// 40 MP are ~0.5 GB).
+pub const STILL_MAX_PIXELS: u64 = 40_000_000;
+
+/// PORT-DEVIATION D46: the size a still of `width x height` gets on a device whose largest 2D texture is `max_dim` and
+/// largest buffer `max_buffer` bytes — the request itself when it fits, else scaled down with its aspect kept.
+pub fn still_size(width: u32, height: u32, max_dim: u32, max_buffer: u64) -> (u32, u32) {
+    let (w, h) = (width.max(1), height.max(1));
+    // the read-back buffer's rows are padded to 256 bytes: keep a margin under the limit
+    let max_px = (STILL_MAX_PIXELS as f64).min(max_buffer as f64 / 4.0 * 0.85);
+    let k = (max_dim as f64 / w.max(h) as f64).min((max_px / (w as f64 * h as f64)).sqrt()).min(1.0);
+    if k < 1.0 { (((w as f64 * k).floor() as u32).max(1), ((h as f64 * k).floor() as u32).max(1)) } else { (w, h) }
+}
+
 /// The main view's far plane — the camera object's `+8`, 700.0 (0x4677FC) — of the screen z the
 /// depth bias offsets (`RE/notes/thrash.md` §6d.3). An offscreen pass names its own
 /// (`render_offscreen`'s `depth_far`).
 pub const VIEW_FAR: f32 = 700.0;
+
+/// PLATFORM GLUE (robustness, no visual change): wgpu's default for an error no scope caught is a panic ("Handling wgpu errors as
+/// fatal by default"), which on a GUI Windows release closes the game silently. The handler installed in [`Core::new`] logs the
+/// error (the first 40, then every 1000th) and the game goes on.
+fn gpu_error(e: wgpu::Error) {
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 40 || n % 1000 == 0 {
+        // (its Display carries the cause: "Validation Error / Caused by: In Device::create_texture ...")
+        tracing::error!(count = n, "wgpu error (uncaptured): {e}");
+    }
+}
+
+/// PLATFORM GLUE (Windows): `dxcompiler.dll` + `dxil.dll` next to the exe (the Windows archive ships both; DXC needs dxil.dll to sign
+/// its shaders): the path to hand `Dx12Compiler::DynamicDxc`, or `None` (FXC) when either is missing or off Windows.
+fn win_dxc_path() -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let (dxc, dxil) = (dir.join("dxcompiler.dll"), dir.join("dxil.dll"));
+    (dxc.is_file() && dxil.is_file()).then(|| dxc.to_string_lossy().into_owned())
+}
+
+/// PLATFORM GLUE: the instance for `backends`; `dxc` = the DXC library path for the Direct3D 12 backend, `None` = FXC.
+/// `WGPU_DX12_COMPILER` still wins over it.
+fn new_instance(window: &Arc<Window>, backends: wgpu::Backends, dxc: Option<&str>) -> wgpu::Instance {
+    let mut dx12 = wgpu::Dx12BackendOptions::default();
+    dx12.shader_compiler = match dxc {
+        Some(p) => wgpu::Dx12Compiler::DynamicDxc { dxc_path: p.to_owned() },
+        None => wgpu::Dx12Compiler::Fxc,
+    };
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        backend_options: wgpu::BackendOptions { dx12, ..Default::default() }.with_env(),
+        // EGL needs the display before any surface exists
+        ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
+    })
+}
+
+/// PLATFORM GLUE (Windows): an Intel (vendor 0x8086) integrated GPU on a non-Direct3D backend is moved to its Direct3D 12 adapter.
+pub(crate) fn prefer_dx12_over(vendor: u32, device_type: wgpu::DeviceType, backend: wgpu::Backend) -> bool {
+    vendor == 0x8086 && device_type == wgpu::DeviceType::IntegratedGpu && backend != wgpu::Backend::Dx12
+}
 
 impl Core {
     pub fn new(window: Arc<Window>) -> Result<Self> {
@@ -360,30 +416,60 @@ impl Core {
         // PLATFORM GLUE: the graphics API. Vulkan / Metal / Direct3D 12 first; OpenGL (EGL / WGL) only when none of
         // them gives an adapter for this window (a machine without a Vulkan driver). `WGPU_BACKEND` (wgpu's own
         // variable, e.g. `gl` or `vulkan`) picks the API instead, for testing the fallback.
-        let open = |backends: wgpu::Backends| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends,
-                // EGL needs the display before any surface exists
-                ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
-            });
+        // PLATFORM GLUE (Windows): the Direct3D 12 backend compiles with DXC from beside the exe, else FXC; an Intel integrated
+        // GPU takes its Direct3D 12 adapter instead of Vulkan (see `win_dxc_path`, `prefer_dx12_over`).
+        let backend_forced = wgpu::Backends::from_env().is_some();
+        let open = |backends: wgpu::Backends, dxc: Option<&str>| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+            let mut instance = new_instance(&window, backends, dxc);
+            let mut dxc = dxc;
+            if dxc.is_some() && !backend_forced && backends.contains(wgpu::Backends::DX12) && pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12)).is_empty() {
+                // DXC was asked for but the Direct3D 12 backend did not come up (the instance drops a backend whose shader compiler failed to load): FXC
+                tracing::warn!("DXC: dxcompiler.dll / dxil.dll next to the exe did not load (no Direct3D 12 adapter with it) - falling back to FXC");
+                dxc = None;
+                instance = new_instance(&window, backends, None);
+            }
+            if let Some(p) = dxc {
+                tracing::info!(path = %p, "Direct3D 12 shader compiler: DXC (dxcompiler.dll + dxil.dll next to the exe; FXC if it fails to load)");
+            } else if cfg!(windows) {
+                tracing::info!("Direct3D 12 shader compiler: FXC (no dxcompiler.dll + dxil.dll next to the exe, or DXC did not load)");
+            }
             // with no driver of these APIs installed at all, already the surface fails
             let surface = instance.create_surface(window.clone()).context("create surface")?;
-            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            let mut adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
                 apply_limit_buckets: false,
             }))
             .context("no suitable GPU adapter")?;
+            // the UHD 600's Vulkan driver died inside `request_device`: an Intel integrated GPU on Windows uses its Direct3D 12 adapter
+            // (the same device); discrete GPUs keep wgpu's choice, and so does everything when `WGPU_BACKEND` is set
+            if cfg!(windows) && !backend_forced {
+                let first = adapter.get_info();
+                if prefer_dx12_over(first.vendor, first.device_type, first.backend) {
+                    let alt = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12)).into_iter().find(|a| {
+                        let i = a.get_info();
+                        i.vendor == first.vendor && i.device == first.device && a.is_surface_supported(&surface)
+                    });
+                    match alt {
+                        Some(a) => {
+                            tracing::info!(name = %first.name, from = ?first.backend, "Intel integrated GPU on Windows: using its Direct3D 12 adapter instead (WGPU_BACKEND overrides)");
+                            adapter = a;
+                        }
+                        None => tracing::warn!(name = %first.name, backend = ?first.backend, "Intel integrated GPU on Windows: no Direct3D 12 adapter for it, keeping the chosen one"),
+                    }
+                }
+            }
             Ok((instance, surface, adapter))
         };
+        let dxc_path = win_dxc_path();
         let (instance, surface, adapter) = match wgpu::Backends::from_env() {
-            Some(chosen) => open(chosen)?,
-            None => match open(wgpu::Backends::METAL | wgpu::Backends::PRIMARY) {
+            Some(chosen) => open(chosen, dxc_path.as_deref())?,
+            None => match open(wgpu::Backends::METAL | wgpu::Backends::PRIMARY, dxc_path.as_deref()) {
                 Ok(found) => found,
                 Err(e) => {
                     tracing::warn!(error = format!("{e:#}"), "no Vulkan / Metal / Direct3D 12 for the window: trying OpenGL");
-                    open(wgpu::Backends::GL)?
+                    open(wgpu::Backends::GL, dxc_path.as_deref())?
                 }
             },
         };
@@ -397,13 +483,26 @@ impl Core {
         let _ = crate::ADAPTER_LABEL.set(format!("{} · {:?}", adapter.get_info().name, adapter.get_info().backend));
         tracing::info!(info = ?adapter.get_info(), features = ?adapter.features(), "chosen adapter");
         tracing::info!(limits = ?adapter.limits(), downlevel = ?adapter.get_downlevel_capabilities(), "chosen adapter limits");
+        // The device request is logged first: a driver that crashes inside it (the UHD 600's Vulkan one did) leaves nothing else to
+        // read, and the next start then runs in safe mode (`guard.rs` in the application).
+        let minimal = crate::prof::minimal();
+        tracing::info!(minimal, "requesting the device (if the log ends here, the driver crashed creating it: the next start runs in safe mode)");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nfs-renderer"),
-            required_features: wgpu::Features::empty(),
+            // no optional feature for the game itself; the profiler adds the timestamp queries only when asked (never in `minimal`)
+            required_features: if crate::prof::wanted() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
             required_limits: wgpu::Limits::default(),
             ..Default::default()
         }))
         .context("request device")?;
+        // A GPU error never stops the game: wgpu's default for an error no scope caught is a panic, which closes a GUI release silently.
+        device.on_uncaptured_error(Arc::new(gpu_error));
+        device.set_device_lost_callback(|reason, msg| tracing::error!(?reason, "wgpu device lost: {msg}"));
+        // TEST GLUE `NFS_TEST_GPU_ERROR=1`: one invalid resource, to see the handler log it and the game go on
+        if std::env::var_os("NFS_TEST_GPU_ERROR").is_some() {
+            let _ = device.create_texture(&wgpu::TextureDescriptor { label: Some("test glue: invalid"), size: wgpu::Extent3d { width: 0, height: 0, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+        }
+        crate::prof::init(&device, &queue);
 
         let caps = surface.get_capabilities(&adapter);
         // a byte surface, as Direct3D 7's was: colours, blends and interpolation work on the stored
@@ -866,7 +965,6 @@ impl Core {
             lens_pending: Vec::new(),
             lens_done: Vec::new(),
             lens_staged: Vec::new(),
-            sprite_log: std::env::var("NFS_SPRITE_LOG").is_ok(),
             object_scratch: Vec::new(),
             sprite_scratch: Vec::new(),
             frames_in_flight: std::collections::VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + 1),
@@ -1510,6 +1608,7 @@ impl Core {
     fn encode_with_gamma(&mut self, scene: &Scene, camera: &Camera, target: &wgpu::TextureView, target_tex: &wgpu::Texture, can_copy: bool, depth: &wgpu::TextureView, width: u32, height: u32, aspect: f32) {
         if self.gamma == 1.0 {
             self.encode_frame(scene, scene.clear_color, true, camera, target, target_tex, can_copy, depth, aspect, VIEW_FAR);
+            crate::prof::end_frame(&self.device);
             return;
         }
         let mut pass = match self.gamma_pass.take() {
@@ -1520,6 +1619,7 @@ impl Core {
         self.encode_frame(scene, scene.clear_color, true, camera, &src, &src_tex, true, depth, aspect, VIEW_FAR);
         pass.resolve(&self.device, &self.queue, target, self.gamma);
         self.gamma_pass = Some(pass);
+        crate::prof::end_frame(&self.device);
     }
 
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
@@ -1594,7 +1694,9 @@ impl Core {
         let view = self.textures[id.0 as usize].view.clone();
         // the scene's items and lights as they are, its own clear colour replaced and no sprites
         let target = self.textures[id.0 as usize]._texture.clone();
+        crate::prof::ctx(" [offscreen]");
         self.encode_frame(scene, clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]), false, camera, &view, &target, false, &depth, width as f32 / height as f32, depth_far.unwrap_or(VIEW_FAR));
+        crate::prof::ctx("");
         id
     }
 
@@ -1618,11 +1720,17 @@ impl Core {
         px
     }
 
-    /// An offscreen texture's pixels as RGBA8 rows (diagnostics: `NFS_MIRROR_DUMP`).
-    pub fn read_texture(&self, id: TextureId) -> Result<(u32, u32, Vec<u8>)> {
-        let (w, h) = *self.offscreen.get(&id.0).ok_or_else(|| anyhow::anyhow!("texture {} is not an offscreen target", id.0))?;
-        let px = self.readback(&self.textures[id.0 as usize]._texture, w, h)?;
-        Ok((w, h, px))
+    /// PORT-DEVIATION D46 (photo mode): a still of the scene at `width x height` — the window's size times 1, 2 or 4 —
+    /// as RGBA8 rows, with its real size: the request is scaled down, keeping its aspect, to the device's largest 2D
+    /// texture, its largest buffer and [`STILL_MAX_PIXELS`]. It is the frame [`Self::render_to_image`] draws (the
+    /// same pipeline, the sprites and the gamma ramp included) at that size, so a bigger still is a bigger frame and
+    /// not a bigger copy of one. The sized depth image is dropped after it; the gamma pass's source is resized back
+    /// by the next window frame.
+    pub fn render_still(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<(u32, u32, Vec<u8>)> {
+        let (w, h) = still_size(width, height, self.device.limits().max_texture_dimension_2d, self.device.limits().max_buffer_size);
+        let r = self.render_to_image(scene, camera, w, h);
+        self.depth_cache.remove(&(w, h));
+        r.map(|px| (w, h, px))
     }
 
     /// Copies a `COPY_SRC` texture to the host as tightly packed RGBA8.
@@ -1895,11 +2003,6 @@ impl Core {
             verts.resize(n_sprites * 6, bytemuck::Zeroable::zeroed());
             for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
                 verts[i * 6..i * 6 + 6].copy_from_slice(&sprite_quad(sp, aspect));
-                if self.sprite_log {
-                    let v = &verts[i * 6];
-                    let w = &verts[i * 6 + 1];
-                    tracing::info!(i, tex = sp.texture.0, bound = self.textures[sp.texture.0 as usize].sprite_bg.is_some(), x0 = v.pos[0], y0 = v.pos[1], x1 = w.pos[0], uv0 = ?v.uv, color = ?v.color, "sprite");
-                }
             }
             self.belt.write_buffer(&mut encoder, &self.sprite_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&verts));
             self.sprite_scratch = verts;
@@ -1925,7 +2028,7 @@ impl Core {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: crate::prof::rp("lens reference"),
                 occlusion_query_set: None,
             multiview_mask: None,
             });
@@ -1950,7 +2053,7 @@ impl Core {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if overlay { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: crate::prof::rp("main pass"),
                 occlusion_query_set: None,
             multiview_mask: None,
             });
@@ -1977,7 +2080,7 @@ impl Core {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: crate::prof::rp("overlay"),
                 occlusion_query_set: None,
             multiview_mask: None,
             });
@@ -2007,7 +2110,7 @@ impl Core {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: crate::prof::rp("sprites"),
                 occlusion_query_set: None,
             multiview_mask: None,
             });
@@ -2054,6 +2157,7 @@ impl Core {
         }
         self.buckets = buckets;
         self.belt.finish();
+        crate::prof::resolve(&mut encoder);
         self.last_submit = Some(self.queue.submit(Some(encoder.finish())));
         self.belt.recall();
         self.lens_map_staged();
@@ -2192,7 +2296,7 @@ impl GammaPass {
                 label: Some("gamma"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: crate::prof::rp("gamma ramp"),
                 occlusion_query_set: None,
             multiview_mask: None,
             });
@@ -2200,6 +2304,48 @@ impl GammaPass {
             pass.set_bind_group(0, bg, &[]);
             pass.draw(0..3, 0..1);
         }
+        crate::prof::resolve(&mut enc);
         queue.submit(Some(enc.finish()));
+    }
+}
+
+#[cfg(test)]
+mod still_tests {
+    use super::*;
+
+    #[test]
+    fn a_still_fits_the_device() {
+        // a 1x / 2x still of a 1280 x 800 window fits as asked
+        assert_eq!(still_size(1280, 800, 8192, 1 << 28), (1280, 800));
+        assert_eq!(still_size(2560, 1600, 8192, 1 << 28), (2560, 1600));
+        // 4x of 1920 x 1080 fits the 8192 side and the pixel cap
+        assert_eq!(still_size(7680, 4320, 8192, 1 << 28), (7680, 4320));
+        // 4x of 2560 x 1600 is past the 8192 texture side and the 40 MP cap: scaled down, the aspect kept
+        let (w, h) = still_size(10240, 6400, 8192, 1 << 28);
+        assert!(w <= 8192 && w as u64 * h as u64 <= STILL_MAX_PIXELS && (w as f32 / h as f32 - 1.6).abs() < 0.01, "{w}x{h}");
+        // the buffer limit: 256 MB at 4 bytes a pixel, less the margin
+        let (w, h) = still_size(8000, 5000, 16384, 1 << 28);
+        assert!((w as u64 * h as u64 * 4) as f64 <= (1u64 << 28) as f64 * 0.85 && (w as f32 / h as f32 - 1.6).abs() < 0.01, "{w}x{h}");
+        // the pixel cap
+        let (w, h) = still_size(16000, 10000, 16384, 1 << 34);
+        assert!(w as u64 * h as u64 <= STILL_MAX_PIXELS, "{w}x{h}");
+        assert_eq!(still_size(0, 0, 8192, 1 << 28), (1, 1));
+    }
+}
+
+#[cfg(test)]
+mod adapter_choice_tests {
+    use super::prefer_dx12_over;
+
+    /// Only an Intel integrated GPU on a non-Direct3D backend is moved to Direct3D 12.
+    #[test]
+    fn dx12_preferred_for_intel_integrated_only() {
+        use wgpu::{Backend as B, DeviceType as D};
+        assert!(prefer_dx12_over(0x8086, D::IntegratedGpu, B::Vulkan));
+        assert!(prefer_dx12_over(0x8086, D::IntegratedGpu, B::Gl));
+        assert!(!prefer_dx12_over(0x8086, D::IntegratedGpu, B::Dx12));
+        assert!(!prefer_dx12_over(0x8086, D::DiscreteGpu, B::Vulkan)); // Arc
+        assert!(!prefer_dx12_over(0x10de, D::DiscreteGpu, B::Vulkan)); // NVIDIA
+        assert!(!prefer_dx12_over(0x1002, D::IntegratedGpu, B::Vulkan)); // AMD APU
     }
 }

@@ -166,6 +166,8 @@ pub struct Replay {
     /// car-info `+0x14/+0x18/+0x1C` hold at the save: 0x4143F0 reads them from there and 0x4144B0
     /// writes them there (0x414546…0x4145A3).
     pub ramp: Ramp,
+    /// Bit 1 of the last sample's buttons byte — the horn (`car+0xD86`), recorded or played back.
+    pub horn: bool,
     /// The other human players' own state (`0x606880 + p·0x20`, `[0x5E9A00 + p·4]`), players
     /// `1 …` — the stream is shared, the block and the slot are per player (`replay.md` §4, §18.15):
     /// an input-exchange race has one human car per player and records every one.
@@ -188,7 +190,7 @@ impl Default for Replay {
 
 impl Replay {
     pub fn new() -> Self {
-        Self { mode: Mode::Recording, stream: vec![0; STREAM_LEN], write: 0, read: 0, block: [0; 32], slot: 0, final_tick: 0, ramp: Ramp::default(), others: Vec::new() }
+        Self { mode: Mode::Recording, stream: vec![0; STREAM_LEN], write: 0, read: 0, block: [0; 32], slot: 0, final_tick: 0, ramp: Ramp::default(), horn: false, others: Vec::new() }
     }
 
     /// A replay loaded for playback. The loaded bytes count as written, so [`Replay::stream`]
@@ -198,7 +200,7 @@ impl Replay {
         let mut s = stream;
         let write = s.len().min(STREAM_LEN);
         s.resize(STREAM_LEN, 0);
-        Self { mode: Mode::Playing, stream: s, write, read: 0, block: [0; 32], slot: 0, final_tick, ramp: Ramp::default(), others: Vec::new() }
+        Self { mode: Mode::Playing, stream: s, write, read: 0, block: [0; 32], slot: 0, final_tick, ramp: Ramp::default(), horn: false, others: Vec::new() }
     }
 
     /// `Replay_startRace` 0x413EA0: while recording, clear the buffer and both cursors; while
@@ -236,13 +238,25 @@ impl Replay {
     /// The hook. During recording it stores `controls` and hands them straight back; during
     /// playback it returns the recorded packet instead. `tick` is the current 64 Hz game tick and
     /// is only used to remember where an overflowing recording stopped.
-    pub fn step(&mut self, controls: Controls, ramp: Ramp, tick: u64) -> Controls {
+    ///
+    /// `horn` is the horn button (bit 1 of the packet's byte 0, `C1_HORN` read > 0x40 at
+    /// 0x412FC5…0x41300B): `Controls` has no field for it, so it travels beside. Recording stores
+    /// it with the sample like the original's whole-byte copy (0x4143F0 reads `[0x5E9664]`);
+    /// playback leaves the stream's in [`Replay::horn`].
+    pub fn step(&mut self, controls: Controls, horn: bool, ramp: Ramp, tick: u64) -> Controls {
         match self.mode {
             Mode::Recording | Mode::Full => {
-                self.record(Packet::from_controls(&controls), ramp, tick);
+                let mut p = Packet::from_controls(&controls);
+                p.buttons |= u8::from(horn) << 1;
+                self.horn = horn;
+                self.record(p, ramp, tick);
                 controls
             }
-            Mode::Playing | Mode::Exhausted => self.playback().to_controls(),
+            Mode::Playing | Mode::Exhausted => {
+                let p = self.playback();
+                self.horn = p.buttons & 2 != 0;
+                p.to_controls()
+            }
         }
     }
 
@@ -2135,6 +2149,38 @@ mod tests {
         let p = Packet::from_controls(&Controls { command: 3, ..c });
         assert_eq!(p.buttons, 0x19);
         assert_eq!(p.to_controls().command, 3);
+    }
+
+    /// PAD-END2: the recorder stores the whole buttons byte as 0x4143F0 does — the reset (command 5, bits
+    /// 3..7 = 0x28) and the horn (bit 1) of the packet — and a playback gives both back; a stream recorded
+    /// without them (an older port file) plays with neither.
+    #[test]
+    fn a_stream_carries_the_reset_and_the_horn() {
+        let c = Controls { throttle: 100, brake: 0, steer: 20, handbrake: false, command: 5 };
+        let mut r = Replay::new();
+        for i in 0..16u64 {
+            // the reset on sample 3, the horn on samples 3..6, a handbrake without either on sample 9
+            let (cmd, horn) = (if i == 3 { 5 } else { 0 }, (3..6).contains(&i));
+            let c = Controls { command: cmd, handbrake: i == 9, ..c };
+            assert_eq!(r.step(c, horn, Ramp::default(), i).command, cmd);
+        }
+        let mut p = Replay::playing(r.stream().to_vec(), 16);
+        for i in 0..16u64 {
+            let got = p.step(Controls::default(), false, Ramp::default(), i);
+            assert_eq!(got.command, if i == 3 { 5 } else { 0 }, "sample {i}");
+            assert_eq!(p.horn, (3..6).contains(&i), "sample {i}");
+            assert_eq!(got.handbrake, i == 9);
+        }
+        // an older stream (no reset, no horn) plays as it always did
+        let mut old = Replay::new();
+        for i in 0..8u64 {
+            old.step(Controls { command: 0, ..c }, false, Ramp::default(), i);
+        }
+        let mut p = Replay::playing(old.stream().to_vec(), 8);
+        for i in 0..8u64 {
+            assert_eq!(p.step(Controls::default(), true, Ramp::default(), i).command, 0);
+            assert!(!p.horn, "playback ignores the live horn");
+        }
     }
 
     #[test]

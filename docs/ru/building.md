@@ -32,7 +32,7 @@ cargo test --workspace
 
 ```sh
 packaging/build_macos.sh      # универсальное приложение для macOS (arm64 + x86_64)
-packaging/build_windows.sh    # Windows x64, кросс-сборка в Docker
+packaging/build_windows.sh    # Windows x64, кросс-сборка в Docker (+ официальный DirectX Shader Compiler: dxcompiler.dll, dxil.dll рядом с exe)
 packaging/build_linux.sh      # Linux x86_64, сборка в Docker
 ```
 
@@ -66,8 +66,11 @@ packaging/build_linux.sh      # Linux x86_64, сборка в Docker
 | `NFS_DEMO=1` | частота кадров, видеокарта, графический API и система в заголовке окна; окно поверх остальных (для записи) |
 | `NFS_AUTOPILOT=1` с `--follow` | оконная гонка едет сама (для записи); `NFS_AUTOPILOT=ai` — машину игрока ведёт ИИ соперников |
 | `NFS_AI_TRACE=<номер>` | трассировка одной машины ИИ в журнале раз в четверть секунды |
+| `NFS_PHOTO_DIR=<папка>` | куда фото-режим сохраняет снимки (по умолчанию `Изображения/PorscheUnleashed`) |
 | `NFS_MIC=1` | голосовой чат с микрофона: в сетевой игре ваш голос с устройства ввода по умолчанию передаётся остальным игрокам, как в оригинале. По умолчанию выключено (голос других слышен всегда) |
 | `WGPU_BACKEND=vulkan`/`gl`/`dx12`/`metal` | графический API (по умолчанию Vulkan / Metal / Direct3D 12, OpenGL — только без них) |
+| `NFS_GPU_PROFILE=1` | время каждого прохода на GPU в журнале, раз в 120 кадров (диагностика; замедляет кадр). `NFS_GPU_PROFILE=minimal` просит у видеокарты простое устройство без необязательных возможностей |
+| `NFS_GUARD=0`/`1` | защита от сбоя при запуске (см. [установка](install.md)): в обычном релизном запуске включена, `0` выключает, `1` включает принудительно |
 
 ## `nfs5.ini`
 
