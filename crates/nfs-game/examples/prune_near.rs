@@ -166,7 +166,7 @@ fn main() {
                     continue;
                 }
                 let eye = Vec3::new(p[0], a.centre.y.min(5.0).max(0.0), p[1]);
-                let view = CullView { eye, forward: fwd, right, up: right.cross(fwd).normalize_or_zero(), tan_h: 0.92, tan_v: 0.69, near: 0.5, draw: far };
+                let view = CullView { eye, forward: fwd, right, up: right.cross(fwd).normalize_or_zero(), tan_h: 0.92, tan_v: 0.69, near: 0.5, draw: far, reach: 1.0 };
                 let d = ((a.centre.x - eye.x).powi(2) + (a.centre.z - eye.z).powi(2)).sqrt();
                 if d - a.radius > near || !view.sphere_visible(a.centre, a.radius) {
                     continue;

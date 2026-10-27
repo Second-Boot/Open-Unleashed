@@ -484,6 +484,44 @@ pub struct CarAssets {
     pub page_text: Option<PageText>,
     /// What slot 19's race branch keys the driver's articles on ([`CarStyle::apply_driver_detail`])
     pub driver: DriverSeat,
+    /// The directory the model's files were read from ([`Self::load_in`]); for [`Self::recipe`]
+    pub dir: PathBuf,
+}
+
+/// ENHANCEMENT ENH-LIVETEX: what it takes to read a [`CarAssets`] again from disk exactly as it was set up: the directory, the model and every
+/// plain field a caller wrote after [`CarAssets::load_in`]. A loaded car keeps one (a few hundred bytes, not the decoded textures), so a
+/// live change of the HD textures / rounded parts can build the car's twins later.
+#[derive(Debug, Clone)]
+pub struct CarRecipe {
+    dir: PathBuf,
+    model: String,
+    style_index: usize,
+    cabrio: bool,
+    front_end_room: bool,
+    style_overlay: Vec<[i16; 3]>,
+    tiny: bool,
+    page_text: Option<PageText>,
+    driver: DriverSeat,
+}
+
+impl CarRecipe {
+    /// The model's name.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The car's files read again with the fields of the original set-up.
+    pub fn load(&self) -> Result<CarAssets, AssetError> {
+        let mut a = CarAssets::load_in(&self.dir, &self.model)?;
+        a.style_index = self.style_index;
+        a.cabrio = self.cabrio;
+        a.front_end_room = self.front_end_room;
+        a.style_overlay = self.style_overlay.clone();
+        a.tiny = self.tiny;
+        a.page_text = self.page_text.clone();
+        a.driver = self.driver;
+        Ok(a)
+    }
 }
 
 /// The inputs of slot 19's driver writes (0x43AEA5…0x43AF6B): car-info `+0x150` **`.DRIVER`**
@@ -510,6 +548,7 @@ impl CarAssets {
     /// two external packs are optional here (`RE/notes/frontend-3d.md` §1).
     pub fn load_in(dir: &Path, model: &str) -> Result<Self, AssetError> {
         let dir = dir.to_path_buf();
+        let dir_kept = dir.clone();
         let file = |suffix: &str| -> Result<PathBuf, AssetError> {
             let n = format!("{model}{suffix}");
             GamePaths::find_file(&dir, &n).ok_or_else(|| AssetError::MissingFile { dir: dir.clone(), name: n })
@@ -553,7 +592,23 @@ impl CarAssets {
             style_overlay: Vec::new(),
             tiny: false,
             driver: DriverSeat::default(),
+            dir: dir_kept,
         })
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX: the recipe to read this car again ([`CarRecipe`]).
+    pub fn recipe(&self) -> CarRecipe {
+        CarRecipe {
+            dir: self.dir.clone(),
+            model: self.model.clone(),
+            style_index: self.style_index,
+            cabrio: self.cabrio,
+            front_end_room: self.front_end_room,
+            style_overlay: self.style_overlay.clone(),
+            tiny: self.tiny,
+            page_text: self.page_text.clone(),
+            driver: self.driver,
+        }
     }
 
     /// Set the body style from a catalogue entry's `nfs5.car +0x1C0`, clamping a negative one to
@@ -585,6 +640,20 @@ impl CarAssets {
     /// Paint: greyscale body texels with alpha in the tint slots get `tint × grey` (§5), `tint` the
     /// 18-slot table `Paint::tint_table` builds as 0x443DB0 does (§5.0a).
     pub fn build_pages(&self, paths: &GamePaths, paint: impl Into<Paint>, style: &CarStyle) -> Result<Vec<TexturePage>, AssetError> {
+        Ok(self.build_pages_hd(paths, paint, style, None)?.0)
+    }
+
+    /// [`Self::build_pages`] and, with `hd` (ENHANCEMENT E41: the HD pack, only when the switch is on), the HD
+    /// twin of every page that got at least one pack image: `scale x` the page's size, built by the same walk in
+    /// the same order — each entry the pack has an image for is blitted at `scale x` with the paint-slot rule
+    /// ([`tint_texel`]) on the HD texels, every other entry (and the page text, drawn at the original size) is the
+    /// finished original page's region enlarged by nearest, so the silhouettes of what has no HD image stay the
+    /// original's. What the HD texels do not keep of the original's writer: the colour truncation to 5 / 6 / 4 bits
+    /// of the 1555 / 565 / 4444 page formats (the point of HD is the smooth colour), and a 565 page's untinted
+    /// palette entries (the original writes nothing there). What they keep: the alpha rule of the page's format
+    /// (1555 one bit — alpha > 0 after the policy of `hdpack::AlphaPolicy`; 565 opaque; 4444 and 32 as they are).
+    /// The slot is `None` for a page without HD. `None` for `hd` is exactly the original's build.
+    pub fn build_pages_hd(&self, paths: &GamePaths, paint: impl Into<Paint>, style: &CarStyle, hd: Option<&crate::hdpack::HdPack>) -> Result<(Vec<TexturePage>, Vec<Option<TexturePage>>), AssetError> {
         let paint: Paint = paint.into();
         let tints = paint.tint_table(paths);
         let crp_path = paths.car_model_dir().join(format!("{}.crp", self.model));
@@ -601,6 +670,10 @@ impl CarAssets {
                 TexturePage { width: w, height: h, rgba: vec![0; (w * h * 4) as usize], is_window, is_alpha: false, bpp }
             })
             .collect();
+        // ENHANCEMENT E41: the HD twins, only when a pack is given and holds something for this car or the shared packs
+        let mut hd_state = hd
+            .filter(|p| p.has_dir(&format!("car/{}", crate::hdpack::safe(&self.model))) || p.has_dir("carglobal"))
+            .map(|p| HdPages::new(p, &pages));
         let embedded = self.crp.embedded_texture_files(&self.crp_data).map_err(fmt_err(&crp_path))?;
         let sf_indices: Vec<u16> = self.crp.material_entries.iter().filter(|e| e.is_part(nfs_formats::crp::tags::SF)).map(|e| e.part_index()).collect();
         // each global file is found, read and unpacked once, by the first page that names it
@@ -637,6 +710,8 @@ impl CarAssets {
             let page_fmt = page_details.and_then(|d| d.get_i64("bpp")).unwrap_or(page_bpp::ARGB1555);
             let file_tint = det.get_i64("tint").unwrap_or(1) != 0;
             let (moffx, moffy) = (det.get_i64("mirroroffsetx").unwrap_or(0), det.get_i64("mirroroffsety").unwrap_or(0));
+            // ENHANCEMENT E41: which pack the entries' keys name (`hdpack` docs)
+            let global_name = det.get_i64("global").and_then(GlobalPack::from_key).map(GlobalPack::file_name);
             // source SHPI bytes
             let data: &[u8] = if let Some(g) = det.get_i64("global") {
                 let Some(pack) = GlobalPack::from_key(g) else { continue };
@@ -734,6 +809,36 @@ impl CarAssets {
                 let text_page = self.page_text.as_ref().zip(lower_sec);
                 let (sx, sy) = (sign12(b.misc[2]), sign12(b.misc[3]));
                 let rect = (sx, sy, b.width as i64, b.height as i64);
+                // ENHANCEMENT E41: this entry's pack image, read once for both copies. Not for an entry that carries
+                // page text (the plate, the race number: drawn at the original size over the finished texels) nor for
+                // a tinted palette entry on a 565 page (the original's writer leaves the page as it was there)
+                let hd_img = hd_state.as_ref().and_then(|st| {
+                    let has_text = text_page.is_some_and(|(_, sec)| ["license", "racedecal", "flyer"].iter().any(|k| sec.get_i64(k).unwrap_or(0) != 0));
+                    if has_text || (page_fmt == page_bpp::RGB565 && path == BlitPath::Palette) {
+                        return None;
+                    }
+                    let key = match global_name {
+                        Some(n) => crate::hdpack::key_car_global(n.rsplit_once('.').map_or(n, |s| s.0), &ename),
+                        None => crate::hdpack::key_car(&self.model, file_no, &ename),
+                    };
+                    if !st.pack.has(&key) {
+                        return None;
+                    }
+                    // the policy is taken from the UNTINTED decode (the palette path's `src` is already painted)
+                    let orig = fsh.decode(data, ei).ok()?;
+                    // a name that occurs again LATER in the same pack (`lit1` 42x11 then 32x16 in `eas8`): the exporter keeps the
+                    // last one under the key (`hd_export`, "the last wins"), so an earlier entry takes the pack image only when
+                    // it is the same picture as that last one — never another entry's image
+                    let want = crate::hdpack::safe(&ename);
+                    let last = fsh.entries.iter().enumerate().skip(ei + 1).filter(|(_, e)| crate::hdpack::safe(e.name.trim_end()) == want).map(|(j, _)| j).next_back();
+                    // (an entry that does not decode was never exported either)
+                    if let Some(later) = last.and_then(|j| fsh.decode(data, j).ok())
+                        && ((later.width, later.height) != (orig.width, orig.height) || later.rgba != orig.rgba)
+                    {
+                        return None;
+                    }
+                    st.pack.load(&key, &orig.rgba, orig.width, orig.height)
+                });
                 let copies: &[(i64, i64)] = if mirror { &[(0, 0), (moffx, moffy)] } else { &[(0, 0)] };
                 for &(ox, oy) in copies {
                     let soft = path == BlitPath::Blitter && !(page_fmt == page_bpp::ARGB8888 && fmt == nfs_formats::fsh::PixelFormat::Argb8888);
@@ -743,10 +848,17 @@ impl CarAssets {
                     if let Some((text, sec)) = text_page {
                         draw_entry_text(page, paths, text, sec, rect, &paint);
                     }
+                    if let Some(st) = hd_state.as_mut() {
+                        st.place(page_no - 1, &pages[page_no - 1], x + ox, y + oy, w, h, hd_img.as_ref(), path, &tints);
+                    }
                 }
             }
         }
-        Ok(pages)
+        let hd_pages = match hd_state {
+            Some(st) => st.finish(&pages),
+            None => vec![None; pages.len()],
+        };
+        Ok((pages, hd_pages))
     }
 
     /// **The `.ais` loader 0x49CA30**: `GameData/Simulation/AICarData/<family>.ais`, the name being the car-info
@@ -1200,9 +1312,214 @@ fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, (x, y): (i64, i64), 
     }
 }
 
+/// ENHANCEMENT E41 (the exporter): one source texture of a car's pages — what `build_pages_hd` looks up in the pack.
+#[derive(Debug, Clone)]
+pub struct CarEntryInfo {
+    /// the pack key (`hdpack::key_car` / `key_car_global`)
+    pub key: String,
+    /// where it lives: `CarModel/<model>.crp#sf<k>` (the embedded pack of `.tpg` file k) or `CarModel/<file>.fsh`
+    pub container: String,
+    pub entry: String,
+    pub width: u32,
+    pub height: u32,
+    /// the SHPI pixel format (`PixelFormat`'s name)
+    pub format: String,
+    /// the base level, RGBA8, as decoded (a tinted entry's alpha is its paint-slot selector)
+    pub rgba: Vec<u8>,
+    /// the paint-slot rule (`tint_texel`) runs on its texels or its palette
+    pub tinted: bool,
+    /// the entry carries page text (`license` / `racedecal` / `flyer`): drawn at the original size, never replaced
+    pub has_text: bool,
+    /// the 1-based `.tpg` page the entry is blitted onto, and that page's `bpp`
+    pub page: usize,
+    pub page_bpp: i64,
+    /// the page is a window / alpha-blended one
+    pub blended_page: bool,
+}
+
+impl CarAssets {
+    /// Every entry of every `.tpg` file of this car (the embedded `sf` packs and the global packs), in file
+    /// order, with the classification the page builder gives it. Not filtered by the style: the superset.
+    pub fn car_entries(&self, paths: &GamePaths) -> Result<Vec<CarEntryInfo>, AssetError> {
+        const GLOBALS: [&str; 5] = ["Shadow.fsh", "INTGLASS.FSH", "Suit.fsh", "Head.fsh", "Cabrio.fsh"];
+        let crp_path = paths.car_model_dir().join(format!("{}.crp", self.model));
+        let hdr = self.tpg.section("header");
+        let numfiles = hdr.and_then(|h| h.get_i64("numfiles")).unwrap_or(0) as usize;
+        let embedded = self.crp.embedded_texture_files(&self.crp_data).map_err(fmt_err(&crp_path))?;
+        let sf_indices: Vec<u16> = self.crp.material_entries.iter().filter(|e| e.is_part(b"sf")).map(|e| e.part_index()).collect();
+        let mut out = Vec::new();
+        for file_no in 1..=numfiles {
+            let Some(det) = self.tpg.section(&format!("file{file_no}.details")) else { continue };
+            let tpage = det.get_i64("tpage").unwrap_or(0);
+            let page_d = self.tpg.section(&format!("tpage{tpage}.details"));
+            let page_bpp = page_d.and_then(|d| d.get_i64("bpp")).unwrap_or(1555);
+            let blended_page = page_d.and_then(|d| d.get_i64("window")).unwrap_or(0) == 1;
+            let owned: Vec<u8>;
+            let (data, global_name, container): (&[u8], Option<&str>, String) = if let Some(g) = det.get_i64("global") {
+                let Some(name) = GLOBALS.get((g as usize).wrapping_sub(1)).copied() else { continue };
+                let Some(p) = GamePaths::find_file(&paths.car_model_dir(), name) else { continue };
+                owned = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
+                (&owned, Some(name), format!("CarModel/{name}"))
+            } else {
+                match sf_indices.iter().position(|&i| i as usize + 1 == file_no) {
+                    Some(k) => (embedded[k], None, format!("CarModel/{}.crp#sf{k}", self.model)),
+                    None => continue,
+                }
+            };
+            let Ok(fsh) = Fsh::parse(data) else { continue };
+            let file_tint = det.get_i64("tint").unwrap_or(1) != 0;
+            for (ei, entry) in fsh.entries.iter().enumerate() {
+                let ename = entry.name.trim_end().to_string();
+                let b = &entry.blocks[0];
+                let Some(fmt) = nfs_formats::fsh::PixelFormat::from_code(b.format_code()) else { continue };
+                let sec = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase()));
+                let bl = sec.and_then(|s| s.get_i64("tint")).map_or(file_tint, |t| t != 0);
+                // `BlitPath::Palette` / `BlitPath::Texel` of `build_pages_hd`
+                let tinted = bl && (fmt == nfs_formats::fsh::PixelFormat::Indexed8 || (fmt == nfs_formats::fsh::PixelFormat::Argb8888 && (page_bpp == 32 || page_bpp == 1555)));
+                let has_text = sec.is_some_and(|s| ["license", "racedecal", "flyer"].iter().any(|k| s.get_i64(k).unwrap_or(0) != 0));
+                let Ok(img) = fsh.decode(data, ei) else { continue };
+                let key = match global_name {
+                    Some(n) => crate::hdpack::key_car_global(n.rsplit_once('.').map_or(n, |s| s.0), &ename),
+                    None => crate::hdpack::key_car(&self.model, file_no, &ename),
+                };
+                out.push(CarEntryInfo { key, container: container.clone(), entry: ename, width: img.width, height: img.height, format: format!("{fmt:?}"), rgba: img.rgba, tinted, has_text, page: tpage.max(0) as usize, page_bpp, blended_page });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// ENHANCEMENT E41: the HD twins of a car's pages while `build_pages_hd` walks the entries (see there).
+struct HdPages<'a> {
+    pack: &'a crate::hdpack::HdPack,
+    scale: u32,
+    pages: Vec<TexturePage>,
+    used: Vec<bool>,
+}
+
+impl<'a> HdPages<'a> {
+    fn new(pack: &'a crate::hdpack::HdPack, originals: &[TexturePage]) -> Self {
+        let scale = pack.scale();
+        let pages = originals
+            .iter()
+            .map(|p| TexturePage { width: p.width * scale, height: p.height * scale, rgba: vec![0; (p.width * scale * p.height * scale * 4) as usize], is_window: p.is_window, is_alpha: p.is_alpha, bpp: p.bpp })
+            .collect();
+        Self { pack, scale, pages, used: vec![false; originals.len()] }
+    }
+
+    /// After the original's blit (and text) of an entry into `orig` at `(x, y)`, `w x h`: bring the HD page's
+    /// rectangle in line. With an image: the HD texels (the paint-slot rule on them, the page format's alpha rule);
+    /// without: the original page's texels there, enlarged by nearest.
+    #[allow(clippy::too_many_arguments)]
+    fn place(&mut self, pi: usize, orig: &TexturePage, x: i64, y: i64, w: u32, h: u32, img: Option<&crate::hdpack::HdImage>, path: BlitPath, tints: &[[u8; 3]; 18]) {
+        let s = self.scale as i64;
+        let hp = &mut self.pages[pi];
+        let Some(img) = img else {
+            for row in 0..h as i64 {
+                let py = y + row;
+                if py < 0 || py >= orig.height as i64 {
+                    continue;
+                }
+                for col in 0..w as i64 {
+                    let px = x + col;
+                    if px < 0 || px >= orig.width as i64 {
+                        continue;
+                    }
+                    let t = &orig.rgba[((py as u32 * orig.width + px as u32) * 4) as usize..][..4];
+                    for dy in 0..s {
+                        for dx in 0..s {
+                            let o = ((((py * s + dy) as u32) * hp.width + (px * s + dx) as u32) * 4) as usize;
+                            hp.rgba[o..o + 4].copy_from_slice(t);
+                        }
+                    }
+                }
+            }
+            return;
+        };
+        self.used[pi] = true;
+        let tinted = matches!(path, BlitPath::Texel | BlitPath::Palette);
+        for row in 0..img.height as i64 {
+            let py = y * s + row;
+            if py < 0 || py >= hp.height as i64 {
+                continue;
+            }
+            for col in 0..img.width as i64 {
+                let px = x * s + col;
+                if px < 0 || px >= hp.width as i64 {
+                    continue;
+                }
+                let i = ((row as u32 * img.width + col as u32) * 4) as usize;
+                let src = [img.rgba[i], img.rgba[i + 1], img.rgba[i + 2], img.rgba[i + 3]];
+                let mut t = if tinted { tint_texel(src, tints) } else { src };
+                t[3] = match hp.bpp {
+                    565 => 255,
+                    1555 => {
+                        if t[3] > 0 {
+                            255
+                        } else {
+                            0
+                        }
+                    }
+                    _ => t[3],
+                };
+                let o = ((py as u32 * hp.width + px as u32) * 4) as usize;
+                hp.rgba[o..o + 4].copy_from_slice(&t);
+            }
+        }
+    }
+
+    /// The pages that got an HD image, the others `None`.
+    fn finish(self, originals: &[TexturePage]) -> Vec<Option<TexturePage>> {
+        let mut out = Vec::with_capacity(self.pages.len());
+        for (i, mut p) in self.pages.into_iter().enumerate() {
+            // `is_alpha` is set while the walk goes
+            p.is_alpha = originals[i].is_alpha;
+            out.push(self.used[i].then_some(p));
+        }
+        out
+    }
+}
+
+/// ENHANCEMENT E41: a car's damage decals for the HD pages — each patch whose page has an HD twin is taken to the twin's
+/// scale: its pack image where the pack has one for `model` (`hdpack::key_car_damage`) and the right size, else the
+/// original decal enlarged by nearest; its position is scaled. Patches on a page without a twin are returned as they are.
+pub fn scale_damage_patches(patches: Vec<DamagePatch>, model: &str, light: bool, pack: &crate::hdpack::HdPack, hd_page: &[bool]) -> Vec<DamagePatch> {
+    let s = pack.scale();
+    patches
+        .into_iter()
+        .map(|mut p| {
+            if !hd_page.get(p.page).copied().unwrap_or(false) {
+                return p;
+            }
+            let (w, h) = (p.image.width, p.image.height);
+            let orig = p.image.mips[0].clone();
+            let key = crate::hdpack::key_car_damage(model, light, p.index, &p.image.name);
+            let rgba = pack.load(&key, &orig, w, h).map(|i| i.rgba).unwrap_or_else(|| {
+                let mut out = vec![0u8; (w * s * h * s * 4) as usize];
+                for y in 0..h * s {
+                    for x in 0..w * s {
+                        let i = (((y / s) * w + x / s) * 4) as usize;
+                        let o = ((y * w * s + x) * 4) as usize;
+                        out[o..o + 4].copy_from_slice(&orig[i..i + 4]);
+                    }
+                }
+                out
+            });
+            p.image.width = w * s;
+            p.image.height = h * s;
+            p.image.mips = vec![rgba];
+            p.x *= s;
+            p.y *= s;
+            p
+        })
+        .collect()
+}
+
 /// One patch of a `<model>D.fsh` / `<model>L.fsh` damage pack (`RE/notes/car-model.md` §11).
 #[derive(Debug, Clone)]
 pub struct DamagePatch {
+    /// The entry's index in the pack (the names repeat: several `0000` of different sizes) — ENHANCEMENT E41's key part
+    pub index: usize,
     /// Last digit of the entry name = the damage zone it belongs to (`car+0x4E4 + 4·zone`).
     pub zone: u8,
     /// `misc[0]`: which texture page the patch is drawn onto.
@@ -1242,6 +1559,7 @@ pub fn damage_patches(paths: &GamePaths, model: &str, light: bool) -> Result<Vec
         let Ok(img) = fsh.decode_mip(&data, i, 0) else { continue };
         let b = &e.blocks[0];
         out.push(DamagePatch {
+            index: i,
             zone,
             page: b.misc[0] as usize,
             x: (b.misc[2] & 0xFFF) as u32,
@@ -1392,6 +1710,7 @@ mod damage_blend_tests {
 
     fn patch(threshold: f32, px: [u8; 4]) -> DamagePatch {
         DamagePatch {
+            index: 0,
             zone: 0,
             page: 0,
             x: 0,

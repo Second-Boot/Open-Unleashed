@@ -33,6 +33,7 @@ impl App {
             // Then the cars' sets (0x43F6E0 at 0x468B6F, after 0x455260): the same draw, `d²`
             // the car's from its last drive
             let mut sprites = p.sprites();
+            let n_track = sprites.len(); // ENHANCEMENT E18: past this index the sprites are the cars' (smoke, dust, spray)
             let mut streaks = Vec::new();
             if let Some(fx) = self.car_effects.as_ref() {
                 let (sp, st) = fx.draw(|k| self.effect_car_position(k));
@@ -47,10 +48,42 @@ impl App {
             if main {
                 self.particles_left_ref_one = p.any_particles() || self.car_effects.as_ref().is_some_and(|fx| fx.any_particles());
             }
-            self.streak_items(out, &streaks);
+            self.streak_items(out, &streaks, main);
             let z_near = self.camera.near;
             let far = self.view_far;
-            for sp in sprites {
+            // ENHANCEMENT E26: how many extra, larger and fainter copies of each wet-road spray puff are drawn (render only: the
+            // particle system is not touched, the copies exist only in this frame's draw list). On wet tarmac every wheel
+            // particle is kind 6 (`wheel_input`: wet && surface 1), grey 0x595959; the copies are only for the main view
+            let spray_dups = if main && self.enh.is_on(nfs_renderer::E26) && self.weather_strengths().1 > 0.05 { self.enh.level(nfs_renderer::E26).min(2) as usize } else { 0 };
+            for (i, sp) in sprites.into_iter().enumerate() {
+                if spray_dups > 0 && i >= n_track && sp.blend == 0 && sp.argb & 0xFF_FFFF == 0x59_5959 {
+                    let Some(&(mesh, material)) = self.track_particle_sprites.get(&(sp.material.clone(), sp.blend)) else { continue };
+                    for k in 0..spray_dups {
+                        // a fixed jitter from the puff's own place (no random state): the copies fan out sideways and up
+                        let h = ((sp.position.x * 12.9898 + sp.position.z * 78.233 + k as f32 * 37.7).sin() * 43758.547).fract();
+                        let h2 = ((sp.position.z * 12.9898 + sp.position.x * 78.233 + k as f32 * 11.3).sin() * 43758.547).fract();
+                        let size = sp.size * (1.45 + 0.35 * k as f32);
+                        let pos = sp.position + right * ((h - 0.5) * sp.size * 0.9) + Vec3::Y * (h2.abs() * sp.size * 0.5);
+                        let (s, c) = sp.degrees.to_radians().sin_cos();
+                        let (r, u) = (right * c + up * s, up * c - right * s);
+                        let m = Mat4::from_cols((r * size).extend(0.0), (u * size).extend(0.0), right.cross(up).extend(0.0), pos.extend(1.0));
+                        let a = sp.argb;
+                        let tint = [((a >> 16) & 0xFF) as f32 / 255.0 * 1.15, ((a >> 8) & 0xFF) as f32 / 255.0 * 1.15, ((a & 0xFF) as f32 / 255.0 * 1.2).min(1.0)];
+                        let d2 = sp.sqd.max(1e-6);
+                        let bias = ((sp.zbias as f64 * (far * z_near / (far - z_near)) as f64 / d2 as f64) as f32).round_ties_even();
+                        out.push(nfs_renderer::DrawItem {
+                            light: tint,
+                            alpha: (a >> 24) as f32 / 255.0 * 0.45,
+                            layer_light: Some(unlit(tint)),
+                            alpha_test: true,
+                            alpha_ref: 1,
+                            depth_bias: bias as i32,
+                            soft: (size * 0.25).clamp(0.2, 0.6),
+                            particle: nfs_renderer::PARTICLE_LIT,
+                            ..nfs_renderer::DrawItem::new(mesh, material, m)
+                        });
+                    }
+                }
                 let Some(&(mesh, material)) = self.track_particle_sprites.get(&(sp.material.clone(), sp.blend)) else { continue };
                 let (s, c) = sp.degrees.to_radians().sin_cos();
                 let (r, u) = (right * c + up * s, up * c - right * s);
@@ -69,6 +102,10 @@ impl App {
                     alpha_test: true,
                     alpha_ref: 1,
                     depth_bias: bias as i32,
+                    // ENHANCEMENT E12 (read only with the switch on): a puff fades over a quarter of its size, 0.2..0.5 m
+                    soft: (size * 0.25).clamp(0.2, 0.5),
+                    // ENHANCEMENT E18: a car's plain-alpha puff (smoke, dust, spray) is lit by the sun; the additive / darkening ones are left
+                    particle: if main && i >= n_track && sp.blend == 0 { nfs_renderer::PARTICLE_LIT } else { 0 },
                     ..nfs_renderer::DrawItem::new(mesh, material, m)
                 });
             }
@@ -80,7 +117,7 @@ impl App {
     /// untextured, unlit, under the definition's blend, with the draw's depth bias `round(zbias ·
     /// cam[+0xC] / d²)` (0x45446B…0x454491, as the billboards') on `DrawItem::depth_bias`; one
     /// draw per system (a run of equal blend, bias and `d²`), `STREAK_CAP` triangles each.
-    fn streak_items(&mut self, out: &mut Vec<nfs_renderer::DrawItem>, streaks: &[nfs_game::track_particles::Streak]) {
+    fn streak_items(&mut self, out: &mut Vec<nfs_renderer::DrawItem>, streaks: &[nfs_game::track_particles::Streak], main: bool) {
         let Some((pool, materials)) = self.streak_draw.as_ref() else { return };
         let Some(r) = self.renderer.as_mut() else { return };
         let z_near = self.camera.near;
@@ -111,6 +148,8 @@ impl App {
                     depth_bias: bias as i32,
                     alpha_test: true,
                     alpha_ref: 1,
+                    soft: 0.3, // ENHANCEMENT E12
+                    particle: if main { nfs_renderer::PARTICLE_SPARK } else { 0 }, // ENHANCEMENT E18: the cars' sparks only (flag 4)
                     ..nfs_renderer::DrawItem::new(mesh, materials[(s.blend as usize).min(2)], Mat4::IDENTITY)
                 });
             }
@@ -170,6 +209,8 @@ impl App {
                 main_view_only: true,
                 alpha_test: true,
                 alpha_ref,
+                soft: 0.3, // ENHANCEMENT E12
+                particle: if k == 0 { nfs_renderer::PARTICLE_LIT_WORLD } else { 0 }, // ENHANCEMENT E18: snow only
                 ..nfs_renderer::DrawItem::new(mesh, material, Mat4::IDENTITY)
             });
         }
@@ -186,7 +227,7 @@ impl App {
     /// The player's car's `Wndo` corners as 0x43A490 hands them on: the loader 0x442200 appends
     /// every record the body style admits (the `BndP` filter, `carinfo[0x56C + 4·slot] == value`)
     /// at `car+0x280`, × 0.4 for `.TINYCAR`, no `y` shift; the first four, model frame, `w = 1`.
-    fn windscreen_quad(&self) -> Option<[Vec3; 4]> {
+    pub(super) fn windscreen_quad(&self) -> Option<[Vec3; 4]> {
         let recs = self.car.crp.window_points(&self.car.crp_data).ok()?;
         let style = nfs_assets::car::CarStyle::from_tpg(&self.car.tpg, self.car.style_index + 1);
         let scale = if self.cheat_bits & CHEAT_TINY != 0 { 0.4 } else { 1.0 };
@@ -420,6 +461,12 @@ impl App {
                 // pass's own states)
                 alpha_test: overlay,
                 alpha_ref: 10,
+                // ENHANCEMENT E11: the sun's disc and the lens flare's layers of the MAIN view reach above
+                // white in the float scene (the renderer applies it only with E11 and E7 on); their alpha
+                // is already the original's probe scale, so the boost follows the occlusion test
+                // only the sun's own layers (sky pass), never the lens flare's ghosts (`overlay`): a
+                // saturated pink ghost has m = 1 in its red channel, so the boost made it a huge glowing disc
+                hdr_boost: if main && !overlay { SUN_HDR_BOOST } else { 1.0 },
                 ..nfs_renderer::DrawItem::new(mesh, material, m)
             });
         }
@@ -595,6 +642,9 @@ impl App {
 /// (0x43D64D…0x43D7B1), the track flares one colour on all four corners (0x44F6E0) and the
 /// particles their ramp's (0x454430 → 0x44F6E0); no light term is computed for any of them — the
 /// port's sun-and-ambient term shaded each quad by its own orientation.
+/// ENHANCEMENT E11: how far above white the sun's full colour is drawn in the float scene.
+const SUN_HDR_BOOST: f32 = 2.0;
+
 /// The sun's `flare.dat` record: the FourCC `anus` as stored (0x460289 pushes `[0x5CF52C]` =
 /// 0x73756E61 to 0x452260), its layers `SUNA` and `BLUR`.
 /// The sun's screen point (0x460290): `(px, py)` in the view's 640 × 480 frame, the sun's offset

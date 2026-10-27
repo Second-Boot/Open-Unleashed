@@ -18,6 +18,10 @@ impl App {
             r.enable_render_thread();
         }
         self.sync_save_side_state();
+        // ENHANCEMENT ENH-UPSCALER: the options panel's rebuild after a change of the set (before the screens are drawn)
+        self.enh_panel_refresh();
+        // ENHANCEMENT ENH-LIVETEX: the HD textures / refined meshes a live change of E41 / E42 asks for, a few ms of work per frame
+        self.enh_live_step(Some(25));
         // PORT-DEVIATION D46: the photo mode's free camera's move of this frame
         self.photo_step();
         // the front end's screens slide and fade in over half a second (`RE/notes/controls.md` §6)
@@ -39,15 +43,20 @@ impl App {
             r.set_fakesort_mode(fakesort_mode);
         }
         self.render_mirror();
+        // ENHANCEMENT E8: the environment faces for this frame (`reflections.rs`), `scene.refl` = 0 otherwise
+        self.render_reflections();
         // the front end's idle redraw (`idle.rs`): the frame the window already shows is not
         // rendered or presented again
         let idle = self.fe_frame_unchanged();
         if nfs_game::config::cfg().nfs_fe_idle_verify.is_set() {
             self.fe_idle_verify(idle);
         }
+        // ENHANCEMENT E29: the camera that is drawn (the shaken one while a shake runs)
+        let render_cam = self.render_camera();
+        self.temporal_cut_check();
         if !idle
             && let Some(r) = self.renderer.as_mut()
-            && let Err(e) = r.render(&self.scene, &self.camera)
+            && let Err(e) = r.render(&self.scene, &render_cam)
         {
             tracing::error!(error = %e, "render failed");
         }
@@ -56,8 +65,20 @@ impl App {
         self.mirror_sky_update();
         self.mirror_weather_step();
         self.frames += 1;
+        // TEST GLUE NFS_FRAME_STATS=1: this frame's time, for the mean / p99 / max below
+        if nfs_game::config::cfg().nfs_frame_stats.is_set() {
+            self.frame_times.push(self.frame_dt * 1000.0);
+        }
         if self.fps_timer.elapsed() >= Duration::from_secs(1) {
             tracing::info!(fps = self.frames, tick = self.tick, "frame stats");
+            if !self.frame_times.is_empty() {
+                let t = &mut self.frame_times;
+                t.sort_by(|a, b| a.total_cmp(b));
+                let mean = t.iter().sum::<f32>() / t.len() as f32;
+                let p99 = t[((t.len() as f32 * 0.99) as usize).min(t.len() - 1)];
+                tracing::info!(frames = t.len(), mean_ms = mean, p99_ms = p99, max_ms = t[t.len() - 1], "frame times");
+                t.clear();
+            }
             // **PLATFORM GLUE** (not in the original): `NFS_DEMO=1` shows the frame rate, the GPU / graphics API and the
             // platform in the window title, for demo recordings (and keeps the window on top, `session.rs`)
             if nfs_game::config::cfg().nfs_demo.is_set()

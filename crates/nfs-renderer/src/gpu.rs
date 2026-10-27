@@ -5,8 +5,40 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+mod csm;
+mod spot;
+mod lamps;
+mod contact;
+mod fill;
+mod init;
+mod resources;
+mod materials;
+mod refl;
+mod readback;
+mod enhanced;
+mod frame;
+mod pipelines;
+mod post;
+mod chain;
+#[cfg(target_os = "macos")]
+mod diag;
+
+// the items the rest of gpu/ names from the two modules above (their own glob `use super::*` sees these)
+use pipelines::{build_mesh_pipelines, HDR_KEY};
+use post::{GammaPass, ScaleBlit};
+#[cfg(test)]
+pub(crate) use post::{blit_source, gamma_source};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MeshId(pub(crate) u32);
+
+impl MeshId {
+    /// ENHANCEMENT ENH-LIVELEAK: an id that names no mesh (the `n`-th), for a caller that pairs parts by identity without having uploaded
+    /// them (a live twin build leaves the unused original copy out). Never given to the renderer.
+    pub fn placeholder(n: u32) -> Self {
+        MeshId(0x8000_0000 | n)
+    }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextureId(pub(crate) u32);
 
@@ -20,26 +52,6 @@ pub struct OffscreenSpec {
     pub reuse: Option<TextureId>,
     pub clear_colour: Option<[f64; 4]>,
     pub depth_far: Option<f32>,
-}
-
-/// The image one frame is encoded into: its view and texture, whether the texture may be copied
-/// from, and the depth view.
-#[derive(Clone, Copy)]
-struct FrameTarget<'a> {
-    view: &'a wgpu::TextureView,
-    texture: &'a wgpu::Texture,
-    can_copy: bool,
-    depth_view: &'a wgpu::TextureView,
-}
-
-/// The per-frame choices of `Core::encode_frame`: the clear colour, whether the 2D sprites follow,
-/// the aspect and the far plane of the screen z.
-#[derive(Clone, Copy)]
-struct FrameOpts {
-    clear_color: [f64; 4],
-    with_sprites: bool,
-    aspect: f32,
-    depth_far: f32,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaterialId(pub(crate) u32);
@@ -64,7 +76,40 @@ struct GlobalsUniform {
     fog: [f32; 4],
     /// the sky pass's fog (`Scene::sky_fog`)
     sky_fog: [f32; 4],
+    /// ENHANCEMENT E8: `.x` the scene's reflection weight (0 = off), `.y` the face map's
+    /// `1 / tan(half fov)`
+    refl: [f32; 4],
+    /// ENHANCEMENT E12: `.xy` the pass's near / far planes, `.z` 1 while the soft depth image is bound
+    soft: [f32; 4],
+    /// ENHANCEMENT E17: `.x` 1 while the water reflection is on, `.y` the sun's glint gain (0 = no sun)
+    water: [f32; 4],
+    /// the sky straight up / at the horizon the water reflects without an environment map
+    water_zenith: [f32; 4],
+    water_horizon: [f32; 4],
+    /// `.xyz` the unit vector to the sun
+    water_sun: [f32; 4],
+    /// ENHANCEMENT E18: `.xyz` the unit vector to the sun, `.w` 1 while the lit particles take it (0 = off, or no sun)
+    fx_sun: [f32; 4],
+    /// ENHANCEMENT E19: `.xyz` the unit vector to the sun, `.w` the sun in-scatter strength of the fog (0 = off)
+    fogsun: [f32; 4],
+    /// ENHANCEMENT E20: `.x` the lightning flash's strength 0..1 (0 = none, master's value)
+    flash: [f32; 4],
+    /// ENHANCEMENT E26: `.x` the rain's strength (0 = off, master's value), `.y` the clock, `.z` the lamp count, `.w` the wetness at the camera
+    rain: [f32; 4],
+    rain_zenith: [f32; 4],
+    rain_horizon: [f32; 4],
+    rain_lamp_pos: [[f32; 4]; crate::RAIN_LAMPS],
+    rain_lamp_col: [[f32; 4]; crate::RAIN_LAMPS],
+    /// the wetness edges: `pos.xyz` + half width, `dir.xyz` + the value before, `val.x` the value after
+    rain_edge_pos: [[f32; 4]; crate::RAIN_EDGES],
+    rain_edge_dir: [[f32; 4]; crate::RAIN_EDGES],
+    rain_edge_val: [[f32; 4]; crate::RAIN_EDGES],
+    /// ENHANCEMENT ENH-TEMPORAL: `.xy` the jitter in NDC (already in `view_proj`), `.zw` the render size in pixels (0 = off)
+    temporal: [f32; 4],
 }
+
+/// ENHANCEMENT E18: a spark's colour is multiplied by this (the hot core of its ramp ends well above 1, over the bloom's threshold).
+const SPARK_GAIN: f32 = 6.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -88,9 +133,18 @@ struct ObjectUniform {
     sky_u: [f32; 4],
     sky_v: [f32; 4],
     sky_on: [f32; 4],
+    /// ENHANCEMENT E8: `.x` the material's reflection class (0 none, 1 paint, 2 glass), `.y` its strength
+    refl: [f32; 4],
+    /// ENHANCEMENT E12: `.x` the fade distance in metres (0 = a hard edge), `.y` how the fade is laid
+    /// on the colour (0 alpha only, 2 toward white for the multiplying blend)
+    soft: [f32; 4],
+    /// ENHANCEMENT E11: `.x` the item's HDR boost (> 1 = a flare layer drawn above white in the float scene)
+    /// ENHANCEMENT E18: `.y` a spark's gain above white (0 = none), `.z` the lit particle kind ([`crate::PARTICLE_LIT`] / `_WORLD`, 0 = none)
+    hdr: [f32; 4],
     /// `view_proj · model` multiplied out in `f64` and rounded once (PORT-DEVIATION D37): the clip
     /// position of a vertex, so that a car 4 km from the world origin does not lose its sub-millimetre
-    /// depth order to `f32` world coordinates
+    /// depth order to `f32` world coordinates. Last in the struct, so the fields master has keep their offsets.
+    /// `view_proj` is this frame's (with ENHANCEMENT ENH-TEMPORAL's jitter when that is on).
     mvp: [[f32; 4]; 4],
 }
 
@@ -114,6 +168,43 @@ struct GpuMesh {
     /// `update_mesh_vertices` that queued bytes): lets a caller that keeps the last vertices it
     /// wrote tell whether anyone else wrote the mesh since ([`Core::mesh_writes`]).
     writes: u32,
+    /// ENHANCEMENT E9: the bounding sphere (centre, radius) of the vertices at upload, in mesh space
+    bounds: ([f32; 3], f32),
+    /// ENHANCEMENT E9: a level flat sheet (a road layer, a decal): no caster
+    flat: bool,
+    /// ENHANCEMENT ENH-LIVELEAK: carved out of a shared arena (its ranges go to the free list on release), the reserved byte sizes of
+    /// the two ranges (the slot a later mesh may take over), and whether the mesh was released (an empty stub now)
+    arena: bool,
+    cap: (u64, u64),
+    released: bool,
+}
+
+/// ENHANCEMENT ENH-LIVELEAK: the arena ranges of a released static mesh (a vertex range and an index range, with their reserved sizes),
+/// kept for the next [`Core::upload_mesh`] they fit.
+struct FreeMeshSlot {
+    /// the buffers' serial ([`GpuMesh::vb_serial`]): the arena's they were carved from
+    serial: u32,
+    vertex_buf: wgpu::Buffer,
+    vertex_offset: u64,
+    vertex_cap: u64,
+    index_buf: wgpu::Buffer,
+    index_offset: u64,
+    index_cap: u64,
+}
+
+/// ENHANCEMENT ENH-LIVELEAK: what the GPU side holds, for the live-build log and the leak checks (`Renderer::resource_stats`).
+/// `*_live` leave out the released slots; `*_bytes` are the live textures' base + mip levels and the live meshes' vertex + index bytes;
+/// `arena_bytes` is every arena buffer ever made (the shared chunks the static meshes are carved from) plus the dynamic meshes' own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceStats {
+    pub textures: usize,
+    pub textures_live: usize,
+    pub texture_bytes: u64,
+    pub meshes: usize,
+    pub meshes_live: usize,
+    pub mesh_bytes: u64,
+    pub arena_bytes: u64,
+    pub materials: usize,
 }
 
 /// The arena the static meshes are carved from: a vertex and an index buffer, filled front to back.
@@ -137,10 +228,16 @@ const ARENA_CHUNK: u64 = 4 << 20;
 const VERTEX_STRIDE: u64 = std::mem::size_of::<Vertex>() as u64;
 const _: () = assert!(VERTEX_STRIDE % 8 == 0, "a vertex range stays 8-byte aligned");
 
+#[derive(Clone)]
 struct GpuTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     sprite_bg: Option<wgpu::BindGroup>,
+    /// ENHANCEMENT E2: the texture came with one level and carries a generated chain (levels 1..
+    /// are ours, the alpha treatment is the value); `None` is every texture as the original has it.
+    /// While E2 is off such a texture is sampled at level 0 only, so it looks as before.
+    generated: Option<crate::mipgen::MipAlpha>,
+    size: (u32, u32),
 }
 
 #[repr(C)]
@@ -184,6 +281,27 @@ struct GpuMaterial {
     texture: TextureId,
     /// the specular map
     env: TextureId,
+    /// ENHANCEMENT E8
+    reflect: crate::Reflect,
+}
+
+/// ENHANCEMENT E2: a scene sampler by address mode — linear magnification / minification, the
+/// given mip filter, `anisotropy_clamp` (wgpu wants every filter linear for anything above 1) and an
+/// optional `lod_max_clamp`.
+fn make_scene_sampler(device: &wgpu::Device, clamp_u: bool, clamp_v: bool, mip: wgpu::MipmapFilterMode, anisotropy: u16, lod_max: Option<f32>) -> wgpu::Sampler {
+    let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("scene E2"),
+        address_mode_u: mode(clamp_u),
+        address_mode_v: mode(clamp_v),
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: mip,
+        lod_max_clamp: lod_max.unwrap_or(32.0),
+        anisotropy_clamp: anisotropy,
+        ..Default::default()
+    })
 }
 
 pub(crate) struct Core {
@@ -191,6 +309,8 @@ pub(crate) struct Core {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// the present modes the surface supports (ENHANCEMENT E6 picks among them)
+    present_modes: Vec<wgpu::PresentMode>,
     depth_view: wgpu::TextureView,
     pipelines: Vec<wgpu::RenderPipeline>, // see `make_pipeline`'s loops for the index
     globals_buf: wgpu::Buffer,
@@ -208,6 +328,34 @@ pub(crate) struct Core {
     /// the car's section map for `R3DSkyMapTextureLayer`, one bind group per texture (group 3)
     sky_layout: wgpu::BindGroupLayout,
     sky_bgs: Vec<Option<wgpu::BindGroup>>,
+    /// ENHANCEMENT E8: the six environment faces (a `D2` array of `refl_size`²), the 1 × 1 black array
+    /// the binding holds while there is none, and the render target a face is drawn into before it is
+    /// copied into its layer (a layer cannot be an attachment while the array is bound)
+    refl: Option<ReflCube>,
+    refl_dummy_view: wgpu::TextureView,
+    _refl_dummy: wgpu::Texture,
+    /// ENHANCEMENT E16: the SH projection of the faces (built on first use; `None` without compute
+    /// shaders), and the zero uniform the binding holds until then
+    probe: Option<crate::probe::Probe>,
+    /// ENHANCEMENT ENH-COAT: the prefilter of the environment cube's mips (made with the first cube), and whether an
+    /// environment face is being drawn now (its frame must not run the prefilter: the faces are not all in yet)
+    coat: Option<crate::coat::CoatFilter>,
+    refl_building: bool,
+    probe_dummy: wgpu::Buffer,
+    compute_supported: bool,
+    /// ENHANCEMENT E12: the depth converter (built on first use), and the 1 x 1 image the binding
+    /// holds while no soft depth is bound
+    soft: Option<crate::soft::SoftDepth>,
+    /// ENHANCEMENT E14: the corner-shading passes (built on first use)
+    ssao: Option<crate::ao::Ssao>,
+    /// ENHANCEMENT E13: the light-shafts pass (built on first use)
+    shafts: Option<crate::shafts::ShaftsPass>,
+    /// ENHANCEMENT E36: the haze pass (built on first use)
+    haze: Option<crate::haze::HazePass>,
+    /// ENHANCEMENT E44: the lighthouse beam pass (built on first use)
+    lbeam: Option<crate::lbeam::LBeamPass>,
+    soft_dummy_view: wgpu::TextureView,
+    _soft_dummy: wgpu::Texture,
     /// `[0x6115CC]+0x190`: set while the view being drawn is the rear-view mirror's (type 1,
     /// 0x43AD39…0x43AD4E), when the specular and sky-map layers take no texture and skip their passes
     no_reflections: bool,
@@ -223,6 +371,20 @@ pub(crate) struct Core {
     /// the `FakeSort` single-draw arm's samplers (Thrash 7 ← 0, `MAG`/`MINFILTER` `POINT`), by
     /// address mode alone — index `clamp_u | clamp_v << 1` — used only for a single-draw item
     point_samplers: [wgpu::Sampler; 4],
+    /// ENHANCEMENT E2, E2 off: `samplers` with the level range cut to level 0 — for a texture with
+    /// a generated chain, which then samples exactly as the original's single level, by address mode
+    level0_samplers: [wgpu::Sampler; 4],
+    /// the same for the `FakeSort` single-draw arm's point samplers
+    point_level0_samplers: [wgpu::Sampler; 4],
+    /// ENHANCEMENT E2, E2 on: trilinear + anisotropic scene samplers by address mode, built for
+    /// `aniso_clamp` (rebuilt when the level changes)
+    aniso_samplers: [wgpu::Sampler; 4],
+    aniso_clamp: u16,
+    /// the adapter's `ANISOTROPIC_FILTERING` (downlevel flag); without it E2 still gives the
+    /// generated mips and trilinear, with the clamp at 1
+    aniso_supported: bool,
+    /// ENH-LITE: how strong the adapter is (integrated / software = weak), for the first-run set
+    gpu_class: crate::GpuClass,
     /// the mip filter's `POINT` → `LINEAR` promotion, `[0x69DD1D]` (`set_trilinear`); clear at start, as the image has it
     trilinear: bool,
     /// `LayerFalseSort1`/`2`'s per-frame pick, [`FakeSortMode`] — `main.rs` sets it from
@@ -238,12 +400,113 @@ pub(crate) struct Core {
     /// applied by [`GammaPass`]. 1.0 (the default 100) draws straight into the target as before.
     gamma: f32,
     gamma_pass: Option<GammaPass>,
+    /// The enhanced game's switches ([`crate::Enhancements`]), set through the command list; the
+    /// core starts on [`crate::Enhancements::ORIGINAL`], whose every GPU-side branch is `master`'s
+    /// code path. An enhancement tests `self.enhancements.is_on(..)` and nothing else.
+    pub(crate) enhancements: crate::Enhancements,
+    /// WIN-STARTUP: a GPU error forced every enhancement off for this run ([`GPU_ERRORS`]); later sets are ignored
+    enh_forced_off: bool,
+    gpu_errors_seen: u32,
+    /// ENHANCEMENT E1: the sample counts (2, 4, 8) the colour format and the depth format both
+    /// support multisampled and resolved, from the adapter (bit `n.trailing_zeros()`)
+    ms_supported: u32,
+    /// ENHANCEMENT E7: the device can draw and blend into `Rgba16Float` and filter it
+    hdr_ok: bool,
+    /// ENHANCEMENT E33: the EDR output's state (macOS; a stub elsewhere that is never on)
+    edr: crate::edr::Edr,
+    /// ENHANCEMENT E33 diagnostic: EDR frames drawn (the probe measures the 20th)
+    #[cfg(target_os = "macos")]
+    edr_frames: u32,
+    /// ENHANCEMENT E7: [`Self::ms_supported`] for `Rgba16Float`
+    ms_supported_hdr: u32,
+    /// ENHANCEMENT E7: the tone-map mode of the 3D pass being encoded (0 = as the original, 1 =
+    /// ACES); `None` = the original's 8-bit target. Set around `encode_frame` by the E7 paths only.
+    cur_hdr: Option<u32>,
+    /// ENHANCEMENT E7: the rear-view mirror's own float image + tone map (its size differs from the
+    /// main view's)
+    scale_blit_mirror: Option<ScaleBlit>,
+    /// ENHANCEMENT E1 / E7: the key (sample count, | [`HDR_KEY`] for the float set) `pipelines` were built for (1 = master's 66)
+    pipeline_samples: u32,
+    /// ENHANCEMENT E1 / E7: the sets built for other keys, kept so a switch back is free
+    pipeline_sets: std::collections::HashMap<u32, Vec<wgpu::RenderPipeline>>,
+    mesh_shader: wgpu::ShaderModule,
+    /// the mesh shader with the inert-at-level-0 blocks, built when the first switch goes on
+    mesh_shader_full: Option<wgpu::ShaderModule>,
+    mesh_layout: wgpu::PipelineLayout,
+    /// ENHANCEMENT E1: multisampled colour + depth targets by (width, height, samples)
+    ms_cache: std::collections::HashMap<(u32, u32, u32), (wgpu::TextureView, wgpu::TextureView)>,
+    /// ENHANCEMENT E3: the scaled 3D image and the blit that lays it over the window-sized image
+    scale_blit: Option<ScaleBlit>,
+    /// ENHANCEMENT ENH-TEMPORAL: the temporal foundation (jitter, motion vectors, masks, the debug pass), made when
+    /// `NFS_TEMPORAL_DEBUG` is set or [`Self::temporal_flag`] is raised; `None` = off, master's frame
+    temporal: Option<crate::temporal::Temporal>,
+    /// ENHANCEMENT ENH-TEMPORAL: a temporal upscaler (phase B: FSR 3.1 / MetalFX temporal) is active: the main view is
+    /// jittered, writes the vectors and masks, and renders at 1 sample. `false` until one is wired.
+    temporal_flag: bool,
+    /// ENHANCEMENT ENH-TEMPORAL: the object pass's second layout (the reprojection matrices), made at first use
+    temporal_gpu: Option<crate::temporal::Gpu>,
+    /// ENHANCEMENT ENH-TEMPORAL: the targets and bind group of the frame being encoded (set around `encode_frame`)
+    cur_temporal: Option<crate::temporal::Cur>,
+    /// ENHANCEMENT ENH-TEMPORAL: the reprojection matrices of the frame being encoded (kept between frames)
+    motion: crate::temporal::Motion,
+    /// ENHANCEMENT ENH-TEMPORAL: the last temporal main view's inputs for an upscaler (phase B)
+    #[allow(dead_code)]
+    temporal_inputs: Option<crate::temporal::Inputs>,
+    /// ENHANCEMENT E37: the FSR 3.1 backend (built at first use) and its state, 0 = not tried, 1 = ready, 2 = unavailable (logged once)
+    fsr: Option<Box<dyn crate::upscale::Upscaler>>,
+    fsr_state: u8,
+    /// ENHANCEMENT E34 (temporal levels): the same slot also holds MetalFX's temporal scaler (macOS): which backend `fsr` is, and E34's own
+    /// state (0 = not tried, 1 = ready, 2 = unavailable / failed)
+    fsr_kind: Option<crate::upscale::UpscalerKind>,
+    #[cfg(target_os = "macos")]
+    mfxt_state: u8,
+    /// ENHANCEMENT E37: the frame being encoded goes through FSR
+    fsr_active: bool,
+    /// ENHANCEMENT E37: FSR's float output (display size) and the bind group the post chain reads it by: `(size, texture, view, bind group)`
+    fsr_out: Option<crate::gfx::RtImage>,
+    /// ENHANCEMENT E37: `encode_with_gamma_inner` calls so far, and the call number of the last FSR frame (a frame in between
+    /// that was not one - a menu, a loading screen, another view - drops the history)
+    frame_no: u64,
+    fsr_last_frame: u64,
+    /// ENHANCEMENT E34: the upscaler backend (built at first use), 0 = not tried, 1 = ready, 2 = unavailable (logged once)
+    upscaler: Option<Box<dyn crate::upscale::Upscaler>>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    upscale_state: u8,
+    /// ENHANCEMENT E34: the frame being encoded goes through the upscaler (set by `encode_with_gamma_inner`)
+    upscale_active: bool,
+    /// ENHANCEMENT E34: the scaler's input / output images and the plain blit that lays its output over the window image
+    upscale_images: Option<crate::upscale::UpscaleImages>,
+    upscale_present: Option<ScaleBlit>,
+    /// ENHANCEMENT E35: SMAA 1x over the tone-mapped image, made at first use
+    smaa: Option<crate::smaa::Smaa>,
+    /// ENHANCEMENTS E10 / E21 / E27 / the depth of field (photo mode, E31) / E40 / E28: the post chain's passes (each built at its first use)
+    post: chain::PostPasses,
     sprite_sampler: wgpu::Sampler,
     object_buf: wgpu::Buffer,
     object_bg: wgpu::BindGroup,
     meshes: Vec<GpuMesh>,
     arena: Option<MeshArena>,
+    /// ENHANCEMENT ENH-LIVELEAK: the ranges of released static meshes, taken by a later upload that fits (best fit)
+    free_slots: Vec<FreeMeshSlot>,
+    /// ENHANCEMENT ENH-LIVELEAK: the empty buffers every released mesh slot points at, and their serial ([`GpuMesh::vb_serial`])
+    mesh_stub: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// ENHANCEMENT ENH-LIVELEAK: the bytes of every arena chunk and dynamic mesh buffer made so far (`ResourceStats::arena_bytes`)
+    arena_bytes: u64,
     textures: Vec<GpuTexture>,
+    /// ENHANCEMENT ENH-LIVELEAK: the 1 x 1 white image every released texture slot shares, and the slots released
+    stub_texture: Option<GpuTexture>,
+    released_textures: std::collections::HashSet<u32>,
+    /// ENHANCEMENT ENH-LIVELEAK: released texture / mesh slots. They wait in `pending_*` until [`Self::recycle_released`] (the end of a live
+    /// pass: every model holding the old id has let go of it by then); a later upload takes a slot from `free_*` instead of growing the table.
+    pending_tex: Vec<u32>,
+    free_tex: Vec<u32>,
+    pending_mesh: Vec<u32>,
+    free_mesh: Vec<u32>,
+    /// ENHANCEMENT ENH-LIVETEX (E41): a texture's HD twin, by the original's index; a material samples the twin while E41 is above 0
+    /// (`Self::shown_texture`), the original otherwise, so F12 / the menu flip between the two without a reload
+    tex_twin: Vec<Option<TextureId>>,
+    /// ENHANCEMENT ENH-LIVETEX (E42): a mesh's refined twin (a car's rounded part), drawn in place of the original while E42 is above 0
+    mesh_twin: Vec<Option<MeshId>>,
     materials: Vec<GpuMaterial>,
     white: TextureId,
     sprite_pipeline: wgpu::RenderPipeline,
@@ -270,6 +533,8 @@ pub(crate) struct Core {
     depth_cache: std::collections::HashMap<(u32, u32), wgpu::TextureView>,
     /// the pass's item indices by stage (sky, opaque, blended, overlay), kept between frames
     buckets: [Vec<u32>; 4],
+    /// the per-item arrays `encode_frame` builds every frame, kept between frames (no allocation per frame)
+    frame_scratch: FrameScratch,
     /// the surface carries `COPY_SRC`, so the lens flare's frame read-back can copy from it
     /// ([`Self::set_lens_enabled`])
     lens_enabled: bool,
@@ -278,11 +543,18 @@ pub(crate) struct Core {
     /// read-backs collected, for the front to hand to the game
     lens_done: Vec<LensRead>,
     /// blocks copied into the frame being encoded, mapped after its submit
-    lens_staged: Vec<(wgpu::Buffer, bool)>,
-    /// the objects and the sprite vertices of the pass being encoded, built here and copied into
-    /// the belt (wgpu's mapped views are write-only), kept between frames
-    object_scratch: Vec<ObjectUniform>,
-    sprite_scratch: Vec<SpriteVertex>,
+    lens_staged: Vec<(wgpu::Buffer, bool, bool)>,
+    /// `NFS_GPU_TIME`, read once, and its running (sum ms, frames)
+    gpu_time_log: bool,
+    gpu_time_acc: (f64, u32),
+    /// ENHANCEMENT E9: the sun shadow maps' pipelines, uniform and map
+    csm: csm::CsmState,
+    /// ENHANCEMENT E15: the headlight spots' uniform and shadow map
+    spot: spot::SpotState,
+    /// ENHANCEMENT E23: the street lamps' uniform
+    lamp: lamps::LampState,
+    /// ENHANCEMENT E43: the cars' contact shadow uniform
+    contact: contact::ContactState,
     /// the last submission of each of the frames still in flight, oldest first, and the newest
     /// submission of the frame being built ([`Self::frame_begin`])
     frames_in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
@@ -302,6 +574,8 @@ const MAX_FRAMES_IN_FLIGHT: usize = 3;
 struct LensPending {
     buf: wgpu::Buffer,
     reference: bool,
+    /// ENHANCEMENT E7: the block was copied from the float image (8 bytes a pixel)
+    half: bool,
     rx: std::sync::mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>,
 }
 
@@ -358,7 +632,10 @@ struct Run {
 /// What a material's bind group (`point`: its point-filtered one) is made of — the diffuse texture,
 /// the sampler's address modes, the specular map and the filter — as one number. Every bind group of
 /// the frame is built under the same `trilinear` ([`Core::set_trilinear`] rebuilds them all), so
-/// two equal keys are two bind groups over the same views and the same sampler.
+/// two equal keys are two bind groups over the same views and the same sampler. The enhanced game's
+/// rebuilds keep that: ENHANCEMENT E2 rebuilds every material, ENHANCEMENT ENH-LIVETEX every material
+/// of the one original texture whose twin changed, and a material's own texture is never a twin's
+/// (recycled) slot.
 fn bind_key(m: &GpuMaterial, point: bool) -> u64 {
     m.texture.0 as u64 | (m.env.0 as u64) << 28 | (m.sampler as u64) << 56 | (point as u64) << 60
 }
@@ -376,11 +653,25 @@ fn sky_tex_of(materials: &[GpuMaterial], no_reflections: bool, item: &crate::Dra
 const MAX_SPRITES: u64 = 8192;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// ENHANCEMENT E19: how far the fog colour is pulled toward the sun's warm colour straight at the sun (a phase
+/// function normalised to 1 there and 0 from 90 degrees away on); modest, the glow only reads as a glow.
+const FOG_SUN_STRENGTH: f32 = 0.5;
+/// ENHANCEMENT E7, the extended-range (EDR / HDR) output seam — NOT enabled. The surface is the
+/// original's byte surface (`Bgra8Unorm`, `Default` = wgpu's sRGB) and the tone map above writes
+/// display-referred 0...1 values into it. EDR on macOS would be a surface of `Rgba16Float` configured
+/// with `wgpu::SurfaceColorSpace::ExtendedSrgbLinear` (the caps list it per format,
+/// `SurfaceCapabilities::format_capabilities`) and a last pass that writes linear light (the tone
+/// map's output decoded with 2.2, white scaled to the display's headroom) instead of the encoded
+/// value; this function and the `format` choice in `Core::new` are the two places that would select
+/// it, and `cfg(target_os = "macos")` is where it would start.
+fn surface_color_space() -> wgpu::SurfaceColorSpace {
+    wgpu::SurfaceColorSpace::default()
+}
+/// ENHANCEMENT E7: the 3D scene's float target format.
+pub(crate) const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const MAX_OBJECTS: u64 = 8192;
-/// The staging belt's chunk: larger than the biggest single frame upload of an ordinary scene.
-const BELT_CHUNK: u64 = 1 << 22;
 /// PORT-DEVIATION D46 (photo mode): the most pixels a still has (an 8-bit target, its depth and the read-back buffer of
-/// 40 MP are ~0.5 GB).
+/// 40 MP are ~0.5 GB; ENHANCEMENT E7's float image and its post chain at that size fit a 6 GB device).
 pub const STILL_MAX_PIXELS: u64 = 40_000_000;
 
 /// PORT-DEVIATION D46: the size a still of `width x height` gets on a device whose largest 2D texture is `max_dim` and
@@ -393,17 +684,58 @@ pub fn still_size(width: u32, height: u32, max_dim: u32, max_buffer: u64) -> (u3
     if k < 1.0 { (((w as f64 * k).floor() as u32).max(1), ((h as f64 * k).floor() as u32).max(1)) } else { (w, h) }
 }
 
+/// The staging belt's chunk: larger than the biggest single frame upload of an ordinary scene.
+const BELT_CHUNK: u64 = 1 << 22;
 /// The main view's far plane — the camera object's `+8`, 700.0 (0x4677FC) — of the screen z the
 /// depth bias offsets (`RE/notes/thrash.md` §6d.3). An offscreen pass names its own
 /// (`render_offscreen`'s `depth_far`).
 pub const VIEW_FAR: f32 = 700.0;
 
+/// ENHANCEMENT E8: `tan` of half the environment faces' field of view — 48 degrees, so 96 degrees across:
+/// a face is a little wider than the 90 degrees that tile the sphere, and the shader reads only the middle
+/// 90 of it, so bilinear filtering never reaches a face's edge.
+pub const REFL_TAN_HALF: f32 = 1.110_612_5;
+
+/// ENHANCEMENT E8: the environment faces' view directions and up vectors, the order of the array's
+/// layers: +X, -X, +Z, -Z, +Y, -Y (`shader.wgsl` `refl_face` holds the same table).
+pub const REFL_FACES: [([f32; 3], [f32; 3]); 6] = [
+    ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    ([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+    ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+    ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+    ([0.0, -1.0, 0.0], [0.0, 0.0, -1.0]),
+];
+
+/// ENHANCEMENT E8: the player's car's environment — six faces in one array texture, plus the target a
+/// face is drawn into.
+struct ReflCube {
+    size: u32,
+    /// the cube's texel format: `Rgba16Float` with the float scene (the sun and the bright lamps keep their radiance above 1
+    /// for the clear coat to reflect), else the surface's
+    format: wgpu::TextureFormat,
+    array: wgpu::Texture,
+    /// all mips (the shader's) and mip 0 alone (the probe's)
+    array_view: wgpu::TextureView,
+    base_view: wgpu::TextureView,
+    /// ENHANCEMENT ENH-COAT: faces drawn since their prefiltered mips were made
+    stale: u8,
+    face: wgpu::Texture,
+    face_view: wgpu::TextureView,
+    /// bit `i` set once face `i` has been drawn; the shader takes the map only when all six are
+    faces_done: u8,
+}
+
+/// How many uncaptured wgpu errors the handler has seen; ENHANCEMENT: [`Core::apply`] sees the count rise and forces every
+/// enhancement off for the rest of the run (the original path), so an enhancement's pipeline or texture the device refuses never
+/// stops the game.
+static GPU_ERRORS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// PLATFORM GLUE (robustness, no visual change): wgpu's default for an error no scope caught is a panic ("Handling wgpu errors as
 /// fatal by default"), which on a GUI Windows release closes the game silently. The handler installed in [`Core::new`] logs the
 /// error (the first 40, then every 1000th) and the game goes on.
 fn gpu_error(e: wgpu::Error) {
-    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let n = GPU_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if n <= 40 || n % 1000 == 0 {
         // (its Display carries the cause: "Validation Error / Caused by: In Device::create_texture ...")
         tracing::error!(count = n, "wgpu error (uncaptured): {e}");
@@ -442,1904 +774,167 @@ pub(crate) fn prefer_dx12_over(vendor: u32, device_type: wgpu::DeviceType, backe
     vendor == 0x8086 && device_type == wgpu::DeviceType::IntegratedGpu && backend != wgpu::Backend::Dx12
 }
 
-impl Core {
-    pub fn new(window: Arc<Window>) -> Result<Self> {
-        let size = window.inner_size();
-        // PLATFORM GLUE: the graphics API. Vulkan / Metal / Direct3D 12 first; OpenGL (EGL / WGL) only when none of
-        // them gives an adapter for this window (a machine without a Vulkan driver). `WGPU_BACKEND` (wgpu's own
-        // variable, e.g. `gl` or `vulkan`) picks the API instead, for testing the fallback.
-        // PLATFORM GLUE (Windows): the Direct3D 12 backend compiles with DXC from beside the exe, else FXC; an Intel integrated
-        // GPU takes its Direct3D 12 adapter instead of Vulkan (see `win_dxc_path`, `prefer_dx12_over`).
-        let backend_forced = wgpu::Backends::from_env().is_some();
-        let open = |backends: wgpu::Backends, dxc: Option<&str>| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
-            let mut instance = new_instance(&window, backends, dxc);
-            let mut dxc = dxc;
-            if dxc.is_some() && !backend_forced && backends.contains(wgpu::Backends::DX12) && pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12)).is_empty() {
-                // DXC was asked for but the Direct3D 12 backend did not come up (the instance drops a backend whose shader compiler failed to load): FXC
-                tracing::warn!("DXC: dxcompiler.dll / dxil.dll next to the exe did not load (no Direct3D 12 adapter with it) - falling back to FXC");
-                dxc = None;
-                instance = new_instance(&window, backends, None);
-            }
-            if let Some(p) = dxc {
-                tracing::info!(path = %p, "Direct3D 12 shader compiler: DXC (dxcompiler.dll + dxil.dll next to the exe; FXC if it fails to load)");
-            } else if cfg!(windows) {
-                tracing::info!("Direct3D 12 shader compiler: FXC (no dxcompiler.dll + dxil.dll next to the exe, or DXC did not load)");
-            }
-            // with no driver of these APIs installed at all, already the surface fails
-            let surface = instance.create_surface(window.clone()).context("create surface")?;
-            let mut adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            }))
-            .context("no suitable GPU adapter")?;
-            // the UHD 600's Vulkan driver died inside `request_device`: an Intel integrated GPU on Windows uses its Direct3D 12 adapter
-            // (the same device); discrete GPUs keep wgpu's choice, and so does everything when `WGPU_BACKEND` is set
-            if cfg!(windows) && !backend_forced {
-                let first = adapter.get_info();
-                if prefer_dx12_over(first.vendor, first.device_type, first.backend) {
-                    let alt = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12)).into_iter().find(|a| {
-                        let i = a.get_info();
-                        i.vendor == first.vendor && i.device == first.device && a.is_surface_supported(&surface)
-                    });
-                    match alt {
-                        Some(a) => {
-                            tracing::info!(name = %first.name, from = ?first.backend, "Intel integrated GPU on Windows: using its Direct3D 12 adapter instead (WGPU_BACKEND overrides)");
-                            adapter = a;
-                        }
-                        None => tracing::warn!(name = %first.name, backend = ?first.backend, "Intel integrated GPU on Windows: no Direct3D 12 adapter for it, keeping the chosen one"),
-                    }
-                }
-            }
-            Ok((instance, surface, adapter))
-        };
-        let dxc_path = win_dxc_path();
-        let (instance, surface, adapter) = match wgpu::Backends::from_env() {
-            Some(chosen) => open(chosen, dxc_path.as_deref())?,
-            None => match open(wgpu::Backends::METAL | wgpu::Backends::PRIMARY, dxc_path.as_deref()) {
-                Ok(found) => found,
-                Err(e) => {
-                    tracing::warn!(error = format!("{e:#}"), "no Vulkan / Metal / Direct3D 12 for the window: trying OpenGL");
-                    open(wgpu::Backends::GL, dxc_path.as_deref())?
-                }
-            },
-        };
-        // diagnostics (port-own, `open-unleashed.log`): every adapter the instance sees, the chosen one with
-        // its features / limits, so a failure on another machine can be read from the log
-        for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
-            let i = a.get_info();
-            tracing::info!(name = %i.name, backend = ?i.backend, device_type = ?i.device_type, driver = %i.driver, driver_info = %i.driver_info, vendor = format_args!("{:#06x}", i.vendor), device = format_args!("{:#06x}", i.device), "gpu adapter available");
-        }
-        tracing::info!(adapter = ?adapter.get_info().name, backend = ?adapter.get_info().backend, "gpu adapter");
-        let _ = crate::ADAPTER_LABEL.set(format!("{} · {:?}", adapter.get_info().name, adapter.get_info().backend));
-        tracing::info!(info = ?adapter.get_info(), features = ?adapter.features(), "chosen adapter");
-        tracing::info!(limits = ?adapter.limits(), downlevel = ?adapter.get_downlevel_capabilities(), "chosen adapter limits");
-        // The device request is logged first: a driver that crashes inside it (the UHD 600's Vulkan one did) leaves nothing else to
-        // read, and the next start then runs in safe mode (`guard.rs` in the application).
-        let minimal = crate::prof::minimal();
-        tracing::info!(minimal, "requesting the device (if the log ends here, the driver crashed creating it: the next start runs in safe mode)");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("nfs-renderer"),
-            // no optional feature for the game itself; the profiler adds the timestamp queries only when asked (never in `minimal`)
-            required_features: if crate::prof::wanted() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
-            required_limits: wgpu::Limits::default(),
-            ..Default::default()
-        }))
-        .context("request device")?;
-        // A GPU error never stops the game: wgpu's default for an error no scope caught is a panic, which closes a GUI release silently.
-        device.on_uncaptured_error(Arc::new(gpu_error));
-        device.set_device_lost_callback(|reason, msg| tracing::error!(?reason, "wgpu device lost: {msg}"));
-        // TEST GLUE `NFS_TEST_GPU_ERROR=1`: one invalid resource, to see the handler log it and the game go on
-        if std::env::var_os("NFS_TEST_GPU_ERROR").is_some() {
-            let _ = device.create_texture(&wgpu::TextureDescriptor { label: Some("test glue: invalid"), size: wgpu::Extent3d { width: 0, height: 0, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
-        }
-        crate::prof::init(&device, &queue);
+/// The per-item arrays of one `encode_frame`, kept between frames so a frame allocates none.
+#[derive(Default)]
+struct FrameScratch {
+    /// the items' object uniforms, uploaded in one copy
+    objects: Vec<ObjectUniform>,
+    /// ENHANCEMENT ENH-TEMPORAL: the items' sky flags and roles of a temporal pass (empty otherwise)
+    sky_flags: Vec<bool>,
+    roles: Vec<f32>,
+    /// the 2D pass's sprite vertices, built here and copied into the belt (wgpu's mapped views are write-only)
+    sprites: Vec<SpriteVertex>,
+}
 
-        let caps = surface.get_capabilities(&adapter);
-        // a byte surface, as Direct3D 7's was: colours, blends and interpolation work on the stored
-        // bytes, not in linear light (`RE/RENDERING.md`, "Colour space")
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
-            .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
-            .unwrap_or(caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-            // the byte pipeline's surface (`RENDERING.md` "Colour space"): no colour-space conversion
-            color_space: Default::default(),
-        };
-        surface.configure(&device, &config);
-        let depth_view = Self::make_depth(&device, &config);
+/// ENHANCEMENT E1: the multisampled colour / depth a 3D pass draws into (resolved into the pass's
+/// own `view`).
+struct Ms {
+    color: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    samples: u32,
+}
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mesh shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("globals"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                // the 128 × 128 `nght` bytes, four to a u32
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                // the car shadow projector's texture (`[0x6115CC]+0x18C`) and its sampler
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // `HEAD` of `Render/common.fsh`, the headlight decal `LayerUVLight` projects
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None,
-                },
-            ],
-        });
-        let object_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("object"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                // every object of a pass in one buffer, indexed by `instance_index`
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<ObjectUniform>() as u64),
-                },
-                count: None,
-            }],
-        });
-        let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("material"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None,
-                },
-                // the specular texture's sampler: `WRAP` both ways, set on each map by the binder
-                // 0x440940 (0x537A70(1) → `tex+0x38` block `+0x14` / `+0x18`, Thrash 0x41 / 0x42)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let sky_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sky map"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                count: None,
-            }],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mesh pipeline layout"),
-            bind_group_layouts: &[Some(&globals_layout), Some(&object_layout), Some(&material_layout), Some(&sky_layout)],
-            immediate_size: 0,
-        });
-        // Thrash state 0x38's pairs (`dx7z.dll` 0x600046BB): 1 `SRCALPHA`/`ONE` (the general arm;
-        // two device kinds take `ONE`/`ONE`), 2 `ZERO`/`INVSRCALPHA`, 3 `DESTCOLOR`/`ZERO`
-        let pair_state = |pair: u8| {
-            use wgpu::BlendFactor as F;
-            let (src, dst) = match pair {
-                1 => (F::SrcAlpha, F::One),
-                2 => (F::Zero, F::OneMinusSrcAlpha),
-                3 => (F::Dst, F::Zero),
-                _ => return wgpu::BlendState::ALPHA_BLENDING,
-            };
-            let c = wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: wgpu::BlendOperation::Add };
-            wgpu::BlendState { color: c, alpha: c }
-        };
-        let make_pipeline = |blend: bool, pair: u8, cull: Option<wgpu::Face>, depth: bool, zwrite: bool, layers: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("mesh pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
-                    })],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(if layers {
-                        "fs_layers"
-                    } else if blend {
-                        "fs_main"
-                    } else {
-                        "fs_opaque"
-                    }),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(if layers {
-                            // `fs_layers` writes the premultiplied sum of the passes and their coverage
-                            let c = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
-                            wgpu::BlendState { color: c, alpha: c }
-                        } else if blend {
-                            pair_state(pair)
-                        } else {
-                            wgpu::BlendState::REPLACE
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    // mirrored clip x (see Camera::view_projection) flips the apparent winding
-                    front_face: wgpu::FrontFace::Cw,
-                    cull_mode: cull,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth && (!blend || zwrite)),
-                    // `ZFUNC` `LESSEQUAL`: `dx7z.dll` makes the device with it (0x6000A545) and the
-                    // game sets it again through the view (Thrash 0x28 ← 3: the race pass
-                    // 0x468B54, the front end's 3D pass 0x4D301D). The front-end rooms' layers —
-                    // light pools and cones on the floor and walls — share their surface's depth
-                    // and pass because of it, drawn after it in `Base+70` order
-                    // (`RE/notes/frontend-3d.md` §9). *(The port kept `LESS` until 2026-09-25,
-                    // for a fight that was the rooms' own states — file order, no pair — not the
-                    // depth test.)*
-                    depth_compare: Some(if depth { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Always }),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        // six a group — the cull (back, none, front) × depth (on, off), `2·cull + !depth` — and the
-        // groups: 0 blend off, 1 the plain alpha pair, 2…4 the other pairs, 5…8 every pair again
-        // with depth writes on (`device_states`), 9 / 10 the layered passes of a blended material
-        // (`fs_layers`, plain pair) without and with depth writes
-        const CULLS: [Option<wgpu::Face>; 3] = [Some(wgpu::Face::Back), None, Some(wgpu::Face::Front)];
-        // (the 66 pipelines compile independently: built on worker threads, kept in the same order)
-        let mut specs = Vec::with_capacity(66);
-        for (blend, pair, zwrite, layers) in [(false, 0, false, false), (true, 0, false, false), (true, 1, false, false), (true, 2, false, false), (true, 3, false, false), (true, 0, true, false), (true, 1, true, false), (true, 2, true, false), (true, 3, true, false), (true, 0, false, true), (true, 0, true, true)] {
-            for i in 0..6 {
-                specs.push((blend, pair, CULLS[i / 2], i % 2 == 0, zwrite, layers));
-            }
-        }
-        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
-        let pipelines: Vec<wgpu::RenderPipeline> = std::thread::scope(|sc| {
-            let make_pipeline = &make_pipeline;
-            let handles: Vec<_> = specs
-                .chunks(specs.len().div_ceil(workers))
-                .map(|c| sc.spawn(move || c.iter().map(|&(blend, pair, cull, depth, zwrite, layers)| make_pipeline(blend, pair, cull, depth, zwrite, layers)).collect::<Vec<_>>()))
-                .collect();
-            handles.into_iter().flat_map(|h| h.join().expect("pipeline worker")).collect()
-        });
-
-        let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globals"),
-            size: std::mem::size_of::<GlobalsUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let headlight_map_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("headlight map"),
-            size: 128 * 128,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        // The projector's texture is the one its track's `sh80` material loaded: 0x44B000 →
-        // 0x44D320 only looks it up, by the part's key `(+0x18, +0x1C)`, which on each of the five
-        // tracks with projectors is that material's `(mt+0x24, mt+0x28)` (`texblock` example). The
-        // material's block is `{…, bias −1, 0, 0}` on every one — `ADDRESSU` / `ADDRESSV` `CLAMP`
-        // (`RE/notes/thrash.md` §7) — and `sh80` has 7 mips, so the mip filter is the loader's
-        // `POINT`, `LINEAR` at `SPECIALFX` 3 (0x44D571, 0x535A60); the bias is the shader's. (Until
-        // 2026-09-25 this sampler clamped as an approximation and read the top level only.) The
-        // `HEAD` decal samples its top level explicitly through the same sampler: `common.fsh`
-        // loads with no state block (0x44D270 → 0x44D2E9 pushes 0), so `HEAD` keeps the
-        // constructor's default 0x5379D0 — `CLAMP` / `CLAMP`, `LINEAR`, mip `NONE`
-        // (`RE/notes/lighting.md` §5.2).
-        // `nfs5.ini` `Filtering=0` (dll 0x100035F0): the wrapper sends Thrash 7 (`MAG`/`MINFILTER`) as 0 =
-        // `POINT` whatever the state block says (the block's value is 1, `LINEAR`) - every sampler below
-        // takes it; the mip filters (state 0x0B) are untouched
-        let mag_min_linear = if crate::point_filter() { wgpu::FilterMode::Nearest } else { wgpu::FilterMode::Linear };
-        let make_proj_sampler = |mip: wgpu::MipmapFilterMode| {
-            device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("projector clamp"),
-                address_mode_u: wgpu::AddressMode::ClampToEdge,
-                address_mode_v: wgpu::AddressMode::ClampToEdge,
-                address_mode_w: wgpu::AddressMode::ClampToEdge,
-                mag_filter: mag_min_linear,
-                min_filter: mag_min_linear,
-                mipmap_filter: mip,
-                ..Default::default()
-            })
-        };
-        let proj_samplers = [make_proj_sampler(wgpu::MipmapFilterMode::Linear), make_proj_sampler(wgpu::MipmapFilterMode::Nearest)];
-        let proj_default = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("projector default"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &proj_default, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &[255, 255, 255, 0],
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        );
-        let proj_default_view = proj_default.create_view(&wgpu::TextureViewDescriptor::default());
-        let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals"),
-            layout: &globals_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: headlight_map_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&proj_samplers[0]) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
-            ],
-        });
-        let object_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("objects"),
-            size: std::mem::size_of::<ObjectUniform>() as u64 * MAX_OBJECTS,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let object_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("objects"),
-            layout: &object_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &object_buf,
-                    offset: 0,
-                    size: None,
-                }),
-            }],
-        });
-        // A texture's own state block (0x5379D0, `RE/notes/thrash.md` §7) asks for linear
-        // magnification and minification (Thrash 7 = 1 → `MAG`/`MINFILTER` `LINEAR`), and a mip
-        // filter that is `POINT` for a texture with mips (0x44D571…0x44D587) and becomes `LINEAR`
-        // at `SPECIALFX` 3, the default (0x535A60). No Thrash state reaches `MAXANISOTROPY` or an
-        // anisotropic filter, so there is none here (until 2026-09-24 this sampler clamped
-        // anisotropy at 8, the port's own). The promotion to `LINEAR` is `[0x69DD1D]`, which
-        // 0x44ED10 clears and sets again only at `SPECIALFX` 3 (0x44EDD1, 0x44EF04) and the front
-        // end's 0x44F020 clears (0x44F080) — `set_trilinear`; below it the mip filter is `POINT`.
-        let make_sampler = |clamp_u: bool, clamp_v: bool, mag_min: wgpu::FilterMode, mip: wgpu::MipmapFilterMode| {
-            let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
-            device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("scene"),
-                address_mode_u: mode(clamp_u),
-                address_mode_v: mode(clamp_v),
-                address_mode_w: wgpu::AddressMode::Repeat,
-                mag_filter: mag_min,
-                min_filter: mag_min,
-                mipmap_filter: mip,
-                ..Default::default()
-            })
-        };
-        let samplers = std::array::from_fn(|i| {
-            let mip = if i & 4 == 0 { wgpu::MipmapFilterMode::Linear } else { wgpu::MipmapFilterMode::Nearest };
-            make_sampler(i & 1 != 0, i & 2 != 0, mag_min_linear, mip)
-        });
-        // `LayerFalseSort1`/`2`'s other arm sets Thrash 7 ← 0 for the one draw (`MAG`/`MINFILTER`
-        // `POINT`) and never touches state 0x0B, so the mip filter here follows the same `POINT`
-        // default as every other sampler below `SPECIALFX` 3 (`trilinear` is false whenever
-        // `fakesort_mode` can pick `Single`/`PerItem` — both are set from the same level, `main.rs`)
-        let point_samplers = std::array::from_fn(|i| make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest));
-
-        // The 2D pass needs its own sampler. The 3D one once asked for `anisotropy_clamp: 8` and
-        // `mipmap_filter: Linear`, which on a single-level texture — every sprite atlas is one —
-        // sampled by a quad a dozen pixels across returns nothing on Metal. That is the fault
-        // recorded as `RE/AUDIT.md` F2: a glyph quad drawn with a 1×1 texture composites fine while
-        // the same quad with the font atlas draws nothing at all, whatever its UV window.
-        let sprite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("sprite linear clamp"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: mag_min_linear,
-            min_filter: mag_min_linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            lod_max_clamp: 0.0,
-            ..Default::default()
-        });
-
-        // 2D sprite pipeline (HUD)
-        //
-        // Blended for every sprite, the front end's included (`RE/notes/thrash.md` §8, settled
-        // 2026-09-26): the FE kit 0x4D8E10 has an opaque `Rs` block `[0x65B948]` (Thrash 0x0A ← 0)
-        // that the flush 0x4DA5F0 picks by the queued item's byte `+8`, but only the untextured
-        // fills set it — 0x4D9280 / 0x4D96B0 / 0x4D98D0 from colours that are all `0xFF` alpha,
-        // where blending gives the same pixel — while every image draw takes it from its caller
-        // (0x4D9B30's arg 8, also via 0x4D9AF0's arg 6; 0x4D9E70's arg 12, also via 0x4D9E10's
-        // arg 10), and all 72 call sites pass 0. `dx7z.dll` turns `ALPHABLENDENABLE` on or off
-        // only for Thrash 0x0A (0x60003EFE) and at device creation; binding a texture
-        // (0x60008000 → 0x60007F30) sets nothing else. The device's alpha test (`GREATER`,
-        // reference 0 / 1 / 10 by what the front end drew last) is carried only for a sprite
-        // under a depth state (`Sprite::depth`), where it decides which pixels write depth; on a
-        // plain sprite it would drop texels of alpha ≤ 10 that blending lays at ≤ 4 %.
-        let sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("sprite"), source: wgpu::ShaderSource::Wgsl(include_str!("sprite.wgsl").into()) });
-        let sprite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sprite"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-            ],
-        });
-        let sprite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("sprite"), bind_group_layouts: &[Some(&sprite_layout)], immediate_size: 0 });
-        let sprite_vertex = [Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SpriteVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4, 3 => Float32] })];
-        let make_sprite_pipeline = |label: &str, fs: &str, depth: wgpu::DepthStencilState| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&sprite_pl),
-                vertex: wgpu::VertexState { module: &sprite_shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &sprite_vertex },
-                fragment: Some(wgpu::FragmentState { module: &sprite_shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
-                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-                depth_stencil: Some(depth),
-                multisample: Default::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let sprite_pipeline = make_sprite_pipeline("sprite", "fs_main", wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() });
-        // A front-end sprite under the kit's depth state (`crate::SpriteDepth`): Thrash 0x39 ← 1
-        // (0x4D30BE) and the compare Thrash 0x28 sets — 3 `LESSEQUAL` (0x4D30C9), 6 `GREATEREQUAL`
-        // inside a mask (0x4DAAC0 → 0x537830) — with the device's alpha test in the shader.
-        let depth_state = |compare| wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(compare), stencil: Default::default(), bias: Default::default() };
-        let sprite_depth_pipelines = [
-            make_sprite_pipeline("sprite lessequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::LessEqual)),
-            make_sprite_pipeline("sprite greaterequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::GreaterEqual)),
-        ];
-        let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
-        let sprite_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("sprites"), size: MAX_SPRITES * 6 * std::mem::size_of::<SpriteVertex>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let mut r = Self {
-            surface,
-            device,
-            queue,
-            config,
-            depth_view,
-            pipelines,
-            globals_buf,
-            globals_bg,
-            globals_layout,
-            proj_samplers,
-            _proj_default: proj_default,
-            proj_default_view,
-            headlight_map_buf,
-            proj_tex: None,
-            head_tex: None,
-            object_layout,
-            material_layout,
-            sky_layout,
-            sky_bgs: Vec::new(),
-            no_reflections: false,
-            base_vertex: adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::BASE_VERTEX),
-            buffer_serial: 0,
-            samplers,
-            point_samplers,
-            trilinear: false,
-            fakesort_mode: FakeSortMode::default(),
-            gamma: 1.0,
-            gamma_pass: None,
-            sprite_sampler,
-            object_buf,
-            object_bg,
-            meshes: Vec::new(),
-            arena: None,
-            textures: Vec::new(),
-            materials: Vec::new(),
-            white: TextureId(0),
-            sprite_pipeline,
-            sprite_depth_pipelines,
-            offscreen: std::collections::HashMap::new(),
-            sprite_layout,
-            sprite_buf,
-            belt,
-            pending_writes: Vec::new(),
-            pending_bytes: Vec::new(),
-            pending_textures: Vec::new(),
-            pending_texture_bytes: Vec::new(),
-            depth_cache: std::collections::HashMap::new(),
-            buckets: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            lens_enabled: false,
-            lens_pending: Vec::new(),
-            lens_done: Vec::new(),
-            lens_staged: Vec::new(),
-            object_scratch: Vec::new(),
-            sprite_scratch: Vec::new(),
-            frames_in_flight: std::collections::VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + 1),
-            last_submit: None,
-        };
-        let _ = &r.object_layout;
-        r.white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
-        Ok(r)
-    }
-
-    fn make_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
-        Self::make_depth_sized(device, config.width, config.height)
-    }
-
-    fn make_depth_sized(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-        device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("depth"),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            })
-            .create_view(&Default::default())
-    }
-
-    /// Execute a frame's command list (`front::CmdList`) in call order — the start of the frame's
-    /// encode: every mutation the scene build made since the last one. A queued vertex / texture write
-    /// lands in the next encoder (`flush_mesh_writes` / `flush_texture_writes`), as it did when the
-    /// callers wrote to the renderer directly; an offscreen pass encodes and submits here, in its place
-    /// in the order, so the writes before it are in its encoder and those after it are not.
-    pub(crate) fn apply(&mut self, list: &mut CmdList) {
-        let CmdList { cmds, bytes, .. } = list;
-        for c in cmds.drain(..) {
-            match c {
-                Cmd::WriteMesh { mesh, start, len } => self.defer_mesh_write(MeshId(mesh), &bytes[start..start + len]),
-                Cmd::UpdateTextureLevel { texture, level, width, height, start, len } => self.queue_texture_level(TextureId(texture), level, width, height, &bytes[start..start + len]),
-                Cmd::HeadlightMap(map) => self.set_headlight_map(&map),
-                Cmd::Projector(t) => self.set_projector_texture(t),
-                Cmd::HeadlightTexture(t) => self.set_headlight_texture(t),
-                Cmd::MirrorView(on) => self.set_mirror_view(on),
-                Cmd::Trilinear(on) => self.set_trilinear(on),
-                Cmd::FakeSort(m) => self.set_fakesort_mode(m),
-                Cmd::Gamma(g) => self.set_gamma(g),
-                Cmd::Resize(w, h) => self.resize(w, h),
-                Cmd::LensProbe(on) => self.set_lens_enabled(on),
-                Cmd::CreateMaterial(d) => {
-                    self.create_material(d);
-                }
-                Cmd::DuplicateMaterial { id, texture } => {
-                    self.duplicate_material_texture(id, texture);
-                }
-                Cmd::DynamicMesh(m) => {
-                    self.upload_dynamic_mesh(&m);
-                }
-                Cmd::Offscreen(j) => {
-                    let id = self.render_offscreen(&j.scene, &j.camera, OffscreenSpec { width: j.width, height: j.height, reuse: j.reuse, clear_colour: j.clear, depth_far: j.depth_far });
-                    debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");
-                }
-            }
-        }
-        bytes.clear();
-    }
-
-    /// The start of a frame, before its commands are applied: the previous frame's last
-    /// submission joins the frames in flight, and once more than [`MAX_FRAMES_IN_FLIGHT`] are
-    /// queued the oldest is waited for. Only the host's pacing: nothing drawn changes.
-    pub(crate) fn frame_begin(&mut self) {
-        if let Some(i) = self.last_submit.take() {
-            self.frames_in_flight.push_back(i);
-        }
-        while self.frames_in_flight.len() > MAX_FRAMES_IN_FLIGHT {
-            let oldest = self.frames_in_flight.pop_front().expect("non-empty");
-            let _ = self.device.poll(wgpu::PollType::Wait { submission_index: Some(oldest), timeout: Some(std::time::Duration::from_secs(1)) });
-        }
-    }
-
-    pub(crate) fn white(&self) -> TextureId {
-        self.white
-    }
-    pub(crate) fn texture_count(&self) -> u32 {
-        self.textures.len() as u32
-    }
-    /// `(vertex bytes, writes)` per mesh, for the front's mirror.
-    pub(crate) fn mesh_infos(&self) -> Vec<(u64, u32)> {
-        self.meshes.iter().map(|m| (m.vertex_len, m.writes)).collect()
-    }
-    pub(crate) fn mesh_vertex_len(&self, id: MeshId) -> u64 {
-        self.meshes[id.0 as usize].vertex_len
-    }
-    pub(crate) fn material_textures(&self) -> Vec<TextureId> {
-        self.materials.iter().map(|m| m.texture).collect()
-    }
-    pub(crate) fn offscreen_sizes(&self) -> std::collections::HashMap<u32, (u32, u32)> {
-        self.offscreen.clone()
-    }
-
-    /// Let the surface be copied from, for the lens flare's frame read-back. Off (the default) the
-    /// surface is a render attachment alone.
-    pub fn set_lens_enabled(&mut self, on: bool) {
-        if self.lens_enabled == on {
-            return;
-        }
-        self.lens_enabled = on;
-        self.config.usage = if on { wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::RENDER_ATTACHMENT };
-        self.surface.configure(&self.device, &self.config);
-        if !on {
-            self.lens_pending.clear();
-        }
-    }
-
-    /// Collect the lens-flare read-backs that have finished (their copies ran and their buffers are
-    /// mapped) into [`Self::lens_done`]; the cost of each is what this takes, in whole milliseconds.
-    fn collect_lens(&mut self) {
-        if self.lens_pending.is_empty() {
-            return;
-        }
-        let t0 = std::time::Instant::now();
-        let _ = self.device.poll(wgpu::PollType::Poll);
-        let mut keep = Vec::new();
-        for p in std::mem::take(&mut self.lens_pending) {
-            match p.rx.try_recv() {
-                Ok(Ok(())) => {
-                    let mut pixels = [0u32; 16];
-                    {
-                        let data = p.buf.slice(..).get_mapped_range().expect("mapped range");
-                        for (row, chunk) in pixels.chunks_exact_mut(4).enumerate() {
-                            for (i, px) in chunk.iter_mut().enumerate() {
-                                let o = row * LENS_ROW as usize + i * 4;
-                                *px = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
-                            }
-                        }
-                    }
-                    p.buf.unmap();
-                    self.lens_done.push(LensRead { reference: p.reference, pixels, cost_ms: t0.elapsed().as_millis() as u32 });
-                }
-                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
-                Err(std::sync::mpsc::TryRecvError::Empty) => keep.push(p),
-            }
-        }
-        // a read-back that never completes does not pile up
-        let n = keep.len();
-        if n > 8 {
-            keep.drain(..n - 8);
-        }
-        self.lens_pending = keep;
-    }
-
-    /// The finished read-backs, taken.
-    pub(crate) fn take_lens(&mut self) -> Vec<LensRead> {
-        std::mem::take(&mut self.lens_done)
-    }
-
-    /// PORT-DEVIATION D9 (PORT-DEVIATIONS.md) [0x460460 / dx7z 0x60003990, a blocking lock in the frame]:
-    /// Copy the 4 × 4 block at the probe's pixel from `target` into a fresh staging buffer and map
-    /// it; [`Self::collect_lens`] picks it up when the copy has run. The block's corner is clamped as
-    /// `nfs5.dll`'s 0x10003320 does for every `THRASH_readrect` (the call at 0x4603FF / 0x460525 is
-    /// routed through it): not below 0, and `corner + 4` below the width / height — else `W − 5`
-    /// / `H − 5` (`dx7z.dll` 0x60003990 itself does no clipping).
-    fn lens_copy(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture, probe: LensProbe, reference: bool) {
-        let (w, h) = (target.width() as i32, target.height() as i32);
-        if w < 5 || h < 5 {
-            return;
-        }
-        let (px, py) = ((probe.x / 640.0 * w as f32).round_ties_even() as i32 - 2, (probe.y / 480.0 * h as f32).round_ties_even() as i32 - 2);
-        // 0x10003320: `max(v, 0)`, then `v + 4 >= size` → `size − 5`
-        let clamp = |v: i32, size: i32| {
-            let v = v.max(0);
-            if v + 4 >= size { size - 5 } else { v }
-        };
-        let (x, y) = (clamp(px, w), clamp(py, h));
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("lens read-back"), size: LENS_ROW * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: 0 }, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(LENS_ROW as u32), rows_per_image: Some(4) } },
-            wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 },
-        );
-        // mapped after the frame's submit ([`Self::lens_map_staged`])
-        self.lens_staged.push((buf, reference));
-    }
-
-    /// Ask for the mapping of every block copied this frame; call after the submit.
-    fn lens_map_staged(&mut self) {
-        for (buf, reference) in std::mem::take(&mut self.lens_staged) {
-            let (tx, rx) = std::sync::mpsc::channel();
-            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-            self.lens_pending.push(LensPending { buf, reference, rx });
-        }
-    }
-
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-        self.depth_view = Self::make_depth(&self.device, &self.config);
-    }
-
-    /// The surface's pixel size.
-    pub fn size(&self) -> (u32, u32) {
-        (self.config.width.max(1), self.config.height.max(1))
-    }
-
-    pub fn aspect(&self) -> f32 {
-        self.config.width as f32 / self.config.height.max(1) as f32
-    }
-
-    /// A mesh whose vertices are rewritten every frame — [`Self::write_mesh_vertices`]. The index
-    /// buffer and the index count are fixed at upload; only the vertex data moves.
-    pub fn upload_dynamic_mesh(&mut self, mesh: &MeshData) -> MeshId {
-        let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("dynamic mesh vb"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-        let index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("dynamic mesh ib"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let (vertex_len, index_len) = (vertex_buf.size(), index_buf.size());
-        let serial = self.buffer_serial;
-        self.buffer_serial += 1;
-        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0 });
-        MeshId(self.meshes.len() as u32 - 1)
-    }
-
-    /// Queue a vertex write for the next frame's encoder (`flush_mesh_writes`); empty writes are
-    /// dropped as `write_buffer` drops them.
-    pub(crate) fn defer_mesh_write(&mut self, id: MeshId, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        self.meshes[id.0 as usize].writes = self.meshes[id.0 as usize].writes.wrapping_add(1);
-        self.pending_writes.push(PendingWrite { mesh: id.0, start: self.pending_bytes.len(), len: bytes.len() });
-        self.pending_bytes.extend_from_slice(bytes);
-    }
-
-    /// Record the queued vertex writes into `encoder`, from the staging belt, in call order.
-    fn flush_mesh_writes(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        for w in &self.pending_writes {
-            let size = wgpu::BufferSize::new(w.len as u64).expect("non-empty write");
-            let m = &self.meshes[w.mesh as usize];
-            self.belt.write_buffer(encoder, &m.vertex_buf, m.vertex_offset, size).copy_from_slice(&self.pending_bytes[w.start..w.start + w.len]);
-        }
-        self.pending_writes.clear();
-        self.pending_bytes.clear();
-    }
-
-    pub fn upload_mesh(&mut self, mesh: &MeshData) -> MeshId {
-        let vbytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
-        let ibytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
-        let (vlen, ilen) = (vbytes.len() as u64, ibytes.len() as u64);
-        // every range is rounded to 8 bytes (a mapped range starts on a multiple of 8, a slice on 4;
-        // and an empty one still reserves 8, so it can be sliced), a vertex range to whole vertices
-        // too (48 bytes, a multiple of 8), so each mesh starts on a vertex: its `base_vertex`
-        let (vreserve, ireserve) = (vlen.next_multiple_of(VERTEX_STRIDE).max(VERTEX_STRIDE), ilen.next_multiple_of(8).max(8));
-        let fits = self.arena.as_ref().is_some_and(|a| a.vertex_used + vreserve <= a.vertex_buf.size() && a.index_used + ireserve <= a.index_buf.size());
-        if !fits {
-            // a full arena goes to the queue now, so the host copies of a whole track's meshes do not pile up
-            if self.arena.as_ref().is_some_and(|a| a.mapped) {
-                self.seal_arena();
-                self.queue.submit(std::iter::empty());
-            }
-            let make = |label: &'static str, usage: wgpu::BufferUsages, need: u64| {
-                self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: ARENA_CHUNK.max(need), usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: true })
-            };
-            let serial = self.buffer_serial;
-            self.buffer_serial += 1;
-            self.arena = Some(MeshArena {
-                serial,
-                vertex_buf: make("mesh arena vb", wgpu::BufferUsages::VERTEX, vreserve),
-                vertex_used: 0,
-                index_buf: make("mesh arena ib", wgpu::BufferUsages::INDEX, ireserve),
-                index_used: 0,
-                mapped: true,
-            });
-        }
-        let a = self.arena.as_mut().expect("arena made");
-        let (vertex_offset, index_offset) = (a.vertex_used, a.index_used);
-        if a.mapped {
-            if !vbytes.is_empty() {
-                a.vertex_buf.slice(vertex_offset..vertex_offset + vlen).get_mapped_range_mut().expect("mapped arena").copy_from_slice(vbytes);
-            }
-            if !ibytes.is_empty() {
-                a.index_buf.slice(index_offset..index_offset + ilen).get_mapped_range_mut().expect("mapped arena").copy_from_slice(ibytes);
-            }
-        } else {
-            if !vbytes.is_empty() {
-                self.queue.write_buffer(&a.vertex_buf, vertex_offset, vbytes);
-            }
-            if !ibytes.is_empty() {
-                self.queue.write_buffer(&a.index_buf, index_offset, ibytes);
-            }
-        }
-        a.vertex_used += vreserve;
-        a.index_used += ireserve;
-        self.meshes.push(GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0 });
-        MeshId(self.meshes.len() as u32 - 1)
-    }
-
-    /// Unmap the mesh arena so the GPU can read it: what [`Self::upload_mesh`] copied into the mapped
-    /// buffers becomes visible to the next frame. A later mesh that still fits goes in as a queued write.
-    fn seal_arena(&mut self) {
-        if let Some(a) = self.arena.as_mut().filter(|a| a.mapped) {
-            a.vertex_buf.unmap();
-            a.index_buf.unmap();
-            a.mapped = false;
-        }
-    }
-
-    pub fn upload_texture(&mut self, tex: &TextureData) -> TextureId {
-        self.upload_texture_mips(tex.width, tex.height, &tex.mips)
-    }
-
-    /// [`Self::upload_texture`] over borrowed levels, so a caller that keeps its pixels does not
-    /// clone a whole mip chain just to hand it over.
-    pub fn upload_texture_mips(&mut self, width: u32, height: u32, mips: &[Vec<u8>]) -> TextureId {
-        let t = Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, width, height, mips);
-        self.textures.push(t);
-        TextureId(self.textures.len() as u32 - 1)
-    }
-
-    /// Several textures at once, the ids in the order given (the next free ones, as the same
-    /// number of [`Self::upload_texture_mips`] calls would hand them). The device and the queue
-    /// are thread-safe, so the textures are built on worker threads and pushed in order.
-    pub fn upload_textures(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
-        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(items.len());
-        let built: Vec<GpuTexture> = if workers <= 1 {
-            items.iter().map(|&(w, h, m)| Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, w, h, m)).collect()
-        } else {
-            let (device, queue, layout, sampler) = (&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler);
-            let chunk = items.len().div_ceil(workers);
-            std::thread::scope(|s| {
-                let handles: Vec<_> = items
-                    .chunks(chunk)
-                    .map(|c| s.spawn(move || c.iter().map(|&(w, h, m)| Self::make_texture(device, queue, layout, sampler, w, h, m)).collect::<Vec<_>>()))
-                    .collect();
-                handles.into_iter().flat_map(|h| h.join().expect("texture worker")).collect()
-            })
-        };
-        let first = self.textures.len() as u32;
-        self.textures.extend(built);
-        (first..self.textures.len() as u32).map(TextureId).collect()
-    }
-
-    fn make_texture(device: &wgpu::Device, queue: &wgpu::Queue, sprite_layout: &wgpu::BindGroupLayout, sprite_sampler: &wgpu::Sampler, width: u32, height: u32, mips: &[Vec<u8>]) -> GpuTexture {
-        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-        let mip_level_count = mips.len().max(1) as u32;
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("texture"),
-            size,
-            mip_level_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let (mut w, mut h) = (width, height);
-        for (level, data) in mips.iter().enumerate() {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                data,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
-        }
-        let view = texture.create_view(&Default::default());
-        let sprite_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sprite tex"),
-            layout: sprite_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sprite_sampler) }],
-        }));
-        tracing::debug!(w = width, h = height, "texture uploaded");
-        GpuTexture { _texture: texture, view, sprite_bg }
-    }
-
-
-    /// One mip level of `Renderer::update_texture`: `data` holds `h` rows of `4 · w` bytes (or more; the
-    /// rest is ignored; less and the level is skipped).
-    pub(crate) fn queue_texture_level(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
-        if self.textures.get(id.0 as usize).is_none() {
-            return;
-        }
-        // queued for the next frame's encoder (`flush_texture_writes`), where `write_texture` would
-        // have executed it (before that submit's commands); the rows are padded to 256 bytes
-        let row = 4 * w as usize;
-        let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
-        if data.len() >= row * h as usize {
-            // a queued write of the same whole level is overwritten in place (the last wins, as the
-            // later `write_texture` would), so frames that are not rendered do not pile writes up
-            let same = self.pending_textures.iter().find(|q| q.texture == id.0 && q.level == level && q.width == w && q.height == h).map(|q| q.start);
-            let start = same.unwrap_or(self.pending_texture_bytes.len());
-            if same.is_none() {
-                self.pending_texture_bytes.resize(start + padded * h as usize, 0);
-                self.pending_textures.push(PendingTextureWrite { texture: id.0, level, width: w, height: h, bytes_per_row: padded as u32, start });
-            }
-            for y in 0..h as usize {
-                self.pending_texture_bytes[start + y * padded..start + y * padded + row].copy_from_slice(&data[y * row..(y + 1) * row]);
-            }
-        }
-    }
-
-    /// A frame that draws nothing (the window occluded, the surface lost) still carries out the
-    /// buffer and texture writes queued for it, as `write_buffer` / `write_texture` did at once:
-    /// left queued, the vertex writes of every skipped frame (a few hundred KB each, thousands of
-    /// frames a second while hidden) piled up to gigabytes and were all copied by the next drawn
-    /// frame (`RE/notes/PERF.md` PERF2).
-    fn flush_writes(&mut self) {
-        if self.pending_writes.is_empty() && self.pending_textures.is_empty() {
-            return;
-        }
-        self.seal_arena();
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("writes") });
-        self.flush_texture_writes(&mut encoder);
-        self.flush_mesh_writes(&mut encoder);
-        self.belt.finish();
-        self.last_submit = Some(self.queue.submit(Some(encoder.finish())));
-        self.belt.recall();
-    }
-
-    /// Record the queued texture writes into `encoder`, from the staging belt, in call order.
-    fn flush_texture_writes(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        for w in &self.pending_textures {
-            let Some(gpu) = self.textures.get(w.texture as usize) else { continue };
-            let len = w.bytes_per_row as usize * w.height as usize;
-            let size = wgpu::BufferSize::new(len as u64).expect("non-empty write");
-            let slice = self.belt.allocate(size, wgpu::BufferSize::new(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64).unwrap());
-            slice.get_mapped_range_mut().expect("belt slice").copy_from_slice(&self.pending_texture_bytes[w.start..w.start + len]);
-            encoder.copy_buffer_to_texture(
-                wgpu::TexelCopyBufferInfo { buffer: slice.buffer(), layout: wgpu::TexelCopyBufferLayout { offset: slice.offset(), bytes_per_row: Some(w.bytes_per_row), rows_per_image: Some(w.height) } },
-                wgpu::TexelCopyTextureInfo { texture: &gpu._texture, mip_level: w.level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::Extent3d { width: w.width, height: w.height, depth_or_array_layers: 1 },
-            );
-        }
-        self.pending_textures.clear();
-        self.pending_texture_bytes.clear();
-    }
-
-    pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
-        let texture = desc.texture.unwrap_or(self.white);
-        let env = desc.env_texture.unwrap_or(self.white);
-        let sampler = desc.clamp[0] as usize | (desc.clamp[1] as usize) << 1;
-        let bind_group = self.material_bind_group(texture, sampler, env);
-        let bind_group_point = desc.false_sort.then(|| self.material_bind_group_point(texture, sampler, env));
-        self.materials.push(GpuMaterial {
-            bind_group,
-            bind_group_point,
-            alpha_blend: desc.alpha_blend,
-            blend_pair: desc.blend_pair.min(3),
-            device_states: desc.device_states,
-            sampler,
-            lod_bias: desc.lod_bias,
-            cull_back: desc.cull_back,
-            view_cull: desc.view_cull,
-            depth_bias: desc.depth_bias,
-            false_sort: desc.false_sort,
-            depth_test: desc.depth_test,
-            env_mix: if desc.env_texture.is_some() { desc.env_mix } else { 0.0 },
-            env_variant: desc.env_variant.min(2),
-            sky_map: desc.sky_map,
-            texture,
-            env,
-        });
-        MaterialId(self.materials.len() as u32 - 1)
-    }
-    /// A new material identical to `id` but sampling `texture` in its place — same blend/cull/lod
-    /// state and specular map, a fresh bind group. Used to give one traffic/cop car instance its
-    /// own decal-page material when `nfs_game::world::CarModel::instantiate` clones the shared
-    /// model's damage resources so two differently-damaged instances in one frame no longer alias
-    /// (`RE/notes/car-model.md` §13.1: this renderer batches every frame's `DrawItem`s and reads
-    /// each `MeshId`/`TextureId`/`MaterialId` once at `render()`, unlike the original's per-car
-    /// synchronous blit 0x572B40).
-    pub fn duplicate_material_texture(&mut self, id: MaterialId, texture: TextureId) -> MaterialId {
-        let Some(m) = self.materials.get(id.0 as usize) else { return id };
-        let (sampler, env, false_sort) = (m.sampler, m.env, m.false_sort);
-        let (alpha_blend, blend_pair, device_states, lod_bias, cull_back, view_cull, depth_bias, depth_test, env_mix, env_variant, sky_map) =
-            (m.alpha_blend, m.blend_pair, m.device_states, m.lod_bias, m.cull_back, m.view_cull, m.depth_bias, m.depth_test, m.env_mix, m.env_variant, m.sky_map);
-        let bind_group = self.material_bind_group(texture, sampler, env);
-        let bind_group_point = false_sort.then(|| self.material_bind_group_point(texture, sampler, env));
-        self.materials.push(GpuMaterial {
-            bind_group,
-            bind_group_point,
-            alpha_blend,
-            blend_pair,
-            device_states,
-            sampler,
-            lod_bias,
-            cull_back,
-            view_cull,
-            depth_bias,
-            false_sort,
-            depth_test,
-            env_mix,
-            env_variant,
-            sky_map,
-            texture,
-            env,
-        });
-        MaterialId(self.materials.len() as u32 - 1)
-    }
-
-    /// Point every reflective material at another environment map — the original re-binds the car's
-    /// environment layers whenever the `.map` section under it changes (`RE/notes/lighting.md` §3).
-    /// `night.psh`'s `nght` bitmap, 128 × 128 bytes, for the headlight projector.
-    pub fn set_headlight_map(&mut self, map: &[u8]) {
-        if map.len() == 128 * 128 {
-            self.queue.write_buffer(&self.headlight_map_buf, 0, map);
-        }
-    }
-
-    /// The car shadow projector's texture, `[0x6115CC]+0x18C` (`RE/notes/crp-geometry.md` §8);
-    /// `None` for none.
-    pub fn set_projector_texture(&mut self, tex: Option<TextureId>) {
-        self.proj_tex = tex;
-        self.rebuild_globals_bg();
-    }
-
-    /// `HEAD` of `Render/common.fsh`, what `Headlights::LayerUVLight` projects (0x452645 fetches it
-    /// by that four-character code); `None` for none.
-    pub fn set_headlight_texture(&mut self, tex: Option<TextureId>) {
-        self.head_tex = tex;
-        self.rebuild_globals_bg();
-    }
-
-    fn rebuild_globals_bg(&mut self) {
-        let pick = |t: Option<TextureId>| match t.and_then(|t| self.textures.get(t.0 as usize)) {
-            Some(t) => &t.view,
-            None => &self.proj_default_view,
-        };
-        let (proj, head) = (pick(self.proj_tex), pick(self.head_tex));
-        self.globals_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals"),
-            layout: &self.globals_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.globals_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.headlight_map_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(proj) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.proj_samplers[!self.trilinear as usize]) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(head) },
-            ],
-        });
-    }
-
-    /// The view about to be drawn is the rear-view mirror's: `[0x6115CC]+0x190` is set from the
-    /// view's type (`[[0x628130]+0x10]+0x2C == 1`, 0x43AD39…0x43AD4E; 0x4691D0 makes the mirror's
-    /// view with type 1), and the specular and sky-map layers then bind no texture and skip their
-    /// passes (0x445578, 0x445B69).
-    /// The same flag keeps out the draws only the main view makes (`DrawItem::main_view_only`).
-    pub fn set_mirror_view(&mut self, on: bool) {
-        self.no_reflections = on;
-    }
-
-    /// The bind group for a section map, made the first time a car binds it.
-    fn sky_bind_group(&mut self, tex: TextureId) {
-        let i = tex.0 as usize;
-        if self.sky_bgs.get(i).is_some_and(|b| b.is_some()) {
-            return;
-        }
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sky map"),
-            layout: &self.sky_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.textures[tex.0 as usize].view) }],
-        });
-        if self.sky_bgs.len() <= i {
-            self.sky_bgs.resize_with(i + 1, || None);
-        }
-        self.sky_bgs[i] = Some(bg);
-    }
-
-    /// A material's bind group: its texture, the sampler for its address modes under the current
-    /// mip filter, and the environment map.
-    fn material_bind_group(&self, texture: TextureId, sampler: usize, env: TextureId) -> wgpu::BindGroup {
-        let sampler = &self.samplers[sampler | (!self.trilinear as usize) << 2];
-        self.material_bind_group_with(texture, sampler, env)
-    }
-
-    /// The same bind group with `MAG`/`MINFILTER` `POINT` (Thrash 7 ← 0) — `LayerFalseSort1`'s
-    /// other arm, for a `FakeSort` material only.
-    fn material_bind_group_point(&self, texture: TextureId, sampler: usize, env: TextureId) -> wgpu::BindGroup {
-        self.material_bind_group_with(texture, &self.point_samplers[sampler], env)
-    }
-
-    fn material_bind_group_with(&self, texture: TextureId, sampler: &wgpu::Sampler, env: TextureId) -> wgpu::BindGroup {
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("material"),
-            layout: &self.material_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.textures[texture.0 as usize].view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.textures[env.0 as usize].view) },
-                // `WRAP` / `WRAP` (index 0: no clamp); sampled at level 0, so the mip half is moot
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[0]) },
-            ],
-        })
-    }
-
-    /// `[0x69DD1D]`, the mip filter's promotion (0x535B40 / 0x535A60, `RE/notes/thrash.md` §4):
-    /// set, every texture with mips is sampled trilinear; clear, `POINT` between the levels.
-    /// 0x44ED10 sets it only at `SPECIALFX` 3 on a card that took `setstate(0x0B, 3)`
-    /// (`[0x6197A6]`, taken as accepted); the front end's 0x44F020 clears it.
-    pub fn set_trilinear(&mut self, on: bool) {
-        if self.trilinear == on {
-            return;
-        }
-        self.trilinear = on;
-        for i in 0..self.materials.len() {
-            let m = &self.materials[i];
-            self.materials[i].bind_group = self.material_bind_group(m.texture, m.sampler, m.env);
-        }
-        self.rebuild_globals_bg();
-    }
-
-    /// `LayerFalseSort1`/`2`'s per-frame pick (`main.rs`'s `App::fakesort_mode`, [`FakeSortMode`]).
-    pub fn set_fakesort_mode(&mut self, mode: FakeSortMode) {
-        self.fakesort_mode = mode;
-    }
-
-    /// State 0x2E's value as the game passes it; `dx7z.dll` 0x600051EE…0x6000522E: `≤ 0` → 0,
-    /// not `< 4` → 4.
-    pub fn set_gamma(&mut self, g: f32) {
-        self.gamma = if g <= 0.0 { 0.0 } else if g < 4.0 { g } else { 4.0 };
-    }
-
-    /// Draw a frame into `target` (`width × height`, the surface's format): straight in at gamma
-    /// 1, otherwise into the gamma pass's own image and then through the ramp into `target`.
-    /// `can_copy`: `target_tex` (or the gamma pass's own image) may be copied from — the lens
-    /// flare's blocks read the frame **before** the ramp, as `THRASH_readrect` reads the back
-    /// buffer and the ramp is the display's.
-    fn encode_with_gamma(&mut self, scene: &Scene, camera: &Camera, frame: FrameTarget, width: u32, height: u32, aspect: f32) {
-        let FrameTarget { view: target, texture: target_tex, can_copy, depth_view: depth } = frame;
-        if self.gamma == 1.0 {
-            self.encode_frame(scene, camera, FrameTarget { view: target, texture: target_tex, can_copy, depth_view: depth }, FrameOpts { clear_color: scene.clear_color, with_sprites: true, aspect, depth_far: VIEW_FAR });
-            crate::prof::end_frame(&self.device);
-            return;
-        }
-        let mut pass = match self.gamma_pass.take() {
-            Some(p) => p,
-            None => GammaPass::new(&self.device, self.config.format),
-        };
-        let (src_tex, src) = pass.source(&self.device, self.config.format, width, height);
-        self.encode_frame(scene, camera, FrameTarget { view: &src, texture: &src_tex, can_copy: true, depth_view: depth }, FrameOpts { clear_color: scene.clear_color, with_sprites: true, aspect, depth_far: VIEW_FAR });
-        pass.resolve(&self.device, &self.queue, target, self.gamma);
-        self.gamma_pass = Some(pass);
-        crate::prof::end_frame(&self.device);
-    }
-
-    pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                self.flush_writes();
-                return Ok(());
-            }
-            // a timeout or an occluded window: skip the frame (wgpu 30)
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                self.flush_writes();
-                return Ok(());
-            }
-            other => anyhow::bail!("surface texture: {other:?}"),
-        };
-        let view = frame.texture.create_view(&Default::default());
-        let aspect = self.aspect();
-        let depth = self.depth_view.clone();
-        let (w, h) = (frame.texture.width(), frame.texture.height());
-        let can_copy = self.lens_enabled;
-        self.encode_with_gamma(scene, camera, FrameTarget { view: &view, texture: &frame.texture, can_copy, depth_view: &depth }, w, h, aspect);
-        self.queue.present(frame);
-        self.collect_lens();
-        Ok(())
-    }
-
-    /// The depth target for a pass of this size: one per size, kept (every pass clears it first,
-    /// so sharing it between offscreen passes is the same as a fresh texture each).
-    fn depth_for(&mut self, width: u32, height: u32) -> wgpu::TextureView {
-        let device = &self.device;
-        self.depth_cache.entry((width, height)).or_insert_with(|| Self::make_depth_sized(device, width, height)).clone()
-    }
-
-    /// Render one frame into an offscreen RGBA8 image (for screenshots and automated checks).
-    /// Render a scene's meshes into an offscreen texture that the sprite pass can then draw, so a
-    /// 3D view can sit **inside** the 2D screen in the right drawing order — what the front end's
-    /// `NFS5.3DCAR` widgets need (`RE/notes/frontend-3d.md` §4). The clear is transparent, so only
-    /// the geometry shows, unless `clear` gives an opaque colour (the in-race rear-view mirror).
-    /// Passing the id of a texture this returned earlier reuses it.
-    /// `depth_far` is the far plane of the pass's own screen z — the scale of the state 0x18 depth
-    /// bias (`encode_frame`): `None` for the main view's 700, the rear view's 65000 (0x4691D0).
-    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, spec: OffscreenSpec) -> TextureId {
-        let OffscreenSpec { width, height, reuse, clear_colour, depth_far } = spec;
-        let (width, height) = (width.max(1), height.max(1));
-        let id = match reuse.filter(|t| self.offscreen.get(&t.0).is_some_and(|(w, h)| *w == width && *h == height)) {
-            Some(t) => t,
-            None => {
-                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("offscreen 3d"),
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: self.config.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
-                let view = texture.create_view(&Default::default());
-                let sprite_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("offscreen tex"),
-                    layout: &self.sprite_layout,
-                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) }],
-                }));
-                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg });
-                let id = TextureId(self.textures.len() as u32 - 1);
-                self.offscreen.insert(id.0, (width, height));
-                id
-            }
-        };
-        let depth = self.depth_for(width, height);
-        let view = self.textures[id.0 as usize].view.clone();
-        // the scene's items and lights as they are, its own clear colour replaced and no sprites
-        let target = self.textures[id.0 as usize]._texture.clone();
-        crate::prof::ctx(" [offscreen]");
-        self.encode_frame(scene, camera, FrameTarget { view: &view, texture: &target, can_copy: false, depth_view: &depth }, FrameOpts { clear_color: clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]), with_sprites: false, aspect: width as f32 / height as f32, depth_far: depth_far.unwrap_or(VIEW_FAR) });
-        crate::prof::ctx("");
-        id
-    }
-
-    pub fn render_to_image(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {
-        let target = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("offscreen"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = target.create_view(&Default::default());
-        let depth = self.depth_for(width, height);
-        self.encode_with_gamma(scene, camera, FrameTarget { view: &view, texture: &target, can_copy: true, depth_view: &depth }, width, height, width as f32 / height as f32);
-        let px = self.readback(&target, width, height);
-        // the read-back above waited for the device, so the frame's lens blocks are mapped
-        self.collect_lens();
-        px
-    }
-
-    /// PORT-DEVIATION D46 (photo mode): a still of the scene at `width x height` — the window's size times 1, 2 or 4 —
-    /// as RGBA8 rows, with its real size: the request is scaled down, keeping its aspect, to the device's largest 2D
-    /// texture, its largest buffer and [`STILL_MAX_PIXELS`]. It is the frame [`Self::render_to_image`] draws (the
-    /// same pipeline, the sprites and the gamma ramp included) at that size, so a bigger still is a bigger frame and
-    /// not a bigger copy of one. The sized depth image is dropped after it; the gamma pass's source is resized back
-    /// by the next window frame.
-    pub fn render_still(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<(u32, u32, Vec<u8>)> {
-        let (w, h) = still_size(width, height, self.device.limits().max_texture_dimension_2d, self.device.limits().max_buffer_size);
-        let r = self.render_to_image(scene, camera, w, h);
-        self.depth_cache.remove(&(w, h));
-        r.map(|px| (w, h, px))
-    }
-
-    /// Copies a `COPY_SRC` texture to the host as tightly packed RGBA8.
-    fn readback(&self, target: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<u8>> {
-        let bytes_per_row = (4 * width).div_ceil(256) * 256;
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (bytes_per_row * height) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(height) } },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        self.queue.submit(Some(enc.finish()));
-        let slice = buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device.poll(wgpu::PollType::wait_indefinitely())?;
-        rx.recv()??;
-        let data = slice.get_mapped_range().expect("mapped range");
-        let mut out = Vec::with_capacity((width * height * 4) as usize);
-        let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
-        for row in 0..height {
-            let r = &data[(row * bytes_per_row) as usize..(row * bytes_per_row + width * 4) as usize];
-            if bgra {
-                for px in r.chunks_exact(4) {
-                    out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-                }
+/// IEEE half to single (the lens probe's read of the float image).
+fn f16_to_f32(h: u16) -> f32 {
+    let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1F) as i32, (h & 0x3FF) as u32);
+    let v = match exp {
+        0 => man as f32 * 2f32.powi(-24),
+        31 => {
+            if man == 0 {
+                f32::INFINITY
             } else {
-                out.extend_from_slice(r);
+                f32::NAN
             }
         }
-        drop(data);
-        buf.unmap();
-        Ok(out)
-    }
-
-    /// Draw one stage's items into `pass`, in order: consecutive items of one mesh under one state
-    /// are one instanced draw. `st` is what the pass already has bound.
-    fn draw_bucket(&self, pass: &mut wgpu::RenderPass<'_>, scene: &Scene, bucket: &[u32], st: &mut DrawState, white: TextureId) {
-        // consecutive items of one mesh under one state are one instanced draw
-        let mut run: Option<Run> = None;
-        for &idx in bucket {
-            let item = &scene.items[idx as usize];
-            let mat = &self.materials[item.material.0 as usize];
-            // mirrored world: the winding flips, so a material whose cull is the view's culls
-            // the other one (0x468C45); any other draws both faces rather than the wrong one
-            let cull = match (mat.cull_back, scene.mirror != item.mirrored, mat.view_cull) {
-                (false, _, _) | (true, true, false) => 1,
-                (true, false, _) => 0,
-                (true, true, true) => 2,
-            };
-            let sub = cull * 2 + (!mat.depth_test as usize);
-            // the blend group without depth writes, and with them (`device_states`)
-            let plain = if mat.alpha_blend && mat.blend_pair > 0 { 1 + mat.blend_pair as usize } else { mat.alpha_blend as usize };
-            let group = if mat.alpha_blend && mat.device_states { 5 + mat.blend_pair as usize } else { plain };
-            let sky_texture = sky_tex_of(&self.materials, self.no_reflections, item);
-            let sky = sky_texture.unwrap_or(white).0;
-            // a blended material with the specular, sky-map or projector pass draws them over its
-            // own blend, not mixed into its colour (`fs_layers`); the plain alpha pair only
-            let layered = mat.alpha_blend && mat.blend_pair == 0 && (sky_texture.is_some() || item.shadow.is_some() || (mat.env_mix > 0.0 && !self.no_reflections));
-            let (plain, group) = if layered { (9, if mat.device_states { 10 } else { 9 }) } else { (plain, group) };
-            // `LayerFalseSort1` / `2`: at `SPECIALFX` 3, always, and at 2 by the runtime
-            // pick (`FakeSortMode`, `RE/notes/thrash.md` §6d.4), the same draw first with
-            // depth writes off, then on (0x449ADB / 0x449B2A). Otherwise (below 2, or 2's
-            // `Single` pick) the other arm never draws twice: one draw, `MAG`/`MINFILTER`
-            // forced `POINT` for it (0x449ABE), depth writes untouched.
-            let fakesort_single = match self.fakesort_mode {
-                FakeSortMode::Single => true,
-                FakeSortMode::Double => false,
-                // `LayerFalseSort1`/`2`'s own fold, per drawn item (0x449AB2, `[0x61975C]
-                // < 10000` unsigned)
-                FakeSortMode::PerItem => !item.fakesort_near,
-            };
-            let material = item.material.0 * 2;
-            if mat.false_sort && mat.alpha_blend && !fakesort_single {
-                // two pipelines in turn on one item: never merged, and the run before it
-                // is drawn first
-                if let Some(r) = run.take() {
-                    self.draw_run(pass, st, &r);
-                }
-                let mut r = Run { first: idx, count: 1, pipeline: plain * 6 + sub, material, sky, mesh: item.mesh.0 };
-                self.draw_run(pass, st, &r);
-                r.pipeline = group * 6 + sub;
-                self.draw_run(pass, st, &r);
-                continue;
-            }
-            let material = if mat.false_sort && mat.alpha_blend && mat.bind_group_point.is_some() { material | 1 } else { material };
-            let next = Run { first: idx, count: 1, pipeline: group * 6 + sub, material, sky, mesh: item.mesh.0 };
-            match &mut run {
-                Some(r) if r.first + r.count == idx && r.pipeline == next.pipeline && r.material == next.material && r.sky == next.sky && r.mesh == next.mesh => r.count += 1,
-                _ => {
-                    if let Some(r) = run.replace(next) {
-                        self.draw_run(pass, st, &r);
-                    }
-                }
-            }
-        }
-        if let Some(r) = run.take() {
-            self.draw_run(pass, st, &r);
-        }
-    }
-
-    /// Set what a run needs that the pass does not already hold, then draw it: one instanced draw
-    /// of `r.count` consecutive objects (`first_instance` = the first object's index).
-    fn draw_run(&self, pass: &mut wgpu::RenderPass<'_>, st: &mut DrawState, r: &Run) {
-        if st.pipeline != r.pipeline {
-            pass.set_pipeline(&self.pipelines[r.pipeline]);
-            st.pipeline = r.pipeline;
-        }
-        let m = &self.materials[(r.material >> 1) as usize];
-        let point = r.material & 1 == 1 && m.bind_group_point.is_some();
-        let key = bind_key(m, point);
-        if st.material != key {
-            let bg = if point { m.bind_group_point.as_ref().unwrap_or(&m.bind_group) } else { &m.bind_group };
-            pass.set_bind_group(2, bg, &[]);
-            st.material = key;
-        }
-        if st.sky != r.sky {
-            pass.set_bind_group(3, self.sky_bgs[r.sky as usize].as_ref().expect("sky bind group made"), &[]);
-            st.sky = r.sky;
-        }
-        let mesh = &self.meshes[r.mesh as usize];
-        if self.base_vertex {
-            // the whole buffer bound once per arena; the mesh is its range of indices and its first
-            // vertex — the same vertices and indices as a bind of its own slices
-            if st.vb != mesh.vb_serial {
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                st.vb = mesh.vb_serial;
-            }
-            if st.ib != mesh.ib_serial {
-                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                st.ib = mesh.ib_serial;
-            }
-            let first_index = (mesh.index_offset / 4) as u32;
-            pass.draw_indexed(first_index..first_index + mesh.index_count, (mesh.vertex_offset / VERTEX_STRIDE) as i32, r.first..r.first + r.count);
-            return;
-        }
-        if st.mesh != r.mesh {
-            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(mesh.vertex_offset..mesh.vertex_offset + mesh.vertex_len.max(4)));
-            pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
-            st.mesh = r.mesh;
-        }
-        pass.draw_indexed(0..mesh.index_count, 0, r.first..r.first + r.count);
-    }
-
-    /// Draw `scene` into `view` / `depth_view`: the 3-D items (sky, opaque, blended), then — when
-    /// `with_sprites` — the 2D sprites. Every buffer write of the frame goes through the staging
-    /// belt into this frame's encoder, so nothing allocates a staging buffer per call. Neither
-    /// pass stores its depth: nothing reads it afterwards (the sprite pass clears it to 1.0).
-    fn encode_frame(&mut self, scene: &Scene, camera: &Camera, frame: FrameTarget, opts: FrameOpts) {
-        let FrameTarget { view, texture: target, can_copy, depth_view } = frame;
-        let FrameOpts { clear_color, with_sprites, aspect, depth_far } = opts;
-        let n = scene.items.len().min(MAX_OBJECTS as usize);
-        let white = self.white;
-        self.sky_bind_group(white);
-        // one walk over the items: each goes into its stage's list, in submission order — no-depth
-        // (sky) first, then opaque, then blended; an `early` blended item goes with the opaque
-        // ones (`DrawItem::early`) — and the section maps its sky-map pass samples get their bind
-        // groups
-        let mut buckets = std::mem::take(&mut self.buckets);
-        for b in &mut buckets {
-            b.clear();
-        }
-        for (i, item) in scene.items.iter().take(n).enumerate() {
-            let (stage, skip) = {
-                let mat = &self.materials[item.material.0 as usize];
-                (if item.overlay { 3 } else if !mat.depth_test { 0 } else if mat.alpha_blend && !item.early { 2 } else { 1 }, item.main_view_only && self.no_reflections)
-            };
-            if let Some(t) = sky_tex_of(&self.materials, self.no_reflections, item) {
-                self.sky_bind_group(t);
-            }
-            if !skip {
-                buckets[stage].push(i as u32);
-            }
-        }
-
-        self.seal_arena();
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        self.flush_texture_writes(&mut encoder);
-        self.flush_mesh_writes(&mut encoder);
-        let vp = camera.view_projection_mirrored(aspect, scene.mirror);
-        let globals = GlobalsUniform {
-            view_proj: vp.to_cols_array_2d(),
-            view: camera.view().to_cols_array_2d(),
-            sun_dir: scene.sun_direction.extend(0.0).to_array(),
-            // .y the view's near plane: a depth-bias pull past it stops there (the original's
-            // screen z goes to 0 or below — in front of everything, `RE/notes/thrash.md` §6)
-            // .z 1 in the rear-view mirror's view: no specular or sky-map pass (`[0x6115CC]+0x190`)
-            ambient: [scene.ambient, camera.near, self.no_reflections as u32 as f32, 0.0],
-            cam_pos: camera.position.extend(1.0).to_array(),
-            headlight: scene.headlight.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
-            headlight_on: [scene.headlight.is_some() as u32 as f32, (scene.headlight.is_some() && scene.headlight_decal) as u32 as f32, 0.0, 0.0],
-            beacon: scene.beacon.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
-            beacon_on: [scene.beacon.is_some() as u32 as f32, 0.0, 0.0, 0.0],
-            fog: scene.fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
-            sky_fog: scene.sky_fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
-        };
-        let size = wgpu::BufferSize::new(std::mem::size_of::<GlobalsUniform>() as u64).expect("globals size");
-        self.belt.write_buffer(&mut encoder, &self.globals_buf, 0, size).copy_from_slice(bytemuck::bytes_of(&globals));
-        if n > 0 {
-            let size = wgpu::BufferSize::new((n * std::mem::size_of::<ObjectUniform>()) as u64).expect("objects size");
-            // built on the CPU and copied in once: wgpu 30's mapped views are write-only
-            // (`WriteOnly`), not a `&mut [u8]` to cast in place
-            // the frame's objects, in a buffer kept between frames
-            let mut objects = std::mem::take(&mut self.object_scratch);
-            objects.clear();
-            objects.resize(n, bytemuck::Zeroable::zeroed());
-            let vp64 = glam::DMat4::from_cols_array(&vp.to_cols_array().map(f64::from));
-            for (o, item) in objects.iter_mut().zip(scene.items.iter().take(n)) {
-                let mat = self.materials.get(item.material.0 as usize);
-                let env_mix = mat.map_or(0.0, |m| m.env_mix);
-                let lod_bias = mat.map_or(0.0, |m| m.lod_bias);
-                // the alpha test: the material's race states, or the draw's own Thrash 0x24 ← 10
-                let alpha_test = mat.is_some_and(|m| m.device_states) || item.alpha_test;
-                // `.w` below: 0 no test, else the reference + ½ — a texel alpha under it (≤ the
-                // reference in bytes) fails `GREATER`
-                let alpha_ref = if alpha_test { item.alpha_ref as f32 + 0.5 } else { 0.0 };
-                // state 0x18 as an offset of the screen z: `b · 2^-15` (0x540500's `× [0x5B3E10]`)
-                // added to the game's `sz = far/(far − near) · (1 − near / Z)` (0x540CE0) — `b` the
-                // material's block plus the draw's own (`DrawItem::depth_bias`) — with near / far the
-                // pass's own planes, which 0x466F30 hands the projection 0x5391B0 (`cam+0xCC` /
-                // `+0xD0`, folded into `cam+0xDC` / `+0xE0`): the main view's near and the camera
-                // object's far 700 (0x4677FC), the rear view's 1 / 65000 (0x4691D0;
-                // `RE/notes/thrash.md` §6d.3). The shader adds it to the port's own clip z, so it is
-                // scaled by the ratio of the two `far / (far − near)` — exactly 1 where the port's
-                // planes are the pass's (the race's main view and its mirror), and keeping the same
-                // view-depth step `≈ b · 2^-15 · Z² / (near · A)` where they are not.
-                let a_game = depth_far / (depth_far - camera.near);
-                let a_port = camera.far / (camera.far - camera.near);
-                let pull = mat.map_or(0.0, |m| depth_bias_offset(m.depth_bias.saturating_add(item.depth_bias)) * (a_port / a_game));
-                *o = ObjectUniform {
-                    model: item.transform.to_cols_array_2d(),
-                    mvp: (vp64 * glam::DMat4::from_cols_array(&item.transform.to_cols_array().map(f64::from))).as_mat4().to_cols_array_2d(),
-                    // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
-                    // .y flags an item the headlight projector lights
-                    env_mix: [env_mix, item.headlit as u32 as f32, item.uv_offset[0], item.uv_offset[1]],
-                    light: [item.light[0], item.light[1], item.light[2], item.alpha],
-                    lit_a: item.layer_light.map_or([0.0; 4], |l| [l.ambient[0], l.ambient[1], l.ambient[2], 1.0]),
-                    lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], 0.0]),
-                    // .w the depth bias's pull, in view depth
-                    lit_dir: item.layer_light.map_or([0.0, 0.0, 0.0, pull], |l| [l.direction[0], l.direction[1], l.direction[2], pull]),
-                    shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
-                    shadow_v: item.shadow.map_or([0.0; 4], |s| s.1),
-                    // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
-                    // .w the alpha test (a material with `device_states`, or the draw's own): its
-                    // reference + ½ in bytes, 0 for none
-                    shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, alpha_ref],
-                    sky_u: item.sky.map_or([0.0; 4], |s| s.u),
-                    sky_v: item.sky.map_or([0.0; 4], |s| s.v),
-                    // .y the item is drawn in the sky pass (its fog is the sky's)
-                    sky_on: [sky_tex_of(&self.materials, self.no_reflections, item).is_some() as u32 as f32, item.sky_pass as u32 as f32, item.fog_w, 0.0],
-                };
-            }
-            self.belt.write_buffer(&mut encoder, &self.object_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&objects));
-            self.object_scratch = objects;
-        }
-
-        // the 2D pass's vertices go into the belt before any pass opens (a copy cannot be
-        // recorded inside one)
-        let n_sprites = if with_sprites { scene.sprites.len().min(MAX_SPRITES as usize) } else { 0 };
-        if with_sprites && scene.sprites.len() > MAX_SPRITES as usize {
-            tracing::warn!(have = scene.sprites.len(), cap = MAX_SPRITES, "sprite budget exceeded — the rest of the frame is dropped");
-            tracing::warn!(wanted = scene.sprites.len(), drawn = n_sprites, "sprite buffer full");
-        }
-        if n_sprites > 0 {
-            let size = wgpu::BufferSize::new((n_sprites * 6 * std::mem::size_of::<SpriteVertex>()) as u64).expect("sprites size");
-            let mut verts = std::mem::take(&mut self.sprite_scratch);
-            verts.clear();
-            verts.resize(n_sprites * 6, bytemuck::Zeroable::zeroed());
-            for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
-                verts[i * 6..i * 6 + 6].copy_from_slice(&sprite_quad(sp, aspect));
-            }
-            self.belt.write_buffer(&mut encoder, &self.sprite_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&verts));
-            self.sprite_scratch = verts;
-        }
-
-        let c = clear_color;
-        let probe = scene.lens_probe.filter(|_| can_copy);
-        let overlay = !buckets[3].is_empty();
-        // The lens flare's reference (0x460290 at 0x4603FF): the block as the sky pass leaves it with
-        // the sun drawn — the stage with no depth test (the sky layers and the sun) alone, drawn
-        // ahead of the frame proper into the same target, which the main pass then clears.
-        if let Some(p) = probe.filter(|p| p.reference) {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("lens reference pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: c[0], g: c[1], b: c[2], a: c[3] }), store: wgpu::StoreOp::Store },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: crate::prof::rp("lens reference"),
-                occlusion_query_set: None,
-            multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &self.object_bg, &[]);
-            let mut st = DrawState::NONE;
-            self.draw_bucket(&mut pass, scene, &buckets[0], &mut st, white);
-            drop(pass);
-            self.lens_copy(&mut encoder, target, p, true);
-        }
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: c[0], g: c[1], b: c[2], a: c[3] }), store: wgpu::StoreOp::Store },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if overlay { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: crate::prof::rp("main pass"),
-                occlusion_query_set: None,
-            multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &self.object_bg, &[]);
-            let mut st = DrawState::NONE;
-            for bucket in &buckets[..3] {
-                self.draw_bucket(&mut pass, scene, bucket, &mut st, white);
-            }
-        }
-        // The lens flare's test (0x460525): the block of the finished 3-D pass, before the flare's
-        // own elements are laid over it
-        if let Some(p) = probe.filter(|p| p.test) {
-            self.lens_copy(&mut encoder, target, p, false);
-        }
-        // the lens flare's elements (0x460460 → 0x451710): flat on the screen over the finished
-        // frame, under no depth test
-        if overlay {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("overlay pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }, depth_slice: None })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: crate::prof::rp("overlay"),
-                occlusion_query_set: None,
-            multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &self.object_bg, &[]);
-            let mut st = DrawState::NONE;
-            self.draw_bucket(&mut pass, scene, &buckets[3], &mut st, white);
-        }
-        // The 2D pass, over the 3-D one. Its depth starts at 1.0: the front end clears the
-        // depth window before its 2D draws (0x4DA890 at 0x4D30AC / 0x4D3182: `THRASH_window(3)`
-        // then `THRASH_clearwindow`, which on `dx7z.dll` clears the depth buffer alone —
-        // 0x60001230 → 0x60008380, `D3DCLEAR_ZBUFFER` without the target when the depth window
-        // is current — to the view's `+0x34`, 1.0 (0x537741, Thrash 0x43, 0x60004C90)). Only a
-        // sprite with a depth state (`Sprite::depth`) tests or writes it; every other draws
-        // as before. With no sprite the pass would draw nothing, so it is not opened.
-        if n_sprites > 0 {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sprite pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: crate::prof::rp("sprites"),
-                occlusion_query_set: None,
-            multiview_mask: None,
-            });
-            // HUD sprites; consecutive ones on one texture and one pipeline are one draw (their
-            // vertices are contiguous in the buffer, in order)
-            pass.set_vertex_buffer(0, self.sprite_buf.slice(..));
-            let mut bound_pipeline: Option<Option<SpriteCompare>> = None;
-            let mut bound_tex = u32::MAX;
-            let mut run: Option<(usize, usize, u32, Option<SpriteCompare>)> = None;
-            let mut flush = |pass: &mut wgpu::RenderPass<'_>, r: (usize, usize, u32, Option<SpriteCompare>)| {
-                let (first, end, tex, pipeline) = r;
-                let Some(bg) = self.textures[tex as usize].sprite_bg.as_ref() else { return };
-                if bound_pipeline != Some(pipeline) {
-                    pass.set_pipeline(match pipeline {
-                        None => &self.sprite_pipeline,
-                        Some(SpriteCompare::LessEqual) => &self.sprite_depth_pipelines[0],
-                        Some(SpriteCompare::GreaterEqual) => &self.sprite_depth_pipelines[1],
-                    });
-                    bound_pipeline = Some(pipeline);
-                }
-                if bound_tex != tex {
-                    pass.set_bind_group(0, bg, &[]);
-                    bound_tex = tex;
-                }
-                pass.draw((first * 6) as u32..(end * 6) as u32, 0..1);
-            };
-            for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
-                if self.textures[sp.texture.0 as usize].sprite_bg.is_none() {
-                    continue;
-                }
-                let pipeline = sp.depth.map(|d| d.compare);
-                match &mut run {
-                    Some((_, end, tex, pl)) if *end == i && *tex == sp.texture.0 && *pl == pipeline => *end += 1,
-                    _ => {
-                        if let Some(r) = run.replace((i, i + 1, sp.texture.0, pipeline)) {
-                            flush(&mut pass, r);
-                        }
-                    }
-                }
-            }
-            if let Some(r) = run.take() {
-                flush(&mut pass, r);
-            }
-        }
-        self.buckets = buckets;
-        self.belt.finish();
-        crate::prof::resolve(&mut encoder);
-        self.last_submit = Some(self.queue.submit(Some(encoder.finish())));
-        self.belt.recall();
-        self.lens_map_staged();
-    }
-}
-
-/// Build the two triangles of a sprite in clip space (y up), rotating about its pivot in screen space.
-fn sprite_quad(sp: &Sprite, aspect: f32) -> [SpriteVertex; 6] {
-    let (z, alpha_ref) = sp.depth.map_or((0.0, 0.0), |d| (d.z, d.alpha_test.map_or(-1.0, f32::from)));
-    if let Some((t, col)) = sp.tri {
-        let v = |p: [f32; 2], c: [f32; 4]| SpriteVertex { pos: [p[0] * 2.0 - 1.0, 1.0 - p[1] * 2.0, z], uv: sp.uv_min, color: c, alpha_ref };
-        let (a, b, c) = (v(t[0], col[0]), v(t[1], col[1]), v(t[2], col[2]));
-        return [a, b, c, c, c, c];
-    }
-    let (sx, sy) = (sp.size[0] / aspect, sp.size[1]);
-    let (px, py) = (sp.pos[0] + sp.pivot[0] * sx, sp.pos[1] + sp.pivot[1] * sy);
-    let (sn, cs) = (sp.rotation * std::f32::consts::TAU).sin_cos();
-    let corner = |u: f32, v: f32| -> SpriteVertex {
-        // local offset from pivot in screen units (aspect-corrected so rotation is not sheared)
-        let lx = (u - sp.pivot[0]) * sx * aspect;
-        let ly = (v - sp.pivot[1]) * sy;
-        let rx = lx * cs - ly * sn;
-        let ry = lx * sn + ly * cs;
-        let x = px + rx / aspect;
-        let y = py + ry;
-        SpriteVertex {
-            pos: [x * 2.0 - 1.0, 1.0 - y * 2.0, z],
-            uv: [sp.uv_min[0] + (sp.uv_max[0] - sp.uv_min[0]) * u, sp.uv_min[1] + (sp.uv_max[1] - sp.uv_min[1]) * v],
-            color: sp.corner_colors.map_or(sp.color, |k| match (u > 0.5, v > 0.5) {
-                (false, false) => k[0],
-                (true, false) => k[1],
-                (true, true) => k[2],
-                (false, true) => k[3],
-            }),
-            alpha_ref,
-        }
+        e => (1.0 + man as f32 / 1024.0) * 2f32.powi(e - 15),
     };
-    let (a, b, c, d) = (corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0));
-    [a, b, c, a, c, d]
+    if sign == 1 { -v } else { v }
 }
 
-/// The display ramp of state 0x2E as a last full-screen pass: `ramp[i] = min(0xFFFF, trunc(i ·
-/// 257 · g))` — `dx7z.dll` scales the ramp it read at the mode set, which is the identity `i · 257`
-/// on a primary surface nobody has touched — shown as `ramp / 0xFFFF` of full scale. The original
-/// needs `DDCAPS2_PRIMARYGAMMA` (`[0x60033FA0]`, caps bit 0x20000, 0x60009115…0x60009123) and
-/// otherwise ignores the state; the port, windowed, always applies it.
-struct GammaPass {
-    pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
-    uniform: wgpu::Buffer,
-    /// the frame's own image, kept while the size holds
-    target: Option<(u32, u32, wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
+/// Single to IEEE half (round to nearest even; overflow to infinity, tiny values to zero / subnormals).
+pub(crate) fn f32_to_f16(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xFF) as i32;
+    let man = b & 0x7F_FFFF;
+    if exp == 0xFF {
+        return sign | 0x7C00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - e);
+        let round = (m >> 12) & 1 != 0 && ((m & 0xFFF) != 0 || (m >> 13) & 1 != 0);
+        return sign | ((m >> 13) as u16 + round as u16);
+    }
+    let mut h = ((e as u32) << 10) | (man >> 13);
+    let round = (man >> 12) & 1 != 0 && ((man & 0xFFF) != 0 || (man >> 13) & 1 != 0);
+    h += round as u32;
+    sign | h as u16
 }
 
-const GAMMA_WGSL: &str = r#"
-@group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var<uniform> g: vec4<f32>;
-@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
-    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
-    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
-}
-@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let c = textureLoad(src, vec2<i32>(pos.xy), 0);
-    let i = round(c.rgb * 255.0);
-    let w = min(floor(i * 257.0 * g.x), vec3<f32>(65535.0));
-    return vec4<f32>(w / 65535.0, c.a);
-}
-"#;
+#[cfg(test)]
+mod tests {
+    use super::{f16_to_f32, GlobalsUniform, ObjectUniform};
+    use std::mem::size_of;
 
-impl GammaPass {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("gamma"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-            ],
-        });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gamma"), source: wgpu::ShaderSource::Wgsl(GAMMA_WGSL.into()) });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gamma"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("gamma"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("gamma"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        Self { pipeline, layout, uniform, target: None }
+    /// The body of `struct <name> { ... }` in a source text: the `(field, type)` pairs in order (comments dropped).
+    fn struct_fields(src: &str, name: &str) -> Option<Vec<(String, String)>> {
+        let head = format!("struct {name} {{");
+        let start = src.find(&head)? + head.len();
+        let body = &src[start..src[start..].find('}')? + start];
+        let mut fields = Vec::new();
+        for line in body.lines() {
+            let line = line.split("//").next().unwrap_or("").trim();
+            // one field per line (a WGSL `array<vec4<f32>, 12>` has a comma of its own)
+            let decl = line.trim_end_matches(',');
+            if !decl.is_empty() {
+                let (n, t) = decl.split_once(':').expect("a `name: type` field");
+                fields.push((n.trim().to_string(), t.split_whitespace().collect::<String>()));
+            }
+        }
+        Some(fields)
     }
 
-    /// The image the frame is drawn into before the ramp, `width × height`.
-    fn source(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
-        if !self.target.as_ref().is_some_and(|(w, h, ..)| *w == width && *h == height) {
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("gamma source"),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&Default::default());
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("gamma"),
-                layout: &self.layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: self.uniform.as_entire_binding() }],
-            });
-            self.target = Some((width, height, texture, view, bg));
+    /// WGSL type -> bytes in a uniform / storage struct (every member here is a multiple of 16 bytes).
+    fn wgsl_size(t: &str) -> usize {
+        match t {
+            "mat4x4<f32>" => 64,
+            "vec4<f32>" => 16,
+            _ => {
+                let inner = t.strip_prefix("array<").and_then(|r| r.strip_suffix('>')).unwrap_or_else(|| panic!("WGSL type `{t}` unknown to the layout test"));
+                let (elem, n) = inner.rsplit_once(',').expect("array<T,N>");
+                wgsl_size(elem) * n.parse::<usize>().unwrap_or_else(|_| panic!("array length `{n}` is not a literal"))
+            }
         }
-        self.target.as_ref().map(|(_, _, t, v, _)| (t.clone(), v.clone())).expect("gamma source")
     }
 
-    fn resolve(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView, g: f32) {
-        let Some((_, _, _, _, bg)) = self.target.as_ref() else { return };
-        queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&[g, 0.0f32, 0.0, 0.0]));
-        let mut enc = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gamma"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: None,
-                timestamp_writes: crate::prof::rp("gamma ramp"),
-                occlusion_query_set: None,
-            multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, bg, &[]);
-            pass.draw(0..3, 0..1);
+    /// Rust field type -> bytes; `crate::RAIN_LAMPS` / `RAIN_EDGES` are resolved by name.
+    fn rust_size(t: &str) -> usize {
+        match t {
+            "[[f32;4];4]" => 64,
+            "[f32;4]" => 16,
+            "[[f32;4];crate::RAIN_LAMPS]" => 16 * crate::RAIN_LAMPS,
+            "[[f32;4];crate::RAIN_EDGES]" => 16 * crate::RAIN_EDGES,
+            _ => panic!("Rust type `{t}` unknown to the layout test"),
         }
-        crate::prof::resolve(&mut enc);
-        queue.submit(Some(enc.finish()));
+    }
+
+    /// A WGSL module that declares one of the uniform / storage structs the Rust side fills must match it field for
+    /// field (names, order, total size). SHADOWFIX: `gpu/shadow.wgsl`'s `Object` lacked the `soft` / `hdr` vec4s that
+    /// were appended to `ObjectUniform`, so its array stride was wrong and the shadows flickered. Append a field in one
+    /// place only and this fails.
+    #[test]
+    fn wgsl_structs_match_the_rust_uniforms() {
+        let rust_src = include_str!("gpu.rs");
+        let cases: [(&str, &str, usize); 2] = [("Globals", "GlobalsUniform", size_of::<GlobalsUniform>()), ("Object", "ObjectUniform", size_of::<ObjectUniform>())];
+        // every .wgsl file under src/ that declares one of the two structs (a new module is picked up by itself)
+        let mut files = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "wgsl") {
+                    files.push(p);
+                }
+            }
+        }
+        let mut checked = 0;
+        for (wgsl_name, rust_name, size) in cases {
+            let rust = struct_fields(rust_src, rust_name).expect("the Rust struct");
+            assert_eq!(rust.iter().map(|(_, t)| rust_size(t)).sum::<usize>(), size, "{rust_name}: the parsed fields do not add up to size_of (padding?)");
+            for f in &files {
+                let src = std::fs::read_to_string(f).unwrap();
+                let Some(wgsl) = struct_fields(&src, wgsl_name) else { continue };
+                checked += 1;
+                let (rn, wn): (Vec<_>, Vec<_>) = (rust.iter().map(|(n, _)| n.as_str()).collect(), wgsl.iter().map(|(n, _)| n.as_str()).collect());
+                assert_eq!(rn, wn, "{}: `struct {wgsl_name}` fields differ from {rust_name}", f.display());
+                assert_eq!(wgsl.iter().map(|(_, t)| wgsl_size(t)).sum::<usize>(), size, "{}: `struct {wgsl_name}` is not {size} bytes ({rust_name})", f.display());
+            }
+        }
+        assert!(checked >= 3, "expected shader.wgsl's Globals + Object and shadow.wgsl's Object, checked {checked}");
+    }
+
+    /// ENHANCEMENT E7: the lens probe's half-float decode (IEEE binary16).
+    #[test]
+    fn half_decode() {
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0x3800), 0.5);
+        assert_eq!(f16_to_f32(0xC000), -2.0);
+        assert_eq!(f16_to_f32(0x7BFF), 65504.0);
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24)); // the smallest subnormal
+        assert_eq!(f16_to_f32(0x0400), 2f32.powi(-14)); // the smallest normal
+        assert_eq!(f16_to_f32(0x3555), 0.333_251_95); // 1/3 rounded
+        assert_eq!(f16_to_f32(0x7C00), f32::INFINITY);
+        assert!(f16_to_f32(0x7E00).is_nan());
     }
 }
 

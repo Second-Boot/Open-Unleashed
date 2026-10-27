@@ -57,9 +57,19 @@ if [ "$WITH_DATA" = 1 ]; then
   find "$DST" -type f \( -iname 'vssver.scc' -o -iname '*.xls' -o -iname '*.h' -o -iname '*.dtx' -o -iname '*.eng' -o -iname '*.pfn' \) -delete
   cargo run -q --release -p nfs-formats --example extract_mad_tables -- "$SRC/nfs5.exe" "$DST/madtables.bin"
   [ -f "$SRC/fe.txt" ] && cp "$SRC/fe.txt" "$DST/"
+  # the enhanced game's own front-end layouts (the "Улучшения" screen) —
+  # read from <game root>/enhanced/layouts by nfs_game::remaster::layouts_dir
+  cp -R enhanced "$DST/"
+  # ENHANCEMENT E41: enhanced/hd_textures/x2 and x4 (the HD texture packs, BC7 / KTX2, untracked) ride along in the copy above when present
+  sh "$(dirname "$0")/hd_pack_check.sh" "$DST"
   # no regs/*.reg: the port reads only "Language" from them, and a missing value is "English",
   # which is what this install's own reg.reg holds (GamePaths::language, 0x4B73F0)
   chmod -R u+w "$DST"
+else
+  # the public build: the enhanced game's own front-end layouts (the "Улучшения" screen) go in the bundle's
+  # Resources/enhanced/layouts (nfs_game::remaster::layouts_dir); never the HD texture pack (made from EA's textures)
+  mkdir -p "$APP/Contents/Resources/enhanced"
+  cp -R enhanced/layouts "$APP/Contents/Resources/enhanced/"
 fi
 # the version of the workspace (Cargo.toml [workspace.package])
 VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)

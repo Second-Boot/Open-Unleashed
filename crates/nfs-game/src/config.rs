@@ -83,6 +83,7 @@ switches! {
     nfs_fe_seq_frames = "NFS_FE_SEQ_FRAMES",
     nfs_fe_seq_script = "NFS_FE_SEQ_SCRIPT",
     nfs_fps_cap = "NFS_FPS_CAP",
+    nfs_frame_stats = "NFS_FRAME_STATS",
     nfs_mission = "NFS_MISSION",
     nfs_shot_ticks = "NFS_SHOT_TICKS",
     nfs_render_thread = "NFS_RENDER_THREAD",
@@ -119,6 +120,9 @@ switches! {
     nfs_shot_scale = "NFS_SHOT_SCALE",
     nfs_shot_seq = "NFS_SHOT_SEQ",
     nfs_shot_size = "NFS_SHOT_SIZE",
+    nfs_temporal_dt = "NFS_TEMPORAL_DT",
+    nfs_temporal_seq = "NFS_TEMPORAL_SEQ",
+    nfs_temporal_ticks = "NFS_TEMPORAL_TICKS",
     // TEST GLUE (PORT-DEVIATION D46, photo mode): a scripted still's photo-mode ops and the race-key script (`app/photo.rs`)
     nfs_photo = "NFS_PHOTO",
     nfs_race_keys = "NFS_RACE_KEYS",

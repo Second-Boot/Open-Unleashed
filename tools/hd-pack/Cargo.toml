@@ -1,0 +1,15 @@
+[package]
+name = "hd-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nfs-assets.workspace = true
+# the game's own mip chain generator (E2's), so a pack file's levels are the ones the game would have made from the PNG
+nfs-renderer.workspace = true
+anyhow.workspace = true
+image.workspace = true
+# OFFLINE ONLY: the BC7 encoder (Intel's ISPC texture compressor, kernels precompiled and shipped in the crate: no ispc needed;
+# macOS arm64 / x86_64, Linux x86_64 / aarch64, Windows MSVC). The game itself only uploads / decodes (nfs-assets: bcdec_rs).
+intel_tex_2 = "0.5"

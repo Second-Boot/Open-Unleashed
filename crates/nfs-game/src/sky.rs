@@ -61,6 +61,9 @@ pub struct Sky {
     track_c: Vec<(i32, u8)>,
     /// `[this+0x50]`: the slice of the last pass's eye (0x45D598)
     slice: i32,
+    /// ENHANCEMENT ENH-LIVETEX: the GPU textures made from the sky pack's entries (original id, entry name) and the HD twins next to them
+    hd_bases: Vec<(nfs_renderer::TextureId, String)>,
+    hd: Option<crate::world::HdSet>,
     /// `[this+0x38…+0x40]`: the last pass's eye (0x45D562…0x45D579)
     eye: Vec3,
 }
@@ -580,6 +583,41 @@ struct Lightning {
     thunder: Option<ThunderCall>,
 }
 
+/// ENHANCEMENT E20: the flicker of the lightning's light on the SCENE inside a strike (the sky keeps the
+/// original's curve): `t` seconds since the strike's first tick, `seed` that tick. 2-4 quick flashes in the
+/// first ~0.5 s, each a sharp rise and an exponential decay (about 70 ms), then a plateau at 40 %.
+/// Deterministic from `seed` alone. Not in the original.
+pub fn flash_envelope(t: f32, seed: u32) -> f32 {
+    const PLATEAU: f32 = 0.4;
+    if t < 0.0 {
+        return 0.0;
+    }
+    if t >= 0.75 {
+        return PLATEAU;
+    }
+    // a small integer hash of the seed -> flash count 2..=4 and the gaps / strengths of each
+    let mut h = seed.wrapping_mul(0x9E37_79B1) ^ 0x85EB_CA6B;
+    let mut next = || {
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2C1B_3C6D);
+        h ^= h >> 12;
+        (h & 0xFFFF) as f32 / 65535.0
+    };
+    let n = 2 + (next() * 2.99) as u32;
+    let (mut at, mut env) = (0.0f32, PLATEAU);
+    for k in 0..n {
+        let amp = if k == 0 { 1.0 } else { 0.6 + 0.4 * next() };
+        if t >= at {
+            // 25 ms attack, then the decay
+            let d = t - at;
+            let pulse = amp * if d < 0.025 { d / 0.025 } else { (-(d - 0.025) / 0.07).exp() };
+            env = env.max(pulse);
+        }
+        at += 0.09 + 0.1 * next();
+    }
+    env.min(1.0)
+}
+
 impl Lightning {
     fn new(bin: &nfs_formats::sky::SkyBin, ltmp: Option<&nfs_assets::texture::TextureImage>) -> Self {
         let mut t = [[0xFF; 4]; 49];
@@ -656,6 +694,17 @@ impl Lightning {
 }
 
 impl MapBlend {
+    /// ENHANCEMENT E20: how far the running flash has lifted this stream over the copy it saved when it
+    /// began — the biggest R / G / B step of any entry, 0…255 (0 while no flash runs). It is the sky's own
+    /// brightening (the bolts' `level · ticks` sums held to the `ltmp` caps, 0x45E550), so it follows the
+    /// original's flash curve to the tick.
+    fn flash_lift(&self) -> i32 {
+        if !self.flash.active {
+            return 0;
+        }
+        self.stream.iter().zip(&self.flash.saved).enumerate().filter(|(k, _)| k % 4 != 3).map(|(_, (a, b))| *a as i32 - *b as i32).max().unwrap_or(0).max(0)
+    }
+
     /// 0x45DF50(t, ticks): a running flash puts the saved stream back and steps; a lightning with
     /// no flash running starts one — the stream saved, the strike's cell truncated, the kind's
     /// numbers taken and every bolt set up again — and the stream stays as it is; otherwise the
@@ -800,15 +849,45 @@ fn horizon_ring_quad(bin: &nfs_formats::sky::SkyBin, q: usize, y0: f32, y1: f32,
 }
 
 impl Sky {
+    /// ENHANCEMENT ENH-LIVETEX: bring the sky's HD twins in line with E41's level (see `TrackWorld::sync_hd`): E41 off - nothing; a scale
+    /// that is not the resident one - that pack's twins are loaded next to the originals and replace the old ones.
+    pub fn sync_hd(&mut self, r: &mut Renderer, track: &TrackAssets) {
+        let Some(scale) = crate::world::hd_scale_wanted(r) else { return };
+        if self.hd.as_ref().is_some_and(|h| h.scale == scale) {
+            return;
+        }
+        let Some(pack) = crate::world::hd_pack_for(r, track) else { return };
+        let jobs: Vec<crate::world::HdJob<'_>> = self
+            .hd_bases
+            .iter()
+            .filter_map(|(id, name)| {
+                let t = track.sky_textures.iter().find(|t| t.name == *name)?;
+                Some(crate::world::HdJob { base: *id, key: nfs_assets::hdpack::key_sky(&track.name, &t.name), orig: t, alpha: nfs_renderer::MipAlpha::Blend })
+            })
+            .collect();
+        let set = crate::world::upload_hd_twins(r, pack, &jobs, "sky");
+        crate::world::replace_hd_set(r, &mut self.hd, set);
+    }
+
     /// `level` is `SKYRENDERING` (`[0x657D9C]`, `Graphics.SkyRendering`).
     /// `fe` is 0x538040's state: the UV object's jitter draws from it as it is made (0x45F3C0).
     pub fn upload(r: &mut Renderer, track: &TrackAssets, level: usize, fe: &mut crate::opponents::FeRng) -> Option<Self> {
         let find = |n: &str| track.sky_textures.iter().find(|t| t.name.trim() == n);
-        fn tex(r: &mut Renderer, t: &nfs_assets::texture::TextureImage) -> nfs_renderer::TextureId {
-            r.upload_texture_mips(t.width, t.height, &t.mips)
-        }
+        // ENHANCEMENT E41 / ENH-LIVETEX: «текстуры» x2 / x4 — the horizon mountains (`horz`, `hor<n>`) and the cloud layers have a pack twin
+        // where the pack has one (`sky/<track>/<entry>`): both are sampled by NORMALIZED UVs (the ring's tile fractions of the strip,
+        // `segment_uv`; the cloud grid's `j / a`, `i / b`), so the bigger texture changes nothing else. Every other entry of the sky pack
+        // is a colour map read on the CPU (never a GPU texture). The originals are uploaded as master does (`bases` lists them for the twins);
+        // E41 off / no pack: master's call, no file looked up.
+        let bases: std::cell::RefCell<Vec<(nfs_renderer::TextureId, String)>> = std::cell::RefCell::new(Vec::new());
+        let tex = |r: &mut Renderer, t: &nfs_assets::texture::TextureImage| -> nfs_renderer::TextureId {
+            let id = r.upload_texture_mips(t.width, t.height, &t.mips);
+            if !t.mips.is_empty() {
+                bases.borrow_mut().push((id, t.name.clone()));
+            }
+            id
+        };
         let mut parts = Vec::new();
-        let sky_mat = |r: &mut Renderer, texture, blend, blend_pair, clamp: bool| r.create_material(MaterialDesc { texture, alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair, clamp: [clamp; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
+        let sky_mat = |r: &mut Renderer, texture, blend, blend_pair, clamp: bool| r.create_material(MaterialDesc { texture, alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair, clamp: [clamp; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false, reflect: nfs_renderer::Reflect::NONE });
 
         let file = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).ok();
         // the blocks of the `SKYRENDERING` level (0x45D8F0 → 0x45FB80, `SkyFile::for_level`) — none
@@ -947,7 +1026,12 @@ impl Sky {
         let lightning = track.sky_bin.as_ref().map(|b| Lightning::new(b, find("ltmp")));
         let ring_turn = track.sky_bin.as_ref().map_or(0.0, |b| b.ring_turn);
         let track_c = track.sky_bin.as_ref().map(|b| b.track_c.clone()).unwrap_or_default();
-        if parts.is_empty() { None } else { Some(Self { parts, grids, blend, last_tick: None, jitter, lightning, ring_turn, track_c, slice: 0, eye: Vec3::ZERO }) }
+        if parts.is_empty() {
+            return None;
+        }
+        let mut sky = Self { parts, grids, blend, last_tick: None, jitter, lightning, ring_turn, track_c, slice: 0, eye: Vec3::ZERO, hd_bases: bases.into_inner(), hd: None };
+        sky.sync_hd(r, track);
+        Some(sky)
     }
 
     /// The layers' update (0x45D030 → each layer's slot 0 → 0x45F0A0): `t` from the `.bin`'s track
@@ -1038,6 +1122,17 @@ impl Sky {
     /// pass's eye (0x45D57C…0x45D587).
     pub fn pass_slice(&self) -> i32 {
         self.slice
+    }
+
+    /// ENHANCEMENT E20: the lightning flash's strength 0…1 now — the sky's own brightening by the running
+    /// flash (`MapBlend::flash_lift`, the biggest over the levels' colour streams) over the `ltmp` map's
+    /// cap (the most a bolt can lift an entry to; 0x7D = 125 on Autobahn and Industrial), so 1 is a fully
+    /// built-up flash and 0 is none. Not in the original: the original only paints the sky.
+    pub fn flash_strength(&self) -> f32 {
+        let Some(l) = &self.lightning else { return 0.0 };
+        let cap = l.ltmp.iter().flat_map(|e| e[1..4].iter().copied()).max().unwrap_or(255).max(1);
+        let lift = self.grids.iter().map(|g| g.colours.flash_lift()).max().unwrap_or(0);
+        (lift as f32 / cap as f32).clamp(0.0, 1.0)
     }
 
     /// The thunder the last strike called (0x4A8340), taken once: the audio update hands it to the
@@ -1336,6 +1431,36 @@ mod stage_tests {
             }
             assert_eq!(a.vertices[1].color[0], ((k + 6) % 16) as f32);
             assert_eq!(b.vertices[1].color[0], ((k + 1) % 16) as f32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod flash_envelope_tests {
+    use super::flash_envelope;
+
+    #[test]
+    fn flickers_then_holds_the_plateau_deterministically() {
+        for seed in [1u32, 977, 123_456, 0xFFFF_FFF0] {
+            // deterministic
+            assert_eq!(flash_envelope(0.2, seed), flash_envelope(0.2, seed));
+            // after the flicker: the plateau
+            assert_eq!(flash_envelope(1.0, seed), 0.4);
+            assert_eq!(flash_envelope(30.0, seed), 0.4);
+            // the first flash peaks near full and everything stays in 0.4..=1
+            let (mut peak, mut dips) = (0.0f32, 0);
+            let mut prev = 0.0;
+            for i in 0..=75 {
+                let e = flash_envelope(i as f32 * 0.01, seed);
+                assert!((0.4..=1.0).contains(&e));
+                peak = peak.max(e);
+                if e > prev + 0.05 {
+                    dips += 1;
+                }
+                prev = e;
+            }
+            assert!(peak > 0.9, "{seed}: peak {peak}");
+            assert!(dips >= 2, "{seed}: rises {dips}");
         }
     }
 }

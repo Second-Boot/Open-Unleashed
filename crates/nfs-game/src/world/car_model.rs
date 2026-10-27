@@ -116,6 +116,66 @@ pub struct CarModel {
     damage_shown: [f32; 10],
     /// the meshes 0x43E390 crushes: every part of an article with `Base+78 & 8` and a `dz` part
     deform: Vec<DeformPart>,
+    /// ENHANCEMENT ENH-LIVETEX: the E41 HD pages and the E42 refined meshes kept NEXT TO the originals above (the model's own ids are always
+    /// the original's, as master's; the renderer shows a twin while its switch is on), and how to load the car again for a live change
+    live: LiveTwins,
+    source: Option<std::sync::Arc<CarSource>>,
+}
+
+/// ENHANCEMENT ENH-LIVETEX: the levels a load builds twins for (0: none). A first load builds what the switches say; a live sync builds
+/// only what the model lacks.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveWant {
+    pub e41: u8,
+    pub e42: u8,
+    /// ENHANCEMENT ENH-LIVELEAK: a live build for the twins alone - the load's own copies of the originals (meshes, pages, materials) are
+    /// not uploaded: they would be thrown away, and a mesh arena cannot give its memory back
+    pub twins_only: bool,
+}
+
+/// ENHANCEMENT ENH-LIVETEX: a car's twins (E41 pages, E42 meshes) and what was last looked up.
+#[derive(Clone, Default)]
+struct LiveTwins {
+    /// the pack scale the pages were last looked up at (0: never - E41 was off); set even when the pack held nothing for this car
+    hd_tried: u32,
+    hd: Option<HdCar>,
+    /// the E42 level the refined meshes were last built for (0: never)
+    round_tried: u8,
+    /// (original mesh, refined mesh) of the parts refined, in the renderer's twin table
+    round_static: Vec<(MeshId, MeshId)>,
+    /// the refined sibling of each [`DeformPart`] (parallel to `CarModel::deform`): the same part's crush on the refined vertices
+    round_deform: Vec<Option<DeformPart>>,
+}
+
+/// ENHANCEMENT ENH-LIVETEX: the HD twins of a car's pages. `pages` / `tex` are parallel to `CarModel::page_textures`; the pixels of a page
+/// no damage decal lands on are not kept (as `damage_pages`), `patches` are the decals taken to the HD scale.
+#[derive(Clone)]
+struct HdCar {
+    pages: Vec<Option<nfs_assets::car::TexturePage>>,
+    patches: Vec<nfs_assets::car::DamagePatch>,
+    tex: Vec<Option<nfs_renderer::TextureId>>,
+}
+
+/// ENHANCEMENT ENH-LIVETEX: the arguments a car was loaded with, kept (with the [`nfs_assets::car::CarRecipe`] that reads its files again) so a
+/// live change of the HD textures / rounded parts can build the missing twins later. `id` names the load: instances made from a model keep it.
+#[derive(Debug)]
+pub struct CarSource {
+    id: u64,
+    recipe: nfs_assets::car::CarRecipe,
+    room: bool,
+    lod: u8,
+    paint: nfs_assets::car::Paint,
+    env: CarEnv,
+    night: bool,
+    race_roof: Option<u32>,
+    skidpad: Option<bool>,
+}
+
+/// ENHANCEMENT ENH-LIVETEX: what one pass of live syncs shares between the models of one load (a template and its instances): the twins the
+/// first of them took, and its page ids.
+#[derive(Default)]
+pub struct LiveCache {
+    by_source: HashMap<u64, (LiveTwins, Vec<nfs_renderer::TextureId>)>,
 }
 
 /// One mesh of a crushable part (0x43E390): its undamaged vertices (`vt#lod`), each vertex's crush
@@ -953,12 +1013,18 @@ struct MaterialCache<'a> {
     ids: HashMap<u16, MaterialId>,
     light: MaterialMap<nfs_formats::crp::LayerLight>,
     shadowed: MaterialSet,
+    /// ENHANCEMENT ENH-LIVELEAK: a twins-only build ([`LiveWant::twins_only`]) creates no material
+    twins_only: bool,
 }
 
 impl MaterialCache<'_> {
     fn get(&mut self, r: &mut Renderer, id: u16) -> MaterialId {
-        let Self { car, env, materials, page_tex, ids: mat_ids, light: material_light, shadowed } = self;
+        let Self { car, env, materials, page_tex, ids: mat_ids, light: material_light, shadowed, twins_only } = self;
 
+        if *twins_only {
+            // ENHANCEMENT ENH-LIVELEAK: no material of a twins-only build is ever drawn
+            return MaterialId::default();
+        }
         if let Some(m) = mat_ids.get(&id) {
             return *m;
         }
@@ -1011,7 +1077,24 @@ impl MaterialCache<'_> {
         // thrash.md` §6d.3): ≈ `b · 2^-15 · Z² / near` of view depth, 0.05 mm a unit at 0.5 m in
         // the driver view (near 0.15), 0.5 m at 50 m. (history: `game-history.md` §10.5)
         let depth_bias = if env.rs_bias { m.and_then(|m| m.rs).map_or(0, |rs| rs[4]) } else { 0 };
-        let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: spec, env_mix: 1.0, env_variant: variant, sky_map: reflective, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias, false_sort: false });
+        // ENHANCEMENT E8: the material class of the dynamic body reflection, read from the file's own
+        // data — the render method and the reflection strength the original keeps for its sphere-map
+        // pass (`mt+284`: 0.5 on the paint, 1.0 on the glass, 0 on `CarExtEnv` pieces that never
+        // reflect, such as the bumper insert of page 3): `CarExtEnv` / `CarExtEnvNS` with a strength
+        // = paint (class 1), `CarWindow` = glass (class 2); the tyres and wheel faces (`CarWheel`),
+        // the interior (`CarInt`, incl. its glass page), the decals and trim (`CarExt`) stay as they are
+        // (`RE/notes/ENHANCEMENTS.md` E8 table)
+        let mut reflect = match m {
+            Some(m) if m.reflection > 0.0 => match m.render_method.as_str() {
+                "CarExtEnv" | "CarExtEnvNS" => nfs_renderer::Reflect { class: nfs_renderer::Reflect::PAINT, strength: m.reflection, interior: false },
+                "CarWindow" => nfs_renderer::Reflect { class: nfs_renderer::Reflect::GLASS, strength: m.reflection, interior: false },
+                _ => nfs_renderer::Reflect::NONE,
+            },
+            _ => nfs_renderer::Reflect::NONE,
+        };
+        // ENHANCEMENT E16: the cabin keeps the original's scalar ambient (the probe looks at the outside)
+        reflect.interior = m.is_some_and(|m| matches!(m.render_method.as_str(), "CarInt" | "CarIntShd"));
+        let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: spec, env_mix: 1.0, env_variant: variant, sky_map: reflective, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias, false_sort: false, reflect });
         if let Some(l) = m.and_then(|m| m.light) {
             material_light.insert(mid, l);
         }
@@ -1046,6 +1129,15 @@ struct CarAccum {
     half_track: f32,
     deform: Vec<DeformPart>,
     lod_lists: LodLists,
+    /// ENHANCEMENT E42: the level (0 off), the refined twins of the static parts (original, twin) and of the crushable ones (by
+    /// `deform`'s order), and the triangles before / after with the time they took
+    e42: u8,
+    round_static: Vec<(MeshId, MeshId)>,
+    round_deform: Vec<Option<DeformPart>>,
+    round_stats: (usize, usize, std::time::Duration),
+    /// ENHANCEMENT ENH-LIVELEAK: a twins-only build uploads no original mesh; its parts are named by placeholders, counted here
+    twins_only: bool,
+    placeholder_n: u32,
 }
 
 impl Default for CarAccum {
@@ -1062,6 +1154,12 @@ impl Default for CarAccum {
             half_track: 0.7,
             deform: Vec::new(),
             lod_lists: LodLists::default(),
+            e42: 0,
+            round_static: Vec::new(),
+            round_deform: Vec::new(),
+            round_stats: (0, 0, std::time::Duration::ZERO),
+            twins_only: false,
+            placeholder_n: 0,
         }
     }
 }
@@ -1153,7 +1251,8 @@ impl CarAccum {
     fn add_article_lod(&mut self, r: &mut Renderer, mats: &mut MaterialCache, car: &CarAssets, lod: u8, c: &ArticleCtx, l: u8) {
         let ArticleCtx { ai, a, g, ty, is_wheel, anim, frame_geometry, damage_geometry } = c;
         let (ai, ty, is_wheel, anim) = (*ai, *ty, *is_wheel, *anim);
-        let Self { lists, skipped, min, max, morph, anim_length, wheel_radius, half_track, deform, .. } = self;
+        let Self { lists, skipped, min, max, morph, anim_length, wheel_radius, half_track, deform, e42, round_static, round_deform, round_stats, twins_only, placeholder_n, .. } = self;
+        let (e42, twins_only) = (*e42, *twins_only);
 
         // 0x43C8F8: the part's `"tr"` + the LOD, **no fallback** — without one the part
         // is drawn in the car's own frame and the whole matrix block, the translation and
@@ -1207,8 +1306,57 @@ impl CarAccum {
                     }
                 }
             }
+            // the crush vectors and zones of this mesh, when it is a crushable part (their length is the source mesh's)
+            let mut crush_streams: Option<(Vec<[f32; 3]>, Vec<u8>)> = None;
+            if let Some((dm, zm)) = &crush
+                && let (Some(d), Some(z)) = (dm.get(k), zm.get(k))
+                && d.mesh.vertices.len() == mesh.vertices.len()
+                && z.mesh.vertices.len() == mesh.vertices.len()
+            {
+                crush_streams = Some((d.mesh.vertices.iter().map(|v| v.position).collect(), z.mesh.vertices.iter().map(|v| v.position[0] as u8).collect()));
+            }
+            // ENHANCEMENT E42 «скругление деталей»: a render-only copy of a round part, made AFTER the measurements above
+            // (the box, the tyre radius: the simulation reads the original), uploaded as the original's TWIN (ENH-LIVETEX: the
+            // original mesh is uploaded as master does and drawn while E42 is off). A wheel's circle is resampled
+            // (same UV, same radius), a mirror / lamp / exhaust / steering wheel gets PN triangles on its authored normals
+            // (`nfs_assets::round`). The crush vectors / zones follow by the same barycentric recipe. Off (level 0) this block
+            // does nothing: master's path.
+            let mut refined_twin: Option<(MeshData, Option<(Vec<[f32; 3]>, Vec<u8>)>)> = None;
+            if e42 > 0 && l <= if e42 > 1 { 4 } else { 3 } && roof_frames.is_empty() {
+                if let Some(kind) = nfs_assets::round::part_kind(&g.name, is_wheel) {
+                    let started = std::time::Instant::now();
+                    let refined = match kind {
+                        nfs_assets::round::Kind::Wheel => nfs_assets::round::refine_wheel(&mesh, if e42 > 1 { 64 } else { 32 }, if e42 > 1 { 6 } else { 4 }),
+                        nfs_assets::round::Kind::Smooth => nfs_assets::round::refine_pn(&mesh, if e42 > 1 { 3 } else { 2 }, 0.9998),
+                    };
+                    round_stats.2 += started.elapsed();
+                    if let Some((m, rs)) = refined {
+                        round_stats.0 += mesh.indices.len() / 3;
+                        round_stats.1 += m.indices.len() / 3;
+                        let rc = crush_streams.as_ref().map(|(d, z)| (rs.blend3(d), rs.nearest(z)));
+                        refined_twin = Some((m, rc));
+                    }
+                }
+            }
             let material = mats.get(r, mm.material);
-            let id = r.upload_mesh(&mesh);
+            // ENHANCEMENT ENH-LIVELEAK: a twins-only build names the original by a placeholder (the model it is for pairs by position)
+            let id = if twins_only {
+                *placeholder_n += 1;
+                MeshId::placeholder(*placeholder_n)
+            } else {
+                r.upload_mesh(&mesh)
+            };
+            let mut round_part: Option<DeformPart> = None;
+            if let Some((rm, rc)) = refined_twin {
+                let rid = r.upload_mesh(&rm);
+                if !twins_only {
+                    r.set_mesh_twin(id, Some(rid));
+                }
+                round_static.push((id, rid));
+                if let Some((delta, zone)) = rc {
+                    round_part = Some(DeformPart { mesh: rid, base: rm.vertices, indices: rm.indices, delta, zone });
+                }
+            }
             if !roof_frames.is_empty() {
                 let mut positions = vec![mm_positions(&mesh)];
                 for f in &roof_frames {
@@ -1219,18 +1367,9 @@ impl CarAccum {
                 }
                 morph[anim].push(MorphPart { mesh: id, scratch: mesh.vertices.clone(), seen: 0, frames: positions });
             }
-            if let Some((dm, zm)) = &crush
-                && let (Some(d), Some(z)) = (dm.get(k), zm.get(k))
-                && d.mesh.vertices.len() == mesh.vertices.len()
-                && z.mesh.vertices.len() == mesh.vertices.len()
-            {
-                deform.push(DeformPart {
-                    mesh: id,
-                    base: mesh.vertices.clone(),
-                    indices: mesh.indices.clone(),
-                    delta: d.mesh.vertices.iter().map(|v| v.position).collect(),
-                    zone: z.mesh.vertices.iter().map(|v| v.position[0] as u8).collect(),
-                });
+            if let Some((delta, zone)) = crush_streams {
+                deform.push(DeformPart { mesh: id, base: mesh.vertices.clone(), indices: mesh.indices.clone(), delta, zone });
+                round_deform.push(round_part);
             }
             parts.push((id, material, local));
             part_channels.push(rot_channel);
@@ -1254,9 +1393,38 @@ impl CarAccum {
     }
 }
 
+impl CarSource {
+    fn recipe_model(&self) -> String {
+        self.recipe.model().to_string()
+    }
+}
+
 impl CarModel {
     pub fn upload(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>) -> anyhow::Result<Self> {
         Self::upload_with_env(r, car, paths, lod, paint, CarUpload::default())
+    }
+
+    /// `opts`: the environment, the night flag, the race roof and the skid-pad context
+    /// ([`CarUpload`]).
+    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>, opts: CarUpload) -> anyhow::Result<Self> {
+        // ENHANCEMENT ENH-LIVETEX: the twins (E41 pages, E42 meshes) the switches ask for are built next to the originals
+        static NEXT_SOURCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let paint: nfs_assets::car::Paint = paint.into();
+        let want = LiveWant { e41: r.enhancements().level(nfs_renderer::E41), e42: r.enhancements().level(nfs_renderer::E42), twins_only: false };
+        let mut m = Self::upload_inner(r, car, paths, lod, paint, opts, want)?;
+        let CarUpload { env, night, race_roof, skidpad } = opts;
+        m.source = Some(std::sync::Arc::new(CarSource {
+            id: NEXT_SOURCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            recipe: car.recipe(),
+            room: car.front_end_room,
+            lod,
+            paint,
+            env,
+            night,
+            race_roof,
+            skidpad,
+        }));
+        Ok(m)
     }
 
     /// The model's `[styleN]` with what `R3DCar`'s load writes over it (0x437C09, slot 19's race /
@@ -1304,34 +1472,79 @@ impl CarModel {
         style
     }
 
-    /// `opts`: the environment, the night flag, the race roof and the skid-pad context
-    /// ([`CarUpload`]).
-    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>, opts: CarUpload) -> anyhow::Result<Self> {
+    /// ENHANCEMENT ENH-LIVETEX: master's `upload_with_env` with the twin levels `want` asks for (all 0 / `twins_only` false
+    /// with the switches off: master's path); a live sync (`sync_live`) calls it again for the twins alone.
+    fn upload_inner(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: nfs_assets::car::Paint, opts: CarUpload, want: LiveWant) -> anyhow::Result<Self> {
         let CarUpload { env, night, race_roof, skidpad } = opts;
         let style = Self::model_style(car, night, race_roof, skidpad);
-        let paint: nfs_assets::car::Paint = paint.into();
         // `R3DCar+0xAA`, the exterior's HSV value `max(r, g, b)` (0x443CA0 from 0x443E18), which
         // picks the damage pack below (0x441FFD, 0x442080)
         let light_paint = paint.exterior.iter().copied().max().unwrap_or(0) > 0x50;
-        let pages = car.build_pages(paths, paint, &style)?;
-        let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages
-            .iter()
-            .map(|p| (r.upload_texture_mips(p.width, p.height, &[p.cache_rgba().into_owned()]), p.is_window || p.is_alpha))
-            .collect();
+        // ENHANCEMENT E41 / ENH-LIVETEX: «новые текстуры» — a race / garage car (not a front-end room, whose pages are written at pixel
+        // positions at run time) with a pack that has the car also gets the pack's pages (x2 or x4 by the level) as HD TWINS next to the
+        // original pages: the originals are uploaded as master does, a material shows the twin while E41 is on. The UVs are normalized, so the
+        // bigger page needs nothing else; the damage decals follow it (`scale_damage_patches`). Off: master's call, nothing extra.
+        let hd_pack = if !car.front_end_room { nfs_assets::hdpack::scale_of_level(want.e41).and_then(|scale| nfs_assets::hdpack::HdPack::global(paths, scale)) } else { None };
+        let (pages, hd_pages) = car.build_pages_hd(paths, paint, &style, hd_pack)?;
+        let hd_present: Vec<bool> = hd_pages.iter().map(|p| p.is_some()).collect();
+        // the original pages as the original's texture cache keeps them (8888 → 4444, `TexturePage::cache_rgba`,
+        // `thrash.md` §6d.9); the HD twins are the pack's own
+        // ENHANCEMENT E2: the page gets a generated mip chain (sampled at level 0 while E2 is
+        // off); blended pages average alpha, the rest keep the alpha test's coverage
+        // (`GREATER 10`, `thrash.md` §6d.4)
+        let page_alpha = |p: &nfs_assets::car::TexturePage| if p.is_window || p.is_alpha { nfs_renderer::MipAlpha::Blend } else { nfs_renderer::MipAlpha::Test(10) };
+        // ENHANCEMENT ENH-LIVELEAK: a twins-only build uploads no original page (the model it is for has its own); the ids are placeholders
+        let twins_only = want.twins_only;
+        let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages.iter().map(|p| (if twins_only { nfs_renderer::TextureId::default() } else { r.upload_texture_generated(p.width, p.height, &p.cache_rgba(), page_alpha(p)) }, p.is_window || p.is_alpha)).collect();
+        // ENHANCEMENT ENH-LIVELEAK: the HD pages are uploaded as one batch (their mip chains are built on worker threads, the ids come back in
+        // the order given - the same ids the page-by-page upload took)
+        let hd_tex: Vec<Option<nfs_renderer::TextureId>> = {
+            let which: Vec<usize> = hd_pages.iter().enumerate().filter(|(_, p)| p.is_some()).map(|(i, _)| i).collect();
+            let items: Vec<(u32, u32, &[Vec<u8>], Option<nfs_renderer::MipAlpha>)> = which
+                .iter()
+                .map(|&i| {
+                    let p = hd_pages[i].as_ref().expect("listed");
+                    (p.width, p.height, std::slice::from_ref(&p.rgba), Some(page_alpha(p)))
+                })
+                .collect();
+            let ids = r.upload_textures_gen(&items);
+            let mut out: Vec<Option<nfs_renderer::TextureId>> = vec![None; hd_pages.len()];
+            for (&i, id) in which.iter().zip(ids) {
+                if !twins_only {
+                    r.set_texture_twin(page_tex[i].0, Some(id));
+                }
+                out[i] = Some(id);
+            }
+            out
+        };
         // the damage decals, `L` for a paint brighter than 0x50, `D` otherwise
         let damage_patches = nfs_assets::car::damage_patches(paths, &car.model, light_paint).unwrap_or_default();
+        // ENHANCEMENT E41: the decals of an HD page are taken to its scale (nothing when no page has an HD twin)
+        let hd_patches = match hd_pack {
+            Some(pack) if hd_present.iter().any(|&b| b) => Some(nfs_assets::car::scale_damage_patches(damage_patches.clone(), &car.model, light_paint, pack, &hd_present)),
+            _ => None,
+        };
+        if hd_present.iter().any(|&b| b) {
+            let hd_kib: usize = hd_pages.iter().flatten().map(|p| p.rgba.len()).sum::<usize>() >> 10;
+            let orig_kib: usize = pages.iter().zip(&hd_present).filter(|(_, h)| **h).map(|(p, _)| p.rgba.len()).sum::<usize>() >> 10;
+            tracing::info!(model = %car.model, pages = hd_present.iter().filter(|&&b| b).count(), of = hd_present.len(), scale = ?hd_pack.map(|p| p.scale()), hd_kib, original_kib_next_to_it = orig_kib, "car HD pages next to the originals (ENHANCEMENT E41)");
+        }
         let page_textures: Vec<nfs_renderer::TextureId> = page_tex.iter().map(|p| p.0).collect();
         let materials = car.crp.materials(&car.crp_data)?;
-        let mut mats = MaterialCache { car, env, materials, page_tex: &page_tex, ids: HashMap::new(), light: MaterialMap::default(), shadowed: MaterialSet::default() };
+        let mut mats = MaterialCache { car, env, materials, page_tex: &page_tex, ids: HashMap::new(), light: MaterialMap::default(), shadowed: MaterialSet::default(), twins_only };
         let arts = car.crp.articles(&car.crp_data)?;
-        let mut acc = CarAccum::default();
+        // ENHANCEMENT E42: the level (0 off); ENHANCEMENT ENH-LIVELEAK: a twins-only build
+        let mut acc = CarAccum { e42: want.e42, twins_only, ..CarAccum::default() };
         for (ai, a) in arts.iter().enumerate() {
             acc.add_article(r, &mut mats, car, &style, lod, ai, a)?;
         }
-        let CarAccum { mut lists, skipped, min, max, lights, morph, anim_length, wheel_radius, half_track, deform, mut lod_lists } = acc;
+        let CarAccum { mut lists, skipped, min, max, lights, morph, anim_length, wheel_radius, half_track, deform, mut lod_lists, e42, round_static, round_deform, round_stats, .. } = acc;
         let MaterialCache { light: material_light, shadowed, .. } = mats;
         let (body_order, unlisted) = lists.order(&mut lod_lists.list);
         let CarParts { body, body_channel, body_info, wheels, .. } = lists;
+        if e42 > 0 {
+            tracing::info!(level = e42, tris_before = round_stats.0, tris_after = round_stats.1, ms = round_stats.2.as_secs_f32() * 1000.0, "round parts refined (ENHANCEMENT E42)");
+        }
         tracing::info!(unlisted, "car part order");
         tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), roof_parts = morph[1].len(), roof_length = anim_length[1], anims = ?anim_length, skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
         tracing::info!(patches = damage_patches.len(), night, "damage decals");
@@ -1387,6 +1600,32 @@ impl CarModel {
             page_textures,
             damage_shown: [0.0; 10],
             deform,
+            live: LiveTwins {
+                hd_tried: nfs_assets::hdpack::scale_of_level(want.e41).unwrap_or(0),
+                hd: hd_patches.map(|patches| {
+                    let touched: std::collections::HashSet<usize> = patches.iter().map(|p| p.page).collect();
+                    HdCar {
+                        pages: hd_pages
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, p)| {
+                                p.map(|mut p| {
+                                    if race_roof.is_some() && !touched.contains(&i) {
+                                        p.rgba = Vec::new();
+                                    }
+                                    p
+                                })
+                            })
+                            .collect(),
+                        patches,
+                        tex: hd_tex,
+                    }
+                }),
+                round_tried: want.e42,
+                round_static,
+                round_deform,
+            },
+            source: None,
         })
     }
 
@@ -1415,8 +1654,13 @@ impl CarModel {
         // `update_damage` overwrites it once this instance takes zone damage. Re-uploaded from
         // `base`/`indices`, not copied GPU-side, so a template already crushed by another
         // instance is not what this instance starts from.
-        for p in &mut c.deform {
+        for (j, p) in c.deform.iter_mut().enumerate() {
             p.mesh = r.upload_mesh(&MeshData { vertices: p.base.clone(), indices: p.indices.clone() });
+            // ENHANCEMENT ENH-LIVETEX: its refined sibling, a pristine copy of its own
+            if let Some(Some(rd)) = c.live.round_deform.get_mut(j) {
+                rd.mesh = r.upload_mesh(&MeshData { vertices: rd.base.clone(), indices: rd.indices.clone() });
+                r.set_mesh_twin(p.mesh, Some(rd.mesh));
+            }
         }
         // the decal pages any zone can touch: a fresh texture (pristine pixels) plus a fresh
         // material for every existing material that samples it, so its bind group is not shared
@@ -1428,9 +1672,21 @@ impl CarModel {
             let mut tex_remap: HashMap<nfs_renderer::TextureId, nfs_renderer::TextureId> = HashMap::new();
             for page_index in touched {
                 let (Some(base), Some(&old_tex)) = (c.damage_pages.get(page_index), c.page_textures.get(page_index)) else { continue };
-                let new_tex = r.upload_texture_mips(base.width, base.height, &[base.cache_rgba().into_owned()]);
+                // ENHANCEMENT E2: as the first upload of the page (the page's kind is not kept; `Test(10)`
+                // is the car pages' draw state, a blended page's alpha is only rarely under 11)
+                let new_tex = r.upload_texture_generated(base.width, base.height, &base.cache_rgba(), nfs_renderer::MipAlpha::Test(10));
                 c.page_textures[page_index] = new_tex;
                 tex_remap.insert(old_tex, new_tex);
+                // ENHANCEMENT ENH-LIVETEX: and the HD twin of the page, pristine too
+                if let Some(hd) = c.live.hd.as_mut()
+                    && let Some(Some(hp)) = hd.pages.get(page_index)
+                    && !hp.rgba.is_empty()
+                {
+                    let alpha = if hp.is_window || hp.is_alpha { nfs_renderer::MipAlpha::Blend } else { nfs_renderer::MipAlpha::Test(10) };
+                    let twin = r.upload_texture_generated(hp.width, hp.height, &hp.rgba, alpha);
+                    r.set_texture_twin(new_tex, Some(twin));
+                    hd.tex[page_index] = Some(twin);
+                }
             }
             let mut mat_remap: HashMap<MaterialId, MaterialId> = HashMap::new();
             let mut remap = |mid: &mut MaterialId, material_light: &mut MaterialMap<nfs_formats::crp::LayerLight>, shadowed: &mut MaterialSet| {
@@ -1462,6 +1718,174 @@ impl CarModel {
         // next `update_damage` call (before this instance's own `draw_items`) fills it in
         c.damage_shown = [0.0; 10];
         c
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX: the meshes of every body and wheel part, in order (what a twin pairs by position).
+    fn part_meshes(&self) -> Vec<MeshId> {
+        self.body.iter().map(|b| b.0).chain(self.wheels.iter().flat_map(|w| w.parts.iter().map(|p| p.0))).collect()
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX: the model still lacks twins for the levels E41 / E42 are at now (never built, or built for another scale /
+    /// level). Flipping a switch to 0 or back to a level whose twins are resident needs nothing.
+    pub fn live_pending(&self, r: &Renderer) -> bool {
+        let Some(src) = &self.source else { return false };
+        let e = r.enhancements();
+        let want41 = nfs_assets::hdpack::scale_of_level(e.level(nfs_renderer::E41)).unwrap_or(0);
+        let want42 = e.level(nfs_renderer::E42);
+        (want41 != 0 && !src.room && self.live.hd_tried != want41) || (want42 != 0 && self.live.round_tried != want42)
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX: bring this model's twins to the levels E41 / E42 are at now (see [`Self::live_pending`]). The first model of
+    /// a load builds them by loading the car again (`CarSource`) with only the missing kinds asked for and adopts the result; the others of
+    /// the load (traffic / police instances) copy from it through `cache`. A short hitch, once per change of level, never per F12 flip.
+    pub fn sync_live(&mut self, r: &mut Renderer, paths: &nfs_assets::GamePaths, cache: &mut LiveCache) {
+        if !self.live_pending(r) {
+            return;
+        }
+        let Some(src) = self.source.clone() else { return };
+        let e = r.enhancements();
+        let want41 = nfs_assets::hdpack::scale_of_level(e.level(nfs_renderer::E41)).unwrap_or(0);
+        let want42 = e.level(nfs_renderer::E42);
+        let need_hd = want41 != 0 && !src.room && self.live.hd_tried != want41;
+        let need_round = want42 != 0 && self.live.round_tried != want42;
+        if let Some((tw, pages)) = cache.by_source.get(&src.id) {
+            let (tw, pages) = (tw.clone(), pages.clone());
+            self.adopt(r, tw, None, Some(&pages), need_hd, need_round);
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut load_ms = 0;
+        let fresh = src.recipe.load().map_err(anyhow::Error::from).and_then(|assets| {
+            load_ms = started.elapsed().as_millis() as u64;
+            let want = LiveWant { e41: if need_hd { e.level(nfs_renderer::E41) } else { 0 }, e42: if need_round { want42 } else { 0 }, twins_only: true };
+            Self::upload_inner(r, &assets, paths, src.lod, src.paint, CarUpload { env: src.env, night: src.night, race_roof: src.race_roof, skidpad: src.skidpad }, want)
+        });
+        match fresh {
+            Ok(fresh) => {
+                let parts = fresh.part_meshes();
+                self.adopt(r, fresh.live, Some(&parts), None, need_hd, need_round);
+                tracing::info!(model = %src.recipe_model(), hd = need_hd, round = need_round, load_ms, ms = started.elapsed().as_millis() as u64, "car twins built live (ENHANCEMENT ENH-LIVETEX)");
+            }
+            Err(err) => {
+                tracing::warn!(model = %src.recipe_model(), error = %err, "car twins could not be built live (ENHANCEMENT ENH-LIVETEX)");
+                // not tried again for these levels
+                if need_hd {
+                    self.live.hd_tried = want41;
+                }
+                if need_round {
+                    self.live.round_tried = want42;
+                }
+            }
+        }
+        cache.by_source.insert(src.id, (self.live.clone(), self.page_textures.clone()));
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX: make `new`'s twins this model's. `fresh_parts`: `new` is a fresh load's own (its ids are taken over, the parts
+    /// paired by position with this model's); `None` with `template_pages`: `new` is a template's (this instance's private page / crush
+    /// resources get copies of their own, everything shared is the template's twin already).
+    fn adopt(&mut self, r: &mut Renderer, new: LiveTwins, fresh_parts: Option<&[MeshId]>, template_pages: Option<&[nfs_renderer::TextureId]>, need_hd: bool, need_round: bool) {
+        if need_hd {
+            self.live.hd_tried = new.hd_tried;
+            let old = self.live.hd.take();
+            if let Some(nh) = new.hd {
+                let mut tex: Vec<Option<nfs_renderer::TextureId>> = vec![None; self.page_textures.len()];
+                for (i, slot) in tex.iter_mut().enumerate() {
+                    let Some(nt) = nh.tex.get(i).copied().flatten() else { continue };
+                    let base = self.page_textures[i];
+                    match template_pages {
+                        None => {
+                            r.set_texture_twin(base, Some(nt));
+                            *slot = Some(nt);
+                        }
+                        Some(tp) if tp.get(i) == Some(&base) => *slot = Some(nt),
+                        Some(_) => {
+                            // a page of this instance's own (a damage decal page): a copy of the HD base page
+                            if let Some(Some(pg)) = nh.pages.get(i).filter(|p| p.as_ref().is_some_and(|p| !p.rgba.is_empty())) {
+                                let alpha = if pg.is_window || pg.is_alpha { nfs_renderer::MipAlpha::Blend } else { nfs_renderer::MipAlpha::Test(10) };
+                                let id = r.upload_texture_generated(pg.width, pg.height, &pg.rgba, alpha);
+                                r.set_texture_twin(base, Some(id));
+                                *slot = Some(id);
+                            }
+                        }
+                    }
+                }
+                self.live.hd = Some(HdCar { pages: nh.pages, patches: nh.patches, tex });
+            }
+            if let Some(old) = old {
+                for (i, o) in old.tex.iter().enumerate() {
+                    let Some(o) = o else { continue };
+                    let now = self.live.hd.as_ref().and_then(|h| h.tex.get(i).copied().flatten());
+                    if now.is_none() {
+                        r.set_texture_twin(self.page_textures[i], None);
+                    }
+                    if now != Some(*o) {
+                        r.release_texture(*o);
+                    }
+                }
+            }
+        }
+        if need_round {
+            self.live.round_tried = new.round_tried;
+            let old_static = std::mem::take(&mut self.live.round_static);
+            let mut now_static: Vec<(MeshId, MeshId)> = Vec::new();
+            match fresh_parts {
+                Some(fp) => {
+                    let map: HashMap<MeshId, MeshId> = new.round_static.iter().copied().collect();
+                    let mine = self.part_meshes();
+                    if mine.len() == fp.len() {
+                        for (m, f) in mine.iter().zip(fp) {
+                            if let Some(&rid) = map.get(f) {
+                                r.set_mesh_twin(*m, Some(rid));
+                                now_static.push((*m, rid));
+                            }
+                        }
+                    } else {
+                        tracing::warn!(mine = mine.len(), fresh = fp.len(), "car twins: the part lists differ, the refined meshes are not adopted");
+                    }
+                }
+                // an instance shares every non-crush mesh with its template: the template's pairs are this model's
+                None => now_static = new.round_static.clone(),
+            }
+            for (b, _) in &old_static {
+                if !now_static.iter().any(|(nb, _)| nb == b) {
+                    r.set_mesh_twin(*b, None);
+                }
+            }
+            // ENHANCEMENT ENH-LIVELEAK: the replaced refined meshes (the previous level's) give their memory back once no twin entry names them.
+            // The static ones are shared with the instances of the same load, which take the new ones from the cache: only the model that
+            // built them (`fresh_parts`) releases them; the crush siblings are private to each model.
+            let old_deform: Vec<MeshId> = self.live.round_deform.iter().flatten().map(|d| d.mesh).collect();
+            let mut dead: Vec<MeshId> = old_deform;
+            if fresh_parts.is_some() {
+                dead.extend(old_static.iter().map(|(_, t)| *t));
+            }
+            self.live.round_static = now_static;
+            // the crush siblings
+            let mut round_deform: Vec<Option<DeformPart>> = Vec::with_capacity(self.deform.len());
+            for (j, p) in self.deform.iter().enumerate() {
+                let mut nd = new.round_deform.get(j).cloned().flatten();
+                if let Some(d) = nd.as_mut() {
+                    if template_pages.is_some() {
+                        d.mesh = r.upload_mesh(&MeshData { vertices: d.base.clone(), indices: d.indices.clone() });
+                    }
+                    r.set_mesh_twin(p.mesh, Some(d.mesh));
+                } else if self.live.round_deform.get(j).is_some_and(|d| d.is_some()) {
+                    r.set_mesh_twin(p.mesh, None);
+                }
+                round_deform.push(nd);
+            }
+            // the twin entries now name the new meshes: the old ones can go (a mesh the new set still holds stays)
+            let keep: std::collections::HashSet<MeshId> = self.live.round_static.iter().map(|(_, t)| *t).chain(round_deform.iter().flatten().map(|d| d.mesh)).collect();
+            let mut done: std::collections::HashSet<MeshId> = std::collections::HashSet::new();
+            for m in dead.into_iter().filter(|m| !keep.contains(m)) {
+                if done.insert(m) {
+                    r.release_mesh(m);
+                }
+            }
+            self.live.round_deform = round_deform;
+        }
+        // the new twins start pristine: the next `update_damage` redraws the crush / decals of every damaged zone on them
+        self.damage_shown = [0.0; 10];
     }
 
     /// **0x438230(0)**, which `R3DCar` slot 7 runs every frame (0x4383CC): when any of the ten
@@ -1500,6 +1924,34 @@ impl CarModel {
                     out.position = [out.position[0] + k_f * d[0], out.position[1] + k_f * d[1], out.position[2] + k_f * d[2]];
                 }
                 r.update_mesh_vertices(p.mesh, &v);
+            }
+            // ENHANCEMENT ENH-LIVETEX: the refined siblings crush the same way (their own vertices, the blended crush vectors)
+            for p in self.live.round_deform.iter().flatten() {
+                if !p.zone.iter().any(|&z| changed.get(z as usize).copied().unwrap_or(false)) {
+                    continue;
+                }
+                let mut v = p.base.clone();
+                for (k, out) in v.iter_mut().enumerate() {
+                    let Some(&k_f) = f.get(p.zone[k] as usize) else { continue };
+                    let d = p.delta[k];
+                    out.position = [out.position[0] + k_f * d[0], out.position[1] + k_f * d[1], out.position[2] + k_f * d[2]];
+                }
+                r.update_mesh_vertices(p.mesh, &v);
+            }
+        }
+        // ENHANCEMENT ENH-LIVETEX: the HD twins of the touched pages, recomposed from the HD base page and the HD-scale decals
+        if let Some(hd) = &self.live.hd {
+            let touched: std::collections::BTreeSet<usize> = hd.patches.iter().map(|p| p.page).collect();
+            for page_index in touched {
+                let (Some(Some(base)), Some(Some(tex))) = (hd.pages.get(page_index), hd.tex.get(page_index)) else { continue };
+                if base.rgba.is_empty() {
+                    continue;
+                }
+                let mut page = base.clone();
+                for patch in hd.patches.iter().filter(|p| p.page == page_index) {
+                    nfs_assets::car::blend_patch(&mut page, patch, damage[patch.zone as usize]);
+                }
+                r.update_texture(*tex, &TextureData::single(page.width, page.height, page.rgba));
             }
         }
         if self.damage_patches.is_empty() {

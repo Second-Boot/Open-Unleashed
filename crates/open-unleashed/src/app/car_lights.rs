@@ -68,6 +68,40 @@ impl App {
         s
     }
 
+    /// ENHANCEMENT E24: the render-side "lit by the tunnel" value of one car, 0..1, or 0 with the switch off, on a night
+    /// track (its lamps are lit already, and a player who put them out keeps that) or outside a covered stretch
+    /// (`TrackWorld::in_tunnel`, the original's bit 15 of the road's overhead flags, the one the tunnel reverb reads).
+    /// It rises over [`TUNNEL_LAMP_IN`] ms after the car's position is covered and falls over [`TUNNEL_LAMP_OUT`] ms
+    /// after it leaves; `now_ms` is the lamp clock of the draw, so the value is the same for the mirror's pass and
+    /// the first call of a car snaps to its target (a still taken in a tunnel has its lamps lit). Render-side only:
+    /// the car's lamp byte (`car+0xD87`, `lamp_bits`), the lights key, the replay and the net messages are not read
+    /// or written here, the value only widens the slots [`Self::lamp_slots_tunnel`] hands the glare / beam / spot draws.
+    pub(crate) fn tunnel_lit(&self, key: u32, pos: Vec3, now_ms: f64) -> f32 {
+        if !self.enh.is_on(nfs_renderer::E24) || self.track.is_night() {
+            return 0.0;
+        }
+        let covered = self.world.as_ref().is_some_and(|w| w.in_tunnel(pos));
+        self.tunnel_lamps.borrow_mut().value_held(key, covered, now_ms)
+    }
+
+    /// ENHANCEMENT E24: [`Self::lamp_slots`] with the tunnel's lit value `f` (0..1, [`Self::tunnel_lit`]) laid over: a
+    /// slot the car's own state leaves dark but its headlights-on state would light (the headlights, the tail
+    /// glow, the combined lamps) is lit at `f` times that intensity; what the car's own state lights is as it was.
+    /// `f == 0` is exactly `lamp_slots`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lamp_slots_tunnel(f: f32, headlights: bool, fade: f32, brake: bool, reverse: bool, signals: (bool, bool, bool), damage: Option<&[f32; 10]>) -> [(bool, f32); 14] {
+        let mut s = Self::lamp_slots(headlights, fade, brake, reverse, signals, damage);
+        if f > 0.0 && !headlights {
+            let on = Self::lamp_slots(true, 1.0, brake, reverse, signals, damage);
+            for (a, b) in s.iter_mut().zip(on) {
+                if !a.0 && b.0 {
+                    *a = (true, b.1 * f);
+                }
+            }
+        }
+        s
+    }
+
     /// Which lamp slots a **front-end car** lights: the lamp function 0x439360 sends the front end
     /// (`[0x65B928]` set, 0x43936E `jne 0x439800`) to its own arm, which lights slots 0 and 1 at
     /// `[0x5B359C]` 0.8, 2 and 3 and 0xA and 0xB at `[0x5B35A4]` 0.6, 8 at `[0x5B35A0]` 0 and 9 at
@@ -242,6 +276,11 @@ impl App {
                 let alpha = (((b * 255.0) as i32) & 0xFF) as f32 / 255.0;
                 let c = l.colour[0];
                 let tint = [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0];
+                // ENHANCEMENT E26: a lit lamp near wet road is also a light the road shows a streak of (render only)
+                if wet > 0.05 && self.enh.is_on(nfs_renderer::E26) {
+                    let s = b.min(1.0) * 1.3;
+                    self.rain.lamps.borrow_mut().push((world, [tint[0] * s, tint[1] * s, tint[2] * s]));
+                }
                 // a billboard: the corners are the lamp's centre plus the camera's two rows `+0xF4` /
                 // `+0xE8` times the 2-D corner offsets (0x43D301…0x43D399), so the quad faces the
                 // camera — the half-axes taken into that plane stand for the offsets' rotation and scale
@@ -296,8 +335,55 @@ impl App {
                     v[2 * k + 1].position = far.into();
                     v[2 * k + 1].color = [rgb[0], rgb[1], rgb[2], 0.0];
                 }
-                out.push(LampDraw::Beam(v));
+                out.push(LampDraw::Beam(v, world));
             }
+        }
+    }
+
+    /// ENHANCEMENT E15 (ENH-CONES): the original's translucent beam strip (0x43D4F0, alpha 16 / 255 at the lamp, 0 at its
+    /// far ring) fades out where E15's own light takes its place: a lamp with a spot this frame (`lit`: every lit lamp
+    /// with its intensity, `over_limit`: the lamps the spot limit left out, which keep the original's cone so no car
+    /// goes dark) gets `alpha * (1 - k)`, `k` the lamp's ramp (up over 350 ms, down over 700 ms, so a lamp crossing the
+    /// limit never pops) times the spot's own intensity (a pop-up car's lamps ramp in). The glare sprites are not touched.
+    pub(crate) fn fade_cones(&mut self, log: &mut Vec<BeamLog>, lit: &[(Vec3, f32)], over_limit: &[Vec3], now_ms: f64) {
+        for b in log.drain(..) {
+            let spot = lit.iter().find(|(p, _)| *p == b.lamp).map_or(0.0, |&(_, i)| i.clamp(0.0, 1.0));
+            let ramp = self.cone_fade.borrow_mut().value(b.key, spot > 0.0 && !over_limit.contains(&b.lamp), now_ms);
+            let k = ramp * spot;
+            if k <= 0.0 {
+                continue;
+            }
+            let mut v = b.verts;
+            for x in &mut v {
+                x.color[3] *= 1.0 - k;
+            }
+            if let Some(r) = self.renderer.as_mut() {
+                r.write_mesh_vertices(b.mesh, &v);
+            }
+        }
+    }
+
+    /// ENHANCEMENT E15: the lit headlights of a car as spotlights (`nfs_renderer::Spots`). Each lamp of the
+    /// model's `CARG` list with the night-beam flag (`L+0x4F`, the headlights, slots 0 / 1) whose slot is lit
+    /// gives its centre through its article's frame (the same `lamp_frames` the glare and the beam use) and the
+    /// beam's forward axis `rot * bf * +Z` (0x43D4F0's far ring pushes along it), tipped [`SPOT_PITCH_DEG`]
+    /// down about the car's right axis so the lower edge of the cone meets the road a few metres ahead.
+    /// `gain` is how dark the place is (night or tunnel 1, open day road less).
+    pub(crate) fn spot_lamps(model: &CarModel, pos: Vec3, rot: Quat, slots: &[(bool, f32); 14], gain: f32, out: &mut Vec<nfs_renderer::SpotLamp>) {
+        let (sin, cos) = SPOT_PITCH_DEG.to_radians().sin_cos();
+        for l in &model.lights {
+            let Some(&(true, intensity)) = slots.get(l.slot as usize) else { continue };
+            if !l.night {
+                continue;
+            }
+            let (gf, bf) = model.lamp_frames(l);
+            let world = pos + rot * gf.transform_point3(l.position);
+            let fwd = (rot * bf.transform_vector3(Vec3::Z)).normalize_or_zero();
+            if fwd == Vec3::ZERO {
+                continue;
+            }
+            let dir = (fwd * cos - (rot * Vec3::Y) * sin).normalize_or_zero();
+            out.push(nfs_renderer::SpotLamp { pos: world, dir, intensity: intensity * gain });
         }
     }
 
@@ -350,8 +436,10 @@ impl App {
         pools: &LampPools,
         used: &mut [usize; 2],
         draws: &mut Vec<LampDraw>,
+        mut cones: Option<(&mut Vec<BeamLog>, u32)>,
     ) {
         let mut renderer = renderer;
+        let mut n_beams = 0;
         for d in draws.drain(..) {
             match d {
                 LampDraw::Glare(item) => items.push(item),
@@ -363,10 +451,14 @@ impl App {
                     // 0x45200F, ← 10 at 0x452083) and the pass's depth writes off
                     items.push(nfs_renderer::DrawItem { layer_light: Some(unlit([1.0; 3])), depth_bias, ..nfs_renderer::DrawItem::new(mesh, mat, Mat4::IDENTITY) });
                 }
-                LampDraw::Beam(v) => {
+                LampDraw::Beam(v, lamp) => {
                     let (Some(r), Some(mat), Some(&mesh)) = (renderer.as_deref_mut(), pools.beam_material, pools.beam.get(used[0])) else { continue };
                     used[0] += 1;
                     r.write_mesh_vertices(mesh, &v);
+                    if let Some((log, key)) = cones.as_mut() {
+                        log.push(BeamLog { key: *key * 16 + n_beams.min(15), mesh, verts: v, lamp });
+                        n_beams += 1;
+                    }
                     // the strip's colour is its vertices' (0x43D64D…0x43D7B1), unlit
                     items.push(nfs_renderer::DrawItem { layer_light: Some(unlit([1.0; 3])), ..nfs_renderer::DrawItem::new(mesh, mat, Mat4::IDENTITY) });
                 }
@@ -537,6 +629,8 @@ impl App {
             alpha_ref: 10,
             early: true,
             depth_bias,
+            // ENHANCEMENT E9: fades where the sun's shadow map draws the car's own shadow (inert without E9)
+            csm: nfs_renderer::CSM_CAR_BLOB,
             ..nfs_renderer::DrawItem::new(mesh, material, Mat4::IDENTITY)
         });
     }
@@ -556,13 +650,72 @@ impl App {
     }
 }
 
+/// ENHANCEMENT E24: the fade-in time of a car's lamps at a tunnel mouth, ms.
+pub(crate) const TUNNEL_LAMP_IN: f64 = 350.0;
+/// ENHANCEMENT E24: the fade-out time after the car leaves the covered stretch, ms.
+pub(crate) const TUNNEL_LAMP_OUT: f64 = 700.0;
+
+/// a covered state that drops for less than this (ms) is a gap in the road's overhead flags, not a tunnel's
+/// end (castle: one tick inside a tunnel reads uncovered), so the fade does not start.
+pub(crate) const TUNNEL_HOLD: f64 = 250.0;
+
+/// ENHANCEMENT E24: every car's render-side tunnel lamp value (key: 0 the camera's car, 1 + i opponent i, 0x100 + i
+/// traffic, 0x200 + i police) and the lamp-clock time it was last stepped to. Never part of a car's state.
+#[derive(Default)]
+pub(crate) struct TunnelLamps {
+    cars: std::collections::HashMap<u32, (f32, f64)>,
+    /// the lamp-clock time each car was last seen covered ([`Self::value_held`])
+    covered_at: std::collections::HashMap<u32, f64>,
+}
+
+impl TunnelLamps {
+    /// [`Self::value`] with the covered state held for [`TUNNEL_HOLD`] ms after the last time it was true.
+    pub(crate) fn value_held(&mut self, key: u32, covered: bool, now_ms: f64) -> f32 {
+        if covered {
+            self.covered_at.insert(key, now_ms);
+        }
+        let held = covered || self.covered_at.get(&key).is_some_and(|&t| (0.0..=TUNNEL_HOLD).contains(&(now_ms - t)));
+        self.value(key, held, now_ms)
+    }
+
+    /// The car's value at `now_ms`, stepped from the last call toward its target (1 when `covered`, else 0). A first
+    /// call, a clock that went back (a restart) or a jump of more than a second (a pause, a teleport) snaps to the target.
+    pub(crate) fn value(&mut self, key: u32, covered: bool, now_ms: f64) -> f32 {
+        let target = if covered { 1.0 } else { 0.0 };
+        let e = self.cars.entry(key).or_insert((target, now_ms));
+        let dt = now_ms - e.1;
+        if !(0.0..=1000.0).contains(&dt) {
+            e.0 = target;
+        } else if covered {
+            e.0 = (e.0 + (dt / TUNNEL_LAMP_IN) as f32).min(1.0);
+        } else {
+            e.0 = (e.0 - (dt / TUNNEL_LAMP_OUT) as f32).max(0.0);
+        }
+        e.1 = now_ms;
+        e.0
+    }
+}
+
+/// ENHANCEMENT E15: the spotlights' downward tilt about the car's right axis, degrees (a headlight's cut-off).
+pub(crate) const SPOT_PITCH_DEG: f32 = 3.0;
+
+/// ENHANCEMENT E15 (ENH-CONES): a beam strip written this frame, kept to be faded once the frame's spots are chosen.
+pub(crate) struct BeamLog {
+    /// the car's key * 16 + the beam's number in the car: the fade ramp's key
+    pub(crate) key: u32,
+    pub(crate) mesh: nfs_renderer::MeshId,
+    pub(crate) verts: [nfs_renderer::Vertex; 18],
+    /// the lamp's world centre, as `spot_lamps` computes it for the same lamp
+    pub(crate) lamp: Vec3,
+}
+
 /// One draw of a car's effect pass 0x43D800, in the order it makes them (`App::lamp_draws`): a
 /// lamp's glare sprite (0x43CDD0), its road reflection (0x451D60, the quad and its depth bias) or
 /// its night beam's 18-vertex strip (0x43D4F0).
 pub(crate) enum LampDraw {
     Glare(nfs_renderer::DrawItem),
     Reflection([nfs_renderer::Vertex; 4], i32),
-    Beam([nfs_renderer::Vertex; 18]),
+    Beam([nfs_renderer::Vertex; 18], Vec3),
 }
 
 /// The camera's side of 0x451D60 (`App::lamp_reflection`): the eye, its row `+0xE8` (`right`), the
@@ -641,12 +794,63 @@ pub(crate) fn lamp_command(bits: u8, code: u8) -> u8 {
 
 #[cfg(test)]
 mod lamp_tests {
-    use super::{App, HeadRamp, lamp_command};
+    use super::{App, HeadRamp, TUNNEL_HOLD, TUNNEL_LAMP_IN, TUNNEL_LAMP_OUT, TunnelLamps, lamp_command};
 
     const N: (bool, bool, bool) = (false, false, false);
 
     /// 0x439360: the tail lamps glow at 0.6 at night without the brake, full with it; gear 0 lights
     /// the reverse slot; a damage zone over 30 breaks its lamps (0x4398C6…).
+    #[test]
+    fn tunnel_lamps_fade_in_and_out_and_snap() {
+        let mut t = TunnelLamps::default();
+        // the first call snaps to the target (a still taken inside has its lamps lit)
+        assert_eq!(t.value(0, true, 1000.0), 1.0);
+        assert_eq!(t.value(1, false, 1000.0), 0.0);
+        // leaving: falls over TUNNEL_LAMP_OUT, no jump
+        let v = t.value(0, false, 1000.0 + TUNNEL_LAMP_OUT / 2.0);
+        assert!((v - 0.5).abs() < 1e-4, "{v}");
+        assert_eq!(t.value(0, false, 1000.0 + TUNNEL_LAMP_OUT), 0.0);
+        // entering: rises over TUNNEL_LAMP_IN; the same time again changes nothing (the mirror's pass)
+        assert_eq!(t.value(0, false, 2500.0), 0.0);
+        let a = t.value(0, true, 2500.0 + TUNNEL_LAMP_IN / 2.0);
+        assert!((a - 0.5).abs() < 1e-4, "{a}");
+        assert_eq!(t.value(0, true, 2500.0 + TUNNEL_LAMP_IN / 2.0), a);
+        // a clock that went back snaps
+        assert_eq!(t.value(0, false, 10.0), 0.0);
+    }
+
+    /// a one-tick gap in the covered bit inside a tunnel changes nothing; a real exit fades after the hold.
+    #[test]
+    fn tunnel_gap_is_held() {
+        let mut t = TunnelLamps::default();
+        assert_eq!(t.value_held(0, true, 1000.0), 1.0);
+        // a gap of two frames (31 ms apart): still 1
+        assert_eq!(t.value_held(0, false, 1031.0), 1.0);
+        assert_eq!(t.value_held(0, false, 1062.0), 1.0);
+        assert_eq!(t.value_held(0, true, 1093.0), 1.0);
+        // a real exit: the value starts to fall only after TUNNEL_HOLD, then falls over TUNNEL_LAMP_OUT
+        assert_eq!(t.value_held(0, false, 1093.0 + 200.0), 1.0);
+        let v = t.value_held(0, false, 1093.0 + TUNNEL_HOLD + TUNNEL_LAMP_OUT / 2.0 + 1.0);
+        assert!(v < 0.95 && v > 0.3, "{v}");
+        assert_eq!(t.value_held(0, false, 1093.0 + TUNNEL_HOLD + 2.0 * TUNNEL_LAMP_OUT), 0.0);
+    }
+
+    #[test]
+    fn tunnel_slots_light_only_what_the_car_leaves_dark() {
+        const N: (bool, bool, bool) = (false, false, false);
+        let off = App::lamp_slots(false, 0.0, false, false, N, None);
+        assert_eq!(App::lamp_slots_tunnel(0.0, false, 0.0, false, false, N, None), off);
+        let half = App::lamp_slots_tunnel(0.5, false, 0.0, false, false, N, None);
+        assert_eq!(half[0], (true, 0.5));
+        assert_eq!(half[2], (true, 0.3));
+        // lamps already on by the car's own byte: untouched
+        assert_eq!(App::lamp_slots_tunnel(1.0, true, 0.7, false, false, N, None), App::lamp_slots(true, 0.7, false, false, N, None));
+        // a broken lamp stays dark, a lit brake lamp stays as it was
+        let d = [40.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert!(!App::lamp_slots_tunnel(1.0, false, 0.0, false, false, N, Some(&d))[0].0);
+        assert_eq!(App::lamp_slots_tunnel(1.0, false, 0.0, true, false, N, None)[2], (true, 1.0));
+    }
+
     #[test]
     fn lamp_slots_glow_and_break() {
         let s = App::lamp_slots(true, 1.0, false, false, N, None);

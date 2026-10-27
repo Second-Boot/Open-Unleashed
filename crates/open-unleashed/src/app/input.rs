@@ -1300,6 +1300,14 @@ impl App {
                 self.bind_lists();
                 return;
             }
+            // ENHANCEMENT framework (`nfs_game::remaster`): the buttons of the «Улучшения» panel live in a
+            // panel, which `controls()` does not list — the release on one runs its port-own callback
+            if !down
+                && let Some(cb) = self.fe.layout_preview.as_ref().and_then(|l| l.callback_at(hit)).filter(|cb| cb.starts_with("ENH"))
+            {
+                self.enh_panel_callback(&cb);
+                return;
+            }
             let controls = self.fe.layout_preview.as_ref().map(|l| l.controls()).unwrap_or_default();
             // a combo takes focus on the **release** (0x4C6CC1, after sound 2 at
             // 0x4C6C97), and focus is what opens its list (0x4C53A0) — clicking the open
@@ -1314,7 +1322,14 @@ impl App {
             // 0x4BC690 (0x4C6C33) and plays sound **5** (0x4C6C38); it does not open.
             // Anywhere else in `backrect` it opens on sound **2** (0x4C6C97), only with
             // rows to show (slot 9 ≠ 0, 0x4C6C4F).
-            let combos = self.fe.layout_preview.as_ref().map(|l| l.combo_sliders()).unwrap_or_default();
+            // ENHANCEMENT ENH-UPSCALER: an inactive row of the «Улучшения» panel (`state=disabled`: its setting cannot act now) neither opens
+            // nor steps
+            let combos: Vec<_> = self
+                .fe
+                .layout_preview
+                .as_ref()
+                .map(|l| l.combo_sliders().into_iter().filter(|c| !(l.widget_disabled_routed(c.index) && c.accessor.as_deref().is_some_and(|a| a.starts_with(nfs_game::remaster::ACCESSOR_PREFIX)))).collect())
+                .unwrap_or_default();
             let strip = !down
                 && was_open != Some(hit)
                 && self.fe.cursor.is_some_and(|(cx, cy)| self.fe.layout_preview.as_ref().is_some_and(|l| l.in_combo_strip(hit, cx, cy)));

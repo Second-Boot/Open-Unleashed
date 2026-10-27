@@ -932,6 +932,8 @@ impl App {
         // the texture pixels are read again for a restart / replay pass (released after the last upload)
         self.track.ensure_textures().expect("track textures");
         let mut world = TrackWorld::upload(&mut renderer, &self.track).expect("track");
+        // ENHANCEMENT E32: the bounce light read (or baked once per track) while the loading screen is up
+        world.gi_prepare(&mut renderer, self.enh.level(nfs_renderer::E32));
         // …and are on the GPU now: the CPU copies (a track's whole mip chains) go
         self.track.release_textures();
         // 0x469065: step 3 inside the track load 0x468FB0, right after `RdrKeys` (0x44FAE0) — the track's

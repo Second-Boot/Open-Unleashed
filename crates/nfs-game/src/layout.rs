@@ -1074,7 +1074,7 @@ impl LayoutScreen {
     /// they reference.
     pub fn load(r: &mut Renderer, paths: &GamePaths, name: &str) -> anyhow::Result<Self> {
         let controls = Arc::new(load_controls(paths));
-        let fe_strings = Arc::new(load_strings(paths));
+        let fe_strings = Arc::new(if crate::remaster::enabled() { crate::remaster::with_extras(load_strings(paths)) } else { load_strings(paths) });
         let mut screen = Self::load_one(r, paths, name, controls.clone(), fe_strings.clone())?;
         if let Some(bg) = screen.layout.screen().and_then(|s| s.get("screen")).and_then(background_layout) {
             match Self::load_one(r, paths, bg, controls, fe_strings) {
@@ -1144,6 +1144,28 @@ impl LayoutScreen {
         let mut keys: Vec<usize> = self.groups.keys().copied().collect();
         keys.sort_unstable();
         keys.into_iter().any(|k| self.groups.get_mut(&k).is_some_and(|g| g.set_panel(r, paths, name, open)))
+    }
+
+    /// ENHANCEMENT framework (`crate::remaster`): replace the content of the `NFS5.PANEL` named
+    /// `name` (here or in a panel this screen holds) with the layout `file` — the «Улучшения» panel's
+    /// page button. The panel keeps its place and its open / closed state. Answers whether found.
+    pub fn swap_panel(&mut self, r: &mut Renderer, paths: &GamePaths, name: &str, file: &str) -> bool {
+        let found = self.layout.elements.iter().position(|e| e.class == "NFS5.PANEL" && e.get("name").is_some_and(|n| n.eq_ignore_ascii_case(name)));
+        if let Some(i) = found {
+            if let Ok(mut g) = Self::load_one(r, paths, file, self.controls.clone(), self.fe_strings.clone()) {
+                g.set_overlay(true);
+                Self::load_children(r, paths, &mut g, 1);
+                g.hud_preview = self.hud_preview.clone();
+                self.groups.insert(i, Box::new(g));
+                // the new group read the pointer's absolute pair for itself; hand it over again
+                let at = self.cursor;
+                self.place_cursor(at);
+            }
+            return true;
+        }
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter().any(|k| self.groups.get_mut(&k).is_some_and(|g| g.swap_panel(r, paths, name, file)))
     }
 
     fn load_children(r: &mut Renderer, paths: &GamePaths, screen: &mut Self, depth: usize) {
@@ -1237,9 +1259,30 @@ impl LayoutScreen {
         // 0x4E1281…0x4E12EF: the loader searches the name for `.lay` and appends it only when it
         // is not already there. Both spellings ship — `filename=audio` and `filename=gearratio.lay`.
         let file = if name.to_ascii_lowercase().contains(".lay") { name.to_string() } else { format!("{name}.lay") };
-        let path = GamePaths::find_file(&dir, &file).ok_or_else(|| anyhow::anyhow!("no layout {file} in {}", dir.display()))?;
+        // ENHANCEMENT framework (branch `remaster`, `crate::remaster`): the port-own «Улучшения»
+        // panel is read from the second directory, and the graphics tab gets its third sub-tab.
+        // Both only when the front-end additions exist in this run (`remaster::enabled`); without
+        // them this is the original's loader, unchanged.
+        let own = crate::remaster::enabled().then(|| crate::remaster::is_screen(name)).unwrap_or(false);
+        let path = if own {
+            let rd = crate::remaster::layouts_dir(paths).ok_or_else(|| anyhow::anyhow!("no enhanced/layouts directory"))?;
+            // every page of the screen is the one file
+            let own_file = format!("{}.lay", crate::remaster::SCREEN);
+            GamePaths::find_file(&rd, &own_file).ok_or_else(|| anyhow::anyhow!("no layout {own_file} in {}", rd.display()))?
+        } else {
+            GamePaths::find_file(&dir, &file).ok_or_else(|| anyhow::anyhow!("no layout {file} in {}", dir.display()))?
+        };
         let bytes = std::fs::read(&path)?;
-        let text: String = bytes.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        let mut text: String = bytes.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        if crate::remaster::enabled() {
+            if own {
+                text.push_str(&crate::remaster::generated_rows(crate::remaster::page_of(name).unwrap_or(0)));
+            } else if let Some(entry) = crate::remaster::splice_file(name).and_then(|f| crate::remaster::layouts_dir(paths).and_then(|d| std::fs::read_to_string(d.join(f)).ok())) {
+                // the third graphics sub-tab: its button into `GraphicsTabs.lay`, its panel into `graphics.lay`
+                text.push('\n');
+                text.push_str(&entry);
+            }
+        }
         let layout = Layout::parse(&text);
 
         let white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
@@ -3085,6 +3128,14 @@ impl LayoutScreen {
     /// parked pointer shows the tooltip half way through its fade.
     fn hover_ms(&self) -> u32 {
         if crate::config::cfg().nfs_fe_cursor.as_str().is_some() { self.clock_ms } else { self.hover_ms }
+    }
+
+    /// The `callback=` of the widget at the flattened index (a panel's included), if it names one.
+    pub fn callback_at(&self, index: usize) -> Option<String> {
+        if let Some((k, j)) = self.route(index) {
+            return self.groups.get(&k)?.callback_at(j);
+        }
+        self.layout.elements.get(index)?.get("callback").filter(|c| !c.is_empty()).map(str::to_string)
     }
 
     /// The class of the widget at the flattened index, following a group the same way the hit

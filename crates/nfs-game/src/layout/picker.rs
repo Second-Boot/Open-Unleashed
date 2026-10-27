@@ -12,7 +12,7 @@ impl LayoutScreen {
         let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(160.0) as f32;
         let width = self.attr_num(e, "width").unwrap_or(0.0) as f32;
         let height = self.attr_num(e, "height").unwrap_or(0.0) as f32;
-        let full: f32 = rows.iter().map(|r| r.height()).sum();
+        let full: f32 = rows.iter().map(|r| r.height()).sum::<f32>() + self.drop_down_pad(e);
         // `refreshRows` 0x4C53F3: the rows' height, clamped, and the scrollbar that clamping raises
         let (rows_h, scrolls) = if full >= max_h { (max_h, true) } else { (full, false) };
         // **The panel is `data.selectionboxwidth` wide when that is wider than the widget**, and

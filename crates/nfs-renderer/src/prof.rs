@@ -3,8 +3,8 @@
 //! `NFS_GPU_PROFILE=minimal` is the other value of the variable: the plain device (no optional feature, so no timestamp
 //! queries), which the start-up crash guard asks for in safe mode. It never turns the profiler on.
 //!
-//! Every render pass of the renderer asks [`rp`] for its `timestamp_writes`; with the env var
-//! unset (or an adapter without `TIMESTAMP_QUERY`) it returns `None` and the pass is exactly what it was. With it
+//! Every render / compute pass of the renderer asks [`rp`] / [`cp`] for its `timestamp_writes`; with the env var
+//! unset (or an adapter without `TIMESTAMP_QUERY`) both return `None` and the pass is exactly what it was. With it
 //! set, each pass writes its begin / end tick into a query set; the encoder that holds the passes resolves them
 //! ([`resolve`]) and [`end_frame`] reads them back (waiting for the device) and logs, every 120 frames, one line per
 //! pass label: the mean ms per frame and the mean number of runs per frame, plus the frame's GPU total. The wait
@@ -78,6 +78,11 @@ pub(crate) fn ctx(c: &'static str) {
 /// `timestamp_writes` for a render pass.
 pub(crate) fn rp(label: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'static>> {
     slot(label).map(|(q, b, e)| wgpu::RenderPassTimestampWrites { query_set: q, beginning_of_pass_write_index: Some(b), end_of_pass_write_index: Some(e) })
+}
+
+/// ENHANCEMENT (the enhancements' compute passes): `timestamp_writes` for a compute pass.
+pub(crate) fn cp(label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'static>> {
+    slot(label).map(|(q, b, e)| wgpu::ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: Some(b), end_of_pass_write_index: Some(e) })
 }
 
 /// Resolve the passes recorded since the last call; call before `encoder.finish()` of every encoder with timed passes.

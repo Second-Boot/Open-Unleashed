@@ -45,19 +45,106 @@ fn same_sprite(a: &Sprite, b: &Sprite) -> bool {
 }
 
 impl App {
-    /// The optional **frame cap**: `NFS_FPS_CAP=<n>` holds the redraw loop to at most `n` frames a
-    /// second by sleeping out the rest of the frame (default off: the loop runs at the display's
-    /// pace, as before). Called at the top of every redraw arm, before the frame's `dt` is read, so
-    /// the sleep is part of that frame's time.
-    // PORT-DEVIATION D4 (RE/notes/PORT-DEVIATIONS.md): NFS_FPS_CAP, opt-in and off by default; the original has no frame cap.
+    /// The frame cap in frames a second, `None` = uncapped. In priority order: `NFS_FPS_CAP=<n>`
+    /// (the port's own switch, D4: tests rely on it); ENHANCEMENT E22 (the menu row «ограничение
+    /// FPS»: 30 / 60 / 120 / 240 or the display's refresh rate); ENHANCEMENT E6 level 2
+    /// (immediate): the front end, which would otherwise spin a core without a vsync, at 120.
+    fn fps_cap(&self) -> Option<f64> {
+        if let Some(c) = nfs_game::config::cfg().nfs_fps_cap.as_str().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0) {
+            return Some(c);
+        }
+        // ENHANCEMENT E22: the menu's cap. "Display" with the display's own sync on (E6 off) is the
+        // sync itself: capping at exactly the refresh rate would only add a beat against it.
+        match self.enh.level(nfs_renderer::E22) {
+            1 => return Some(30.0),
+            2 => return Some(60.0),
+            3 => return Some(120.0),
+            4 => return Some(240.0),
+            5 if self.enh.level(nfs_renderer::E6) != 0 => return Some(self.display_refresh_hz()),
+            // ENHANCEMENT E22 «auto»: on the battery 60 frames a second (the GPU is what heats the machine), on mains
+            // power as «display»
+            6 if self.on_battery() => return Some(60.0),
+            6 if self.enh.level(nfs_renderer::E6) != 0 => return Some(self.display_refresh_hz()),
+            _ => {}
+        }
+        // ENHANCEMENT E6 (immediate): without a vsync the present does not pace the loop, so the
+        // front end (a 640x480 menu) would spin a core at full speed on every animated screen;
+        // hold it to 120 frames a second. The race stays uncapped (that is the point of the level).
+        (self.enh.level(nfs_renderer::E6) == 2 && self.race.is_none() && self.vehicle.is_none()).then_some(120.0)
+    }
+
+    /// ENHANCEMENT E22 «auto»: whether the machine runs on its battery, asked of the OS every five seconds (a
+    /// platform that cannot say counts as mains power).
+    fn on_battery(&self) -> bool {
+        if let Some((at, b)) = self.pace_battery.get()
+            && at.elapsed() < Duration::from_secs(5)
+        {
+            return b;
+        }
+        let b = crate::power::on_battery().unwrap_or(false);
+        if self.pace_battery.get().is_none_or(|(_, old)| old != b) {
+            tracing::info!(battery = b, "power source (E22 auto)");
+        }
+        self.pace_battery.set(Some((Instant::now(), b)));
+        b
+    }
+
+    /// ENHANCEMENT E22: the refresh rate of the monitor the window is on (winit's
+    /// `refresh_rate_millihertz`), 60 when the platform does not say. Re-read every two seconds so
+    /// a window dragged to another display follows.
+    fn display_refresh_hz(&self) -> f64 {
+        if let Some((at, hz)) = self.pace_refresh.get()
+            && at.elapsed() < Duration::from_secs(2)
+        {
+            return hz;
+        }
+        let hz = self
+            .window
+            .as_ref()
+            .and_then(|w| w.current_monitor())
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map(|mhz| mhz as f64 / 1000.0)
+            .filter(|hz| *hz >= 1.0)
+            .unwrap_or(60.0);
+        if self.pace_refresh.get().is_none_or(|(_, old)| old != hz) {
+            tracing::info!(hz, "display refresh rate (E22)");
+        }
+        self.pace_refresh.set(Some((Instant::now(), hz)));
+        hz
+    }
+
+    /// The optional **frame cap** (see [`fps_cap`](Self::fps_cap)): holds the redraw loop to at most
+    /// the cap's frames a second (default off: the loop runs at the display's pace, as before).
+    /// Called at the top of every redraw arm, before the frame's `dt` is read, so the wait is part
+    /// of that frame's time. A **deadline** scheduler: each frame's start is the previous deadline
+    /// plus one period (so a late wake-up does not stretch the next frame), sleeping to ~1 ms
+    /// before it and spinning the rest — the OS sleep alone overshoots by up to a millisecond or
+    /// more. A frame that ran more than a period late restarts the schedule (no burst to catch up).
+    // PORT-DEVIATION D4 (RE/notes/PORT-DEVIATIONS.md): NFS_FPS_CAP, opt-in and off by default; the original has no frame cap. ENHANCEMENT E22 is the menu row on the same pacer.
     pub(crate) fn pace_frame(&self) {
-        let user = nfs_game::config::cfg().nfs_fps_cap.as_str().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0);
-        // PORT-DEVIATION D45 (RE/notes/PORT-DEVIATIONS.md): a race whose window is hidden presents at most 30 fps
+        // PORT-DEVIATION D45 (RE/notes/PORT-DEVIATIONS.md): a race whose window is hidden presents at most 30 fps;
+        // with E22's cap the slower of the two
         let hidden = self.vehicle.is_some() && self.window_hidden();
-        let Some(want) = frame_floor(user, hidden) else { return };
-        let spent = self.last_frame.elapsed();
-        if spent < want {
-            std::thread::sleep(want - spent);
+        let Some(period) = frame_floor(self.fps_cap(), hidden) else {
+            self.pace_next.set(None);
+            return;
+        };
+        let now = Instant::now();
+        let mut target = self.pace_next.get().map_or(now, |t| t + period);
+        if now > target + period {
+            target = now;
+        }
+        self.pace_next.set(Some(target));
+        // the spin margin follows how far the OS sleep overshot lately (1 ms to start; 0.3..3 ms,
+        // decaying 2 % a frame), so the spin is as short as the timer allows
+        let spin = self.pace_spin.get();
+        if let Some(sleep) = target.checked_duration_since(now).and_then(|d| d.checked_sub(spin)) {
+            std::thread::sleep(sleep);
+            let over = Instant::now().saturating_duration_since(target.checked_sub(spin).unwrap_or(now));
+            self.pace_spin.set(spin.mul_f64(0.98).max(over.mul_f64(1.5)).clamp(Duration::from_micros(300), Duration::from_millis(3)));
+        }
+        while Instant::now() < target {
+            std::hint::spin_loop();
         }
     }
 
@@ -100,7 +187,7 @@ impl App {
         let (w, h, s) = self.hud_geometry();
         // the front end has no `SPECIALFX` level: no mip promotion, the fake-sort mode of level `None`
         let target = (w, h, s.to_bits(), false, self.fakesort_mode(None));
-        let Scene { items: _, sprites, clear_color, sun_direction, ambient, mirror, headlight, headlight_decal, beacon, fog, sky_fog, lens_probe: _ } = &self.scene;
+        let Scene { items: _, sprites, clear_color, sun_direction, ambient, mirror, headlight, headlight_decal, headlight_gain: _, beacon, fog, sky_fog, lens_probe: _, refl: _, sun_shadow: _, overcast_shadow: _, spots: _, lamps: _, shafts: _, water: _, ao: _, flash: _, eye: _, motion: _, rain: _, dof: _, haze: _, drops: _, contacts: _, cover: _, lbeam: _ } = &self.scene;
         let plain = !mirror && headlight.is_none() && !headlight_decal && beacon.is_none();
         if plain
             && let Some(p) = &self.presented
@@ -130,8 +217,9 @@ impl App {
         }
         let (w, h, _) = self.hud_geometry();
         self.sync_gamma();
+        let cam = self.render_camera();
         let Some(r) = self.renderer.as_mut() else { return };
-        let img = r.render_to_image(&self.scene, &self.camera, w, h).expect("verify render");
+        let img = r.render_to_image(&self.scene, &cam, w, h).expect("verify render");
         if idle {
             assert!(self.idle_check.as_deref() == Some(img.as_slice()), "front-end idle redraw skipped a frame that differs from the one shown");
             tracing::debug!("front-end idle frame verified identical");
@@ -144,6 +232,10 @@ impl App {
     /// vsync does: sleep out the rest of an 8 ms frame (120 Hz — never slower than the display's
     /// own cadence on a 60 Hz one would have been).
     pub(crate) fn idle_wait(&self) {
+        // a frame cap (D4 / E22) paces at the top of the next frame
+        if self.fps_cap().is_some() {
+            return;
+        }
         let want = Duration::from_millis(8);
         let spent = self.last_frame.elapsed();
         if spent < want {
@@ -157,8 +249,8 @@ impl App {
 pub(crate) const HIDDEN_FPS: f64 = 30.0;
 
 /// The shortest frame time the host holds the redraw loop to: the slower of `NFS_FPS_CAP` (D4) and,
-/// while the window is hidden, [`HIDDEN_FPS`]; `None` = no cap. (On the enhanced branch the
-/// frame-limit enhancement's value joins here as one more `min` of the rates.)
+/// while the window is hidden, [`HIDDEN_FPS`]; `None` = no cap. (On the enhanced branch
+/// `user_cap` is `fps_cap`: `NFS_FPS_CAP`, else ENHANCEMENT E22's menu cap.)
 pub(crate) fn frame_floor(user_cap: Option<f64>, hidden: bool) -> Option<Duration> {
     let rate = match (user_cap, hidden) {
         (Some(c), true) => Some(c.min(HIDDEN_FPS)),

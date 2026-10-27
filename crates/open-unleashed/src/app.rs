@@ -7,6 +7,8 @@ mod menu;
 mod fe_lists;
 mod fe_colour;
 mod fe_choices;
+mod enhancements;
+mod camfx;
 mod profile;
 mod chronicle;
 mod fe_cars;
@@ -27,9 +29,16 @@ mod replay;
 mod render_scene;
 mod hud_pass;
 mod car_lights;
+mod rain;
+mod drops;
+mod haze;
 mod mirror;
+mod reflections;
+mod fe_enh;
 mod scratch;
 mod effects;
+mod cover;
+mod street_lamps;
 mod force_feedback;
 mod lens_flare;
 mod camera;
@@ -486,6 +495,10 @@ pub(crate) struct App {
     pub(crate) lamp_pools: LampPools,
     /// `GameData/Render/flare.dat` (0x4522B0) and a sprite for every texture its records name
     pub(crate) flare_defs: Vec<nfs_formats::flare::FlareDef>,
+    /// ENHANCEMENT E23: the track's street lamps, classified once per race
+    pub(crate) street_lamps: Option<Vec<street_lamps::LampSite>>,
+    /// ENHANCEMENT E9 (ENH-TUNPOOL): the track's covered boxes, built once per race
+    pub(crate) cover: Option<std::sync::Arc<Vec<nfs_renderer::CoverBox>>>,
     pub(crate) flare_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
     /// the sun's flare textures (`SUN_FLARE`'s two layers) as sky-pass sprites: additive, no depth
     /// test (`sun_items`)
@@ -518,6 +531,10 @@ pub(crate) struct App {
     /// the windscreen drops' draw (the splat object, `particles.md` §7.5): `common.fsh`'s `SPLT`
     /// and a dynamic mesh of `SPLAT_SLOTS` triangles
     pub(crate) splat_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// ENHANCEMENT E40: the windscreen's corners of the car (keyed by model, style and the tiny-car flag) and the clock until
+    /// which the renderer keeps the glass after the rain
+    pub(crate) drops_quad: Option<((String, usize, bool), Option<[Vec3; 4]>)>,
+    pub(crate) drops_until: f64,
     /// the particle streaks of 0x454EC0 (the cars' sparks, `nfs_game::track_particles::Streak`):
     /// a pool of dynamic triangle lists of `STREAK_CAP` triangles and an untextured, vertex-coloured
     /// material per blend mode 0…2
@@ -539,8 +556,13 @@ pub(crate) struct App {
     /// this frame's cars' and skid marks' own `+0xC` entries (`round(d²)`-keyed, `RE/RENDERING.md`
     /// "The view's lists"), the main pass's
     pub(crate) blended_dyn_items: Vec<(u32, nfs_renderer::DrawItem)>,
+    /// ENHANCEMENT E37: what the last frame's view looked like, to tell a camera cut the renderer cannot see in the
+    /// camera's numbers (`App::temporal_cut_check`)
+    pub(crate) temporal_sig: Option<(u16, bool, bool, u64)>,
     /// the scene build's reusable buffers (`scratch.rs`)
     pub(crate) scratch: scratch::SceneScratch,
+    /// ENHANCEMENT E26: the wet road's caches and this frame's lamps (`rain.rs`)
+    pub(crate) rain: rain::RainState,
     /// the even tick's non-player collision events (`simulate::tick_collide_*`), kept between ticks for its capacity; empty outside the tick
     pub(crate) ai_hits_buf: Vec<(AudioCar, nfs_audio::sfx::QueuedSfx)>,
     /// `live_order`'s last answer under the `(progress, tick)` pairs it was ranked from, and the
@@ -555,6 +577,8 @@ pub(crate) struct App {
     pub(crate) dyn_pose: Option<DynPose>,
     /// **TEST GLUE**: the interpolation fraction `NFS_SHOT_SEQ` sets for each of its sub-tick frames
     pub(crate) test_alpha: Option<f32>,
+    /// ENHANCEMENTS E27 / E29: the camera effects' memory (previous camera, shake envelope)
+    pub(crate) camfx: camfx::CamFxState,
     /// where the sky pass's items sit in `scene.items` (before the track's), for the mirror's own
     /// sky pass to replace
     pub(crate) sky_item_range: (usize, usize),
@@ -578,6 +602,15 @@ pub(crate) struct App {
     /// The rear-view mirror's camera for this frame (AUDIT §O), and the texture it renders into.
     pub(crate) rear_mirror: Option<Camera>,
     pub(crate) mirror_tex: Option<TextureId>,
+    /// ENHANCEMENT E8: the faces of the player's car's environment map drawn so far (bit per face), the
+    /// next face in the round robin, the face size and the eye the map was last drawn from
+    pub(crate) refl_done: u8,
+    pub(crate) refl_next: u32,
+    pub(crate) refl_size: u32,
+    pub(crate) refl_eye: Vec3,
+    /// ENHANCEMENT E20: the tick the running lightning strike was first seen at and the tick it was last seen
+    /// at (the flicker envelope runs from the first; a gap of 32 ticks without a flash starts a new strike)
+    pub(crate) flash_strike: Option<(u32, u32)>,
     /// `HWrongWay`'s blink: `+0x14` ticks counted, `+0x18` the tick of the last draw, `+0x24`
     /// visible. Every draw adds the ticks since the last one, and the visible half flips off once
     /// the count passes 64, the hidden half back on once it passes 32, the count restarting
@@ -631,6 +664,18 @@ pub(crate) struct App {
     /// what `fe.txt` / the command line assigned by name (`modes.md` §1.2) and an accessor the file has no key for
     /// reads 0 — see `choice_index`.
     pub(crate) fe0: bool,
+    /// The enhanced game's switches and how they were chosen (`nfs_game::remaster`, branch
+    /// `remaster`); pushed to the renderer by [`App::enh_apply`].
+    pub(crate) enh: nfs_renderer::Enhancements,
+    pub(crate) enh_mode: nfs_game::remaster::Mode,
+    /// ENH-SAVE: the player's set while the F12 A/B shows another (`remaster::ab_toggle`); the A/B is never stored.
+    pub(crate) enh_stash: Option<nfs_renderer::Enhancements>,
+    /// ENHANCEMENT ENH-UPSCALER: the options panel's lines changed with the set; rebuilt next frame (`enh_panel_refresh`)
+    pub(crate) enh_panel_dirty: bool,
+    /// ENHANCEMENT ENH-LIVETEX: E41 / E42 changed (or the set did): the next frames check that the track, the sky and every car have the HD
+    /// textures / refined meshes the new levels ask for (`enh_live_step`); the cache is what one pass shares between a car and its instances
+    pub(crate) enh_live_dirty: bool,
+    pub(crate) enh_live_cache: nfs_game::world::LiveCache,
     pub(crate) slot_seen: (u32, u32),
     /// The bumper / driver slot's look-around yaw `+0xC6` in degrees (0x4611C0,
     /// `camera::look_step`) and the view it belongs to; a view switch starts it again at 0
@@ -651,6 +696,12 @@ pub(crate) struct App {
     pub(crate) hud_hidden: bool,
     /// The player car's headlight ramp, `[car+0x64]+0x110` (`HeadRamp`).
     pub(crate) head_ramp: HeadRamp,
+    /// ENHANCEMENT E24: the cars' render-side tunnel lamp values (never part of a car's state).
+    pub(crate) tunnel_lamps: std::cell::RefCell<car_lights::TunnelLamps>,
+    /// ENHANCEMENT E15: the same ramp for the spotlights' gain at day (`App::spot_gain`).
+    pub(crate) spot_cover: std::cell::RefCell<car_lights::TunnelLamps>,
+    /// ENHANCEMENT E15 (ENH-CONES): the same ramp per beam strip, 1 while E15's spot replaces the original's cone.
+    pub(crate) cone_fade: std::cell::RefCell<car_lights::TunnelLamps>,
     /// The game tick the camera slot was last updated for. The dispatcher 0x463C30 is a **64 Hz**
     /// scheduler entry (`Sched_insert(Sc64, 0x463C30, 0)` at 0x414F8C, run by every `GameTick`
     /// 0x414FF0), so the slot's followers (the chase / heli offset, the driver's head lag, the
@@ -712,6 +763,15 @@ pub(crate) struct App {
     /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a command-line race, `Game.Difficutly` (`FeCatalogues::difficulty`) for a layout launch (0x4EB470), the event's in career
     pub(crate) race_skill: u8,
     pub(crate) last_frame: Instant,
+    /// ENHANCEMENT E22 / D4: the frame pacer's next deadline, and the display refresh rate it last
+    /// read (Hz, when it was read), see `idle.rs`
+    pub(crate) pace_next: std::cell::Cell<Option<Instant>>,
+    pub(crate) pace_spin: std::cell::Cell<Duration>,
+    pub(crate) pace_refresh: std::cell::Cell<Option<(Instant, f64)>>,
+    /// ENHANCEMENT E22 «auto»: whether the machine ran on its battery when last asked (and when)
+    pub(crate) pace_battery: std::cell::Cell<Option<(Instant, bool)>>,
+    /// **TEST GLUE** `NFS_FRAME_STATS=1`: this second's frame times (ms), logged as mean / p99 / max
+    pub(crate) frame_times: Vec<f32>,
     /// winit's last `Occluded` (the window is not on screen); see `idle.rs` `window_hidden`
     pub(crate) occluded: bool,
     /// what the window last showed, for the front end's idle redraw (`idle.rs`)
@@ -790,6 +850,17 @@ pub(crate) struct FrontEnd {
     /// 0x4E9CE0 builds the shadow's texture matrix from, before its base draw 0x4E9FF0 moves the
     /// car (0x4D1700 at 0x4EA06A) and turns the room (`[+0x288]` at 0x4EA0CF)
     pub(crate) garage_shadow_prev: Option<Mat4>,
+    /// ENHANCEMENT ENH-FE3D (`app/fe_enh.rs`): the room's own pieces of this frame (the environment faces' scene), the
+    /// weight of the environment map the scene takes, what the map is (0 none, 1 the room's faces, 2 the studio), its
+    /// face size, the eye it was drawn from, the faces done (bits) and the next one, and the room car's place.
+    pub(crate) enh_room: Vec<nfs_renderer::DrawItem>,
+    pub(crate) enh_refl: f32,
+    pub(crate) enh_env_kind: u8,
+    pub(crate) enh_env_size: u32,
+    pub(crate) enh_env_eye: Vec3,
+    pub(crate) enh_env_done: u8,
+    pub(crate) enh_env_next: u32,
+    pub(crate) enh_car_pos: Option<Vec3>,
     /// `Render/common.fsh`'s `FESH`, the garage's shadow map (0x4E9E4B), uploaded on first use
     pub(crate) garage_shadow_tex: Option<nfs_renderer::TextureId>,
     /// The front-end cars' blob shadow (`R3DCar` slot 2 0x437AB0 → 0x43B820, front-end branch):

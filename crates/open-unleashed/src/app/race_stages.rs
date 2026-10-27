@@ -1119,7 +1119,7 @@ impl App {
                 .iter()
                 .find(|t| t.name.trim() == name)
                 .or_else(|| images.iter().find(|t| t.name.trim().eq_ignore_ascii_case(name)))?;
-            let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
+            let tex = upload_sprite_texture(renderer, img, &img.cache_mips());
             let mesh = renderer.upload_mesh(quad);
             let material = renderer.create_material(nfs_renderer::MaterialDesc {
                 alpha_blend: true,
@@ -1184,6 +1184,8 @@ impl App {
         // name the loader swapped into place (the pack has both `spik` and `SPIK`)
         self.flare_defs = std::fs::read(self.paths.render_dir().join("flare.dat")).map(|d| nfs_formats::flare::parse(&d)).unwrap_or_default();
         self.flare_sprites.clear();
+        self.street_lamps = None;
+        self.cover = None;
         self.sun_sprites.clear();
         self.lens_sprites.clear();
         // the lens flare's per-race object (0x4601F0 → 0x460780): its element positions
@@ -1208,7 +1210,7 @@ impl App {
                     tracing::debug!(name, "flare texture not in common.fsh");
                     continue;
                 };
-                let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
+                let tex = upload_sprite_texture(renderer, img, &img.cache_mips());
                 let mesh = renderer.upload_mesh(&quad);
                 // the flares' state object `[0x61BCB4]` is set to blend 1, additive, at 0x4514E7
                 let material = renderer.create_material(nfs_renderer::MaterialDesc {
@@ -1254,7 +1256,7 @@ impl App {
         if let Some(images) = common.as_ref()
             && let Some(img) = images.iter().find(|t| t.name.trim() == "SPLT")
         {
-            let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
+            let tex = upload_sprite_texture(renderer, img, &img.cache_mips());
             let material = renderer.create_material(nfs_renderer::MaterialDesc {
                 alpha_blend: true,
                 cull_back: false,
@@ -1310,7 +1312,7 @@ impl App {
                 // `GRSS`, ...) sit in the original's texture cache as 4444, `>> 4` per byte
                 // (`cache_4444_from_8888`, `thrash.md` §6d.9 — PA-SMOKE: the bytes found by a gdb search of
                 // the running original)
-                let tex = *textures.entry(name.clone()).or_insert_with(|| renderer.upload_texture_mips(img.width, img.height, &img.cache_mips()));
+                let tex = *textures.entry(name.clone()).or_insert_with(|| upload_sprite_texture(renderer, img, &img.cache_mips()));
                 let mesh = renderer.upload_mesh(&quad);
                 let material = renderer.create_material(nfs_renderer::MaterialDesc {
                     alpha_blend: true,
@@ -1330,7 +1332,7 @@ impl App {
             for (k, params) in [nfs_game::weather::Params::snow(0.0), nfs_game::weather::Params::rain(0.0)].iter().enumerate() {
                 let img = params.texture_names(level).iter().find_map(|n| images.iter().find(|t| t.name.trim() == n.as_str()));
                 self.weather_draws[k] = img.map(|img| {
-                    let tex = renderer.upload_texture_mips(img.width, img.height, &img.cache_mips());
+                    let tex = upload_sprite_texture(renderer, img, &img.cache_mips());
                     let material = renderer.create_material(nfs_renderer::MaterialDesc {
                         alpha_blend: true,
                         cull_back: false,
@@ -1351,5 +1353,17 @@ impl App {
         self.track_particles = None;
         self.car_effect_defs = car_defs;
         self.car_effects = None;
+    }
+}
+
+/// ENHANCEMENT E2: a `common.fsh` / `particle.fsh` sprite texture (skid marks, shadow, glare,
+/// flares, particles, weather) — the original has these with one level; they get a generated mip
+/// chain (blended alpha), sampled at level 0 while E2 is off. One that arrives with its own mips
+/// keeps them.
+fn upload_sprite_texture(renderer: &mut Renderer, img: &nfs_assets::texture::TextureImage, mips: &[Vec<u8>]) -> nfs_renderer::TextureId {
+    if mips.len() == 1 {
+        renderer.upload_texture_generated(img.width, img.height, &mips[0], nfs_renderer::MipAlpha::Blend)
+    } else {
+        renderer.upload_texture_mips(img.width, img.height, mips)
     }
 }

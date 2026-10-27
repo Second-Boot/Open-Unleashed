@@ -8,6 +8,9 @@
 //!   folder). A start that finds the file already there knows the previous one never reached [`CONFIRM_SECS`] of life
 //!   nor a clean exit; it writes `gpu-safe.flag` and runs in safe mode: `NFS_GPU_PROFILE=minimal` (a device with no
 //!   optional feature) and, on Windows, `WGPU_BACKEND=dx12`, unless the player set either variable.
+//! * ENHANCEMENT (enhanced game): a safe start also runs with every enhancement off ([`safe`]; an explicit `NFS_ENH` wins),
+//!   and picking a set in the options panel ends safe mode at once ([`clear_safe`]). An `enh-safe.flag` left by an older
+//!   build is honoured once as `gpu-safe.flag` and removed.
 //! * safe mode lasts ONE start: a safe start that survives (lives [`CONFIRM_SECS`], or ends cleanly) drops the flag,
 //!   so the next start tries the normal path again; if that start dies too, the guard puts the following one in safe
 //!   mode again.
@@ -51,6 +54,13 @@ pub fn begin() {
     let _ = std::fs::create_dir_all(&d);
     let guard = d.join("startup.guard");
     let flag = d.join("gpu-safe.flag");
+    // the older build's flag (enhanced game: `enh-safe.flag`) counts once, as this one's, and is removed
+    let old = d.join("enh-safe.flag");
+    if old.exists() {
+        tracing::warn!("found the older build's enh-safe.flag: safe mode for this start");
+        let _ = std::fs::write(&flag, b"the previous start did not finish; this start asks for a plain GPU device\n");
+        let _ = std::fs::remove_file(&old);
+    }
     if guard.exists() {
         tracing::warn!("the previous start did not finish (a crash?): safe mode for this start");
         let _ = std::fs::write(&flag, b"the previous start did not finish; this start asks for a plain GPU device\n");
@@ -81,6 +91,19 @@ pub fn begin() {
             }
         })
         .ok();
+}
+
+/// Whether this start is in safe mode (the caller turns the enhancements off then).
+pub fn safe() -> bool {
+    SAFE.load(Ordering::Relaxed)
+}
+
+/// ENHANCEMENT: the player chose a set: safe mode is over.
+pub fn clear_safe() {
+    if SAFE.swap(false, Ordering::Relaxed) {
+        let _ = std::fs::remove_file(dir().join("gpu-safe.flag"));
+        tracing::info!("a set was chosen in the panel: safe mode is over");
+    }
 }
 
 /// The run ended cleanly (or with a reported error): this start counts as survived.

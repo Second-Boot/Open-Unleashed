@@ -42,7 +42,7 @@ fn main() {
                 continue;
             }
             let right = fwd.cross(Vec3::Y).normalize_or_zero();
-            let view = CullView { eye: Vec3::new(p[0], h + 1.2, p[1]), forward: fwd, right, up: right.cross(fwd).normalize_or_zero(), tan_h: 0.92, tan_v: 0.69, near: 0.5, draw: 700.0 };
+            let view = CullView { eye: Vec3::new(p[0], h + 1.2, p[1]), forward: fwd, right, up: right.cross(fwd).normalize_or_zero(), tan_h: 0.92, tan_v: 0.69, near: 0.5, draw: 700.0, reach: 1.0 };
             let walk = CellWalk::new(&view, &occluders);
             eyes += 1;
             let mut hit = false;

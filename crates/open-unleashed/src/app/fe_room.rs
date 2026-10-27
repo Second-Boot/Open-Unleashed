@@ -512,8 +512,12 @@ impl App {
     /// gives them (`RE/notes/frontend-3d.md` §2, §3).
     pub(crate) fn fe_room_items(&mut self) {
         let Some(room) = self.fe_room_of() else {
+            self.fe.enh_refl = 0.0;
             return;
         };
+        // ENHANCEMENT ENH-FE3D: this frame's room pieces / car place start empty (`fe_enh.rs`)
+        self.fe.enh_room.clear();
+        self.fe.enh_car_pos = None;
         // the front end's eye (set again below with the rig's angle): the lamps' glares (the effect
         // pass 0x43D800, `fe_lamp_items`) face this camera
         self.camera.position = Vec3::ZERO;
@@ -686,10 +690,14 @@ impl App {
             if let (Some((tex, _)), Some(r)) = (shadow, self.renderer.as_mut()) {
                 r.set_projector_texture(Some(tex));
             }
+            let enh_fe = (self.fe_enh_on(nfs_renderer::E9), self.fe_enh_on(nfs_renderer::E8));
             for (_, model) in &self.fe.room {
                 let mut its = model.draw_items_block(nfs_game::world::CarPose::still(room_m), &nfs_game::world::FRONT_END_PASSES, &room_light);
                 model.apply_projector(&mut its, shadow.map(|s| s.1));
-                items.extend(in_submission_order(its));
+                let mut its = in_submission_order(its);
+                // ENHANCEMENT ENH-FE3D: the room's pieces receive the car's shadow and feed the environment faces
+                crate::app::fe_enh::tag_room_piece(&mut its, &mut self.fe.enh_room, enh_fe.0, enh_fe.1);
+                items.extend(its);
                 self.fe_lamp_items(model, room_m, ROOM_LAMPS, &mut items);
             }
         }
@@ -792,6 +800,12 @@ impl App {
         self.camera.fov_y_radians = nfs_game::camera::fov_y_window(h);
         self.camera.near = FE_NEAR;
         self.camera.far = FE_FAR;
+        // ENHANCEMENT ENH-FE3D: the room scene's and the car views' share of the enhanced game (`fe_enh.rs`)
+        let room_car = self.fe.cars.iter().any(|c| c.0 == usize::MAX);
+        let car_at = if dealer_drawn { self.fe.enh_car_pos } else { room_car.then_some(pos) };
+        let fx = self.fe_enh_prepare(car_at, self.scene.ambient, self.scene.sun_direction);
+        self.scene.ao = fx.ao;
+        self.scene.sun_shadow = fx.shadow;
         if views.is_empty() {
             return;
         }
@@ -808,6 +822,9 @@ impl App {
                 items,
                 ambient,
                 sun_direction: sun,
+                // ENHANCEMENT ENH-FE3D
+                refl: fx.refl,
+                ao: fx.ao,
                 ..Scene::default()
             };
             let Some(r) = self.renderer.as_mut() else {
@@ -894,6 +911,8 @@ impl App {
         let early_room = [CarPass { lod: 2, mask: 0x30, flag: false }];
         let early_car = [CarPass { lod: 4, mask: 0x30, flag: false }];
         let mut items = Vec::new();
+        let enh_fe = (self.fe_enh_on(nfs_renderer::E9), self.fe_enh_on(nfs_renderer::E8));
+        self.fe.enh_car_pos = Some(Vec3::new(-layout.pos[0], layout.pos[1], layout.pos[2]));
         let car = self.fe.cars.iter().find(|c| c.0 == usize::MAX).map(|c| &c.4);
         let blob = self.fe.blob_shadow;
         // the first pass is the **reflection**: 0x4D15F0 queues with `+0x471 = 1`, which sends the
@@ -906,10 +925,13 @@ impl App {
                 let m = &self.fe.room[*k].1;
                 let at = place(*p, 0.5);
                 let its = m.draw_items_block(nfs_game::world::CarPose::still(if reflect { reflected(at) } else { at }), passes_room, room_light);
-                items.extend(in_submission_order(its).into_iter().map(|mut it| {
+                let mut its = in_submission_order(its);
+                for it in &mut its {
                     it.mirrored = reflect;
-                    it
-                }));
+                }
+                // ENHANCEMENT ENH-FE3D: the sections take the car's shadow; the ordinary pass's feed the environment faces
+                crate::app::fe_enh::tag_room_piece(&mut its, &mut self.fe.enh_room, enh_fe.0, enh_fe.1 && passes_room.len() == FRONT_END_PASSES.len());
+                items.extend(its);
                 // the effect pass of the ordinary draw (the reflection pass is the model alone)
                 if !reflect {
                     self.fe_lamp_items(m, at, ROOM_LAMPS, &mut items);

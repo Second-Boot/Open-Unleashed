@@ -1,0 +1,21 @@
+# Vendored from the upstream wgpu-ffx repository (MIT), see ../README.md for the commit and the changes.
+[package]
+name = "wgpu-ffx"
+version = "0.1.0"
+edition = "2024"
+authors = ["wgpu-ffx developers", "Advanced Micro Devices, Inc."]
+license = "MIT"
+description = "AMD FidelityFX FSR 3 Upscaler for wgpu (vendored, ported to wgpu 30)"
+publish = false
+
+[dependencies]
+bitflags = "2"
+bytemuck = { version = "1.14", features = ["derive"] }
+half = { version = "2.7", features = ["bytemuck"] }
+thiserror = "2"
+wgpu = { version = "30", default-features = false, features = ["spirv", "wgsl"] }
+wgpu-ffx-shaders-spv = { path = "../wgpu-ffx-shaders-spv" }
+pollster = "1"
+
+[dev-dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan", "metal", "dx12"] }

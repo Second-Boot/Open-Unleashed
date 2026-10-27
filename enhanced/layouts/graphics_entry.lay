@@ -1,0 +1,26 @@
+; Spliced into graphics.lay at load (nfs_game::layout::load_one) when the enhanced game's front-end
+; additions are on: the panel the third sub-tab (graphicstabs_entry.lay) selects — the port-own
+; enhancements.lay, loaded like graphicsettings / advgraphics (a panel of the full 640x480 area, up
+; only while its tab is selected) — and the tab strip's third separator, one step left / down of the
+; original's (313,65 35 tall; 271,85 19 tall; 229,106 19 tall).
+[section.900]
+id=NFS5.Rectangle
+name=ID_RECTANGLE
+state=normal
+pos=229,106
+size=1,19
+color=0xff000000
+transon=LEFT
+transoff=SAME
+swrenderoff=
+
+[section.901]
+id=NFS5.PANEL
+name=ID_ENHPANEL
+state=normal
+pos=0,0
+size=640,480
+color=0x8000ff00
+filename=enhancements
+transon=
+transoff=

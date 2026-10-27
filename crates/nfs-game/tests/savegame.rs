@@ -895,7 +895,7 @@ fn a_sav_car_without_a_stock_list_gets_its_stock_parts() {
 
     // the race goldens' seed, when the fixtures exist
     let Some(home) = std::env::var_os("HOME") else { return };
-    let path = std::path::Path::new(&home).join("RustroverProjects/nfs5-fixtures/fe_save_pristine/8DRIVER.sav");
+    let path = std::path::Path::new(&home).join("fixtures/fe_save_pristine/8DRIVER.sav");
     let Ok(data) = std::fs::read(&path) else { return };
     let s = SaveFile::parse(&data).unwrap();
     let raw = &s.player.as_ref().unwrap().cars[0];

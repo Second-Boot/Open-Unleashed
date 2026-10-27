@@ -11,7 +11,6 @@ tracing.workspace = true
 nfs-renderer.workspace = true
 glam.workspace = true
 nfs-physics.workspace = true
-
-[dev-dependencies]
-# `examples/fshdump.rs` writes the decoded pages out as PNGs
+# ENHANCEMENT E41: the HD texture pack's PNGs are read by `hdpack` (the examples write PNGs with it too)
 image.workspace = true
+bcdec_rs = "0.2.0"

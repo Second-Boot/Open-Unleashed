@@ -26,9 +26,20 @@
 //!   ops applied before the still: `fwd=m`, `right=m`, `up=m` (move), `yaw=deg`, `pitch=deg`, `roll=deg`,
 //!   `fov=deg`, `hud=on|off`, `shot=<1|2|4>` (save a still now). `NFS_RACE_KEYS` (`race_keys_script`) feeds key
 //!   presses through the window handler's photo-mode and pause-menu paths.
+//!
+//! **The enhanced extras** (each behind its own enhancement; with every switch off — `NFS_ENH=off` — photo mode is master's):
+//! * ENHANCEMENT E7 (the float scene) carries photo mode's **depth of field** (the `dof.rs` pass): F (pad X) switches it,
+//!   `1` / `2` its focus distance (the pad's d-pad left / right), `3` / `4` its aperture, `5` focuses on the viewed car;
+//!   its keys and hint lines exist only while E7 is on (`dof_available`). The still runs the whole post chain at its size
+//!   (`Renderer::render_still`).
+//! * ENHANCEMENT E31 sets the lens of a replay that plays (not in photo mode, which has its own): the focus follows the
+//!   viewed car (low-passed), f/3.5; nothing in the cockpit / bumper views (the car is under 2.5 m away).
+//! * ENHANCEMENTS E27 / E29 (motion blur, shake) and E40 (windscreen drops) are off while photo mode is up.
+//! * TEST GLUE `NFS_PHOTO` op `dof=<focus m|car>[,f]` / `dof=off`.
 
 use crate::*;
 use nfs_game::photo::{S_ENTER, S_FAILED, S_FOV, S_KEYS_MOVE, S_KEYS_PAD, S_KEYS_SHOT, S_KEYS_ZOOM, S_SAVED, S_SIZE, S_TITLE};
+use nfs_renderer::{DOF_F_MAX, DOF_F_MIN, Dof, E7, E31};
 use std::collections::HashSet;
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -43,6 +54,18 @@ const MOVE_SPEED: f32 = 8.0;
 const LOOK_SPEED: f32 = 1.2;
 const MOUSE_LOOK: f32 = 0.0025;
 const ROLL_SPEED: f32 = 0.8;
+/// ENHANCEMENT E7 (photo mode's depth of field): the focus distance's limits, metres.
+const FOCUS_MIN: f32 = 0.3;
+const FOCUS_MAX: f32 = 700.0;
+/// ENHANCEMENT E31: the lens a replay gets (f-number), and the distance under which the viewed car is in the cockpit / bumper.
+const REPLAY_F_NUMBER: f32 = 3.5;
+const REPLAY_MIN_DISTANCE: f32 = 2.5;
+/// ENHANCEMENT E7: the ids of the depth-of-field lines (`nfs_game::remaster::PHOTO_DOF_STRINGS`).
+const S_DOF_KEYS: usize = 0;
+const S_DOF_PAD: usize = 1;
+const S_DOF: usize = 2;
+const S_DOF_OFF: usize = 3;
+const S_FOCUS: usize = 4;
 
 /// What one frame of input asks of the free camera (all axes -1..1; the angles in the units of the speeds above).
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -55,6 +78,10 @@ pub(crate) struct PhotoInput {
     pub(crate) roll: f32,
     /// positive zooms in
     pub(crate) zoom: f32,
+    /// ENHANCEMENT E7: positive moves the focus away
+    pub(crate) focus: f32,
+    /// ENHANCEMENT E7: positive opens the lens (a smaller f-number)
+    pub(crate) aperture: f32,
     pub(crate) fast: bool,
     pub(crate) slow: bool,
     /// mouse pixels turned this frame (already limited to a drag)
@@ -137,6 +164,34 @@ impl FreeCam {
     }
 }
 
+/// ENHANCEMENT E7: photo mode's lens (the depth of field), kept apart from the free camera (R resets the camera, not the lens).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Lens {
+    pub(crate) on: bool,
+    pub(crate) focus: f32,
+    pub(crate) f_number: f32,
+}
+
+impl Default for Lens {
+    fn default() -> Self {
+        Self { on: false, focus: 10.0, f_number: 2.8 }
+    }
+}
+
+impl Lens {
+    /// One frame of input over `dt` seconds.
+    pub(crate) fn step(&mut self, dt: f32, i: &PhotoInput) {
+        let dt = dt.clamp(0.0, 0.1);
+        self.focus = (self.focus * (i.focus * 0.9 * dt).exp()).clamp(FOCUS_MIN, FOCUS_MAX);
+        self.f_number = (self.f_number * (-i.aperture * 0.7 * dt).exp()).clamp(DOF_F_MIN, DOF_F_MAX);
+    }
+
+    /// The lens for the renderer, when on.
+    pub(crate) fn dof(&self) -> Option<Dof> {
+        self.on.then_some(Dof { focus: self.focus, f_number: self.f_number })
+    }
+}
+
 /// What photo mode keeps between frames.
 #[derive(Default)]
 pub(crate) struct PhotoState {
@@ -169,6 +224,10 @@ pub(crate) struct PhotoState {
     shots: u32,
     /// entered by the test glue (`NFS_PHOTO`): stills are sized from `NFS_SHOT_SIZE` and written before returning
     scripted: bool,
+    /// ENHANCEMENT E7: the depth of field
+    lens: Lens,
+    /// ENHANCEMENT E31: the replay's lens focus, low-passed
+    replay_focus: Option<f32>,
 }
 
 impl PhotoState {
@@ -255,6 +314,17 @@ impl App {
         nfs_game::photo::photo_text(&self.fe.strings, k)
     }
 
+    /// ENHANCEMENT E7: whether photo mode's depth of field can act (the float scene it works on is on): its keys, pad buttons and
+    /// hint lines exist only then.
+    pub(crate) fn dof_available(&self) -> bool {
+        self.enh.is_on(E7)
+    }
+
+    /// ENHANCEMENT E7: line `k` of the depth-of-field strings.
+    fn photo_dof_text(&self, k: usize) -> String {
+        nfs_game::remaster::photo_dof_text(&self.fe.strings, k)
+    }
+
     /// Whether the window is the render target a still is sized from.
     fn photo_base_size(&self) -> Option<(u32, u32)> {
         if self.screenshot.is_some() || self.photo.scripted {
@@ -298,6 +368,9 @@ impl App {
     pub(crate) fn photo_enter(&mut self) -> bool {
         let Some(entry) = self.photo_entry() else { return false };
         let cam = FreeCam::from_camera(&self.camera);
+        // ENHANCEMENT E7: the lens starts on the viewed car
+        let to = self.car_pos - cam.pos;
+        let lens = Lens { focus: to.dot(cam.forward()).max(to.length() * 0.5).clamp(FOCUS_MIN, FOCUS_MAX), ..Default::default() };
         if entry == PhotoEntry::Replay && !self.paused && !self.replay.frozen {
             self.replay.frozen = true;
             self.photo.froze_replay = true;
@@ -317,6 +390,7 @@ impl App {
             writers: keep.1,
             shots: keep.2,
             scripted: self.photo.scripted,
+            lens,
             ..Default::default()
         };
         // a pad's menu key that came with the press must not reach the hidden pause menu
@@ -344,6 +418,9 @@ impl App {
         // must not outlive it
         let _ = self.input.take_pressed(Action::Pause);
         self.input.pad_menu.clear();
+        // ENHANCEMENTS E7 / E31: no lens left behind
+        self.scene.dof = None;
+        self.photo.replay_focus = None;
         tracing::info!("photo mode off");
     }
 
@@ -421,12 +498,23 @@ impl App {
             KeyCode::KeyH => self.photo.hud = !self.photo.hud,
             KeyCode::Tab => self.photo.hint = !self.photo.hint,
             KeyCode::Digit6 => self.photo.scale_ix = (self.photo.scale_ix + 1) % STILL_SCALES.len(),
+            // ENHANCEMENT E7: the depth of field, and the focus on the viewed car
+            KeyCode::KeyF if self.dof_available() => self.photo.lens.on = !self.photo.lens.on,
+            KeyCode::Digit5 if self.dof_available() => self.photo_focus_on_car(),
             KeyCode::KeyR => {
                 if let (Some(e), Some(c)) = (self.photo.entry, self.photo.cam.as_mut()) {
                     *c = e;
                 }
             }
             _ => {}
+        }
+    }
+
+    /// ENHANCEMENT E7: the focus on the viewed car.
+    fn photo_focus_on_car(&mut self) {
+        if let Some(c) = self.photo.cam {
+            let to = self.car_pos - c.pos;
+            self.photo.lens.focus = to.dot(c.forward()).max(to.length() * 0.5).clamp(FOCUS_MIN, FOCUS_MAX);
         }
     }
 
@@ -469,10 +557,18 @@ impl App {
             pitch: axis(&[KeyCode::ArrowUp], &[KeyCode::ArrowDown]),
             roll: axis(&[KeyCode::KeyX], &[KeyCode::KeyZ]),
             zoom: axis(&[KeyCode::Equal, KeyCode::NumpadAdd], &[KeyCode::Minus, KeyCode::NumpadSubtract]),
+            focus: 0.0,
+            aperture: 0.0,
             fast: k(KeyCode::ShiftLeft) + k(KeyCode::ShiftRight) > 0.0,
             slow: k(KeyCode::ControlLeft) + k(KeyCode::ControlRight) > 0.0,
             mouse: (0.0, 0.0),
         };
+        // ENHANCEMENT E7: the lens keys
+        let dof = self.dof_available();
+        if dof {
+            i.focus = axis(&[KeyCode::Digit2], &[KeyCode::Digit1]);
+            i.aperture = axis(&[KeyCode::Digit3], &[KeyCode::Digit4]);
+        }
         // the pointer's raw motion since the last frame, kept only while the right button drags
         let (dx, dy) = std::mem::take(&mut self.input.mouse_delta);
         if self.photo.look_drag {
@@ -488,6 +584,13 @@ impl App {
             i.zoom += p.dpad_up as i32 as f32 - p.dpad_down as i32 as f32;
             i.fast |= p.left_thumb;
             let prev = self.photo.pad;
+            // ENHANCEMENT E7: the d-pad's left / right focus, X the depth of field
+            if dof {
+                i.focus += p.dpad_right as i32 as f32 - p.dpad_left as i32 as f32;
+                if p.west && !prev.west {
+                    self.photo.lens.on = !self.photo.lens.on;
+                }
+            }
             if p.south && !prev.south {
                 self.photo.pending_still = true;
             }
@@ -519,6 +622,8 @@ impl App {
         if let Some(c) = self.photo.cam.as_mut() {
             c.step(dt, &i);
         }
+        // ENHANCEMENT E7
+        self.photo.lens.step(dt, &i);
         // the pad's Start is the pause action (`Gamepads::poll` presses it), its d-pad / A / B the pause menu's keys
         // (D10): never let them queue for the hidden menu
         let _ = self.input.take_pressed(Action::Pause);
@@ -561,12 +666,45 @@ impl App {
         }
     }
 
-    /// The status line of the hint: the title, the still's size, the angle of view.
+    /// The status line of the hint: the title, the still's size, the angle of view (and, ENHANCEMENT E7, the depth of field).
     fn photo_status_line(&self) -> String {
         let (bw, bh) = self.photo_base_size().unwrap_or((0, 0));
         let s = STILL_SCALES[self.photo.scale_ix];
         let c = self.photo.cam.unwrap_or_else(|| FreeCam::from_camera(&self.camera));
-        format!("{}   {} {}x {}x{}   {} {:.0}", self.photo_text(S_TITLE), self.photo_text(S_SIZE), s, bw * s, bh * s, self.photo_text(S_FOV), c.fov_y.to_degrees())
+        let mut line = format!("{}   {} {}x {}x{}   {} {:.0}", self.photo_text(S_TITLE), self.photo_text(S_SIZE), s, bw * s, bh * s, self.photo_text(S_FOV), c.fov_y.to_degrees());
+        if self.dof_available() {
+            let l = self.photo.lens;
+            let dof = if l.on { format!("{} f/{:.1} {:.1} m", self.photo_dof_text(S_FOCUS), l.f_number, l.focus) } else { self.photo_dof_text(S_DOF_OFF) };
+            line += &format!("   {}: {}", self.photo_dof_text(S_DOF), dof);
+        }
+        line
+    }
+
+    /// The effects of the frame in photo mode: the lens of the free camera (ENHANCEMENT E7). Outside photo mode: E31's lens in
+    /// a replay.
+    pub(crate) fn photo_scene_fx(&mut self) {
+        if self.photo.active {
+            self.scene.dof = if self.dof_available() { self.photo.lens.dof() } else { None };
+            return;
+        }
+        self.scene.dof = None;
+        if !self.enh.is_on(E31) || !self.playback_running() || self.vehicle.is_none() {
+            self.photo.replay_focus = None;
+            return;
+        }
+        let d = (self.car_pos - self.camera.position).length();
+        if d < REPLAY_MIN_DISTANCE {
+            self.photo.replay_focus = None;
+            return;
+        }
+        // the focus follows the car with a short low-pass, so a camera cut or a passing car does not snap it
+        let dt = self.frame_dt.clamp(0.0, 0.1);
+        let f = match self.photo.replay_focus {
+            Some(f) => f + (d - f) * (1.0 - (-dt * 6.0).exp()),
+            None => d,
+        };
+        self.photo.replay_focus = Some(f);
+        self.scene.dof = Some(Dof { focus: f.clamp(FOCUS_MIN, FOCUS_MAX), f_number: REPLAY_F_NUMBER });
     }
 
     /// The hint of photo mode (and the one-line pointer to it on the pause menu / in a replay), appended after the
@@ -587,6 +725,11 @@ impl App {
                 v.push(self.photo_status_line());
                 for k in [S_KEYS_MOVE, S_KEYS_ZOOM, S_KEYS_SHOT, S_KEYS_PAD] {
                     v.push(self.photo_text(k));
+                }
+                // ENHANCEMENT E7: the depth of field's keys
+                if self.dof_available() {
+                    v.push(self.photo_dof_text(S_DOF_KEYS));
+                    v.push(self.photo_dof_text(S_DOF_PAD));
                 }
             }
             v
@@ -704,9 +847,28 @@ impl App {
                     let c = self.photo.cam.as_mut().expect("photo camera");
                     c.fov_y = a.clamp(FOV_MIN, FOV_MAX).to_radians();
                 }
+                // ENHANCEMENT E7: `dof=<focus m|car>[,f]` / `dof=off`
+                "dof" if self.dof_available() => {
+                    if arg.trim() == "off" {
+                        self.photo.lens.on = false;
+                    } else {
+                        let on_car = arg.trim().starts_with("car");
+                        if on_car {
+                            self.photo_focus_on_car();
+                        } else {
+                            self.photo.lens.focus = a.clamp(FOCUS_MIN, FOCUS_MAX);
+                        }
+                        self.photo.lens.on = true;
+                        if let Some(f) = arg.split(',').nth(1).and_then(|s| s.trim().parse::<f32>().ok()) {
+                            self.photo.lens.f_number = f.clamp(DOF_F_MIN, DOF_F_MAX);
+                        }
+                    }
+                }
                 "hud" => self.photo.hud = arg.trim() == "on",
                 "shot" => {
                     self.rebuild_scene();
+                    // ENHANCEMENT E8: the environment faces a frame would draw
+                    self.render_reflections();
                     let s = a as u32;
                     if STILL_SCALES.contains(&s) {
                         self.photo_save_still(s);
@@ -791,6 +953,22 @@ mod tests {
         let mut c = FreeCam::from_camera(&cam(Vec3::ZERO, Vec3::Z, Vec3::Y));
         c.step(5.0, &PhotoInput { forward: 1.0, ..Default::default() });
         assert!(c.pos.z <= MOVE_SPEED * 0.1 + 1e-4);
+    }
+
+    #[test]
+    fn the_lens_stays_in_range_and_is_off_until_switched_on() {
+        let mut l = Lens::default();
+        assert_eq!(l.dof(), None);
+        for _ in 0..500 {
+            l.step(0.1, &PhotoInput { focus: -1.0, aperture: 1.0, ..Default::default() });
+        }
+        assert_eq!((l.focus, l.f_number), (FOCUS_MIN, DOF_F_MIN));
+        for _ in 0..500 {
+            l.step(0.1, &PhotoInput { focus: 1.0, aperture: -1.0, ..Default::default() });
+        }
+        assert_eq!((l.focus, l.f_number), (FOCUS_MAX, DOF_F_MAX));
+        l.on = true;
+        assert_eq!(l.dof(), Some(Dof { focus: l.focus, f_number: l.f_number }));
     }
 
     #[test]

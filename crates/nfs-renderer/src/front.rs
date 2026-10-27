@@ -18,7 +18,7 @@
 //! the core in hand, so they first take it back (waiting for the frame in flight) and run the list.
 
 use crate::gpu::{Core, MaterialId, MeshId, OffscreenSpec, TextureId};
-use crate::{Camera, FakeSortMode, LensRead, MaterialDesc, MeshData, Scene, TextureData, Vertex};
+use crate::{Camera, MipAlpha, FakeSortMode, LensRead, MaterialDesc, MeshData, Scene, TextureData, Vertex};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,12 +38,40 @@ pub(crate) enum Cmd {
     Trilinear(bool),
     FakeSort(FakeSortMode),
     Gamma(f32),
+    /// ENHANCEMENT ENH-TEMPORAL: a temporal upscaler is active (`Core::temporal_flag`)
+    Temporal(bool),
+    /// ENHANCEMENT E37: a camera cut the renderer cannot see (a view change, a replay jump, photo mode, a pause): the temporal
+    /// history (FSR's, the vectors' previous frame) is dropped at the next frame
+    TemporalCut,
+    /// the enhanced game's switches ([`crate::Enhancements`])
+    Enhancements(crate::Enhancements),
+    /// ENHANCEMENT ENH-LIVETEX: a texture's HD twin (E41), a mesh's refined twin (E42), a replaced twin's memory back
+    TextureTwin(TextureId, Option<TextureId>),
+    MeshTwin(MeshId, Option<MeshId>),
+    ReleaseTexture(TextureId),
+    /// ENHANCEMENT ENH-LIVELEAK
+    ReleaseMesh(MeshId),
+    /// ENHANCEMENT ENH-LIVELEAK
+    RecycleReleased,
     Resize(u32, u32),
     LensProbe(bool),
     CreateMaterial(MaterialDesc),
     DuplicateMaterial { id: MaterialId, texture: TextureId },
     DynamicMesh(Box<MeshData>),
     Offscreen(Box<OffscreenJob>),
+    /// ENHANCEMENT E8: one environment face of the player's car
+    ReflFace(Box<ReflFaceJob>),
+    /// ENHANCEMENT ENH-FE3D: the six faces from the CPU (a front-end studio): size, six RGBA8 images
+    ReflUpload(u32, Vec<Vec<f32>>),
+}
+
+pub(crate) struct ReflFaceJob {
+    pub scene: Scene,
+    pub camera: Camera,
+    pub face: u32,
+    pub size: u32,
+    pub clear: [f64; 4],
+    pub depth_far: f32,
 }
 
 pub(crate) struct OffscreenJob {
@@ -120,6 +148,12 @@ pub struct Renderer {
     offscreen: HashMap<u32, (u32, u32)>,
     /// the last [`Self::set_gamma`] value, so an unchanged one records nothing
     gamma: f32,
+    /// the last [`Self::set_enhancements`] value, so an unchanged one records nothing
+    enhancements: crate::Enhancements,
+    /// ENHANCEMENT E33: the display does extended-range output (probed once at the start, on the main thread)
+    edr_ok: bool,
+    /// ENH-LITE: the adapter's class, read once at the start
+    gpu_class: crate::GpuClass,
 }
 
 impl Renderer {
@@ -133,6 +167,9 @@ impl Renderer {
             material_tex: core.material_textures(),
             offscreen: core.offscreen_sizes(),
             gamma: 1.0,
+            enhancements: crate::Enhancements::ORIGINAL,
+            edr_ok: core.edr_available(),
+            gpu_class: core.gpu_class(),
             meshes,
             size,
             core: Some(Box::new(core)),
@@ -143,6 +180,11 @@ impl Renderer {
             pending_err: None,
             lens_done: Vec::new(),
         })
+    }
+
+    /// ENHANCEMENT E33: the display does extended-range (EDR / HDR) output; always false off macOS.
+    pub fn edr_available(&self) -> bool {
+        self.edr_ok
     }
 
     /// Move the encode / submit / present of every frame to a render thread of its own. From here
@@ -292,8 +334,11 @@ impl Renderer {
         let core = self.home();
         let id = core.upload_mesh(mesh);
         let vertex_len = core.mesh_vertex_len(id);
-        debug_assert_eq!(id.0 as usize, self.meshes.len());
-        self.meshes.push(MeshMirror { vertex_len, writes: 0 });
+        // ENHANCEMENT ENH-LIVELEAK: a recycled slot of a released mesh
+        match self.meshes.get_mut(id.0 as usize) {
+            Some(m) => *m = MeshMirror { vertex_len, writes: 0 },
+            None => self.meshes.push(MeshMirror { vertex_len, writes: 0 }),
+        }
         id
     }
 
@@ -310,11 +355,45 @@ impl Renderer {
         id
     }
 
+    /// ENHANCEMENT E2: [`Self::upload_texture_mips`] for a single level (`rgba`, `width x height`)
+    /// that gets a generated mip chain beneath it (`MipAlpha` says how alpha is filtered). While
+    /// E2 is off the texture is sampled at level 0 only, as the original's. For the cars' pages and
+    /// the sprites, never the track's own textures.
+    pub fn upload_texture_generated(&mut self, width: u32, height: u32, rgba: &[u8], alpha: MipAlpha) -> TextureId {
+        let core = self.home();
+        let id = core.upload_texture_generated(width, height, rgba, alpha);
+        self.n_textures = core.texture_count();
+        id
+    }
+
     /// Several textures at once, the ids in the order given (the next free ones, as the same number
     /// of [`Self::upload_texture_mips`] calls would hand them).
     pub fn upload_textures(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
         let core = self.home();
         let ids = core.upload_textures(items);
+        self.n_textures = core.texture_count();
+        ids
+    }
+
+    /// [`Self::upload_textures`] where an item may carry a `MipAlpha`: a single-level texture then
+    /// gets a generated chain (ENHANCEMENT E2, the track's single-level textures).
+    pub fn upload_textures_gen(&mut self, items: &[(u32, u32, &[Vec<u8>], Option<MipAlpha>)]) -> Vec<TextureId> {
+        let core = self.home();
+        let ids = core.upload_textures_gen(items);
+        self.n_textures = core.texture_count();
+        ids
+    }
+
+    /// ENHANCEMENT E41: whether the device takes BC7 textures ([`Self::upload_textures_bc7`]).
+    pub fn supports_bc7(&mut self) -> bool {
+        self.home().supports_bc7()
+    }
+
+    /// ENHANCEMENT E41: BC7 textures of the HD pack, uploaded as they are (`(width, height, levels)`, the base level a multiple of 4
+    /// each, `levels[0]` first, 16 bytes per 4x4 block); the ids in the order given. Only when [`Self::supports_bc7`].
+    pub fn upload_textures_bc7(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
+        let core = self.home();
+        let ids = core.upload_textures_bc7(items);
         self.n_textures = core.texture_count();
         ids
     }
@@ -445,6 +524,80 @@ impl Renderer {
         }
     }
 
+    /// ENHANCEMENT ENH-TEMPORAL: raise the temporal flag a temporal upscaler (FSR 3.1, MetalFX temporal) needs: the race's main
+    /// view is then drawn jittered at one sample, with motion vectors, reactive / composition masks and depth
+    /// (`RE/notes/ENHANCEMENTS.md`, "Temporal foundation"). Default off, and nothing sets it yet: the debug env var
+    /// `NFS_TEMPORAL_DEBUG` is the other way in.
+    /// ENHANCEMENT E37: FSR 3.1 raises this flag by itself while its switch is on (the renderer knows the switch and
+    /// whether the backend came up, `gpu.rs::temporal_frame`); this call stays the explicit way for another backend.
+    #[allow(dead_code)]
+    pub fn set_temporal(&mut self, on: bool) {
+        self.list.cmds.push(Cmd::Temporal(on));
+    }
+
+    /// ENHANCEMENT E37: the camera cut at the next frame - the app calls it for what the renderer cannot see in the camera's
+    /// numbers: a view change (chase to bumper), photo mode in / out, a replay jump, a new race, a pause. Without a temporal
+    /// upscaler on it does nothing.
+    pub fn temporal_cut(&mut self) {
+        self.list.cmds.push(Cmd::TemporalCut);
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX (E41): `twin` is `base`'s HD texture. Materials that sample `base` show the twin while E41 is above 0 and `base`
+    /// itself otherwise, so the enhancement switch flips the textures without a reload. `None` clears it. Recorded in call order.
+    pub fn set_texture_twin(&mut self, base: TextureId, twin: Option<TextureId>) {
+        self.list.cmds.push(Cmd::TextureTwin(base, twin));
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX (E42): `twin` is the refined copy of `base`'s mesh; a draw of `base` uses it while E42 is above 0.
+    pub fn set_mesh_twin(&mut self, base: MeshId, twin: Option<MeshId>) {
+        self.list.cmds.push(Cmd::MeshTwin(base, twin));
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX: give back the video memory of a texture nothing shows any more (a replaced HD twin); the id stays valid
+    /// (a 1 x 1 image). Never for a texture a material still samples as its own.
+    pub fn release_texture(&mut self, id: TextureId) {
+        self.list.cmds.push(Cmd::ReleaseTexture(id));
+    }
+
+    /// ENHANCEMENT ENH-LIVELEAK: give back the memory of a mesh nothing draws any more (a replaced refined twin; the caller clears its
+    /// twin entry first): a static mesh's arena ranges are used again by a later upload that fits; the id stays valid (an empty mesh).
+    pub fn release_mesh(&mut self, id: MeshId) {
+        self.list.cmds.push(Cmd::ReleaseMesh(id));
+    }
+
+    /// ENHANCEMENT ENH-LIVELEAK: the texture / mesh slots released so far may be taken by later uploads (the end of a live pass, when no
+    /// model holds a released id any more).
+    pub fn recycle_released(&mut self) {
+        self.list.cmds.push(Cmd::RecycleReleased);
+    }
+
+    /// ENHANCEMENT ENH-LIVELEAK: the GPU side's resident resources, with everything recorded so far executed (the live-build log, the
+    /// leak checks).
+    pub fn resource_stats(&mut self) -> crate::gpu::ResourceStats {
+        self.home().resource_stats()
+    }
+
+    /// The enhanced game's switches ([`crate::Enhancements`]), carried to the GPU side through the
+    /// command list — so with the render thread (D5) they take effect in call order, at the start
+    /// of the next frame handed over; only a change is recorded. The core starts with
+    /// [`crate::Enhancements::ORIGINAL`].
+    pub fn set_enhancements(&mut self, e: crate::Enhancements) {
+        if self.enhancements != e {
+            self.enhancements = e;
+            self.list.cmds.push(Cmd::Enhancements(e));
+        }
+    }
+
+    /// ENH-LITE: how strong the GPU is (integrated / software = weak).
+    pub fn gpu_class(&self) -> crate::GpuClass {
+        self.gpu_class
+    }
+
+    /// The switches last set.
+    pub fn enhancements(&self) -> crate::Enhancements {
+        self.enhancements
+    }
+
     /// Render a scene's meshes into an offscreen texture that the sprite pass can then draw, so a
     /// 3D view can sit **inside** the 2D screen in the right drawing order — what the front end's
     /// `NFS5.3DCAR` widgets need (`RE/notes/frontend-3d.md` §4). The clear is transparent, so only
@@ -468,6 +621,21 @@ impl Renderer {
         self.list.cmds.push(Cmd::Offscreen(Box::new(OffscreenJob { scene: scene.clone_without_sprites(), camera: *camera, width, height, reuse, clear: clear_colour, depth_far, id })));
         self.list.barrier = self.list.cmds.len();
         id
+    }
+
+    /// ENHANCEMENT E8: draw face `face` (0..6: +X, -X, +Z, -Z, +Y, -Y, `gpu::REFL_FACES`) of the
+    /// player's car's environment map from `camera` into a `size`² image and put it in the map. Recorded
+    /// like an offscreen pass; the main view uses the map once all six faces have been drawn and
+    /// `Scene::refl` is set.
+    pub fn render_refl_face(&mut self, scene: &Scene, camera: &Camera, face: u32, size: u32, clear: [f64; 4], depth_far: f32) {
+        self.list.cmds.push(Cmd::ReflFace(Box::new(ReflFaceJob { scene: scene.clone_without_sprites(), camera: *camera, face, size, clear, depth_far })));
+        self.list.barrier = self.list.cmds.len();
+    }
+
+    /// ENHANCEMENT ENH-FE3D: set the environment map from six CPU-made `size x size` RGBA f32 faces (display values, may exceed 1) (`REFL_FACES` order).
+    pub fn upload_refl_faces(&mut self, size: u32, faces: Vec<Vec<f32>>) {
+        self.list.cmds.push(Cmd::ReflUpload(size, faces));
+        self.list.barrier = self.list.cmds.len();
     }
 
     pub fn render_to_image(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {

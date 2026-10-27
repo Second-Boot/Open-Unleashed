@@ -62,7 +62,7 @@ impl App {
                 let forward = (cam.target - cam.position).normalize_or_zero();
                 let right = forward.cross(cam.up).normalize_or_zero();
                 let tan_v = (cam.fov_y_radians * 0.5).tan();
-                let cull = nfs_game::world::CullView { eye: cam.position, forward, right, up: right.cross(forward).normalize_or_zero(), tan_h: tan_v * (240.0 / 84.0), tan_v, near: cam.near, draw: (self.draw_distance / 3.0).max(50.0) };
+                let cull = nfs_game::world::CullView { eye: cam.position, forward, right, up: right.cross(forward).normalize_or_zero(), tan_h: tan_v * (240.0 / 84.0), tan_v, near: cam.near, draw: (self.draw_distance / 3.0).max(50.0), reach: 1.0 };
                 let render_w = self.renderer.as_ref().map_or(640.0, |r| r.size().0.max(1) as f32);
                 let p = DynPose { mirror_pass: true, cull: Some(cull), lod: (w.max(1) as f32, h.max(1) as f32), ref_width: render_w, ..pose };
                 let (saved_cam, saved_far) = (std::mem::replace(&mut self.camera, cam), std::mem::replace(&mut self.view_far, 65000.0));
@@ -84,7 +84,7 @@ impl App {
             let right = forward.cross(cam.up).normalize_or_zero();
             let up = right.cross(forward).normalize_or_zero();
             let tan_v = (cam.fov_y_radians * 0.5).tan();
-            let view = nfs_game::world::CullView { eye: cam.position, forward, right, up, tan_h: tan_v * (240.0 / 84.0), tan_v, near: cam.near, draw: (self.draw_distance / 3.0).max(50.0) };
+            let view = nfs_game::world::CullView { eye: cam.position, forward, right, up, tan_h: tan_v * (240.0 / 84.0), tan_v, near: cam.near, draw: (self.draw_distance / 3.0).max(50.0), reach: 1.0 };
             // the mirror's walk is 0x488CC0's next count (0x47FB49): the eighth re-registers
             self.walk_calls = self.walk_calls.wrapping_add(1);
             if self.walk_calls & 7 == 0
@@ -183,7 +183,14 @@ impl App {
         effects.clear();
         self.scratch.effects = effects;
         self.scratch.mirror_dyn = mirror_dyn;
+        self.rain_items(&mut items);
         let mut scene = self.scene.clone_header(items);
+        // ENHANCEMENT E21: no eye adaptation in the mirror
+        scene.eye = false;
+        // ENHANCEMENTS E27 / E29: nor motion blur or shake
+        scene.motion = None;
+        // ENHANCEMENT E40: nor drops on the windscreen
+        scene.drops = None;
         // the clear: 0x459A70 at 0x468DE8, before the mirror's sky pass (so at the slice the main
         // pass saved), with `[0x627F43] & 0x10` set for the pass (0x468DA8…0x468E1F) — the colour
         // record's group B (`SkyBin::background_at`); the view's constructor colour 0xFF77BBFF

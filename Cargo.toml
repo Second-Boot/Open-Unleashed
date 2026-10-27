@@ -16,6 +16,7 @@ members = [
     "tools/track-viewer",
     "tools/car-viewer",
     "tools/format-dumper",
+    "tools/hd-pack",
 ]
 
 [workspace.package]

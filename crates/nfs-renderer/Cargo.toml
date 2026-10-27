@@ -12,3 +12,16 @@ tracing.workspace = true
 anyhow.workspace = true
 winit.workspace = true
 pollster.workspace = true
+# ENHANCEMENT E37: AMD FSR 3.1 temporal upscaling (vendored in third_party/, ported to wgpu 30)
+wgpu-ffx = { path = "../../third_party/wgpu-ffx" }
+
+# ENHANCEMENT E34: MetalFX upscaling (macOS only; the versions wgpu-hal 30's Metal backend uses)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-metal-fx = "0.3"
+
+[dev-dependencies]
+# the WGSL test runs every composed shader through naga's front end and validator: the version and
+# the front end wgpu 30 already builds (no new feature reaches the game's build)
+naga = { version = "=30.0.1", features = ["wgsl-in"] }

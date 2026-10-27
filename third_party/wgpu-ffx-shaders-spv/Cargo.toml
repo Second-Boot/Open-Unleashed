@@ -1,0 +1,12 @@
+# Vendored from the upstream wgpu-ffx repository (MIT), see ../README.md.
+[package]
+name = "wgpu-ffx-shaders-spv"
+version = "0.1.0"
+edition = "2024"
+authors = ["wgpu-ffx developers", "Advanced Micro Devices, Inc."]
+license = "MIT"
+description = "Pre-compiled SPIR-V shaders for wgpu-ffx (FidelityFX SDK 1.1.4)"
+publish = false
+
+[lints.clippy]
+too_many_arguments = "allow"

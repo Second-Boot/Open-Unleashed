@@ -1,0 +1,158 @@
+//! ENHANCEMENT E21 — eye adaptation on the float scene (E7), applied in the tone-map pass.
+//!
+//! **Not the original.** The original's exposure is flat: leaving a tunnel is a hard cut in brightness.
+//! Here a one-pixel pass measures the frame's mean log-luminance (a fixed 16 x 16 grid of bilinear taps
+//! of the float image) and keeps two smoothed copies of it on the GPU: a quick one `F` (half-life
+//! 0.12 s, the scene as it is now) and a slow one `S` (half-life 0.6 s, what the eye has got used to).
+//! The tone map multiplies the image by `2^clamp(k (F - S), -cap, cap)`: when the scene turns
+//! brighter than the eye is used to (a tunnel exit) the image is a little overexposed and settles
+//! within a few seconds, when it turns darker (an entry) it is a little dark and lifts. A steady scene
+//! has `F = S`, so the exposure is exactly 1: nothing changes where the average brightness does not.
+//! Capped at +-0.5 EV. The state (two `Rgba32Float` pixels, ping-pong) never leaves the GPU, so there is
+//! no read-back; the first frame (and a changed image size after a resize) starts at `F = S`.
+//!
+//! All plain wgpu / WGSL (a render pass into a 1 x 1 `Rgba32Float`, read with `textureLoad`).
+
+use crate::gfx::{self, Fullscreen, PostCtx};
+use crate::wgsl;
+use std::time::Instant;
+
+/// Half-lives in seconds of the quick and the slow average.
+const HALF_LIFE_FAST: f32 = 0.12;
+const HALF_LIFE_SLOW: f32 = 0.6;
+/// EV per EV of difference, and the cap in EV.
+const GAIN: f32 = 0.35;
+pub(crate) const CAP_EV: f32 = 0.5;
+/// The longest frame step the smoothing believes (a stall must not snap the adaptation).
+const MAX_DT: f32 = 0.25;
+
+/// The WGSL that the tone-map pass needs when the eye is on: the state and its parameters.
+pub(crate) const TONE_BINDINGS: &str = r#"
+@group(1) @binding(0) var eye_state: texture_2d<f32>;
+@group(1) @binding(1) var<uniform> eye_params: array<vec4<f32>, 2>;
+fn eye_exposure() -> f32 {
+    let st = textureLoad(eye_state, vec2<i32>(0, 0), 0);
+    let ev = clamp(eye_params[1].x * (st.x - st.y), -eye_params[1].y, eye_params[1].y);
+    return exp2(ev);
+}
+"#;
+
+const MEASURE_WGSL: &str = r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+@group(1) @binding(0) var prev: texture_2d<f32>;
+@group(1) @binding(1) var<uniform> params: array<vec4<f32>, 2>;
+@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    var sum = 0.0;
+    for (var j = 0; j < 16; j = j + 1) {
+        for (var i = 0; i < 16; i = i + 1) {
+            let uv = (vec2<f32>(f32(i), f32(j)) + 0.5) / 16.0;
+            let c = min(textureSampleLevel(t, s, uv, 0.0).rgb, vec3<f32>(4.0));
+            let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+            sum = sum + log2(max(l, 1.0 / 128.0));
+        }
+    }
+    let m = sum / 256.0;
+    let old = textureLoad(prev, vec2<i32>(0, 0), 0);
+    if params[0].z > 0.5 {
+        return vec4<f32>(m, m, 0.0, 1.0);
+    }
+    return vec4<f32>(mix(old.x, m, params[0].x), mix(old.y, m, params[0].y), 0.0, 1.0);
+}
+"#;
+
+/// The measure pass's shader.
+pub(crate) fn measure_source() -> String {
+    wgsl::compose(&[wgsl::FULLSCREEN_VS, MEASURE_WGSL])
+}
+
+pub(crate) struct EyePass {
+    pipeline: wgpu::RenderPipeline,
+    /// group 1 of the tone-map pass and of the measure pass: the state texture + the parameters
+    pub state_layout: wgpu::BindGroupLayout,
+    params: wgpu::Buffer,
+    states: [(wgpu::Texture, wgpu::TextureView, wgpu::BindGroup); 2],
+    /// the state the last frame wrote
+    cur: usize,
+    last: Option<Instant>,
+    size: (u32, u32),
+    /// test glue: `NFS_EYE_DT=<seconds>` steps the smoothing by that much every frame (a scripted run's frames
+    /// are not at real time); the original has no such thing and neither does a normal run
+    fixed_dt: Option<f32>,
+}
+
+impl EyePass {
+    pub fn new(device: &wgpu::Device, image_layout: &wgpu::BindGroupLayout) -> Self {
+        let state_layout = gfx::bgl(device, "eye state", &[gfx::bgl_tex(0, wgpu::TextureSampleType::Float { filterable: false }, false), gfx::bgl_uniform(1, wgpu::ShaderStages::FRAGMENT)]);
+        let module = gfx::wgsl_module(device, "eye measure", &measure_source());
+        let pl = gfx::pipeline_layout(device, "eye measure", &[image_layout, &state_layout]);
+        let pipeline = Fullscreen::new("eye measure", &pl, &module).build(device, &[gfx::target(wgpu::TextureFormat::Rgba32Float, None)]);
+        let params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("eye params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let make = || {
+            let t = gfx::texture_2d(device, "eye state", 1, 1, wgpu::TextureFormat::Rgba32Float, gfx::RT_USAGE);
+            let v = t.create_view(&Default::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("eye state"),
+                layout: &state_layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&v) }, wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() }],
+            });
+            (t, v, bg)
+        };
+        let states = [make(), make()];
+        Self { pipeline, state_layout, params, states, cur: 0, last: None, size: (0, 0), fixed_dt: std::env::var("NFS_EYE_DT").ok().and_then(|v| v.parse().ok()) }
+    }
+
+    /// The bind group (group 1) the tone-map pass reads the state the last `encode` wrote through.
+    pub fn tone_group(&self) -> &wgpu::BindGroup {
+        &self.states[self.cur].2
+    }
+
+    /// Measure the float image (`image_bg`, `cx.size`) and step the adaptation: the new state is written to the other
+    /// texture and becomes the current one.
+    pub fn encode(&mut self, cx: &mut PostCtx, image_bg: &wgpu::BindGroup) {
+        let (queue, (width, height)) = (cx.queue, cx.size);
+        let encoder = &mut *cx.encoder;
+        let now = Instant::now();
+        let dt = self.fixed_dt.unwrap_or_else(|| self.last.map_or(0.0, |t| now.duration_since(t).as_secs_f32())).min(MAX_DT);
+        // a first frame or a new image size starts at rest (no jump from a size change)
+        let init = self.last.is_none() || self.size != (width, height);
+        self.last = Some(now);
+        self.size = (width, height);
+        let (af, as_) = (alpha(dt, HALF_LIFE_FAST), alpha(dt, HALF_LIFE_SLOW));
+        let p: [f32; 8] = [af, as_, init as u32 as f32, 0.0, GAIN, CAP_EV, 0.0, 0.0];
+        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&p));
+        let (prev, next) = (self.cur, 1 - self.cur);
+        {
+            let mut pass = gfx::color_pass(encoder, "eye measure", "eye adaptation", &self.states[next].1, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, image_bg, &[]);
+            pass.set_bind_group(1, &self.states[prev].2, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.cur = next;
+    }
+}
+
+/// The share a half-life `half` takes of a step of `dt` seconds.
+fn alpha(dt: f32, half: f32) -> f32 {
+    1.0 - 0.5f32.powf(dt / half)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoothing_is_a_half_life() {
+        assert_eq!(alpha(0.0, 0.6), 0.0);
+        assert!((alpha(0.6, 0.6) - 0.5).abs() < 1e-6);
+        assert!(alpha(0.12, HALF_LIFE_FAST) > alpha(0.12, HALF_LIFE_SLOW));
+    }
+
+    #[test]
+    fn exposure_is_capped() {
+        // a 6 EV jump never moves the image by more than the cap
+        assert_eq!((GAIN * 6.0).clamp(-CAP_EV, CAP_EV), CAP_EV);
+        assert_eq!((GAIN * -6.0).clamp(-CAP_EV, CAP_EV), -CAP_EV);
+    }
+}

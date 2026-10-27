@@ -760,7 +760,9 @@ impl App {
         if let Some(n) = nfs_game::config::cfg().nfs_lens_warmup.as_str().and_then(|v| v.parse::<u32>().ok()) {
             for _ in 0..n {
                 self.rebuild_scene();
-                let _ = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1);
+                self.render_reflections();
+                let cam = self.render_camera();
+                let _ = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &cam, shot_geometry().0, shot_geometry().1);
                 std::thread::sleep(Duration::from_millis(210));
             }
             self.rebuild_scene();
@@ -772,11 +774,14 @@ impl App {
             self.rebuild_scene();
         }
         self.sync_gamma();
+        // ENHANCEMENT E8: the environment faces a frame would draw (all six on the first call)
+        self.render_reflections();
+        let cam = self.render_camera(); // ENHANCEMENT E29: the shaken camera when a shake runs
         let rgba = self
             .renderer
             .as_mut()
             .unwrap()
-            .render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1)
+            .render_to_image(&self.scene, &cam, shot_geometry().0, shot_geometry().1)
             .expect("offscreen render");
         image::save_buffer(&path, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8)
             .expect("write png");
@@ -789,10 +794,39 @@ impl App {
                 self.test_alpha = Some(k as f32 / n as f32);
                 self.rebuild_scene();
                 self.render_mirror();
-                let rgba = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1).expect("offscreen render");
+                self.render_reflections();
+                let cam = self.render_camera();
+                let rgba = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &cam, shot_geometry().0, shot_geometry().1).expect("offscreen render");
                 let sp = format!("{}.seq{k}.png", path.trim_end_matches(".png"));
                 image::save_buffer(&sp, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8).expect("write png");
             }
+            self.test_alpha = None;
+        }
+        // **TEST GLUE** (not in the original, ENHANCEMENT ENH-TEMPORAL): `NFS_TEMPORAL_SEQ=<n>` also writes `n` more frames after
+        // the still, `<shot>.tseq<k>.png`, each one frame of a 60 fps run later than the one before (`NFS_TEMPORAL_DT` ticks of the
+        // 64 Hz simulation, default 1.0667): the poses are the last tick's blended on past the current one at the same rate (the
+        // cars' and the camera's motion continues as it was, nothing of the simulation is run), the scene rebuilt for each as a
+        // frame does. The temporal passes (`NFS_TEMPORAL_DEBUG`) need such a run of consecutive frames for their history.
+        if let Some(n) = nfs_game::config::cfg().nfs_temporal_seq.as_str().and_then(|v| v.parse::<u32>().ok()) {
+            let dt = nfs_game::config::cfg().nfs_temporal_dt.as_str().and_then(|v| v.parse::<f32>().ok()).unwrap_or(64.0 / 60.0);
+            // (ENH-MOTIONID) `NFS_TEMPORAL_TICKS=1`: the draw clock `tick` also advances by `dt` (rounded) a frame, so the pieces of a
+            // breakable prop (sampled by the tick, not by the fraction) fly on through the sequence; the simulation is still not run
+            let tick0 = self.tick;
+            let advance = nfs_game::config::cfg().nfs_temporal_ticks.is_set();
+            for k in 0..n {
+                self.test_alpha = Some((k + 1) as f32 * dt);
+                if advance {
+                    self.tick = tick0 + ((k + 1) as f32 * dt).round() as u64;
+                }
+                self.rebuild_scene();
+                self.render_mirror();
+                self.render_reflections();
+                let cam = self.render_camera();
+                let rgba = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &cam, shot_geometry().0, shot_geometry().1).expect("offscreen render");
+                let sp = format!("{}.tseq{k}.png", path.trim_end_matches(".png"));
+                image::save_buffer(&sp, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8).expect("write png");
+            }
+            self.tick = tick0;
             self.test_alpha = None;
         }
         event_loop.exit();
@@ -837,11 +871,49 @@ impl App {
             }
         }
         let (w, h, _) = shot_geometry();
+        let cam = self.render_camera(); // ENHANCEMENT E29
         if let Some(r) = self.renderer.as_mut()
-            && let Ok(rgba) = r.render_to_image(&self.scene, &self.camera, w, h)
+            && let Ok(rgba) = r.render_to_image(&self.scene, &cam, w, h)
         {
             image::save_buffer(&out, &rgba, w, h, image::ColorType::Rgba8).expect("write png");
             tracing::info!(path = out, tick = self.tick, eye = ?self.camera.position, target = ?self.camera.target, view = self.camera_view(), "NFS_SHOT_TICKS: still written");
+        }
+        // **TEST GLUE** (ENH-SAVE) `NFS_ENH_LIVE=<tick>:<E-token>:<delta>,…`: right after that tick's still, the same step the
+        // panel's combo makes (`enh_step`, which saves like the panel does), then the same tick again as
+        // `<prefix>.t<tick>.live.png` — a live change inside one run, the same frame before and after
+        // ENH-LIVETEX: the token `F12` is the A/B key (`enh_toggle_all`, a view that is never saved; the delta is ignored); every matching item gets its
+        // own still, `.live.png`, `.live2.png`, ... (so `250:F12:0,250:F12:0` shows the flip and the flip back, `250:E41:1,250:E41:1` x4 -> orig -> x2)
+        if let Ok(live) = std::env::var("NFS_ENH_LIVE") {
+            let mut n = 0;
+            for item in live.split(',') {
+                let mut p = item.trim().split(':');
+                let (Some(t), Some(tok), Some(d)) = (p.next().and_then(|t| t.parse::<u64>().ok()), p.next(), p.next().and_then(|d| d.parse::<i32>().ok())) else { continue };
+                if t != self.tick {
+                    continue;
+                }
+                let stepped = if tok.eq_ignore_ascii_case("f12") {
+                    self.enh_toggle_all();
+                    true
+                } else {
+                    self.enh_step(&format!("{}{tok}", nfs_game::remaster::ACCESSOR_PREFIX), d)
+                };
+                if !stepped {
+                    continue;
+                }
+                // the twins a new level needs are made now (a frame loop would spread them over frames)
+                self.enh_live_step(None);
+                self.billboard_key_frame();
+                self.rebuild_scene();
+                let cam = self.render_camera();
+                let (w, h, _) = shot_geometry();
+                n += 1;
+                let name = if n == 1 { format!("{path}.t{}.live.png", self.tick) } else { format!("{path}.t{}.live{n}.png", self.tick) };
+                if let Some(r) = self.renderer.as_mut()
+                    && let Ok(rgba) = r.render_to_image(&self.scene, &cam, w, h)
+                {
+                    image::save_buffer(name, &rgba, w, h, image::ColorType::Rgba8).expect("write png");
+                }
+            }
         }
     }
 }

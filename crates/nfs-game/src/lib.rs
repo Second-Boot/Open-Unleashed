@@ -13,6 +13,8 @@ pub mod cheats;
 pub mod dialog;
 pub mod end_of_era;
 pub mod fitted_tree;
+/// ENHANCEMENT E32 baked bounce light
+pub mod gi;
 pub mod intro;
 pub mod junctions;
 pub mod keyname;
@@ -30,6 +32,7 @@ pub mod replay;
 pub mod rng;
 pub mod room;
 pub mod racecar;
+pub mod remaster;
 pub mod records;
 pub mod save;
 pub mod scripts;

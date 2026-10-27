@@ -1,6 +1,6 @@
 #!/bin/sh
 # Windows x64 cross-build (cargo-xwin, msvc target, in Docker) -> target/dist/<APP_ID>-windows-x64-<version>[-with-data].zip
-# Contents: <APP_ID>.exe, dxcompiler.dll, dxil.dll, licenses/dxc/, README.txt, LICENSE.txt, THIRD-PARTY-LICENSES.txt,
+# Contents: <APP_ID>.exe, dxcompiler.dll, dxil.dll, licenses/dxc/, enhanced/layouts, README.txt, LICENSE.txt, THIRD-PARTY-LICENSES.txt,
 # game/ (empty: where the player's data goes; with --with-data the game data itself, see stage_data.sh: private use only).
 # Also next to the exe: dxcompiler.dll + dxil.dll (the official DirectX Shader Compiler, pinned below, checksum verified, cached in
 # target/dxc-cache) and its licences under licenses/dxc/. The game loads them for the DirectX 12 backend (wgpu Dx12Compiler::DynamicDxc,
@@ -46,7 +46,7 @@ fi
 rm -rf "$DIST/stage-win"
 mkdir -p "$STAGE"
 mv "$DIST/app-win.exe" "$STAGE/$APP_ID.exe"
-if [ "$WITH_DATA" = 1 ]; then cp -R "$DIST/stage/game" "$STAGE/game"; else stage_game_dir "$STAGE/game"; fi
+if [ "$WITH_DATA" = 1 ]; then cp -R "$DIST/stage/game" "$STAGE/game"; else stage_game_dir "$STAGE/game"; stage_enhanced_layouts "$STAGE"; fi
 cp "$DXC_CACHE/unpacked/bin/x64/dxcompiler.dll" "$DXC_CACHE/unpacked/bin/x64/dxil.dll" "$STAGE/"
 mkdir -p "$STAGE/licenses/dxc"
 cp "$DXC_CACHE"/unpacked/LICENSE-*.txt "$STAGE/licenses/dxc/"

@@ -2367,6 +2367,11 @@ impl App {
         // included; 0x40F740 clears them (`take_contact`). *(Until batch A6 the port took the
         // last event's own magnitude and let the pair rounds' wall hits raise none.)*
         let (contact_mag, contact_kind) = v.take_contact();
+        // ENHANCEMENT E29: a hard contact kicks the picture's shake (render-side state, decays with the clock; the sim
+        // reads nothing of it)
+        if contact_mag > 1.5 {
+            self.camfx.kick = self.camfx.kick.max(((contact_mag - 1.5) / 25.0).clamp(0.0, 1.0));
+        }
         // 0x40F740 → 0x412230: the force-feedback jolt, on the same words (the car's body frame is
         // `R·(point − position)`, 0x4122A8…0x4122CB)
         if contact_mag > 0.0 {

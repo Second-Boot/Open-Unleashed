@@ -18,3 +18,7 @@
 # Python bytecode
 __pycache__/
 *.pyc
+
+# ENHANCEMENT E41: the HD texture pack (big binaries, made from the original textures: never committed, never public)
+/enhanced/hd_textures/
+/remaster/hd_textures/

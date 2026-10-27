@@ -556,6 +556,10 @@ impl App {
     }
 
     pub(crate) fn choice_index(&self, name: &str) -> Option<(usize, &'static [u32])> {
+        // ENHANCEMENT framework: the «Улучшения» screen's own accessors (`Enh.<token>`)
+        if name.starts_with(nfs_game::remaster::ACCESSOR_PREFIX) {
+            return self.enh_choice(name);
+        }
         let (_, key, options) = CHOICE_ACCESSORS.iter().find(|(n, _, _)| *n == name)?;
         // `Tournament.EventType`'s count is the era's (0x506AA0) and its table the club lists
         // alone once the Evolution is over (0x4FD1A0) — `CareerUi::event_type_rows`

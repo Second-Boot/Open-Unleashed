@@ -141,7 +141,9 @@ impl App {
     /// A race's lens-flare object (0x4601F0 → 0x460780): the state at its constructor values,
     /// `LENSFLARE` as the launch's accessor dump left it (module doc) and `flarepos.dat`.
     pub(crate) fn lens_reset(&mut self) {
-        let enabled = self.choice_index(choice::GRAPHICS_LENS_FLARE).is_some_and(|(i, _)| i != 0);
+        // TEST GLUE (not in the original): `NFS_LENS_FORCE=1` switches the lens flare on for a scripted run (a race
+        // without the front end has the setting at 0, so no still ever showed the flare's elements)
+        let enabled = self.choice_index(choice::GRAPHICS_LENS_FLARE).is_some_and(|(i, _)| i != 0) || std::env::var_os("NFS_LENS_FORCE").is_some();
         let mut positions = DEFAULT_POSITIONS;
         if let Ok(d) = std::fs::read(self.paths.render_dir().join("flarepos.dat")) {
             positions = [0.0; 14];
@@ -187,7 +189,8 @@ impl App {
         let readback = bin.sun_readback;
         let Some(r) = self.renderer.as_ref() else { return };
         let aspect = r.aspect();
-        let cam = self.camera;
+        // ENHANCEMENT E29: the camera that is drawn (shaken), so the flare and its occlusion probe stay on the sun
+        let cam = self.render_camera();
         // the sky pass's projection of the sun (0x460306): the lens flare runs on it wherever it fell —
         // `nfs5.dll` removed the file's `+0x18D` (on the window) gate, 0x46049A
         let Some(pt) = self.sun_point_any(&cam, aspect, SUN_VIEW_MAIN) else { return };

@@ -28,6 +28,14 @@ An independent implementation written from scratch in Rust (winit + wgpu) that r
 | Where the game data goes | [docs/en/game-data.md](docs/en/game-data.md) | [docs/ru/game-data.md](docs/ru/game-data.md) |
 | Controls | [docs/en/controls.md](docs/en/controls.md) | [docs/ru/controls.md](docs/ru/controls.md) |
 | Building from source, options | [docs/en/building.md](docs/en/building.md) | [docs/ru/building.md](docs/ru/building.md) |
+| The enhanced version | [docs/en/enhanced.md](docs/en/enhanced.md) | [docs/ru/enhanced.md](docs/ru/enhanced.md) |
+
+## Enhanced version
+
+This branch (`enhanced`) adds optional render enhancements on top of the faithful engine: better lighting, shadows,
+reflections, anti-aliasing, upscaling (AMD FidelityFX FSR 3), HD textures made from your own copy and more. Each has its
+own switch in the in-game enhancements screen; with all of them off the game is the original. Gameplay, physics and the
+network protocol are unchanged. Details: [docs/en/enhanced.md](docs/en/enhanced.md).
 
 ## Quick start
 
@@ -50,5 +58,9 @@ Bug reports and pull requests: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The community patch 1.0.6 by Verok, whose run-time fixes to the original executable this engine reproduces where
 they change the game's behaviour.
+
+Enhanced version: AMD FidelityFX Super Resolution 3 through [wgpu-ffx](https://github.com/cwfitzgerald/wgpu-ffx)
+(MIT, vendored in `third_party/`); the DirectX Shader Compiler (Windows builds, its licences in `licenses/dxc`);
+upscaling models used by `tools/hd-textures`: 4x-PBRify (CC0) and 4xTextures_GTAV_rgt-s by **Philip Hofmann** (CC-BY-4.0).
 
 *OpenUnleashed is a working name.*

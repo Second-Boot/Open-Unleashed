@@ -36,7 +36,19 @@ impl App {
                     // 2026-09-29: the `NFS_PLAY_INTRO=1` walk left one up ~10s).
                     .with_visible(!scripted);
                 let window = Arc::new(event_loop.create_window(attrs).expect("window"));
-                let renderer = Renderer::new(window.clone()).expect("renderer");
+                let mut renderer = Renderer::new(window.clone()).expect("renderer");
+                // ENH-LITE: no stored choice and no `NFS_ENH` = the first run: a weak GPU (integrated, not
+                // Apple Silicon; or software) gets the light preset, any other the full defaults. Logged once;
+                // nothing is written (the file appears at the first change in the panel), so it is the same
+                // choice every start until the player picks one.
+                if nfs_game::remaster::auto_pending() && self.enh_mode == nfs_game::remaster::Mode::Normal {
+                    let (set, class) = nfs_game::remaster::auto_set(renderer.gpu_class());
+                    tracing::info!(gpu_class = ?class, enhancements = %set.describe(), "first run: enhancement set chosen by the GPU class (ENH-LITE)");
+                    self.enh = set;
+                }
+                renderer.set_enhancements(self.enh);
+                // ENHANCEMENT ENH-UPSCALER: the options panel is generated from this set
+                nfs_game::remaster::set_panel_state(self.enh);
                 (window, renderer)
             }
         };

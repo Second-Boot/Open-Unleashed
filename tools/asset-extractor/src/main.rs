@@ -5,7 +5,10 @@
 //! asset-extractor fsh <file.fsh> <outdir>        # SHPI entries → PNG (base mip)
 //! asset-extractor crp <file.crp> <out.obj>       # lowest-LOD geometry → Wavefront OBJ (+ .mtl with texture names)
 //! asset-extractor unpack <file> <out>            # RefPack-decompress a single file
+//! asset-extractor hd-export <outdir> --track alps --car 993 | --all   # the HD texture export (see hd_export.rs)
 //! ```
+mod hd_export;
+
 use anyhow::{bail, Context, Result};
 use nfs_formats::{bigf::Bigf, crp::Crp, fsh::Fsh, refpack};
 use std::fmt::Write as _;
@@ -13,6 +16,10 @@ use std::path::{Path, PathBuf};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // ENHANCEMENT E41: the HD texture export (keys + manifest for the upscaling pipeline), its own argument list
+    if args.first().map(String::as_str) == Some("hd-export") {
+        return hd_export::run(&args[1..]);
+    }
     let (Some(cmd), Some(input), Some(out)) = (args.first(), args.get(1), args.get(2)) else {
         bail!("usage: asset-extractor <viv|fsh|crp|unpack> <input> <output>");
     };

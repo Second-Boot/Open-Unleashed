@@ -102,6 +102,9 @@ pub struct TrackWorld {
     /// — and the one texture every shipped one names (`sh80`), uploaded.
     pub projectors: Vec<Projector>,
     pub projector_texture: Option<nfs_renderer::TextureId>,
+    /// ENHANCEMENT ENH-LIVETEX: the originals' texture ids by name and the HD twins made next to them (`sync_hd`)
+    tex_ids: HashMap<String, (nfs_renderer::TextureId, bool)>,
+    hd: Option<HdSet>,
     /// Which projectors are in the map `[0x627DFC]`: 0x450DBD → 0x456090 puts one there when its
     /// article draws, and nothing takes it out before the track is unloaded (0x455FF0 ← 0x46912C).
     projector_registered: Vec<bool>,
@@ -125,6 +128,10 @@ pub struct TrackWorld {
     /// draw items uploaded — what the walk's draw picks from per frame ([`Self::visible_items`]).
     /// (history: `game-history.md` §9.2)
     pub track_lods: Vec<TrackArticleGpu>,
+    /// ENHANCEMENT E26: the centre (world space) of each road part's mesh (surface type 1): the point whose slice gives its wetness.
+    pub road_centres: HashMap<MeshId, Vec3>,
+    /// ENHANCEMENT E32: the baked bounce light's state (`crate::gi`); `None` on a night track and in the hard original.
+    pub gi: Option<crate::gi::State>,
     /// The `Vis ` segments the walk's occlusion test 0x488B50 uses.
     pub occluders: Vec<Occluder>,
     /// The instance drawer's items outside [`Self::cull_articles`]: one per breakable
@@ -150,6 +157,9 @@ pub struct TrackWorld {
     uv_plan: UvPlan,
     /// The `WAnimBundle` articles the port moves ([`Self::animate_articles`]).
     anim_articles: Vec<AnimArticle>,
+    /// ENHANCEMENT E44: the track's lighthouse beams ([`LBeamSrc`]) and whether their sheets are hidden now.
+    lbeams: Vec<LBeamSrc>,
+    lbeam_hidden: bool,
     /// The next registration number a moved ref takes.
     next_seq: u32,
 }
@@ -369,6 +379,10 @@ pub struct CullView {
     pub tan_v: f32,
     pub near: f32,
     pub draw: f32,
+    /// ENHANCEMENT E5: the draw-distance factor (1.0 = the original). `draw` arrives already scaled
+    /// by it; the walk scales the rest of the distance gates the same way: the frustum's far
+    /// ([`FRUSTUM_FAR`]), a mid-ground article's band and every LOD's distance.
+    pub reach: f32,
 }
 
 /// An article the walk draws this frame: the LOD its drawer picks and the value the walk hands the
@@ -421,7 +435,7 @@ impl CullView {
             if a > r {
                 return false;
             }
-        } else if depth - FRUSTUM_FAR > r {
+        } else if depth - FRUSTUM_FAR * self.reach > r {
             return false;
         }
         for (x, t) in [(rel.dot(self.right), self.tan_h), (rel.dot(self.up), self.tan_v)] {
@@ -494,7 +508,10 @@ fn walk_item(v: &CullView, near: &[&Occluder], drawer: ArticleDrawer, centre: Ve
     }
     let d2 = (centre - v.eye).length_squared();
     let value = match drawer {
-        ArticleDrawer::MidGround { band } => (d2 < band * band).then_some(d2)?,
+        ArticleDrawer::MidGround { band } => {
+            let band = band * v.reach;
+            (d2 < band * band).then_some(d2)?
+        }
         _ => {
             let s = (bit_root(d2) - radius).max(0.0);
             (s * s < v.draw * v.draw).then_some(s * s)?
@@ -505,7 +522,8 @@ fn walk_item(v: &CullView, near: &[&Occluder], drawer: ArticleDrawer, centre: Ve
         ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => value.trunc() as f64,
         ArticleDrawer::Instance | ArticleDrawer::Anim => rounded as f64,
     };
-    let lod = lods.iter().position(|l| key < (l.distance as f64) * (l.distance as f64))?;
+    let reach = v.reach as f64;
+    let lod = lods.iter().position(|l| key < (l.distance as f64 * reach) * (l.distance as f64 * reach))?;
     Some(ArticleDraw { lod, value: rounded, order: (0, 0) })
 }
 
@@ -812,6 +830,23 @@ impl TrackWorld {
     /// are) and its body's position now.
     pub fn track_smackable(&self, k: usize) -> Option<(usize, Vec3, Vec3)> {
         self.smack_anims.get(k).map(|a| (a.article, a.home, a.position))
+    }
+
+    /// ENHANCEMENT E23: every kind-2 flare of the track in world space, whether the walk runs it
+    /// this frame or not (the placed articles' with an animated article's matrix as it stands, the
+    /// `.scn` GEOM instances' through their item's matrix as placed at the upload). Where the street
+    /// lamps are, for the lights; static data of the track (no per-frame walk).
+    pub fn all_flares(&self) -> Vec<TrackFlare> {
+        let placed = self.flares.iter().map(|f| match self.anim_articles.iter().find(|a| a.article == f.article) {
+            Some(a) => TrackFlare { position: a.matrix.transform_point3(f.position), direction: a.matrix.transform_vector3(f.direction), ..f.clone() },
+            None => f.clone(),
+        });
+        let instances = self.instance_flares.iter().filter_map(|(slot, f)| {
+            let ic = self.instance_culls.get(*slot)?;
+            let m = self.items.get(ic.first_item)?.transform;
+            Some(TrackFlare { position: m.transform_point3(f.position), direction: m.transform_vector3(f.direction), ..f.clone() })
+        });
+        placed.chain(instances).collect()
     }
 
     /// The flares that run this frame, in world space: the placed articles' ([`Self::flares`],
@@ -1152,6 +1187,115 @@ pub fn node_wholly_pruned(v: &CullView, ncx: f32, ncz: f32, nr: f32) -> bool {
 mod cull_tree_tests {
     use super::*;
 
+    /// `master`'s `CullView::sphere_visible` and `walk_item`, verbatim but for the name (before ENHANCEMENT E5's `reach`).
+    fn master_sphere_visible(v: &CullView, c: Vec3, r: f32) -> bool {
+        let rel = c - v.eye;
+        let depth = rel.dot(v.forward);
+        let a = v.near - depth;
+        if a > 0.0 {
+            if a > r {
+                return false;
+            }
+        } else if depth - FRUSTUM_FAR > r {
+            return false;
+        }
+        for (x, t) in [(rel.dot(v.right), v.tan_h), (rel.dot(v.up), v.tan_v)] {
+            let cos = 1.0 / (1.0 + t * t).sqrt();
+            let p = x - depth * t;
+            if p > 0.0 {
+                if p * cos > r {
+                    return false;
+                }
+            } else {
+                let q = x + depth * t;
+                if q < 0.0 && -q * cos > r {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn master_walk_item(v: &CullView, near: &[&Occluder], drawer: ArticleDrawer, centre: Vec3, radius: f32, lods: &[CullLod]) -> Option<ArticleDraw> {
+        if !master_sphere_visible(v, centre, radius) {
+            return None;
+        }
+        let mid = matches!(drawer, ArticleDrawer::MidGround { .. });
+        let (eye, c) = ([v.eye.x, v.eye.z], [centre.x, centre.z]);
+        if near.iter().any(|o| (!mid || o.raised) && segments_cross([o.a[0], o.a[1]], [o.a[0] + o.d[0], o.a[1] + o.d[1]], eye, c)) {
+            return None;
+        }
+        let d2 = (centre - v.eye).length_squared();
+        let value = match drawer {
+            ArticleDrawer::MidGround { band } => (d2 < band * band).then_some(d2)?,
+            _ => {
+                let s = (bit_root(d2) - radius).max(0.0);
+                (s * s < v.draw * v.draw).then_some(s * s)?
+            }
+        };
+        let rounded = value.round_ties_even();
+        let key = match drawer {
+            ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => value.trunc() as f64,
+            ArticleDrawer::Instance | ArticleDrawer::Anim => rounded as f64,
+        };
+        let lod = lods.iter().position(|l| key < (l.distance as f64) * (l.distance as f64))?;
+        Some(ArticleDraw { lod, value: rounded, order: (0, 0) })
+    }
+
+    /// ENHANCEMENT E5: with `reach == 1.0` (the original, `NFS_ENH=off`) the walk is master's bit for bit —
+    /// `FRUSTUM_FAR * 1.0`, `band * 1.0` and `distance as f64 * 1.0` are exact in IEEE. The culled list feeds the item order
+    /// the renderer draws, so it must not move. Many pseudo-random items (a fixed LCG) plus the exact edges of every gate.
+    #[test]
+    fn walk_with_reach_1_equals_master_walk() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move |lo: f32, hi: f32| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            lo + (hi - lo) * ((seed >> 40) as f32 / (1u64 << 24) as f32)
+        };
+        let lods = [
+            CullLod { distance: 40, effects: true, first: 0, last: 1, lod: 0 },
+            CullLod { distance: 150, effects: true, first: 1, last: 2, lod: 1 },
+            CullLod { distance: 420, effects: false, first: 2, last: 3, lod: 2 },
+            CullLod { distance: 0xFFFF, effects: true, first: 3, last: 4, lod: 3 },
+        ];
+        let wall = Occluder { raised: false, a: [-30.0, 60.0], d: [60.0, 0.0], len2: 3600.0, inv_len2: 1.0 / 3600.0 };
+        let raised = Occluder { raised: true, a: [80.0, -40.0], d: [0.0, 300.0], len2: 90000.0, inv_len2: 1.0 / 90000.0 };
+        let occ: [&[&Occluder]; 3] = [&[], &[&wall], &[&wall, &raised]];
+        let drawers = [ArticleDrawer::Static, ArticleDrawer::MidGround { band: 600.0 }, ArticleDrawer::MidGround { band: 700.0 }, ArticleDrawer::Instance, ArticleDrawer::Anim];
+        let mut seen = [0usize; 2];
+        for _ in 0..400 {
+            let yaw = rnd(-3.2, 3.2);
+            let forward = Vec3::new(yaw.sin(), rnd(-0.3, 0.1), yaw.cos()).normalize();
+            let right = forward.cross(Vec3::Y).normalize();
+            let up = right.cross(forward);
+            let v = CullView { eye: Vec3::new(rnd(-500.0, 500.0), rnd(0.0, 50.0), rnd(-500.0, 500.0)), forward, right, up, tan_h: rnd(0.4, 1.2), tan_v: rnd(0.3, 0.9), near: rnd(0.1, 1.0), draw: rnd(100.0, 900.0), reach: 1.0 };
+            for _ in 0..40 {
+                let r = rnd(0.5, 250.0);
+                let dir = (forward * rnd(-0.2, 1.0) + right * rnd(-1.0, 1.0) + up * rnd(-0.5, 0.5)).normalize_or_zero();
+                // a random distance, or one on the far / band / draw edges (± the radius)
+                let d = match rnd(0.0, 4.0) as u32 {
+                    0 => FRUSTUM_FAR + r,
+                    1 => 600.0,
+                    2 => v.draw + r,
+                    _ => rnd(0.0, 1200.0),
+                };
+                let c = v.eye + dir * d;
+                for drawer in drawers {
+                    for near in occ {
+                        let (a, b) = (walk_item(&v, near, drawer, c, r, &lods), master_walk_item(&v, near, drawer, c, r, &lods));
+                        assert_eq!(a.map(|x| (x.lod, x.value.to_bits())), b.map(|x| (x.lod, x.value.to_bits())), "{v:?} {drawer:?} c {c} r {r}");
+                        seen[a.is_some() as usize] += 1;
+                    }
+                }
+            }
+            // the sphere test alone, on its far edge
+            let c = v.eye + forward * (FRUSTUM_FAR + 3.0);
+            assert_eq!(v.sphere_visible(c, 3.0), master_sphere_visible(&v, c, 3.0));
+        }
+        // both outcomes were exercised
+        assert!(seen[0] > 1000 && seen[1] > 1000, "{seen:?}");
+    }
+
     /// Locked against `cull_tree_node_prune_census.rs`'s own `sanity_check` (same formula,
     /// independently re-derived here to catch a sign regression in either copy).
     #[test]
@@ -1159,7 +1303,7 @@ mod cull_tree_tests {
         // `right`/`up` follow `main.rs`'s own construction: `right = forward.cross(up)`, so
         // `forward = +Z, up = +Y` gives `right = -X` (not `+X` — the wedge's side normals below
         // must use the *same* handedness `CullView.right` already carries everywhere else).
-        let base = CullView { eye: Vec3::ZERO, forward: Vec3::Z, right: Vec3::NEG_X, up: Vec3::Y, tan_h: 1.0, tan_v: 1.0, near: 1.0, draw: 300.0 };
+        let base = CullView { eye: Vec3::ZERO, forward: Vec3::Z, right: Vec3::NEG_X, up: Vec3::Y, tan_h: 1.0, tan_v: 1.0, near: 1.0, draw: 300.0, reach: 1.0 };
         // dead ahead at 100 m, within far and the wedge: never pruned.
         assert!(!node_wholly_pruned(&base, 0.0, 100.0, 1.0));
         // 90 degrees to the side, same distance: wholly outside a 45 degree (tan_h = 1) wedge.
@@ -1522,7 +1666,182 @@ pub fn car_specular_maps(r: &mut Renderer, paths: &nfs_assets::GamePaths, front_
     })
 }
 
+/// ENHANCEMENT E41: the HD pack of this run for the level the switch is at (1 = the x2 pack, 2 = the x4 pack; `None`: level 0, or no
+/// pack of that scale on disk, the original is used), the game root taken from the track's own directory (`<root>/GameData/Track`).
+/// At level 0 nothing is looked for: no file is touched.
+pub(crate) fn hd_pack_for(r: &Renderer, track: &TrackAssets) -> Option<&'static nfs_assets::hdpack::HdPack> {
+    let scale = nfs_assets::hdpack::scale_of_level(r.enhancements().level(nfs_renderer::E41))?;
+    let root = track.dir.parent()?.parent()?.to_path_buf();
+    nfs_assets::hdpack::HdPack::global(&nfs_assets::GamePaths { root }, scale)
+}
+
+/// ENHANCEMENT E41: one texture of a pack as the uploader takes it.
+pub(crate) enum HdLoaded {
+    /// RGBA8 levels (a PNG with the chain made here, or a KTX2 decoded on the CPU)
+    Rgba(u32, u32, Vec<Vec<u8>>),
+    /// BC7 blocks, every level (a KTX2 on a device that takes BC)
+    Bc7(u32, u32, Vec<Vec<u8>>),
+}
+
+/// ENHANCEMENT E41: load one pack texture of `key` for the original `t`-sized (`ow x oh`, level 0 `orig`) texture: BC7 when the device takes it
+/// and the file is one, else RGBA8 with its mip chain (the file's own for a KTX2, E2's generator for a PNG). `alpha` is the chain's
+/// alpha mode for a PNG. `None`: no file / wrong size / unreadable (the original is used).
+pub(crate) fn load_hd_texture(pack: &nfs_assets::hdpack::HdPack, key: &str, orig: &[u8], ow: u32, oh: u32, bc7: bool, alpha: nfs_renderer::MipAlpha) -> Option<HdLoaded> {
+    use nfs_assets::hdpack::HdFile;
+    Some(match pack.load_any(key, orig, ow, oh, bc7)? {
+        HdFile::Bc7(img) if img.width % 4 == 0 && img.height % 4 == 0 => HdLoaded::Bc7(img.width, img.height, img.levels),
+        HdFile::Bc7(img) => HdLoaded::Rgba(img.width, img.height, nfs_assets::hdpack::decode_chain(&img)),
+        HdFile::Chain { width, height, mips } => HdLoaded::Rgba(width, height, mips),
+        HdFile::Rgba(img) => {
+            let rest = nfs_renderer::mip_chain(&img.rgba, img.width, img.height, alpha);
+            let (w, h) = (img.width, img.height);
+            let mut mips = vec![img.rgba];
+            mips.extend(rest);
+            HdLoaded::Rgba(w, h, mips)
+        }
+    })
+}
+
+/// ENHANCEMENT ENH-LIVETEX: the HD twins one loader made (a track's, the sky's, a car's pages): the scale they were loaded at, the original
+/// textures they are twins of, and their own ids (given back to the renderer when another scale replaces them).
+#[derive(Debug, Clone, Default)]
+pub struct HdSet {
+    pub scale: u32,
+    pub bases: Vec<nfs_renderer::TextureId>,
+    pub twins: Vec<nfs_renderer::TextureId>,
+}
+
+/// ENHANCEMENT ENH-LIVETEX: one texture to look up in the pack: the ORIGINAL's id (already uploaded, as master does), the pack key, the
+/// original's pixels (the size and the alpha policy of the pack image's check) and the alpha mode of a PNG's generated chain.
+pub(crate) struct HdJob<'a> {
+    pub base: nfs_renderer::TextureId,
+    pub key: String,
+    pub orig: &'a nfs_assets::texture::TextureImage,
+    pub alpha: nfs_renderer::MipAlpha,
+}
+
+/// ENHANCEMENT ENH-LIVETEX: the pack scale E41's current level asks for (`None`: level 0).
+pub(crate) fn hd_scale_wanted(r: &Renderer) -> Option<u32> {
+    nfs_assets::hdpack::scale_of_level(r.enhancements().level(nfs_renderer::E41))
+}
+
+/// ENHANCEMENT ENH-LIVETEX: make `new` the current set of `cur`: a base the old set had and the new one lacks goes back to its original,
+/// the replaced twins give their video memory back (the originals stay, so F12 flips without a reload).
+pub(crate) fn replace_hd_set(r: &mut Renderer, cur: &mut Option<HdSet>, new: HdSet) {
+    if let Some(old) = cur.take() {
+        let kept: std::collections::HashSet<nfs_renderer::TextureId> = new.bases.iter().copied().collect();
+        for b in old.bases.iter().filter(|b| !kept.contains(b)) {
+            r.set_texture_twin(*b, None);
+        }
+        for t in old.twins {
+            r.release_texture(t);
+        }
+    }
+    *cur = Some(new);
+}
+
+/// ENHANCEMENT E41 / ENH-LIVETEX: upload the HD twins of `jobs` - each replaced by its pack image where the pack has one - and register them
+/// with the renderer ([`Renderer::set_texture_twin`]); the originals are already there. Shown while E41 is on.
+///
+/// A twin gets the pack's `scale x` pixels with a full mip chain (the file's own for a KTX2 / BC7, made by E2's generator
+/// ([`nfs_renderer::mip_chain`]; an alpha-tested texture keeps its coverage, `Test(10)`) for a PNG), so the sampler path is the
+/// original's. BC7 files are uploaded as they are when the device takes BC (`TEXTURE_COMPRESSION_BC`), else decoded on the CPU. The pixels are
+/// read and chained on worker threads and uploaded in runs of `HD_RUN` textures, so the CPU never holds the whole HD set.
+pub(crate) fn upload_hd_twins(r: &mut Renderer, pack: &nfs_assets::hdpack::HdPack, jobs: &[HdJob<'_>], what: &str) -> HdSet {
+    const HD_RUN: usize = 24;
+    type Loaded = Option<HdLoaded>;
+    let started = std::time::Instant::now();
+    let bc7 = r.supports_bc7();
+    let mut set = HdSet { scale: pack.scale(), ..Default::default() };
+    let (mut direct, mut bytes, mut orig_bytes) = (0usize, 0u64, 0u64);
+    for run in jobs.chunks(HD_RUN) {
+        let load = |j: &HdJob<'_>| -> Loaded {
+            if j.orig.mips.is_empty() {
+                return None;
+            }
+            load_hd_texture(pack, &j.key, &j.orig.mips[0], j.orig.width, j.orig.height, bc7, j.alpha)
+        };
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(run.len());
+        let per = run.len().div_ceil(workers.max(1));
+        let loaded: Vec<Loaded> = std::thread::scope(|s| {
+            let load = &load;
+            let handles: Vec<_> = run.chunks(per).map(|c| s.spawn(move || c.iter().map(load).collect::<Vec<_>>())).collect();
+            handles.into_iter().flat_map(|h| h.join().expect("HD texture worker")).collect()
+        });
+        // the RGBA8 ones in one call, the BC7 ones in another; each texture is named by its slot in the run
+        let mut ids: Vec<Option<nfs_renderer::TextureId>> = vec![None; run.len()];
+        let rgba_slots: Vec<usize> = (0..run.len()).filter(|&i| matches!(loaded[i], Some(HdLoaded::Rgba(..)))).collect();
+        let items: Vec<(u32, u32, &[Vec<u8>], Option<nfs_renderer::MipAlpha>)> = rgba_slots
+            .iter()
+            .filter_map(|&i| if let Some(HdLoaded::Rgba(w, h, mips)) = &loaded[i] { Some((*w, *h, mips.as_slice(), None)) } else { None })
+            .collect();
+        for (&i, id) in rgba_slots.iter().zip(r.upload_textures_gen(&items)) {
+            ids[i] = Some(id);
+        }
+        let bc_slots: Vec<usize> = (0..run.len()).filter(|&i| matches!(loaded[i], Some(HdLoaded::Bc7(..)))).collect();
+        let bc_items: Vec<(u32, u32, &[Vec<u8>])> = bc_slots.iter().filter_map(|&i| if let Some(HdLoaded::Bc7(w, h, l)) = &loaded[i] { Some((*w, *h, l.as_slice())) } else { None }).collect();
+        for (&i, id) in bc_slots.iter().zip(r.upload_textures_bc7(&bc_items)) {
+            ids[i] = Some(id);
+        }
+        for (i, j) in run.iter().enumerate() {
+            let Some(id) = ids[i] else { continue };
+            orig_bytes += j.orig.mips.iter().map(|m| m.len() as u64).sum::<u64>();
+            match &loaded[i] {
+                Some(HdLoaded::Rgba(_, _, mips)) => bytes += mips.iter().map(|m| m.len() as u64).sum::<u64>(),
+                Some(HdLoaded::Bc7(_, _, levels)) => {
+                    direct += 1;
+                    bytes += levels.iter().map(|m| m.len() as u64).sum::<u64>();
+                }
+                None => {}
+            }
+            r.set_texture_twin(j.base, Some(id));
+            set.bases.push(j.base);
+            set.twins.push(id);
+        }
+    }
+    tracing::info!(what, scale = pack.scale(), twins = set.twins.len(), bc7 = direct, total = jobs.len(), hd_mib = bytes >> 20, original_mib_resident_next_to_it = orig_bytes >> 20, ms = started.elapsed().as_millis() as u64, "HD textures uploaded next to the originals (ENHANCEMENT E41)");
+    set
+}
+
+/// ENHANCEMENT E41 / ENH-LIVETEX: a track's HD jobs: every `.fsh` texture but the car-shadow projector's map (sampled by a projective
+/// matrix, not a surface UV); a name that occurs again later in the pack is not looked up (the later one is the one the materials name,
+/// and the pack holds the last under the key). `ids`: the originals' ids by name (the later duplicate wins, as in the materials).
+fn track_hd_jobs<'a>(track: &'a TrackAssets, ids: &HashMap<String, (nfs_renderer::TextureId, bool)>) -> Vec<HdJob<'a>> {
+    let exclude: std::collections::HashSet<String> = track_projectors(track).iter().map(|p| nfs_assets::hdpack::safe(&p.texture)).collect();
+    let last: HashMap<String, usize> = track.textures.iter().enumerate().map(|(i, t)| (nfs_assets::hdpack::safe(&t.name), i)).collect();
+    track
+        .textures
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| !t.mips.is_empty() && !exclude.contains(&nfs_assets::hdpack::safe(&t.name)) && last.get(&nfs_assets::hdpack::safe(&t.name)) == Some(i))
+        .filter_map(|(_, t)| {
+            let base = ids.get(&t.name)?.0;
+            let alpha = if t.has_alpha { nfs_renderer::MipAlpha::Test(10) } else { nfs_renderer::MipAlpha::Blend };
+            Some(HdJob { base, key: nfs_assets::hdpack::key_track(&track.name, &t.name), orig: t, alpha })
+        })
+        .collect()
+}
+
 impl TrackWorld {
+    /// ENHANCEMENT ENH-LIVETEX: E41 is on at a scale whose twins are not resident (the caller then needs the CPU textures of the track back:
+    /// `TrackAssets::ensure_textures`).
+    pub fn hd_pending(&self, r: &Renderer, track: &TrackAssets) -> bool {
+        hd_scale_wanted(r).is_some_and(|scale| self.hd.as_ref().is_none_or(|h| h.scale != scale)) && hd_pack_for(r, track).is_some()
+    }
+
+    /// ENHANCEMENT ENH-LIVETEX: bring the HD twins in line with E41's level after a change (the F12 flip needs nothing: the renderer shows
+    /// the twins or the originals by the switch). Level 0: nothing (a resident set stays for the way back). A level whose scale is not the
+    /// resident one (first use, x2 <-> x4): that pack is loaded now next to the originals and replaces the old twins (a short hitch).
+    pub fn sync_hd(&mut self, r: &mut Renderer, track: &TrackAssets) {
+        if !self.hd_pending(r, track) {
+            return;
+        }
+        let Some(pack) = hd_pack_for(r, track) else { return };
+        let jobs = track_hd_jobs(track, &self.tex_ids);
+        let set = upload_hd_twins(r, pack, &jobs, "track (live)");
+        replace_hd_set(r, &mut self.hd, set);
+    }
+
     /// The sky-map texture of layer 0 at `slice`: the `.map` section covering it, in its covered or
     /// open variant (`RE/notes/lighting.md` §3, §3.2). `None` outside every section, where the
     /// original binds none (0x4411AD) — *corrected 2026-09-26: not "the default maps"*.
@@ -1602,6 +1921,14 @@ impl TrackWorld {
         let geometry = track.build_geometry()?;
         let materials = track.materials()?;
         let tex_ids = Self::upload_track_textures(r, track);
+        // ENHANCEMENT E41 / ENH-LIVETEX: the originals are always uploaded as master does; with E41 on and a pack present, the pack's images
+        // (x2 / x4 by the level) are uploaded NEXT TO them as their twins, and a material shows the twin while E41 is on (the sizes of
+        // everything else, the UVs, stay the original's: the shader samples normalized UVs). Off: no pack lookup at all, nothing extra.
+        let mut hd_set: Option<HdSet> = None;
+        if let Some(pack) = hd_pack_for(r, track) {
+            let jobs = track_hd_jobs(track, &tex_ids);
+            hd_set = Some(upload_hd_twins(r, pack, &jobs, "track"));
+        }
         let methods = track.crp.render_methods(&track.crp_data).unwrap_or_default();
         let mut mat_ids: HashMap<u16, MaterialId> = HashMap::new();
         let mut material_for = |r: &mut Renderer, id: u16| {
@@ -1633,7 +1960,7 @@ impl TrackWorld {
                 let false_sort = m.and_then(|m| methods.iter().find(|r| r.name == m.render_method).map(|r| r.built_ops(0, m.op_mask).any(|o| o.class == 0x800F))).unwrap_or(false);
                 // the material's address modes, states 0x41 / 0x42 (`thrash.md` §7): 0 clamps
                 let clamp = m.map_or([false; 2], |m| m.address.map(|a| a == 0));
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: true, depth_bias, false_sort })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: true, depth_bias, false_sort, reflect: nfs_renderer::Reflect::NONE })
             })
         };
         // The track's own geometry: the walk 0x47F890 draws each article on its own through its
@@ -1687,7 +2014,8 @@ impl TrackWorld {
             .filter(|a| a.animation.is_some() && track.animdefs.sound_by_fourcc(a.tag).is_some())
             .map(|a| a.index)
             .collect();
-        let mut track_lods = Self::upload_track_lods(r, &geometry, &|k| breakable_articles.contains(&k) || smackable_articles.contains(&k), &mut material_for);
+        // ENHANCEMENT E26: `road_centres`, the wet road's mesh centres
+        let (mut track_lods, road_centres) = Self::upload_track_lods(r, &geometry, &materials, &|k| breakable_articles.contains(&k) || smackable_articles.contains(&k), &mut material_for);
         let mut lists = ItemLists::default();
         let broken = Self::breakables(r, track, &geometry, &props, &mut lists, &mut material_for);
         let (moved, smack_anims) = Self::upload_track_smackables(r, track, &geometry, &track_smackables, &mut lists, &mut material_for);
@@ -1743,6 +2071,84 @@ impl TrackWorld {
             .iter()
             .filter_map(|(id, mid)| materials.get(*id as usize).and_then(|m| nfs_assets::track::uv_animate(&methods, m)).map(|a| (*mid, a)))
             .collect();
+        // ENHANCEMENT E17: the materials that are horizontal water (`nfs_assets::track::is_water`)
+        let water: std::collections::HashSet<MaterialId> = mat_ids
+            .iter()
+            .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| nfs_assets::track::uv_animate(&methods, m).is_some_and(|a| nfs_assets::track::is_water(m, a))))
+            .map(|(_, mid)| *mid)
+            .collect();
+        for it in items.iter_mut().chain(track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
+            it.water = water.contains(&it.material);
+        }
+        // ENHANCEMENT ENH-BEAM (E9): a translucent glow sheet takes no sun shadow and casts none. A material whose texture's
+        // alpha never reaches one half ([`is_translucent_sheet`]: the lighthouse beam `lths` peaks at 119 / 255; on the shipped
+        // tracks also coastal's / canyon's `wtr4` foam strips) is a sheet of light or haze, not an object: the shadow pass's
+        // own cut (`shadow_on.w`, the alpha test GREATER 10 of the track's blended items) made every such texel a solid
+        // occluder (the beam's box shadow on the road) and the receiving darkened the glow into a grey box with straight
+        // edges. Rule by the data's alpha, no name list; horizontal water keeps its roles; the original path (switches off)
+        // never reads `csm`.
+        let sheet_crp: std::collections::HashSet<u16> = mat_ids
+            .iter()
+            .filter(|(id, mid)| {
+                !water.contains(*mid) && materials.get(**id as usize).and_then(|m| track.textures.iter().find(|t| t.name == m.texture_name())).is_some_and(|t| t.has_alpha && t.mips.first().is_some_and(|px| is_translucent_sheet(px)))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        {
+            let sheets: std::collections::HashSet<MaterialId> = mat_ids.iter().filter(|(id, _)| sheet_crp.contains(*id)).map(|(_, mid)| *mid).collect();
+            for it in items.iter_mut().chain(track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
+                if sheets.contains(&it.material) {
+                    it.csm &= !(nfs_renderer::CSM_CAST | nfs_renderer::CSM_RECEIVE);
+                }
+            }
+        }
+        // ENHANCEMENT ENH-DBLSH: the track's `sh80` ground-shadow decals (the depth-biased `S_Normal` / `S_UVAnimate` blocks,
+        // `thrash.md` section 6d.3) that have a sun-shadow caster over them fade out where E9 draws that caster's shadow
+        // (`CSM_DECAL`): a decal is tagged when some caster (an instance prop or a non-ground article part under
+        // `MAX_CASTER_RADIUS`) stands inside its footprint; a decal over no caster (a hillside, a part too big to cast) stays.
+        {
+            let decal_mats: std::collections::HashSet<MaterialId> = mat_ids
+                .iter()
+                .filter(|(id, _)| materials.get(**id as usize).and_then(|m| nfs_assets::track::render_states(&methods, m)).is_some_and(|rs| rs[4] != 0))
+                .map(|(_, mid)| *mid)
+                .collect();
+            let mut casters: Vec<Vec3> = items.iter().filter(|i| i.csm & nfs_renderer::CSM_CAST != 0 && !decal_mats.contains(&i.material)).map(|i| i.transform.w_axis.truncate()).collect();
+            for art in &geometry.world {
+                if let Some(g) = track_lods.iter().find(|g| g.article == art.index) {
+                    for ((_, meshes), (_, drawn)) in art.lods.iter().zip(g.lods.iter()) {
+                        for (mm, it) in meshes.iter().zip(drawn.iter()) {
+                            if it.csm & nfs_renderer::CSM_CAST != 0 && !decal_mats.contains(&it.material) && !mm.mesh.vertices.is_empty() {
+                                let (lo, hi) = mm.mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.position)), h.max(Vec3::from(v.position))));
+                                if (hi - lo).length() * 0.5 < 60.0 {
+                                    casters.push(art.transform.transform_point3((lo + hi) * 0.5));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let (mut tagged, mut total) = (0, 0);
+            for art in &geometry.world {
+                let Some(g) = track_lods.iter_mut().find(|g| g.article == art.index) else { continue };
+                for ((_, meshes), (_, drawn)) in art.lods.iter().zip(g.lods.iter_mut()) {
+                    for (mm, it) in meshes.iter().zip(drawn.iter_mut()) {
+                        if !decal_mats.contains(&it.material) || mm.mesh.vertices.is_empty() {
+                            continue;
+                        }
+                        let (lo, hi) = mm.mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| {
+                            let p = art.transform.transform_point3(Vec3::from(v.position));
+                            (l.min(p), h.max(p))
+                        });
+                        total += 1;
+                        if casters.iter().any(|c| c.x >= lo.x - 3.0 && c.x <= hi.x + 3.0 && c.z >= lo.z - 3.0 && c.z <= hi.z + 3.0 && c.y >= lo.y - 8.0 && c.y <= hi.y + 40.0) {
+                            it.csm |= nfs_renderer::CSM_DECAL;
+                            tagged += 1;
+                        }
+                    }
+                }
+            }
+            tracing::info!(decals = total, with_caster = tagged, "track sh80 decals (ENHANCEMENT ENH-DBLSH)");
+        }
         tracing::info!(props = props.len(), breakable = props.iter().filter(|p| p.breakable.is_some()).count(), "track props");
         let projectors = track_projectors(track);
         let projector_texture = projectors.first().and_then(|p| tex_ids.get(&p.texture)).map(|t| t.0);
@@ -1753,6 +2159,57 @@ impl TrackWorld {
         let (article_nodes, article_seq) = build_article_nodes(&fitted, &cull_articles);
         let next_seq = article_seq.iter().filter(|&&q| q != u32::MAX).count() as u32;
         let anim_articles = Self::anim_articles(track, &cull_articles, &mut track_lods);
+        // ENHANCEMENT E44: the lighthouse beams (animated translucent sheets) and the draw items that are their boxes
+        let lbeams: Vec<LBeamSrc> = {
+            let mut cands: Vec<(usize, Vec<Vec3>)> = Vec::new();
+            for art in geometry.world.iter().filter(|a| a.animation.is_some() && anim_articles.iter().any(|x| x.article == a.index)) {
+                let Some((_, meshes)) = art.lods.first() else { continue };
+                let verts: Vec<Vec3> = meshes.iter().filter(|m| sheet_crp.contains(&m.material)).flat_map(|m| m.mesh.vertices.iter().map(|v| Vec3::from(v.position))).collect();
+                if verts.len() >= 3 {
+                    cands.push((art.index, verts));
+                }
+            }
+            let frame0: HashMap<usize, Mat4> = anim_articles.iter().map(|a| (a.article, a.matrix)).collect();
+            let mut out = lbeam_sources(&cands, &frame0);
+            // every draw item of the sheet materials of each source's articles: what the box hides
+            for src in out.iter_mut() {
+                for &art_index in &src.articles {
+                    let Some(art) = geometry.world.iter().find(|a| a.index == art_index) else { continue };
+                    let Some(g) = track_lods.iter().position(|g| g.article == art_index) else { continue };
+                    for (l, ((_, meshes), (_, drawn))) in art.lods.iter().zip(track_lods[g].lods.iter()).enumerate() {
+                        for (k, (mm, _)) in meshes.iter().zip(drawn.iter()).enumerate() {
+                            if sheet_crp.contains(&mm.material) {
+                                src.items.push((g, l, k));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        if !lbeams.is_empty() {
+            tracing::info!(beams = lbeams.len(), items = lbeams.iter().map(|b| b.items.len()).sum::<usize>(), "ENHANCEMENT E44: lighthouse beams found");
+        }
+        // ENHANCEMENT E32: the bounce light's input (the bake itself waits until the switch is on), on a day
+        // track, not in the hard original (`NFS_ENH=off`): every world article drawn through `track_lods`
+        // but the animated ones (their matrix moves)
+        let gi = (crate::remaster::enabled() && !track.is_night()).then(|| {
+            let t = std::time::Instant::now();
+            let animated: std::collections::HashSet<usize> = anim_articles.iter().map(|a| a.article).collect();
+            let skip = |a: &nfs_assets::track::ArticleMeshes| breakable_articles.contains(&a.index) || smackable_articles.contains(&a.index) || a.animation.is_some() || animated.contains(&a.index);
+            let (input, parts) = crate::gi::build(track, &geometry, &skip, crate::gi::to_sun(track));
+            let by_article: HashMap<usize, usize> = track_lods.iter().enumerate().map(|(g, a)| (a.article, g)).collect();
+            let targets: Vec<crate::gi::Target> = parts
+                .into_iter()
+                .filter_map(|p| {
+                    let g = *by_article.get(&p.article)?;
+                    let item = track_lods[g].lods.get(p.lod)?.1.get(p.part)?;
+                    Some(crate::gi::Target { g, l: p.lod, k: p.part, original: item.mesh, variant: None, part: p })
+                })
+                .collect();
+            tracing::info!(receivers = input.recv_pos.len(), triangles = input.occ.tris.len(), parts = targets.len(), ms = t.elapsed().as_millis() as u64, "ENHANCEMENT E32: bounce light input");
+            crate::gi::State { track: track.name.clone(), input: Some(std::sync::Arc::new(input)), targets, sky: crate::gi::sky_colour(track), sun: crate::gi::to_sun(track).is_some(), samples: None, pending: None, level: 0, active: false }
+        });
         let occluders = track_occluders(track);
         tracing::info!(articles = cull_articles.iter().flatten().count(), drawn = track_lods.len(), lods = track_lods.iter().map(|a| a.lods.len()).sum::<usize>(), occluders = occluders.len(), instances = instance_culls.len(), "track culling");
         let mut world = Self {
@@ -1782,11 +2239,15 @@ impl TrackWorld {
             emitters: track_emitters(track),
             projectors,
             projector_texture,
+            tex_ids,
+            hd: hd_set,
             projector_registered,
             cull_articles,
             article_nodes,
             article_seq,
             track_lods,
+            road_centres,
+            gi,
             occluders,
             instance_culls,
             instance_regs: Vec::new(),
@@ -1795,6 +2256,8 @@ impl TrackWorld {
             uv_animate,
             uv_plan: UvPlan::default(),
             anim_articles,
+            lbeams,
+            lbeam_hidden: false,
             next_seq,
         };
         world.register_instances();
@@ -1805,8 +2268,13 @@ impl TrackWorld {
     /// same consecutive ones, in file order. Keyed by name: `(id, has_alpha)`.
     fn upload_track_textures(r: &mut Renderer, track: &TrackAssets) -> HashMap<String, (nfs_renderer::TextureId, bool)> {
         let mut tex_ids = HashMap::new();
-        let items: Vec<(u32, u32, &[Vec<u8>])> = track.textures.iter().map(|t| (t.width, t.height, t.mips.as_slice())).collect();
-        for (tex, id) in track.textures.iter().zip(r.upload_textures(&items)) {
+        // ENHANCEMENT E2: a texture the data ships with ONE level gets a generated chain (alpha-tested
+        // coverage kept for the cut-outs); sampled at level 0 only while E2 is off, so master's result
+        let single = track.textures.iter().filter(|t| t.mips.len() == 1 && t.width.max(t.height) > 1).count();
+        tracing::info!(single_level = single, total = track.textures.len(), "track textures without mips (ENHANCEMENT E2 generates their chains)");
+        let items: Vec<(u32, u32, &[Vec<u8>], Option<nfs_renderer::MipAlpha>)> =
+            track.textures.iter().map(|t| (t.width, t.height, t.mips.as_slice(), Some(if t.has_alpha { nfs_renderer::MipAlpha::Test(10) } else { nfs_renderer::MipAlpha::Blend }))).collect();
+        for (tex, id) in track.textures.iter().zip(r.upload_textures_gen(&items)) {
             tex_ids.insert(tex.name.clone(), (id, tex.has_alpha));
         }
         tex_ids
@@ -1818,10 +2286,12 @@ impl TrackWorld {
     fn upload_track_lods(
         r: &mut Renderer,
         geometry: &nfs_assets::track::TrackGeometry,
+        materials: &[nfs_formats::crp::Material],
         skip: &dyn Fn(usize) -> bool,
         material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId,
-    ) -> Vec<TrackArticleGpu> {
+    ) -> (Vec<TrackArticleGpu>, HashMap<MeshId, Vec3>) {
         let mut track_lods: Vec<TrackArticleGpu> = Vec::new();
+        let mut road_centres: HashMap<MeshId, Vec3> = HashMap::new();
         for art in &geometry.world {
             if skip(art.index) {
                 continue;
@@ -1830,13 +2300,28 @@ impl TrackWorld {
                 .lods
                 .iter()
                 .map(|(lod, meshes)| {
-                    (*lod, meshes.iter().map(|mm| DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), art.transform)).collect())
+                    // ENHANCEMENT E9: every part takes a car's sun shadow, a part whose material is not drivable ground
+                    // (surface type `flags & 0xF` = 0, `collision_grid`) also casts one
+                    (*lod, meshes.iter().map(|mm| {
+                        let mesh = r.upload_mesh(&mm.mesh);
+                        let surface = materials.get(mm.material as usize).map(|m| m.flags & 0xF);
+                        // ENHANCEMENT E26: surface type 1 (tarmac, the type the original's wet spray tests, `wheel_input`) is the road
+                        // the rain wets; its mesh centre (world space) is kept for the slice lookup of its wetness
+                        let road = if surface == Some(1) && !mm.mesh.vertices.is_empty() {
+                            let (lo, hi) = mm.mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.position)), h.max(Vec3::from(v.position))));
+                            road_centres.insert(mesh, art.transform.transform_point3((lo + hi) * 0.5));
+                            nfs_renderer::CSM_ROAD
+                        } else {
+                            0
+                        };
+                        DrawItem { csm: nfs_renderer::CSM_RECEIVE | road | if surface.is_some_and(|f| f != 0) { 0 } else { nfs_renderer::CSM_CAST }, ..DrawItem::new(mesh, material_for(r, mm.material), art.transform) }
+                    }).collect())
                 })
                 .collect();
             let parts = art.lods.iter().map(|(_, meshes)| meshes.iter().map(|mm| (mm.flags, mm.key_hi, art.transform.transform_point3(Vec3::from(mm.centre)))).collect()).collect();
             track_lods.push(TrackArticleGpu { article: art.index, lods, parts });
         }
-        track_lods
+        (track_lods, road_centres)
     }
 
     /// Each track smackable's article: an instance item of its own (the walk answers it through
@@ -1866,7 +2351,7 @@ impl TrackWorld {
             let drawn = if slot.is_some() { &own.lods[..] } else { &own.lods[..own.lods.len().min(1)] };
             for (lod, meshes) in drawn {
                 for mm in meshes {
-                    items.push(DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), own.transform));
+                    items.push(DrawItem { csm: nfs_renderer::CSM_RECEIVE | nfs_renderer::CSM_CAST, ..DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), own.transform) });
                     item_cull.push(slot.map(|s| (s, *lod)));
                 }
             }
@@ -2034,7 +2519,7 @@ impl TrackWorld {
                 let drawn = if cull.is_some() { &lods[..] } else { &lods[..lods.len().min(1)] };
                 for (lod, parts) in drawn {
                     for (mesh, material) in parts {
-                        items.push(DrawItem::new(*mesh, *material, world_tr));
+                        items.push(DrawItem { csm: nfs_renderer::CSM_RECEIVE | nfs_renderer::CSM_CAST, ..DrawItem::new(*mesh, *material, world_tr) });
                         item_element.push((inst.source == 1).then_some(inst.element));
                         item_cull.push(cull.map(|k| (k, *lod)));
                         if let (Some(p), Some(t)) = (loop_piece.as_ref(), art.and_then(|a| a.animation.as_ref())) {
@@ -2107,6 +2592,98 @@ impl TrackWorld {
         (env_by_id, env_map)
     }
 
+    /// ENHANCEMENT E44: the lighthouse beams of the track in world space for this frame (the animated article's own matrix: the
+    /// rotation is the original's). Empty on a track without one.
+    pub fn lbeams(&self) -> Vec<nfs_renderer::LBeam> {
+        self.lbeams
+            .iter()
+            .filter_map(|b| {
+                let m = self.anim_articles.iter().find(|a| a.article == b.articles[0])?.matrix;
+                Some(nfs_renderer::LBeam { apex: m.transform_point3(b.apex), axis: m.transform_vector3(b.axis).normalize_or_zero(), length: b.length, sigma0: b.sigma0, spread: b.spread })
+            })
+            .collect()
+    }
+
+    /// ENHANCEMENT E44: hide (or show again) the original's translucent sheets of the lighthouse beams: the soft beam replaces them.
+    /// An item flagged `shadow_only` is not drawn in the views (the sheets cast no shadow since ENH-BEAM, so they vanish).
+    pub fn lbeam_hide(&mut self, hide: bool) {
+        if self.lbeam_hidden == hide {
+            return;
+        }
+        self.lbeam_hidden = hide;
+        for b in &self.lbeams {
+            for &(g, l, k) in &b.items {
+                if let Some(it) = self.track_lods.get_mut(g).and_then(|a| a.lods.get_mut(l)).and_then(|(_, v)| v.get_mut(k)) {
+                    it.shadow_only = hide;
+                }
+            }
+        }
+    }
+
+    /// ENHANCEMENT E32: put the track's parts on the bounce-lit copies of their meshes at `level` (0 = the
+    /// original meshes). The first call with the switch on reads the cache or starts the bake; the copies are
+    /// uploaded once the samples are there and rewritten when the level changes. Drawing only.
+    /// ENHANCEMENT E32 at the track's load: with the switch on, the samples are read or baked now (the
+    /// loading waits) and the copies are uploaded, so the first frame is lit. Off: nothing.
+    pub fn gi_prepare(&mut self, r: &mut Renderer, level: u8) {
+        if level == 0 {
+            return;
+        }
+        if let Some(gi) = self.gi.as_mut() {
+            gi.prepare();
+        }
+        self.gi_update(r, level);
+    }
+
+    pub fn gi_update(&mut self, r: &mut Renderer, level: u8) {
+        let Self { gi, track_lods, road_centres, .. } = self;
+        let Some(gi) = gi.as_mut() else { return };
+        let params = crate::gi::params(level);
+        if params.is_none() || gi.poll().is_none() {
+            if gi.active {
+                for t in &gi.targets {
+                    track_lods[t.g].lods[t.l].1[t.k].mesh = t.original;
+                }
+                gi.active = false;
+            }
+            return;
+        }
+        let (Some(p), Some(samples)) = (params, gi.samples.as_ref()) else { return };
+        if gi.level != level {
+            let t0 = std::time::Instant::now();
+            let colours: Vec<[f32; 4]> = gi.targets.iter().flat_map(|t| t.part.mesh.vertices.iter().map(|v| v.color)).collect();
+            let ctx = crate::gi::context(gi.sky, &colours, samples, gi.sun);
+            for t in gi.targets.iter_mut() {
+                let mut mesh = t.part.mesh.clone();
+                for (j, v) in mesh.vertices.iter_mut().enumerate() {
+                    if let Some(s) = t.part.samples.get(j).and_then(|&u| samples.get(u as usize)) {
+                        v.color = crate::gi::shade(v.color, s, &p, &ctx);
+                    }
+                }
+                match t.variant {
+                    Some(id) => r.update_mesh_vertices(id, &mesh.vertices),
+                    None => {
+                        let id = r.upload_mesh(&mesh);
+                        if let Some(c) = road_centres.get(&t.original).copied() {
+                            road_centres.insert(id, c);
+                        }
+                        t.variant = Some(id);
+                    }
+                }
+            }
+            tracing::info!(level, parts = gi.targets.len(), ms = t0.elapsed().as_millis() as u64, "ENHANCEMENT E32: bounce light applied");
+            gi.level = level;
+        }
+        if !gi.active {
+            for t in &gi.targets {
+                if let Some(v) = t.variant {
+                    track_lods[t.g].lods[t.l].1[t.k].mesh = v;
+                }
+            }
+            gi.active = true;
+        }
+    }
+
     /// `Graphics.Headlights` below Projected: no item takes the `HEAD` decal (`main.rs`).
     pub fn clear_uv_lit(&mut self) {
         for it in self.items.iter_mut().chain(self.track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
@@ -2130,6 +2707,7 @@ impl TrackWorld {
             let local = anim_matrix(&a.track, seconds, a.seconds_per_frame, a.looping);
             if let Some(item) = self.items.get_mut(a.item) {
                 item.transform = a.base * local;
+                item.motion_id = nfs_renderer::motion_item(a.item); // ENHANCEMENT E37 (ENH-MOTIONID)
             }
         }
         self.animate_articles(seconds);
@@ -2152,10 +2730,11 @@ impl TrackWorld {
             let m = anim_matrix(&a.track, seconds, WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME, WANIM_BUNDLE_DEFAULT_LOOPING);
             let (centre, radius) = (m.transform_point3(a.centre), m.transform_vector3(Vec3::splat(a.radius)).max_element());
             let (article, gpu) = (a.article, a.gpu);
-            if let Some(g) = gpu.and_then(|g| self.track_lods.get_mut(g)) {
-                for (_, items) in g.lods.iter_mut() {
-                    for it in items.iter_mut() {
+            if let (Some(gi), Some(g)) = (gpu, gpu.and_then(|g| self.track_lods.get_mut(g))) {
+                for (l, (_, items)) in g.lods.iter_mut().enumerate() {
+                    for (i, it) in items.iter_mut().enumerate() {
                         it.transform = m;
+                        it.motion_id = nfs_renderer::motion_article(gi, l, i); // ENHANCEMENT E37 (ENH-MOTIONID)
                     }
                 }
             }
@@ -2255,6 +2834,38 @@ impl TrackWorld {
             };
         }
         self.uv_plan.applied = Some(ticks128);
+    }
+
+    /// ENHANCEMENT E9 (SHADOWFIX): the sun shadows' casters the view walk left out — scenery within `reach` metres of
+    /// `centre` that the walk did not draw this frame (outside the frustum, behind an occluder, past its LOD range) —
+    /// as `shadow_only` items at their coarsest LOD, so a tree or a hillside just past the screen edge keeps its shadow
+    /// instead of popping it in. Pushed after the frame's real items; the renderer draws them only into the shadow map.
+    /// Not the original's (the original has no shadows); drawing only.
+    pub fn shadow_casters(&self, draws: &[Option<ArticleDraw>], centre: Vec3, reach: f32, out: &mut Vec<DrawItem>) {
+        let near = |c: Vec3, r: f32| (c - centre).length() - r < reach;
+        for a in &self.track_lods {
+            let Some(Some(c)) = self.cull_articles.get(a.article).map(|c| c.as_ref()) else { continue };
+            if draws.get(a.article).copied().flatten().is_some() || !near(c.centre, c.radius) {
+                continue;
+            }
+            let Some(lod) = c.lods.last().map(|l| l.lod) else { continue };
+            let Some((_, parts)) = a.lods.iter().find(|(n, _)| *n == lod) else { continue };
+            out.extend(parts.iter().filter(|i| i.csm & nfs_renderer::CSM_CAST != 0).map(|i| DrawItem { shadow_only: true, ..*i }));
+        }
+        let n = self.cull_articles.len();
+        for (k, item) in self.items.iter().enumerate() {
+            if item.csm & nfs_renderer::CSM_CAST == 0 {
+                continue;
+            }
+            let Some((slot, lod)) = self.item_cull.get(k).copied().flatten() else { continue };
+            let Some(ic) = self.instance_culls.get(slot) else { continue };
+            if ic.broken.is_some() || draws.get(n + slot).copied().flatten().is_some() || !near(ic.centre, ic.radius) {
+                continue;
+            }
+            if ic.lods.last().is_some_and(|l| l.lod == lod) {
+                out.push(DrawItem { shadow_only: true, ..*item });
+            }
+        }
     }
 
     /// Draw items with the hidden mission elements filtered out.
@@ -2477,7 +3088,7 @@ impl TrackWorld {
             let drawn = if slot.is_some() { &own.lods[..] } else { &own.lods[..own.lods.len().min(1)] };
             for (lod, meshes) in drawn {
                 for mm in meshes {
-                    items.push(DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), own.transform));
+                    items.push(DrawItem { csm: nfs_renderer::CSM_RECEIVE | nfs_renderer::CSM_CAST, ..DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), own.transform) });
                     item_cull.push(slot.map(|k| (k, *lod)));
                 }
             }
@@ -2525,7 +3136,7 @@ impl TrackWorld {
     /// `rec+8` branch), the next update 0x476810 tears the pieces down (0x476710) and nothing of
     /// the prop is drawn again; its answer stays 0, so cars pass.
     pub fn break_props(&mut self, tick: u32) {
-        for b in &mut self.broken {
+        for (bi, b) in self.broken.iter_mut().enumerate() {
             if let BreakState::Whole = b.state
                 && let Some((start, velocity)) = self.props.get(b.prop).and_then(|p| p.breakable.as_ref()).and_then(|x| x.started.get())
             {
@@ -2565,7 +3176,9 @@ impl TrackWorld {
                         b.lead = Some(m);
                     }
                     for (mesh, material) in &t.meshes {
-                        b.pieces.push(DrawItem::new(*mesh, *material, b.instance * m));
+                        // ENHANCEMENT E37 (ENH-MOTIONID): the piece's own identity: this breakable and its place in the list
+                        let motion_id = nfs_renderer::motion_piece(bi, b.pieces.len());
+                        b.pieces.push(DrawItem { csm: nfs_renderer::CSM_RECEIVE | nfs_renderer::CSM_CAST, motion_id, ..DrawItem::new(*mesh, *material, b.instance * m) });
                     }
                 }
                 b.state = BreakState::Playing { start, lead_done: !lead };
@@ -2604,6 +3217,7 @@ impl TrackWorld {
         });
         for (i, base) in list.iter() {
             self.items[*i].transform = pose * *inv * *base;
+            self.items[*i].motion_id = nfs_renderer::motion_item(*i); // ENHANCEMENT E37 (ENH-MOTIONID)
         }
         if let SmackableOwner::Article(article) = owner
             && let Some(a) = self.smack_anims.iter_mut().find(|a| a.article == article)
@@ -2755,6 +3369,101 @@ fn quat_rows_0x48a1e0(q: [f32; 4]) -> [Vec3; 3] {
         Vec3::new(y2 * x - z2 * w, 1.0 - x2 * x - z2 * z, z2 * y + xw),
         Vec3::new(z2 * x + y2 * w, z2 * y - xw, 1.0 - x2 * x - y2 * y),
     ]
+}
+
+/// ENHANCEMENT ENH-BEAM (E9): a texture (RGBA8) whose alpha has texels above the test reference (10) but never reaches one
+/// half: a translucent sheet (glow, haze, foam), which neither casts nor takes a sun shadow. A cut-out (foliage, fence,
+/// sign) has opaque texels and is not one; a fully transparent texture is not either.
+fn is_translucent_sheet(rgba: &[u8]) -> bool {
+    const REF: u8 = 10;
+    const HALF: u8 = 128;
+    rgba.chunks_exact(4).any(|p| p[3] > REF) && rgba.chunks_exact(4).all(|p| p[3] < HALF)
+}
+
+/// ENHANCEMENT E44: a lighthouse beam found in the track's data: the articles (animated, translucent sheets) that make it, its
+/// apex (the lamp), axis, length and cross-section in the first article's own frame, and the draw items (`track_lods` entry, LOD,
+/// part) of its sheets.
+struct LBeamSrc {
+    articles: Vec<usize>,
+    apex: Vec3,
+    axis: Vec3,
+    length: f32,
+    sigma0: f32,
+    spread: f32,
+    items: Vec<(usize, usize, usize)>,
+}
+
+/// How wide the soft core is against the sheets' half-height: the original's texture alpha falls to one half at about a fifth of
+/// the sheet's half-height off its spine (`lths`, measured on the texture: column 2 of 16 reads 114 -> 52 over 3 of 16 rows).
+const LBEAM_CORE: f32 = 0.17;
+
+/// ENHANCEMENT E44: the beams of the candidate articles (`(article, vertices in its own frame)`, one entry per translucent-sheet
+/// article that has an animation; `frame0` = each one's matrix at frame 0): articles whose apexes coincide in the world are one
+/// beam (the coastal lighthouse's `BOX01` / `OBJECT01` are two crossed sheets of one beam). The apex is the vertex the sheets share
+/// most (the lamp end of a wedge), the axis points to the middle of the far end, the length is the far end's reach along it and
+/// the cross-section follows the sheets' half-height (local Y) near and far.
+fn lbeam_sources(cands: &[(usize, Vec<Vec3>)], frame0: &HashMap<usize, Mat4>) -> Vec<LBeamSrc> {
+    // (article, apex in its frame, apex in the world at frame 0)
+    let mut placed: Vec<(usize, Vec3, Vec3)> = Vec::new();
+    for (article, verts) in cands {
+        // the vertices the sheets share most are the two ends of the wedge's spine; the lamp end is the one nearer the article's
+        // own origin (the pivot the lantern's rotation turns about)
+        let share = |a: &Vec3| verts.iter().filter(|v| v.distance(*a) < 0.05).count();
+        let top = verts.iter().map(share).max().unwrap_or(0);
+        let apex = verts.iter().copied().filter(|a| share(a) == top).min_by(|a, b| a.length().total_cmp(&b.length())).unwrap_or(Vec3::ZERO);
+        let world = frame0.get(article).map_or(apex, |m| m.transform_point3(apex));
+        tracing::debug!(article, ?apex, ?world, "E44 candidate");
+        placed.push((*article, apex, world));
+    }
+    let mut out: Vec<LBeamSrc> = Vec::new();
+    let mut used = vec![false; placed.len()];
+    for i in 0..placed.len() {
+        if used[i] {
+            continue;
+        }
+        let members: Vec<usize> = (i..placed.len()).filter(|&j| !used[j] && placed[j].2.distance(placed[i].2) < 1.0).collect();
+        for &j in &members {
+            used[j] = true;
+        }
+        let a0 = placed[i].1;
+        // the union of the members' vertices in the first member's frame (their frames are the same up to the animation's own phase)
+        let verts: Vec<Vec3> = members.iter().flat_map(|&j| {
+            let off = a0 - placed[j].1;
+            cands[j].1.iter().map(move |v| *v + off)
+        }).collect();
+        let dist = |v: &Vec3| v.distance(a0);
+        let max = verts.iter().map(dist).fold(0.0f32, f32::max);
+        if max < 5.0 {
+            continue;
+        }
+        let far: Vec<Vec3> = verts.iter().copied().filter(|v| dist(v) >= 0.9 * max).collect();
+        let centre = far.iter().fold(Vec3::ZERO, |a, v| a + *v) / far.len() as f32;
+        let axis = (centre - a0).normalize_or_zero();
+        if axis == Vec3::ZERO {
+            continue;
+        }
+        let length = far.iter().map(|v| (*v - a0).dot(axis)).sum::<f32>() / far.len() as f32;
+        // the sheets' half-height (local Y) at the far end and at the near rim; the soft core's sigma follows it linearly
+        let half = |set: &[Vec3]| set.iter().map(|v| (v.y - a0.y).abs()).fold(0.0f32, f32::max);
+        let h_far = half(&far);
+        let near: Vec<Vec3> = verts.iter().copied().filter(|v| (*v - a0).dot(axis) > 0.02 * length && (*v - a0).dot(axis) < 0.3 * length).collect();
+        let (sigma0, spread) = if near.is_empty() {
+            (0.7 * LBEAM_CORE * h_far, 0.3 * LBEAM_CORE * h_far / length)
+        } else {
+            let s_near = near.iter().map(|v| (*v - a0).dot(axis)).sum::<f32>() / near.len() as f32;
+            let h_near = half(&near);
+            let slope = (h_far - h_near) / (length - s_near).max(1.0);
+            ((h_near - slope * s_near).max(0.2 * h_far) * LBEAM_CORE, slope.max(0.0) * LBEAM_CORE)
+        };
+        // a narrow core at the glass that widens toward the end (the far end's sigma is kept)
+        let (sigma0, spread) = {
+            let far_sigma = sigma0 + spread * length;
+            let s0 = 0.3 * sigma0;
+            (s0, (far_sigma - s0) / length)
+        };
+        out.push(LBeamSrc { articles: members.iter().map(|&j| placed[j].0).collect(), apex: a0, axis, length, sigma0, spread, items: Vec::new() });
+    }
+    out
 }
 
 /// One `WAnimBundle` article the port moves ([`TrackWorld::animate_articles`]).
@@ -3425,7 +4134,7 @@ mod cull_tests {
     use super::*;
 
     fn view() -> CullView {
-        CullView { eye: Vec3::ZERO, forward: Vec3::Z, right: Vec3::X, up: Vec3::Y, tan_h: 1.0, tan_v: 0.75, near: 0.5, draw: 400.0 }
+        CullView { eye: Vec3::ZERO, forward: Vec3::Z, right: Vec3::X, up: Vec3::Y, tan_h: 1.0, tan_v: 0.75, near: 0.5, draw: 400.0, reach: 1.0 }
     }
 
     /// 0x539480: a sphere ahead is in, one behind the near plane by more than its radius or past
@@ -3563,5 +4272,43 @@ mod parked_slot_tests {
         let p = parked_scene_slots(0);
         assert_eq!(p.len(), 64);
         assert!(p.iter().all(|s| s.tag == u32::from_le_bytes(*b"DFLT") && s.transform.w_axis.truncate() == Vec3::new(0.0, 9999.0, 0.0) && s.scale == Vec3::ONE));
+    }
+}
+
+#[cfg(test)]
+mod sheet_tests {
+    use super::is_translucent_sheet;
+
+    fn tex(alphas: &[u8]) -> Vec<u8> {
+        alphas.iter().flat_map(|&a| [255, 255, 255, a]).collect()
+    }
+
+    /// ENHANCEMENT E44: the coastal lighthouse's two crossed sheets (`BOX01` / `OBJECT01`, local vertices as in the `.crp`) are one
+    /// beam: apex at the lamp end (nearer the pivot), axis to the far end, length about 102 m, a cross-section of a few metres
+    #[test]
+    fn lighthouse_sheets_are_one_beam() {
+        use super::{lbeam_sources, Mat4, Vec3};
+        let a = Vec3::new(-2.187, 8.409, 1.798);
+        let box01 = vec![Vec3::new(-63.76, 21.81, 81.71), a, Vec3::new(-7.26, 18.12, 7.95), Vec3::new(-63.76, 21.81, 81.71), Vec3::new(-58.43, 8.41, 87.92), a, Vec3::new(-7.26, -1.30, 7.95), Vec3::new(-58.43, 8.41, 87.92), Vec3::new(-63.76, -4.99, 81.71), Vec3::new(-7.26, -1.30, 7.95), a, Vec3::new(-58.43, 8.41, 87.92)];
+        let obj = vec![a, Vec3::new(-64.05, 21.81, 81.49), Vec3::new(-7.29, 18.12, 7.92), a, Vec3::new(-70.57, 8.41, 77.18), Vec3::new(-64.05, 21.81, 81.49), Vec3::new(-7.29, -1.30, 7.92), Vec3::new(-70.57, 8.41, 77.18), Vec3::new(-64.05, -4.99, 81.49), Vec3::new(-7.29, -1.30, 7.92), a, Vec3::new(-70.57, 8.41, 77.18)];
+        let f0: std::collections::HashMap<usize, Mat4> = [(16, Mat4::IDENTITY), (456, Mat4::IDENTITY)].into_iter().collect();
+        let b = lbeam_sources(&[(16, box01), (456, obj)], &f0);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].articles, vec![16, 456]);
+        assert!(b[0].apex.distance(a) < 0.1);
+        assert!((b[0].length - 102.0).abs() < 3.0, "{}", b[0].length);
+        assert!(b[0].axis.dot(Vec3::new(-0.61, 0.0, 0.79)) > 0.99);
+        assert!(b[0].sigma0 > 0.2 && b[0].sigma0 < 3.0 && b[0].spread >= 0.0);
+    }
+
+    /// ENHANCEMENT ENH-BEAM: the lighthouse beam's alpha (0..=119) is a sheet; a cut-out with opaque texels, a fully
+    /// transparent texture and a half-opaque fence (231 max) are not
+    #[test]
+    fn translucent_sheet_rule() {
+        assert!(is_translucent_sheet(&tex(&[0, 34, 80, 119])));
+        assert!(!is_translucent_sheet(&tex(&[0, 0, 255, 255])));
+        assert!(!is_translucent_sheet(&tex(&[0, 0, 0, 5])));
+        assert!(!is_translucent_sheet(&tex(&[0, 151, 231])));
+        assert!(!is_translucent_sheet(&tex(&[0, 100, 128])));
     }
 }

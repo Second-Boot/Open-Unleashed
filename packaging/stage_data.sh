@@ -15,5 +15,11 @@ cargo run -q --release -p nfs-formats --example extract_mad_tables -- "$SRC/nfs5
 [ -f "$SRC/fe.txt" ] && cp "$SRC/fe.txt" "$DST/"
 # the game's version ("3.5"): the network session name carries it, and a host refuses any other
 [ -f "$SRC/version.txt" ] && cp "$SRC/version.txt" "$DST/"
+# the enhanced game's own front-end layouts (the "Улучшения" screen) —
+# read from <game root>/enhanced/layouts by nfs_game::remaster::layouts_dir
+cp -R enhanced "$DST/"
+# ENHANCEMENT E41: the HD texture packs, enhanced/hd_textures/x2 and x4 (untracked, ignored; BC7 / KTX2, made by `hd-pack bc7` from the
+# upscaling pipeline's PNGs), ride along in the same copy when they are there; the game looks for <game root>/enhanced/hd_textures/x<N>
+sh "$(dirname "$0")/hd_pack_check.sh" "$DST"
 chmod -R u+w "$DST"
 du -sh "$DST"

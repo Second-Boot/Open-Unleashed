@@ -5,6 +5,9 @@
 #                          LICENSE, THIRD-PARTY-LICENSES.txt (with the DirectX Shader Compiler's licences when the
 #                          Windows build ships it) and the README's disclaimer files
 #   stage_game_dir <dir>   the public build's empty game/ with the instructions where the data goes
+#   stage_enhanced_layouts <dir>
+#                          the enhanced game's own front-end layouts beside the executable (<dir>/enhanced/layouts,
+#                          nfs_game::remaster::layouts_dir); the HD texture pack is never part of a public build
 . packaging/brand.sh
 parse_pack_args() {
   WITH_DATA=0
@@ -28,4 +31,8 @@ stage_legal() {
 stage_game_dir() {
   mkdir -p "$1"
   brand_readme packaging/GAME-DATA.txt > "$1/PUT-GAME-DATA-HERE.txt"
+}
+stage_enhanced_layouts() {
+  mkdir -p "$1/enhanced"
+  cp -R enhanced/layouts "$1/enhanced/"
 }

@@ -347,6 +347,14 @@ impl ApplicationHandler for App {
                     return;
                 }
                 self.input.key_event(&event);
+                // ENHANCEMENT framework: F12 = every enhancement on <-> off, live (the original's
+                // F9 is `I_MUSIC`, so the debug key is F12, which it does not use)
+                if event.state == winit::event::ElementState::Pressed
+                    && !event.repeat
+                    && matches!(event.logical_key.as_ref(), winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12))
+                {
+                    self.enh_toggle_all();
+                }
                 // 0x4D2850: the callback list sees the key, then a screen or the background in
                 // transition, or a busy room, drops it (`fe_input_swallowed`)
                 if self.fe_input_swallowed() {
@@ -941,6 +949,11 @@ impl ApplicationHandler for App {
                     };
                     self.replay.loop_count += 1;
                     for _ in 0..n {
+                        // **TEST GLUE** (not in the original): `--follow` without `--autotest` drives a windowed race itself (the scripted
+                        // pursuit steers, the throttle is held), so a live frame-time measurement has a moving car
+                        if self.follow_road && self.autotest.is_none() {
+                            self.input.press(Action::Throttle);
+                        }
                         self.simulate();
                         // race over ends `RaceFrame` (0x415D17) and the session loop restarts
                         // the race as its replay

@@ -344,12 +344,21 @@ impl LayoutScreen {
     /// the 16-tick ramp `min((now − [+0x1D4])·[+0x1C4]/16, [+0x1C4])` (0x4C5626…0x4C564D) of the
     /// clamped rows' height `[+0x1C4]` (0x4C53F3), and 0 while the combo is not focused
     /// (0x4C53C4 zeroes `[+0x1C4]`). The port takes the settled end.
+    /// ENHANCEMENT ENH-UI: the port's own screens may give a drop-down extra height at the foot
+    /// (`data.portpad`, a key no original layout carries, so 0 there): the original's 14 px rows
+    /// are shorter than its small font's glyph cell, and the panel's depth mask cuts the last
+    /// row's descenders (the original shows the same on `display.lay`'s combos). Both the drawn
+    /// panel and its hit rect add it.
+    pub(super) fn drop_down_pad(&self, e: &nfs_formats::lay::Element) -> f32 {
+        self.attr_num(e, "portpad").unwrap_or(0.0) as f32
+    }
+
     pub(super) fn drop_down_rect(&self, e: &nfs_formats::lay::Element, i: usize, x: f32, y: f32) -> Option<(f32, f32, f32, f32)> {
         let (rows, _) = self.lists.get(&i)?;
         let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(160.0) as f32;
         let width = self.attr_num(e, "width").unwrap_or(0.0) as f32;
         let height = self.attr_num(e, "height").unwrap_or(0.0) as f32;
-        let full: f32 = rows.iter().map(|r| r.height()).sum();
+        let full: f32 = rows.iter().map(|r| r.height()).sum::<f32>() + self.drop_down_pad(e);
         let scrolls = full >= max_h;
         let sbw = self.attr_num(e, "selectionboxwidth").unwrap_or(0.0) as f32;
         let grow = (sbw - width).max(0.0);

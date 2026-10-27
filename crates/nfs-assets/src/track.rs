@@ -165,6 +165,16 @@ pub fn uv_animate(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -> O
     Some(UvAnimate { mode: read_u32(b, 0), rate: read_i32(b, 4) })
 }
 
+/// ENHANCEMENT E17: whether a material is **horizontal water** the enhanced game lays a reflection on:
+/// its render method scrolls V ([`uv_animate`] mode 0) and its texture is one of the water textures
+/// the shipped tracks use for sea, harbour and rivers: `wtr1` (monaco1-5 harbour), `wtr3` (coastal sea,
+/// canyon river), `rvr2` (forest river). The other mode-0 materials scroll something that is not a
+/// water surface: the waterfalls `wfw1/2/4` (canyon, castle, forest: vertical), `muck`, `tred`, `stl5`
+/// (industrial). Read from the data: the listing is in `ENHANCEMENTS.md` E17.
+pub fn is_water(m: &Material, a: UvAnimate) -> bool {
+    a.mode == 0 && matches!(&m.texture, [b'w', b't', b'r', _] | [b'r', b'v', b'r', _])
+}
+
 /// The `Rs` block a material's first pass applies — Thrash states **6, 0x0A, 0x38, 2, 0x18** and a
 /// closing −1 (`LayerState` 0x53F780 → 0x540660, `RE/notes/thrash.md` §6) — when its render
 /// method carries one: the first `LayerState` (class 8) op the material builds, and the block its

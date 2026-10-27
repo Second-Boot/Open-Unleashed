@@ -1,0 +1,127 @@
+//! ENHANCEMENT E8: the dynamic environment map of the player's car.
+//!
+//! The race's main scene is drawn without the player's car from the car's position into the six faces of an
+//! environment map, a few faces a frame in turn, and the paint and glass of every car in the main view take
+//! it through a Schlick-Fresnel clear coat (`shader.wgsl` `shade`, `Scene::refl`) on top of the original's
+//! sphere-map highlight, which stays. Nothing here feeds the simulation: it reads the world and draws.
+//!
+//! What a face holds: the sky (ring, layers, sun) and the track's geometry as the main walk lists it
+//! (`World::article_draws_into` / `track_draw_lists_into`, the same lists the rear-view mirror builds for its
+//! own eye), under the main view's light, fog and clear colour — no cars, skid marks, particles or weather
+//! (an opponent is not in the player's reflection; the clear coat of an opponent's own paint reads the same
+//! map: the surroundings, not the other cars).
+
+use crate::*;
+
+/// The levels of E8 (the clear coat's: 1 new, 2 normal, 3 worn; `ENHANCEMENTS.md`): the faces' size and how many are drawn per
+/// frame. ENHANCEMENT ENH-COAT: the cube is 256 px at every level (the lacquer's roughness picks a mip of it), two faces a frame.
+pub(super) fn level_params(level: u8) -> Option<(u32, u32)> {
+    match level {
+        0 => None,
+        _ => Some((256, 2)),
+    }
+}
+
+impl App {
+    /// Draws this frame's faces of the environment map and says whether the main scene takes it
+    /// (`Scene::refl`). Called after the mirror pass, before the main view is rendered.
+    pub(crate) fn render_reflections(&mut self) {
+        self.scene.refl = 0.0;
+        // ENHANCEMENT ENH-FE3D: the front end's scene takes the weight its own map was made for (`fe_enh.rs`)
+        if self.vehicle.is_none() {
+            self.scene.refl = self.fe.enh_refl;
+            return;
+        }
+        let Some((size, per_frame)) = level_params(self.enh.level(nfs_renderer::E8)) else {
+            self.refl_done = 0;
+            return;
+        };
+        let (Some(pose), true, true) = (self.dyn_pose, self.vehicle.is_some(), self.world.is_some()) else { return };
+        if self.renderer.is_none() {
+            return;
+        }
+        let eye = pose.local_pos + Vec3::Y * 0.3;
+        // a new size, or a car that jumped (a new race, a reset): every face again
+        if size != self.refl_size || eye.distance(self.refl_eye) > 300.0 {
+            self.refl_done = 0;
+            self.refl_size = size;
+        }
+        self.refl_eye = eye;
+        let n = if self.refl_done == 0x3F { per_frame } else { 6 };
+        for _ in 0..n {
+            let face = self.refl_next % 6;
+            self.refl_next = (face + 1) % 6;
+            self.render_refl_face(eye, face, size);
+            self.refl_done |= 1 << face;
+        }
+        self.scene.refl = 1.0;
+    }
+
+    /// One face: the sky and the track from `eye` along `REFL_FACES[face]`.
+    fn render_refl_face(&mut self, eye: Vec3, face: u32, size: u32) {
+        let (dir, up) = nfs_renderer::REFL_FACES[face as usize];
+        let (forward, up) = (Vec3::from(dir), Vec3::from(up));
+        let tan = nfs_renderer::REFL_TAN_HALF;
+        let cam = Camera { position: eye, target: eye + forward, up, fov_y_radians: 2.0 * tan.atan(), near: 0.3, far: self.camera.far };
+        let right = forward.cross(up).normalize_or_zero();
+        let reach = self.enh_reach();
+        let cull = nfs_game::world::CullView { eye, forward, right, up: right.cross(forward).normalize_or_zero(), tan_h: tan, tan_v: tan, near: cam.near, draw: (self.draw_distance * reach * 0.5).max(100.0), reach };
+        let mut items = std::mem::take(&mut self.scratch.mirror_items);
+        items.clear();
+        // the sky first (no depth test), the track after it, as the main scene lays them out
+        if let Some(s) = self.sky.as_ref().filter(|_| !self.sky_off()) {
+            let view = nfs_game::sky::SkyView { eye, forward, up, main: true };
+            let sun = self.sun_items(&cam, 1.0, SUN_VIEW_MAIN);
+            items.extend(s.draw_items(&view, false));
+            items.extend(sun);
+            items.extend(s.draw_items(&view, true));
+        }
+        if let Some(world) = self.world.as_ref() {
+            let sc = &mut self.scratch;
+            let mut draws = std::mem::take(&mut sc.mirror_draws);
+            draws.clear();
+            world.article_draws_into(&cull, &mut draws);
+            world.track_draw_lists_into(&draws, eye, &mut sc.mirror_lists);
+            nfs_renderer::sort_order(&sc.mirror_lists.near, false, &mut sc.order);
+            sc.mirror_merged.clear();
+            let near = &sc.mirror_lists.near;
+            sc.mirror_merged.extend(sc.order.iter().map(|&(_, i)| nfs_renderer::DrawItem { early: true, layer_light: Some(nfs_game::world::TRACK_LIGHT), ..near[i as usize].1 }));
+            sc.blended.clear();
+            sc.blended.extend(sc.mirror_lists.far.iter().map(|&(k, i)| (k, nfs_renderer::DrawItem { layer_light: Some(nfs_game::world::TRACK_LIGHT), ..i })));
+            nfs_renderer::farthest_first_into(&sc.blended, &mut sc.order, &mut sc.mirror_merged);
+            sc.mirror_merged.extend(sc.mirror_lists.rest.iter().map(|&i| nfs_renderer::DrawItem { layer_light: Some(nfs_game::world::TRACK_LIGHT), ..i }));
+            items.extend_from_slice(&sc.mirror_merged);
+            sc.mirror_draws = draws;
+        }
+        // the main scene's light, fog and clear colour, in the true (un-mirrored) world; no reflection in it
+        let mut scene = self.scene.clone_header(items);
+        scene.mirror = false;
+        scene.refl = 0.0;
+        scene.ao = false;
+        scene.eye = false;
+        // ENHANCEMENTS E27 / E29: nor motion blur or shake
+        scene.motion = None;
+        // ENHANCEMENT E9: the environment faces are drawn without sun shadows (a shadow pass per face would cost six)
+        scene.sun_shadow = None;
+        scene.overcast_shadow = None;
+        // ENHANCEMENT E17: no water reflection inside the environment faces (it would reflect the previous map)
+        scene.water = None;
+        // ENHANCEMENT E15: nor with the headlight spots
+        scene.spots = nfs_renderer::Spots::default();
+        scene.lamps = nfs_renderer::Lamps::default();
+        // ENHANCEMENT E43: nor the cars' contact shadows
+        scene.contacts = nfs_renderer::Contacts::default();
+        scene.haze = None;
+        scene.lbeam = None;
+        scene.drops = None;
+        scene.lens_probe = None;
+        // ENHANCEMENT ENH-COAT: the faces are float images now (the float scene's format): no light shafts / depth of field in them
+        scene.shafts = None;
+        scene.dof = None;
+        let clear = scene.clear_color;
+        if let Some(r) = self.renderer.as_mut() {
+            r.render_refl_face(&scene, &cam, face, size, clear, nfs_renderer::VIEW_FAR);
+        }
+        self.scratch.mirror_items = scene.items;
+    }
+}

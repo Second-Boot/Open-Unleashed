@@ -116,6 +116,10 @@ impl App {
             self.choices.insert(key.to_string(), (v + delta).clamp(lo, hi) as usize);
             return;
         }
+        // ENHANCEMENT framework: an `Enh.<token>` row flips its switch
+        if base.starts_with(nfs_game::remaster::ACCESSOR_PREFIX) && self.enh_step(base, delta) {
+            return;
+        }
         if let Some((cur, options)) = self.choice_index(base) {
             let key = CHOICE_ACCESSORS.iter().find(|(n, _, _)| *n == base).map(|(_, k, _)| *k).unwrap_or_default();
             let next = (cur as i32 + delta).rem_euclid(options.len() as i32) as usize;

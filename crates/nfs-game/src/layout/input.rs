@@ -3,6 +3,16 @@
 use super::*;
 
 impl LayoutScreen {
+    /// ENHANCEMENT ENH-UPSCALER: [`Self::widget_disabled`] for a flattened index that may be inside an embedded panel (the «Улучшения»
+    /// panel's rows are generated with `state=disabled` when their setting cannot act). Not the original's: it follows the route like
+    /// the by-name helpers below.
+    pub fn widget_disabled_routed(&self, index: usize) -> bool {
+        if let Some((k, j)) = self.route(index) {
+            return self.groups.get(&k).is_some_and(|g| g.widget_disabled_routed(j));
+        }
+        self.widget_disabled(index)
+    }
+
     /// Enable or disable a widget, as the by-name helper **0x50D880** does: 0x50D8DB reads the
     /// bit, and its argument is **enable**, not disable — 0x50D8EA takes 0x4C7DF0, which is
     /// `and al, 0xEF`, and 0x50D8F1 takes 0x4C7E10, which is `or al, 0x10` behind the template's
