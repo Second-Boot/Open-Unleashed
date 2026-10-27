@@ -20,9 +20,14 @@
 //! * **A2, the effect types — a pad only.** A haptic device gets the four effects one for one
 //!   ([`di_call`], `nfs_input::ff::sdl_effect`; units and millisecond rounding there). On a pad the backend has constant strong / weak motor magnitudes only (50 ms ticks).
 //!   Road (a square wave of 6…17 Hz, magnitude ≤ 5000 of 10000) → the strong motor at a constant
-//!   level `magnitude · gain · total`; engine (a sine, 10…35 Hz) → the weak motor, the same level
-//!   law; jolt (a constant force with a polar direction and an envelope) → a strong pulse of its
-//!   magnitude for its duration (rounded up to 50 ms), the direction dropped. The spring that
+//!   level `magnitude · gain/50 · total/50` ([`pad_level`]: the factory 50 is the effect's own
+//!   magnitude, 100 doubles it up to the motor's full); engine (a sine, 10…35 Hz) → the weak motor at
+//!   `magnitude · gain/100 · total/100` ([`level`], a buzz under everything); jolt (a constant force
+//!   with a polar direction and an envelope) → a pulse of **both** motors at `pad_level` for its
+//!   duration, at least [`MIN_PULSE_MS`], the direction dropped. *(Until PAD-FF 2026-10-27 every
+//!   effect took `level`: at the factory 50 / 50 a crash was a quarter of the strong motor over the
+//!   engine's buzz on the weak one, the road 6…12 %, and the landing's 500 µs jolt a 1 ms call no
+//!   motor spins up in — on an Xbox pad a crash was hardly felt and a landing not at all.)* The spring that
 //!   carries the grip / self-aligning feel (`FfCommand::Spring`) has **no counterpart on a pad** and
 //!   is not output.
 //! * **A3, the clock.** `[0x6559E0]`, the 128 Hz counter the jolt's re-arm window and left/right
@@ -37,6 +42,16 @@ use nfs_physics::force_feedback::{FfCar, FfCommand, FfEffect, FfLevels, ForceFee
 fn level(magnitude: i32, gain: i32, total: i32) -> f32 {
     (magnitude as f32 / 10000.0) * (gain as f32 / 100.0) * (total as f32 / 100.0)
 }
+
+/// A2 on a pad: the factory level 50 of both the effect's gain and the total is the effect's own
+/// magnitude, capped at the motor's full (PORT-DEVIATION D24).
+fn pad_level(magnitude: i32, gain: i32, total: i32) -> f32 {
+    ((magnitude as f32 / 10000.0) * (gain as f32 / 50.0) * (total as f32 / 50.0)).min(1.0)
+}
+
+/// A2: the shortest pulse a pad gets — a rumble motor needs about this long to spin up, and the
+/// landing's jolt is 500 µs (0x41251C).
+const MIN_PULSE_MS: u32 = 100;
 
 impl App {
     /// The five `FF.*` accessors, the first dword of the original's five option globals
@@ -64,7 +79,7 @@ impl App {
             return;
         }
         let enabled = self.gamepads.rumble_supported();
-        tracing::info!("force feedback: {} — {}", if enabled { "armed" } else { "off" }, self.gamepads.rumble_describe());
+        tracing::info!(levels = ?self.ff_levels(), "force feedback: {} — {}", if enabled { "armed" } else { "off" }, self.gamepads.rumble_describe());
         self.ff = Some(ForceFeedback::new(enabled, false));
     }
 
@@ -132,15 +147,18 @@ pub(crate) fn ff_output(pads: &mut nfs_input::gamepad::Gamepads, cmds: &[FfComma
         return;
     }
     for c in cmds {
+        if !matches!(c, FfCommand::Spring { .. }) {
+            tracing::debug!(?c, "force feedback command");
+        }
         match *c {
             FfCommand::Stop(FfEffect::Road) => pads.rumble_sustain(Motor::Strong, 0.0),
             FfCommand::Stop(FfEffect::Engine) => pads.rumble_sustain(Motor::Weak, 0.0),
             FfCommand::Stop(FfEffect::Collision | FfEffect::Grip) => {}
-            FfCommand::Periodic { effect: FfEffect::Road, magnitude, gain, .. } => pads.rumble_sustain(Motor::Strong, level(magnitude, gain, total)),
+            FfCommand::Periodic { effect: FfEffect::Road, magnitude, gain, .. } => pads.rumble_sustain(Motor::Strong, pad_level(magnitude, gain, total)),
             FfCommand::Periodic { effect: FfEffect::Engine, magnitude, gain, .. } => pads.rumble_sustain(Motor::Weak, level(magnitude, gain, total)),
             FfCommand::Periodic { .. } => {}
             FfCommand::Spring { .. } => {}
-            FfCommand::Jolt { magnitude, duration_us, gain, .. } => pads.rumble_pulse(level(magnitude, gain, total), (duration_us.max(0) / 1000) as u32),
+            FfCommand::Jolt { magnitude, duration_us, gain, .. } => pads.rumble_pulse(pad_level(magnitude, gain, total), ((duration_us.max(0) / 1000) as u32).max(MIN_PULSE_MS)),
         }
     }
 }
@@ -165,13 +183,26 @@ pub(crate) fn ff_collision(ff: &mut Option<ForceFeedback>, pads: &mut nfs_input:
     if !ff.enabled {
         return;
     }
-    let cmds = ff.collision_jolt(car, kind, body_point, magnitude, levels, replay, ff_clock(tick).wrapping_add(1));
+    tracing::debug!(kind, magnitude, "force feedback: the player's contact (0x412230)");
+    let cmds = ff.collision_jolt(car, nfs_physics::force_feedback::FfImpact { kind: kind, body_point: body_point, magnitude: magnitude }, levels, replay, ff_clock(tick).wrapping_add(1));
     ff_output(pads, &cmds, levels.total);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A2 (PAD-FF): on a pad the factory 50 / 50 is the effect's own magnitude, 100 / 100 is capped at
+    /// full, 0 is off.
+    #[test]
+    fn a_pads_levels_are_relative_to_the_factory_fifty() {
+        assert_eq!(pad_level(10000, 50, 50), 1.0);
+        assert_eq!(pad_level(5000, 50, 50), 0.5);
+        assert_eq!(pad_level(5000, 100, 100), 1.0);
+        assert_eq!(pad_level(10000, 25, 50), 0.5);
+        assert_eq!(pad_level(10000, 0, 50), 0.0);
+        assert_eq!(level(10000, 50, 50), 0.25);
+    }
 
     /// PAD-HANG: a pad arriving after the race armed with nothing is armed; one arriving beside the
     /// armed pad is not; a wheel arriving beside an armed pad takes over (A1); outside a race nothing.

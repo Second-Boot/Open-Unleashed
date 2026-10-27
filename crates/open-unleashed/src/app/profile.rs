@@ -436,6 +436,24 @@ impl App {
                 self.input.bindings.by_id.insert(id, nfs_input::bindings::Binding::from_fields(fields));
             }
         }
+        self.pad_layout_if_untouched();
+    }
+
+    /// **PORT-DEVIATION D44 item 9**: a standard pad's layout for rows the player never changed. The
+    /// start-up factory (0x51E89B) gives the pad's layout only to a pad present at start, and on
+    /// macOS a Bluetooth pad is reported a second or more later (GameController's discovery), so a
+    /// player's rows stayed the keyboard's and the pad drove nothing. Run when a device is connected
+    /// and when a profile's rows are loaded: rows equal to the keyboard's factory rows take the first
+    /// standard pad's layout of item 2 (the keys still answer, item 7); any other rows are kept.
+    pub(crate) fn pad_layout_if_untouched(&mut self) {
+        let id_of = |n: &str| accessors::controller_action(n).and_then(nfs_input::binding_id);
+        let Some(pad) = self.input.pads.iter().position(|r| r.standard) else { return };
+        if !self.input.rows_are_keyboard_defaults(id_of) {
+            return;
+        }
+        self.input.default_controls(Some(pad), id_of);
+        self.fe.controllers_sel = pad + 1;
+        tracing::info!(pad, "the keyboard's factory rows take the connected pad's layout (D44 item 9)");
     }
 
     /// Which accessor `CARSETTINGS.CAR` forwards to — 0x4B88F0's switch on `Game.GameType`. The

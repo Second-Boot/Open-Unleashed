@@ -138,7 +138,6 @@ fn message_box(text: &str) {
     unsafe extern "C" {
         fn CFStringCreateWithBytes(alloc: *const c_void, bytes: *const u8, len: isize, encoding: u32, external: u8) -> CFStringRef;
         fn CFRelease(cf: *const c_void);
-        #[allow(clippy::too_many_arguments)]
         fn CFUserNotificationDisplayAlert(
             timeout: f64,
             flags: usize,

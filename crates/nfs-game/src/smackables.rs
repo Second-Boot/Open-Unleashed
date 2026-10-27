@@ -13,6 +13,14 @@ use glam::{Mat3, Mat4, Quat, Vec3};
 use nfs_physics::smackable::{collide_among, Smackable};
 use nfs_physics::vehicle::Vehicle;
 
+/// How many cars the race has: `n_cars` in `0x5E8B34[]` and the `racers` that lead the list
+/// ([`RaceSmackables::step`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Field {
+    pub n_cars: usize,
+    pub racers: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RaceSmackables {
     /// The bodies, built on the first [`Self::step`] from `TrackWorld::smackables` (0x4A17F0 at
@@ -53,8 +61,8 @@ impl RaceSmackables {
     /// `car+0` follows. Not carried (`skill-tests.md` §5.4): the props' own sound event (never
     /// heard in the original). (The 8 m ceiling rule is in `Vehicle::car_ground_body`;
     /// `car+0x43C` is only ever written 0, so its skip never runs.)
-    #[allow(clippy::too_many_arguments)]
-    pub fn step(&mut self, world: &TrackWorld, table: Option<&crate::race::SliceTable>, tick: u64, n_cars: usize, racers: usize, cars: &mut [(&mut Vehicle, f32)], walls: &mut dyn FnMut(&mut Vehicle)) -> Vec<(usize, f32)> {
+    pub fn step(&mut self, world: &TrackWorld, table: Option<&crate::race::SliceTable>, tick: u64, field: Field, cars: &mut [(&mut Vehicle, f32)], walls: &mut dyn FnMut(&mut Vehicle)) -> Vec<(usize, f32)> {
+        let Field { n_cars, racers } = field;
         if !self.spawned {
             self.spawned = true;
             self.props = world

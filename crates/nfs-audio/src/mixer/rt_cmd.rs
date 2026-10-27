@@ -220,7 +220,7 @@ impl Core {
                 }
             }
             Cmd::Start { id, clip, volume, word, bend, pan, looping, sel, tabled, filter } => {
-                g.start_patch_as(id, clip, volume, word, looping, sel, tabled);
+                g.start_patch_as(id, PatchStart { clip, volume, word, looping, sel, tabled });
                 let rate = g.mix_rate();
                 for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
                     v.bend = bend as i8;

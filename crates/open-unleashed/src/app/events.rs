@@ -721,6 +721,9 @@ impl ApplicationHandler for App {
                 // gamepad: d-pad / left stick moves, A (cross) selects, B backs — PORT-DEVIATION D10
                 // (PORT-DEVIATIONS.md) [the FE reads no pad, event pump 0x529700]
                 self.gamepads.poll(&mut self.input);
+                if self.gamepads.take_pad_hotplug() {
+                    self.pad_layout_if_untouched();
+                }
                 if nfs_game::config::cfg().nfs_ff_test.is_set() {
                     self.gamepads.rumble_test_tick();
                 }
@@ -757,20 +760,33 @@ impl ApplicationHandler for App {
                 if self.fe_input_swallowed() || self.fe.binding_base.is_some() {
                     keys.clear();
                 }
+                // PAD-HANG2: a frame that ends early asks for the next one itself. The frames run as a
+                // chain (each `draw_frame` asks for the next redraw), and this redraw has used up the
+                // last one: a race started by the pad's A here (`menu_key` → `start_from_layout`) never
+                // drew a frame — the window stood on the loading screen with winit idling (`Poll`) —
+                // where the keyboard's Enter, handled on its own event, leaves the pending redraw alone
+                let next_frame = |app: &Self| {
+                    if let Some(w) = &app.window {
+                        w.request_redraw();
+                    }
+                };
                 for k in keys {
                     self.menu_key(k, event_loop);
                     if self.fe.menu.is_none() {
+                        next_frame(self);
                         return;
                     }
                 }
                 // the dialog's tick (0x512980 and the kind's own), its answer, and the covering
                 // the manager keeps while it is up (0x4D2000 on the raise, 0x4D1E70 on the dismiss)
                 if self.fe_dialog_answer(event_loop) {
+                    next_frame(self);
                     return;
                 }
                 // the end-of-era show's tick (0x4FF180): back one screen when it is over
                 if self.fe.layout_preview.as_ref().is_some_and(|l| l.end_of_era_leave()) {
                     self.fe_back(0, event_loop);
+                    next_frame(self);
                     return;
                 }
                 // the front end draws from `rebuild_scene` like everything else, so it keeps
@@ -790,6 +806,9 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested if event_loop.exiting() => {}
             WindowEvent::RedrawRequested => {
                 self.gamepads.poll(&mut self.input);
+                if self.gamepads.take_pad_hotplug() {
+                    self.pad_layout_if_untouched();
+                }
                 // PAD-HANG: a force-feedback device connected after the race armed (a Bluetooth
                 // pad's discovery ends after the arm, or the player switches one on) is armed now
                 if self.gamepads.take_ff_hotplug() && super::force_feedback::ff_rearm_wanted(self.vehicle.is_some(), self.ff.as_ref(), self.gamepads.haptic_armed(), self.gamepads.haptic_device().is_some()) {

@@ -1940,7 +1940,7 @@ impl App {
                 c.collide_walls(&w.walls, &w.tree, &patch_height);
                 c.collide_props(&w.props, &w.tree, tick);
             };
-            let hits = self.smackables.step(w, self.slices.as_ref(), self.tick, n_cars, racers, &mut cars, &mut walls);
+            let hits = self.smackables.step(w, self.slices.as_ref(), self.tick, nfs_game::smackables::Field { n_cars, racers }, &mut cars, &mut walls);
             let mut touched_cops = Vec::new();
             let mut touched_traffic = Vec::new();
             for (i, effect) in hits {
@@ -2513,7 +2513,7 @@ impl App {
         // 0x40F6DE: the human's offset is zero — `Car_placeAtSlice` 0x49B090 puts the
         // origin on the slice centre and drops the body onto the road (`place_at_slice`),
         // dir `car+0xEAC` (+1 along this port's lap)
-        v.place_at_slice(&w.collision, specs, sl.centre, sl.forward, [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, false);
+        v.place_at_slice(&w.collision, specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward, raw: [sl.lateral, sl.up, sl.forward] }, Vec3::ZERO, false, false);
         // 0x40F727…: `car+0x33C…+0x344` = 0, then 0x40F400: the spin and `+0x418` the placement's
         // `Susp_update` left
         v.velocity = Vec3::ZERO;
@@ -2663,7 +2663,7 @@ impl App {
                         .map_or(Vec3::ZERO, |p| Vec3::new(p[0], sl.centre.y, p[1]));
                     if exchange_seat.is_some() || net_human {
                         // a human's reset (0x40F6DE: offset zero, `car+0x52C & 8` clear), the player's own block
-                        o.vehicle.place_at_slice(&w.collision, &o.specs, sl.centre, sl.forward, [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, false);
+                        o.vehicle.place_at_slice(&w.collision, &o.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward, raw: [sl.lateral, sl.up, sl.forward] }, Vec3::ZERO, false, false);
                         o.vehicle.velocity = Vec3::ZERO;
                         o.vehicle.angular_velocity = Vec3::ZERO;
                         o.vehicle.airborne_count = 0;
@@ -2673,7 +2673,7 @@ impl App {
                         o.vehicle.reset_countdown = 0;
                     } else {
                     o.vehicle.reset_to(o.vehicle.position, o.vehicle.orientation);
-                    o.vehicle.place_at_slice(&w.collision, &o.specs, sl.centre, sl.forward, [sl.lateral, sl.up, sl.forward], line, true, false);
+                    o.vehicle.place_at_slice(&w.collision, &o.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward, raw: [sl.lateral, sl.up, sl.forward] }, line, true, false);
                     // 0x40F711…0x40F724: the velocity, then 0x40F400 the spin and `+0x418`
                     o.vehicle.velocity = Vec3::ZERO;
                     o.vehicle.angular_velocity = Vec3::ZERO;
@@ -3242,7 +3242,7 @@ impl App {
                     ai.release(a, *slot);
                 }
                 if let Some(s) = self.snd.sfx.as_mut() {
-                    s.siren(a, *slot, false, 0.0, 0, nfs_audio::ai_engine::PITCH_BASE_STILL, 0);
+                    s.siren(a, *slot, false, 0.0, nfs_audio::ai_engine::Heard { pan: 0, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL }, 0);
                     // 0x4A7FF8 / 0x4A80BD: the slot's loop voice `slot + 0x22` too
                     s.stop_ai_loop(a, *slot);
                 }
@@ -3283,16 +3283,9 @@ impl App {
                             a,
                             slot,
                             &set,
-                            frac,
-                            d,
-                            cos,
-                            pan,
-                            nfs_audio::ai_engine::ai_speed_16(o.vehicle.v_long()),
-                            nfs_audio::ai_engine::PITCH_BASE_STILL,
-                            self.snd.audio_settings.audio_quality,
-                            crowding,
-                            view == 0x0B,
-                            ai_levels,
+                            nfs_audio::ai_engine::AiCarInput { rpm_frac: frac, distance: d, cos, speed16: nfs_audio::ai_engine::ai_speed_16(o.vehicle.v_long()) },
+                            nfs_audio::ai_engine::Heard { pan, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL },
+                            nfs_audio::ai_engine::AiScene { detail: self.snd.audio_settings.audio_quality, crowding, spline_cam: view == 0x0B, levels: ai_levels },
                         );
                         // **A remote human's horn**. The cars in the audio slots are every car but the
                         // listener's own (0x4A7DC0, `0x5E8B34[]` less `[0x655F50]`), so another player's car is
@@ -3313,7 +3306,7 @@ impl App {
                             if horn && self.tick % 32 == 1 {
                                 tracing::debug!(target: "netplay", seat = i, slot, tick = self.tick, distance = d, "a remote human's horn is voiced (0x4A7080's human arm)");
                             }
-                            ai.honk(a, slot, horn, d, pan, nfs_audio::ai_engine::PITCH_BASE_STILL, self.snd.audio_settings.ambient_level);
+                            ai.honk(a, slot, horn, d, nfs_audio::ai_engine::Heard { pan, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL }, self.snd.audio_settings.ambient_level);
                         }
                     }
                     // traffic uses the same cheap path. Its engine speed is real: `0x408360`
@@ -3349,16 +3342,9 @@ impl App {
                             a,
                             slot,
                             &set,
-                            frac,
-                            d,
-                            cos,
-                            pan,
-                            nfs_audio::ai_engine::ai_speed_16(c.velocity.dot(c.orientation.row(2))),
-                            nfs_audio::ai_engine::PITCH_BASE_STILL,
-                            self.snd.audio_settings.audio_quality,
-                            crowding,
-                            view == 0x0B,
-                            ai_levels,
+                            nfs_audio::ai_engine::AiCarInput { rpm_frac: frac, distance: d, cos, speed16: nfs_audio::ai_engine::ai_speed_16(c.velocity.dot(c.orientation.row(2))) },
+                            nfs_audio::ai_engine::Heard { pan, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL },
+                            nfs_audio::ai_engine::AiScene { detail: self.snd.audio_settings.audio_quality, crowding, spline_cam: view == 0x0B, levels: ai_levels },
                         );
                         // The horn (`traffic.md` §12.3, `nfs_audio::ai_engine::HonkTimer`): the even
                         // tick's `0x4013D0` programs the slot's honk timers — HONK_HORN (mask 8) ⇒
@@ -3393,7 +3379,7 @@ impl App {
                         if step != nfs_audio::ai_engine::HonkStep::Idle {
                             tracing::debug!(slot, car = i, ?step, timer = t.timer, "traffic honk timer");
                         }
-                        ai.honk(a, slot, step == nfs_audio::ai_engine::HonkStep::Play, d, pan, nfs_audio::ai_engine::PITCH_BASE_STILL, self.snd.audio_settings.ambient_level);
+                        ai.honk(a, slot, step == nfs_audio::ai_engine::HonkStep::Play, d, nfs_audio::ai_engine::Heard { pan, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL }, self.snd.audio_settings.ambient_level);
                     }
                     // a cop is an AI car like the traffic (`AIHigh_Cop`): 0x4A7080 treats every slot
                     // car alike (bank = its catalogue sound set, voice `slot + 6`), and its engine
@@ -3421,16 +3407,9 @@ impl App {
                             a,
                             slot,
                             set,
-                            frac,
-                            d,
-                            cos,
-                            pan,
-                            nfs_audio::ai_engine::ai_speed_16(c.velocity.dot(c.orientation.row(2))),
-                            nfs_audio::ai_engine::PITCH_BASE_STILL,
-                            self.snd.audio_settings.audio_quality,
-                            crowding,
-                            view == 0x0B,
-                            ai_levels,
+                            nfs_audio::ai_engine::AiCarInput { rpm_frac: frac, distance: d, cos, speed16: nfs_audio::ai_engine::ai_speed_16(c.velocity.dot(c.orientation.row(2))) },
+                            nfs_audio::ai_engine::Heard { pan, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL },
+                            nfs_audio::ai_engine::AiScene { detail: self.snd.audio_settings.audio_quality, crowding, spline_cam: view == 0x0B, levels: ai_levels },
                         );
                     }
                 }
@@ -3446,7 +3425,7 @@ impl App {
                 let rel = c.position - cam;
                 let d = rel.length();
                 let pan = pan_of(rel);
-                s.siren(a, slot, c.active && c.lights, d, pan, nfs_audio::ai_engine::PITCH_BASE_STILL, self.snd.audio_settings.ambient_level);
+                s.siren(a, slot, c.active && c.lights, d, nfs_audio::ai_engine::Heard { pan, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL }, self.snd.audio_settings.ambient_level);
             }
         }
         // Every non-player car's loop producer `Car_bodyScrapeSfx` 0x40FFF0 → `Car_squealSfx`
@@ -3830,7 +3809,7 @@ impl App {
                 let road_a = if view == 0x0C { nfs_audio::fix_atten(0x64_0000, 0x1_0000, 7, dist) } else { e.road_gain() };
                 // `car+0x464`, the body's surface nibble (0x4AA0CE, 0x4AA246…0x4AA253), not a
                 // wheel's; `V >> 1` in modes 2 and 3 (0x4AA2C8)
-                s.road_roll(a, v.v_long(), v.surface_nibble(), road_a, mode >= 2, nfs_audio::ai_engine::PITCH_BASE_STILL, pan);
+                s.road_roll(a, v.v_long(), v.surface_nibble(), road_a, mode >= 2, nfs_audio::ai_engine::Heard { pan, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL });
             }
             // §4.5: `[ebp+0x13]` and `(int)(|car+0x35C| · 5) != 0` (0x4AA4D8…0x4AA4E5); the
             // walk's draws are 0x538040's (the shared `fe_rng`), at this point of the audio update
@@ -3841,14 +3820,10 @@ impl App {
             if let Some(e) = &self.snd.engine_sound {
                 s.turbo(
                     a,
-                    v.boost,
-                    v.throttle_raw,
-                    v.rpm,
-                    self.specs.redline,
+                    nfs_audio::sfx::TurboState { boost: v.boost, throttle: v.throttle_raw, rpm: v.rpm, redline: self.specs.redline },
                     e.aux_volume(mode),
                     e.turbo_gain(),
-                    nfs_audio::ai_engine::PITCH_BASE_STILL,
-                    pan,
+                    nfs_audio::ai_engine::Heard { pan, pitch_base: nfs_audio::ai_engine::PITCH_BASE_STILL },
                 );
             }
         }

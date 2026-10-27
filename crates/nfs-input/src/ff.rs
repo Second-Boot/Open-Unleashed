@@ -2,7 +2,7 @@
 //! both SDL3:
 //!
 //! * **Rumble** ([`Rumbler`], a standard pad on every OS): two sustained motor levels (strong /
-//!   weak) and one-shot strong pulses through `SDL_RumbleGamepad` — the low- and high-frequency
+//!   weak) and one-shot pulses of both through `SDL_RumbleGamepad` — the low- and high-frequency
 //!   motors (XInput / GameInput / Windows.Gaming.Input on Windows, evdev `FF_RUMBLE` or HIDAPI on
 //!   Linux, GameController + CoreHaptics on macOS, which is what the port's own `ff_macos.rs`
 //!   did by hand until SDL3). The mapping of the original's effects onto two motors is
@@ -41,7 +41,7 @@ impl RumbleSink for crate::gamepad::Devices {
     }
 }
 
-/// The rumble state: both sustained levels and the pulse in flight. SDL's rumble call sets both
+/// The rumble state: both sustained levels and the pulse in flight (on both motors). SDL's rumble call sets both
 /// motors at once for a duration, so every change re-sends the combined state.
 ///
 /// **Rate limit (PAD-HANG, PORT-DEVIATION D24).** The producers hand a new level every Sc32 tick
@@ -106,7 +106,9 @@ impl Rumbler {
             }
             None => 0.0,
         };
-        let (low, high) = (quantise(self.strong.max(pulse)), quantise(self.weak));
+        // a pulse drives both motors (PAD-FF, D24 A2): over the engine's buzz on the weak motor a
+        // strong-only pulse was hardly felt
+        let (low, high) = (quantise(self.strong.max(pulse)), quantise(self.weak.max(pulse)));
         let renew = |t: std::time::Instant| now.saturating_duration_since(t).as_millis() >= u128::from(SUSTAIN_MS / 2);
         let due = match self.sent {
             None => low != 0 || high != 0,
@@ -126,6 +128,7 @@ impl Rumbler {
             Some((end, _)) if self.weak <= 0.0 && self.strong <= 0.0 => end.saturating_duration_since(now).as_millis().max(1) as u32,
             _ => SUSTAIN_MS,
         };
+        tracing::debug!(low, high, ms, urgent, pulse_ended, "rumble call");
         if low == 0 && high == 0 {
             pads.rumble(0, 0, 0);
             self.sent = None;
@@ -134,6 +137,7 @@ impl Rumbler {
             self.sent = Some((low, high, now));
             self.retry_at = None;
         } else {
+            tracing::debug!(low, high, "rumble call refused");
             // refused: not again every tick (SDL's GameController driver answers "Haptics engine
             // was stopped" for good once CoreHaptics stopped the engine)
             self.retry_at = Some(now + RETRY);
@@ -160,7 +164,7 @@ impl Rumbler {
         }
     }
 
-    /// A one-shot strong pulse of `level` (0…1) for `ms` milliseconds.
+    /// A one-shot pulse of both motors at `level` (0…1) for `ms` milliseconds.
     pub fn pulse(&mut self, pads: &mut crate::gamepad::Devices, level: f32, ms: u32) {
         if self.start_pulse(std::time::Instant::now(), level, ms) {
             self.apply(pads, true);
@@ -522,8 +526,8 @@ mod tests {
         assert_eq!(s.calls.last(), Some(&(quantise(0.4), quantise(0.5), SUSTAIN_MS)), "a motor starting");
         assert!(r.start_pulse(t0 + Duration::from_millis(20), 1.0, 300));
         r.apply_at(&mut s, t0 + Duration::from_millis(20), true);
-        assert_eq!(s.calls.last(), Some(&(u16::MAX, quantise(0.5), SUSTAIN_MS)), "the pulse");
-        // its end drops the strong motor back at once
+        assert_eq!(s.calls.last(), Some(&(u16::MAX, u16::MAX, SUSTAIN_MS)), "the pulse, on both motors");
+        // its end drops both motors back at once
         r.apply_at(&mut s, t0 + Duration::from_millis(330), false);
         assert_eq!(s.calls.last(), Some(&(quantise(0.4), quantise(0.5), SUSTAIN_MS)), "the pulse's end");
         sustain_at(&mut r, &mut s, t0 + Duration::from_millis(340), Motor::Strong, 0.0);
@@ -538,7 +542,7 @@ mod tests {
         // a lone pulse carries its own duration
         assert!(r.start_pulse(t0 + Duration::from_millis(500), 0.5, 200));
         r.apply_at(&mut s, t0 + Duration::from_millis(500), true);
-        assert_eq!(s.calls.last(), Some(&(quantise(0.5), 0, 200)));
+        assert_eq!(s.calls.last(), Some(&(quantise(0.5), quantise(0.5), 200)));
     }
 
     /// A refused call is not retried every tick.

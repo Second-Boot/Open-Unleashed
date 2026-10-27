@@ -42,12 +42,12 @@ fn place_at_slice_drops_the_body_onto_the_road() {
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
     v.set_car_body(pts, Vec3::new(0.91, 0.631, 2.1));
     v.game_tick = 0;
-    v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 5.0), Vec3::Z, [Vec3::X, Vec3::Y, Vec3::Z], Vec3::new(1.5, 0.5, 0.0), true, false);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 5.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z] }, Vec3::new(1.5, 0.5, 0.0), true, false);
     assert!((v.position - Vec3::new(6.5, 0.631, 5.0)).length() < 1e-4, "{:?}", v.position);
     assert!((v.draw_origin().y).abs() < 1e-4);
     assert_eq!(v.body_height, 0.0);
     v.game_tick = 0x1C1;
-    v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 5.0), Vec3::Z, [Vec3::X, Vec3::Y, Vec3::Z], Vec3::new(-2.0, 0.0, 7.0), true, true);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 5.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z] }, Vec3::new(-2.0, 0.0, 7.0), true, true);
     assert!((v.position - Vec3::new(-2.0, 0.631, 7.0)).length() < 1e-4, "{:?}", v.position);
     assert!((v.orientation.row(2) - Vec3::NEG_Z).length() < 1e-5, "flipped: forward negated");
 }
@@ -162,10 +162,10 @@ fn a_rolled_car_takes_forty_on_the_roof_once() {
     v.cos_tilt = -1.0;
     v.body_height = 0.0;
     v.min_height = 0.0;
-    v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &flat(), 1, true);
+    v.car_ground_body(GroundContact { dh: 0.0, n: Vec3::Y, q: Vec3::ZERO, surf: 1 }, 1300.0, None, &flat(), 1, true);
     assert!(v.rollover_sound && v.damage[8] == 40.0);
     v.rollover_sound = false;
-    v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &flat(), 1, true);
+    v.car_ground_body(GroundContact { dh: 0.0, n: Vec3::Y, q: Vec3::ZERO, surf: 1 }, 1300.0, None, &flat(), 1, true);
     assert!(!v.rollover_sound, "the roof is at 40 now");
     // the direction of travel follows the velocity, or the forward row at rest
     assert!(v.travel_dir.is_normalized());
@@ -186,7 +186,7 @@ fn a_hard_landing_resets_the_human_car() {
         w.airborne = true;
         w.slip = 0.5;
     }
-    v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &flat(), 1, true);
+    v.car_ground_body(GroundContact { dh: 0.0, n: Vec3::Y, q: Vec3::ZERO, surf: 1 }, 1300.0, None, &flat(), 1, true);
     assert!(v.landing_sound.is_some_and(|c| c > 6.0));
     assert_eq!(v.airborne_count, 0);
     assert!(v.wheels.iter().all(|w| w.slip == 0.0 && w.airborne));
@@ -202,7 +202,7 @@ fn a_tilted_car_off_its_body_falls_through_to_the_resting_arm() {
     v.body_height = 0.003;
     v.min_height = 0.003;
     v.velocity = Vec3::new(5.0, -0.1, 0.0);
-    v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &grid, 1, true);
+    v.car_ground_body(GroundContact { dh: 0.0, n: Vec3::Y, q: Vec3::ZERO, surf: 1 }, 1300.0, None, &grid, 1, true);
     assert!(v.position.y.abs() < 1e-6, "{:?}", v.position);
     assert_eq!(v.body_height, 0.0);
     assert_eq!(v.velocity, Vec3::new(5.0, 0.0, 0.0));
@@ -218,10 +218,10 @@ fn the_rollover_bounce_reads_the_velocity_from_before_the_impulse() {
     v.body_height = 0.0;
     v.min_height = 0.0;
     v.velocity = Vec3::new(0.0, 3.0, 0.0);
-    v.car_ground_body(0.0, Vec3::Y, far, 1, 1300.0, None, &grid, 1, true);
+    v.car_ground_body(GroundContact { dh: 0.0, n: Vec3::Y, q: far, surf: 1 }, 1300.0, None, &grid, 1, true);
     assert_eq!(v.velocity.y, 3.0);
     v.velocity = Vec3::new(1.0, -4.0, 0.0);
-    v.car_ground_body(0.0, Vec3::Y, far, 1, 1300.0, None, &grid, 1, true);
+    v.car_ground_body(GroundContact { dh: 0.0, n: Vec3::Y, q: far, surf: 1 }, 1300.0, None, &grid, 1, true);
     // surface 1's bounce is 0.7: −4 + 0.7·4
     assert!((v.velocity.y - (-4.0 + 0.7 * 4.0)).abs() < 1e-5, "{:?}", v.velocity);
     assert!((v.velocity.x - 0.95).abs() < 1e-6);
@@ -237,7 +237,7 @@ fn a_hard_landing_clamps_the_spin_per_component() {
     v.min_height = -0.2;
     v.velocity = Vec3::new(0.0, -8.0, 0.0);
     v.angular_velocity = Vec3::new(0.7, -0.7, 2.0);
-    v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &grid, 1, true);
+    v.car_ground_body(GroundContact { dh: 0.0, n: Vec3::Y, q: Vec3::ZERO, surf: 1 }, 1300.0, None, &grid, 1, true);
     assert_eq!(v.angular_velocity, Vec3::new(0.7, -0.7, 0.75));
     assert!((v.position.y + 0.05).abs() < 1e-6);
     assert!((v.velocity.y - 0.4 * 0.7 * 8.0).abs() < 1e-5, "{:?}", v.velocity);
@@ -259,16 +259,16 @@ fn a_placed_car_takes_the_raw_slice_frame() {
     let rows = |v: &Vehicle| (v.orientation.row(0), v.orientation.row(1), v.orientation.row(2));
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
     // centre on (x > z), the corner pushed 1.5 m along the built lateral across `x = z`
-    v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 4.9), fwd, [lat, up, fwd], Vec3::new(1.5, 0.5, 0.0), false, false);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 4.9), forward: fwd, raw: [lat, up, fwd] }, Vec3::new(1.5, 0.5, 0.0), false, false);
     assert_eq!(rows(&v), (lat, up, fwd));
     assert_eq!(v.frame, v.orientation);
     // flipped, from the other side of the line
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
-    v.place_at_slice(&grid, &specs, Vec3::new(4.9, 0.0, 5.0), fwd, [lat, up, fwd], Vec3::new(-1.5, 0.5, 0.0), false, true);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(4.9, 0.0, 5.0), forward: fwd, raw: [lat, up, fwd] }, Vec3::new(-1.5, 0.5, 0.0), false, true);
     assert_eq!(rows(&v), (-lat, up, -fwd));
     // the same patch: the built frame (up = the patch normal, orthonormal)
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
-    v.place_at_slice(&grid, &specs, Vec3::new(20.0, 0.0, 0.0), fwd, [lat, up, fwd], Vec3::new(1.5, 0.5, 0.0), false, false);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(20.0, 0.0, 0.0), forward: fwd, raw: [lat, up, fwd] }, Vec3::new(1.5, 0.5, 0.0), false, false);
     assert_eq!(v.orientation.row(1), Vec3::Y);
     assert!((v.orientation.row(0).dot(v.orientation.row(2))).abs() < 1e-6);
 }

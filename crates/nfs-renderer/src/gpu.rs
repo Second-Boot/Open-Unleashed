@@ -9,6 +9,38 @@ use winit::window::Window;
 pub struct MeshId(pub(crate) u32);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextureId(pub(crate) u32);
+
+/// What an offscreen pass (`Renderer::render_offscreen`) renders into: the size, an earlier texture
+/// to reuse, the clear colour (`None` = transparent) and the far plane of the pass's own screen z
+/// (`None` = [`VIEW_FAR`]).
+#[derive(Clone, Copy, Debug)]
+pub struct OffscreenSpec {
+    pub width: u32,
+    pub height: u32,
+    pub reuse: Option<TextureId>,
+    pub clear_colour: Option<[f64; 4]>,
+    pub depth_far: Option<f32>,
+}
+
+/// The image one frame is encoded into: its view and texture, whether the texture may be copied
+/// from, and the depth view.
+#[derive(Clone, Copy)]
+struct FrameTarget<'a> {
+    view: &'a wgpu::TextureView,
+    texture: &'a wgpu::Texture,
+    can_copy: bool,
+    depth_view: &'a wgpu::TextureView,
+}
+
+/// The per-frame choices of `Core::encode_frame`: the clear colour, whether the 2D sprites follow,
+/// the aspect and the far plane of the screen z.
+#[derive(Clone, Copy)]
+struct FrameOpts {
+    clear_color: [f64; 4],
+    with_sprites: bool,
+    aspect: f32,
+    depth_far: f32,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaterialId(pub(crate) u32);
 
@@ -1024,7 +1056,7 @@ impl Core {
                     self.upload_dynamic_mesh(&m);
                 }
                 Cmd::Offscreen(j) => {
-                    let id = self.render_offscreen(&j.scene, &j.camera, j.width, j.height, j.reuse, j.clear, j.depth_far);
+                    let id = self.render_offscreen(&j.scene, &j.camera, OffscreenSpec { width: j.width, height: j.height, reuse: j.reuse, clear_colour: j.clear, depth_far: j.depth_far });
                     debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");
                 }
             }
@@ -1601,13 +1633,13 @@ impl Core {
 
     /// Draw a frame into `target` (`width × height`, the surface's format): straight in at gamma
     /// 1, otherwise into the gamma pass's own image and then through the ramp into `target`.
-    #[allow(clippy::too_many_arguments)]
     /// `can_copy`: `target_tex` (or the gamma pass's own image) may be copied from — the lens
     /// flare's blocks read the frame **before** the ramp, as `THRASH_readrect` reads the back
     /// buffer and the ramp is the display's.
-    fn encode_with_gamma(&mut self, scene: &Scene, camera: &Camera, target: &wgpu::TextureView, target_tex: &wgpu::Texture, can_copy: bool, depth: &wgpu::TextureView, width: u32, height: u32, aspect: f32) {
+    fn encode_with_gamma(&mut self, scene: &Scene, camera: &Camera, frame: FrameTarget, width: u32, height: u32, aspect: f32) {
+        let FrameTarget { view: target, texture: target_tex, can_copy, depth_view: depth } = frame;
         if self.gamma == 1.0 {
-            self.encode_frame(scene, scene.clear_color, true, camera, target, target_tex, can_copy, depth, aspect, VIEW_FAR);
+            self.encode_frame(scene, camera, FrameTarget { view: target, texture: target_tex, can_copy, depth_view: depth }, FrameOpts { clear_color: scene.clear_color, with_sprites: true, aspect, depth_far: VIEW_FAR });
             crate::prof::end_frame(&self.device);
             return;
         }
@@ -1616,7 +1648,7 @@ impl Core {
             None => GammaPass::new(&self.device, self.config.format),
         };
         let (src_tex, src) = pass.source(&self.device, self.config.format, width, height);
-        self.encode_frame(scene, scene.clear_color, true, camera, &src, &src_tex, true, depth, aspect, VIEW_FAR);
+        self.encode_frame(scene, camera, FrameTarget { view: &src, texture: &src_tex, can_copy: true, depth_view: depth }, FrameOpts { clear_color: scene.clear_color, with_sprites: true, aspect, depth_far: VIEW_FAR });
         pass.resolve(&self.device, &self.queue, target, self.gamma);
         self.gamma_pass = Some(pass);
         crate::prof::end_frame(&self.device);
@@ -1642,7 +1674,7 @@ impl Core {
         let depth = self.depth_view.clone();
         let (w, h) = (frame.texture.width(), frame.texture.height());
         let can_copy = self.lens_enabled;
-        self.encode_with_gamma(scene, camera, &view, &frame.texture, can_copy, &depth, w, h, aspect);
+        self.encode_with_gamma(scene, camera, FrameTarget { view: &view, texture: &frame.texture, can_copy, depth_view: &depth }, w, h, aspect);
         self.queue.present(frame);
         self.collect_lens();
         Ok(())
@@ -1663,7 +1695,8 @@ impl Core {
     /// Passing the id of a texture this returned earlier reuses it.
     /// `depth_far` is the far plane of the pass's own screen z — the scale of the state 0x18 depth
     /// bias (`encode_frame`): `None` for the main view's 700, the rear view's 65000 (0x4691D0).
-    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32, reuse: Option<TextureId>, clear_colour: Option<[f64; 4]>, depth_far: Option<f32>) -> TextureId {
+    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, spec: OffscreenSpec) -> TextureId {
+        let OffscreenSpec { width, height, reuse, clear_colour, depth_far } = spec;
         let (width, height) = (width.max(1), height.max(1));
         let id = match reuse.filter(|t| self.offscreen.get(&t.0).is_some_and(|(w, h)| *w == width && *h == height)) {
             Some(t) => t,
@@ -1695,7 +1728,7 @@ impl Core {
         // the scene's items and lights as they are, its own clear colour replaced and no sprites
         let target = self.textures[id.0 as usize]._texture.clone();
         crate::prof::ctx(" [offscreen]");
-        self.encode_frame(scene, clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]), false, camera, &view, &target, false, &depth, width as f32 / height as f32, depth_far.unwrap_or(VIEW_FAR));
+        self.encode_frame(scene, camera, FrameTarget { view: &view, texture: &target, can_copy: false, depth_view: &depth }, FrameOpts { clear_color: clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]), with_sprites: false, aspect: width as f32 / height as f32, depth_far: depth_far.unwrap_or(VIEW_FAR) });
         crate::prof::ctx("");
         id
     }
@@ -1713,7 +1746,7 @@ impl Core {
         });
         let view = target.create_view(&Default::default());
         let depth = self.depth_for(width, height);
-        self.encode_with_gamma(scene, camera, &view, &target, true, &depth, width, height, width as f32 / height as f32);
+        self.encode_with_gamma(scene, camera, FrameTarget { view: &view, texture: &target, can_copy: true, depth_view: &depth }, width, height, width as f32 / height as f32);
         let px = self.readback(&target, width, height);
         // the read-back above waited for the device, so the frame's lens blocks are mapped
         self.collect_lens();
@@ -1882,8 +1915,9 @@ impl Core {
     /// `with_sprites` — the 2D sprites. Every buffer write of the frame goes through the staging
     /// belt into this frame's encoder, so nothing allocates a staging buffer per call. Neither
     /// pass stores its depth: nothing reads it afterwards (the sprite pass clears it to 1.0).
-    #[allow(clippy::too_many_arguments)]
-    fn encode_frame(&mut self, scene: &Scene, clear_color: [f64; 4], with_sprites: bool, camera: &Camera, view: &wgpu::TextureView, target: &wgpu::Texture, can_copy: bool, depth_view: &wgpu::TextureView, aspect: f32, depth_far: f32) {
+    fn encode_frame(&mut self, scene: &Scene, camera: &Camera, frame: FrameTarget, opts: FrameOpts) {
+        let FrameTarget { view, texture: target, can_copy, depth_view } = frame;
+        let FrameOpts { clear_color, with_sprites, aspect, depth_far } = opts;
         let n = scene.items.len().min(MAX_OBJECTS as usize);
         let white = self.white;
         self.sky_bind_group(white);

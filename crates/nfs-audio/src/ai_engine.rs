@@ -107,6 +107,34 @@ pub struct Levels {
     pub ambient: u8,
 }
 
+/// Where a voiced source is heard from: the stereo angle and the doppler word (`pitchBase`,
+/// [`PITCH_BASE_STILL`] when nothing moves).
+#[derive(Clone, Copy, Debug)]
+pub struct Heard {
+    pub pan: u16,
+    pub pitch_base: i32,
+}
+
+/// What [`AiEngines::update`] reads of one car: the engine speed fraction, the distance and the
+/// cosine of the angle to the listener, the road-noise speed.
+#[derive(Clone, Copy, Debug)]
+pub struct AiCarInput {
+    pub rpm_frac: i32,
+    pub distance: f32,
+    pub cos: f32,
+    pub speed16: i32,
+}
+
+/// What [`AiEngines::update`] reads of the scene: the detail setting, the crowding value, the
+/// spline camera flag and the category levels.
+#[derive(Clone, Copy, Debug)]
+pub struct AiScene {
+    pub detail: u8,
+    pub crowding: u8,
+    pub spline_cam: bool,
+    pub levels: Levels,
+}
+
 /// `Traffic_pickGear` **0x408130** — the gear `0x408360` (the traffic / cop drive) stores in
 /// `car+0xD82` and turns into the engine speed `car+0xDB4 = carSpecs[0x60 + 4·gear] · car+0x35C`
 /// (0x408495…0x4084BD) that 0x4A7080 divides by the redline `carSpecs[0x94]` for the engine loops:
@@ -360,8 +388,10 @@ impl AiEngines {
     /// road loop started in the ambient category, and was stopped — not started — at volume 0,
     /// where the original keeps it playing silent; the pitch was the float `(rpm/redline + 0.2) ·
     /// doppler · 1.25` floored at 0.05, a word off at the rounding.)*
-    #[allow(clippy::too_many_arguments)]
-    pub fn update(&mut self, out: &AudioOutput, index: usize, set: &str, rpm_frac: i32, distance: f32, cos: f32, pan: u16, speed16: i32, pitch_base: i32, detail: u8, crowding: u8, spline_cam: bool, levels: Levels) {
+    pub fn update(&mut self, out: &AudioOutput, index: usize, set: &str, car: AiCarInput, heard: Heard, scene: AiScene) {
+        let AiCarInput { rpm_frac, distance, cos, speed16 } = car;
+        let Heard { pan, pitch_base } = heard;
+        let AiScene { detail, crowding, spline_cam, levels } = scene;
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
         }
@@ -433,8 +463,8 @@ impl AiEngines {
     /// is `0x5D1478[11]` = 50 and the slot 0xA. *(Until 2026-09-25 the port played the horn
     /// unbent; until 2026-09-27 the bend was a float factor on the pitch and the horn stopped at
     /// volume 0.)*
-    #[allow(clippy::too_many_arguments)]
-    pub fn honk(&mut self, out: &AudioOutput, index: usize, on: bool, distance: f32, pan: u16, pitch_base: i32, ambient_level: u8) {
+    pub fn honk(&mut self, out: &AudioOutput, index: usize, on: bool, distance: f32, heard: Heard, ambient_level: u8) {
+        let Heard { pan, pitch_base } = heard;
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
         }

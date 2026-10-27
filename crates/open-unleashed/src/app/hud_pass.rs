@@ -116,33 +116,35 @@ impl App {
         let layout = &SCREEN_LAYOUTS[self.choice_index(choice::DISPLAY_SCREEN_LAYOUT).map_or(0, |(i, _)| i.min(3))];
         self.scene.sprites.extend(h.sprites(
             hud_aspect,
-            layout,
-            // `HSpeedometer`: `speed · 3.6` or `· 2.237` by `SPEEDUNITS` (`hud.md` §3.3)
-            v.speed() * if mph { 2.237_413_9 } else { 3.6 },
-            v.rpm,
-            self.tick,
-            self.race.as_ref(),
-            // no countdown in a replay or in one of the three test drives (0x4184FC…0x41850E),
-            // nor while a billboard is queued: 0x418514 calls 0x426A60 (`[0x60C9C4]` non-empty)
-            // and returns before drawing anything — the pause menu hides it (audit 2026-09-27)
-            !in_replay_now && self.fe.test_drive.is_none() && self.billboard_key == 0,
-            time_penalty,
-            time_alert,
-            &text,
-            wrong_way,
-            tray4,
-            time_slide,
-            // `car+0xB24` once the player's state is 2: the finish sets it to `tick − 448` —
-            // a race at 0x416643 / 0x416840 (the finish tick is `car+0xB14`, `RaceProgress::
-            // tick`), a skill test at 0x416170 (`SkillTest::time_ticks`). A knocked-out player
-            // (0x416649…) and a skill test's DNF are state 3 and keep the running clock
-            match &self.skill {
-                Some(sk) => sk.time_ticks.filter(|_| !sk.dnf),
-                None => self
-                    .race
-                    .as_ref()
-                    .filter(|r| r.finished && !self.player_eliminated)
-                    .map(|r| r.tick.saturating_sub(RACE_START_TICK)),
+            crate::hud::HudFrame {
+                layout,
+                // `HSpeedometer`: `speed · 3.6` or `· 2.237` by `SPEEDUNITS` (`hud.md` §3.3)
+                speed_kmh: v.speed() * if mph { 2.237_413_9 } else { 3.6 },
+                rpm: v.rpm,
+                tick: self.tick,
+                race: self.race.as_ref(),
+                // no countdown in a replay or in one of the three test drives (0x4184FC…0x41850E),
+                // nor while a billboard is queued: 0x418514 calls 0x426A60 (`[0x60C9C4]` non-empty)
+                // and returns before drawing anything — the pause menu hides it (audit 2026-09-27)
+                countdown: !in_replay_now && self.fe.test_drive.is_none() && self.billboard_key == 0,
+                time_penalty,
+                time_alert,
+                text: &text,
+                wrong_way,
+                slide: tray4,
+                time_slide,
+                // `car+0xB24` once the player's state is 2: the finish sets it to `tick − 448` —
+                // a race at 0x416643 / 0x416840 (the finish tick is `car+0xB14`, `RaceProgress::
+                // tick`), a skill test at 0x416170 (`SkillTest::time_ticks`). A knocked-out player
+                // (0x416649…) and a skill test's DNF are state 3 and keep the running clock
+                finish_time: match &self.skill {
+                    Some(sk) => sk.time_ticks.filter(|_| !sk.dnf),
+                    None => self
+                        .race
+                        .as_ref()
+                        .filter(|r| r.finished && !self.player_eliminated)
+                        .map(|r| r.tick.saturating_sub(RACE_START_TICK)),
+                },
             },
         ));
         self.hud_damage(hud_aspect, tray4, live);
@@ -502,7 +504,7 @@ impl App {
             // not drawn in state 0 (0x42D28E), faded by the state's per cent otherwise
             if let Some(pct) = self.replay_bar.pct(clock) {
                 let tips: [&str; 7] = std::array::from_fn(|i| self.fe.strings.hud(nfs_game::replay::bar_tooltip(i, self.replay.frozen, self.replay_net.is_some())).unwrap_or_default());
-                h.replay_bar(&mut self.scene.sprites, hud_aspect, self.replay.frozen, self.replay_net.is_some(), &self.replay_bar, pct, self.fe.cursor, &tips);
+                h.replay_bar(&mut self.scene.sprites, hud_aspect, crate::hud::ReplayBarDraw { frozen: self.replay.frozen, network: self.replay_net.is_some(), bar: &self.replay_bar, pct, cursor: self.fe.cursor, tips: &tips });
             }
         }
     }

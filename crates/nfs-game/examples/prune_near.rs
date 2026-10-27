@@ -50,8 +50,24 @@ fn old_locate(n: &OldNode, min: (f32, f32), max: (f32, f32), level: u32, fmin: (
     }
     (n, min, max, level)
 }
-#[allow(clippy::too_many_arguments)]
-fn old_spread(n: &OldNode, min: (f32, f32), max: (f32, f32), level: u32, weight: u32, spent: u32, fmin: (f32, f32), fmax: (f32, f32), out: &mut Vec<((f32, f32), (f32, f32))>) {
+/// Where `old_spread` is in the tree: the level, the weight of the path and what it has spent.
+#[derive(Clone, Copy)]
+struct Depth {
+    level: u32,
+    weight: u32,
+    spent: u32,
+}
+
+/// An item's footprint, the minimum and maximum corners.
+#[derive(Clone, Copy)]
+struct Footprint {
+    min: (f32, f32),
+    max: (f32, f32),
+}
+
+fn old_spread(n: &OldNode, min: (f32, f32), max: (f32, f32), depth: Depth, foot: Footprint, out: &mut Vec<((f32, f32), (f32, f32))>) {
+    let Depth { level, weight, spent } = depth;
+    let Footprint { min: fmin, max: fmax } = foot;
     if n.children.iter().all(Option::is_none) {
         out.push((min, max));
         return;
@@ -81,7 +97,7 @@ fn old_spread(n: &OldNode, min: (f32, f32), max: (f32, f32), level: u32, weight:
     for q in 0..4 {
         if ov[q] {
             let (a, b) = quad(min, max, q);
-            old_spread(n.children[q].as_ref().unwrap(), a, b, level + 1, weight + 1, ns, fmin, fmax, out);
+            old_spread(n.children[q].as_ref().unwrap(), a, b, Depth { level: level + 1, weight: weight + 1, spent: ns }, foot, out);
         }
     }
 }
@@ -118,7 +134,7 @@ fn main() {
                 let (fmin, fmax) = ((a.footprint_min.x, a.footprint_min.z), (a.footprint_max.x, a.footprint_max.z));
                 let (st, smin, smax, sl) = old_locate(&old_tree, rmin, rmax, 0, fmin, fmax);
                 let mut out = Vec::new();
-                old_spread(st, smin, smax, sl, 1, 0, fmin, fmax, &mut out);
+                old_spread(st, smin, smax, Depth { level: sl, weight: 1, spent: 0 }, Footprint { min: fmin, max: fmax }, &mut out);
                 out.into_iter().map(|(a, b)| (((a.0 + b.0) * 0.5), ((a.1 + b.1) * 0.5), 0.7071 * (b.0 - a.0))).collect()
             })
             .collect();

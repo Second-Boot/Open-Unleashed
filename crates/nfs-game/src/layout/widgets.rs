@@ -219,7 +219,7 @@ impl LayoutScreen {
 
     pub(super) fn draw_combo(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, overlay: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, h, aspect, selected, hovered, .. } = d;
-        self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
+        self.glinty_box(d, out, tint);
         // The combo's own bevel, 0x4C69DF — the last call site of 0x521050 whose
         // arguments were not all read (§4.58, §4.68). Its gate is four tests at
         // 0x4C6947…0x4C698D: not a list box (`[+0x1DD]`), hovered (0x4C7C90), a
@@ -651,7 +651,7 @@ impl LayoutScreen {
             let (x0, y0, x1, y1) = (x + 1.0, y + 1.0, x + w - 1.0, y + h - 1.0);
             self.gouraud(out, aspect, [[x0, y0], [x1, y0], [x0, y1], [x1, y1]], [l, r, l, r]);
         }
-        self.template_widget(out, aspect, e, state, x, y, strings);
+        self.template_widget(out, aspect, TemplateSpot { e, state, x, y }, strings);
         if self.pressed_on(i, hovered) {
             self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
         } else if self.attr_num(e, "dropshadow") == Some(2.0) {
@@ -710,7 +710,7 @@ impl LayoutScreen {
             out.push(self.quad(aspect, x + w, y, 1.0, at("stemrightheight"), stem));
         }
         // and the glinty box itself, which is the last thing the draw does (0x4C9461)
-        self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
+        self.glinty_box(d, out, tint);
     }
 
     // Two more that are only their template, and both had their caption in the wrong
@@ -730,7 +730,7 @@ impl LayoutScreen {
         let state = self.state_for(e, i, selected, hovered);
         let frame = (self.classes[i] == WidgetClass::BottomBarButton).then(|| self.bar_button_frame(e, hovered == Some(i), self.pressed_on(i, hovered))).flatten();
         let first = out.len();
-        self.template_widget_at(out, aspect, e, state, x, y, strings, frame);
+        self.template_widget_at(out, aspect, TemplateSpot { e, state, x, y }, strings, frame);
         if e.class != "NFS5.BOTTOMBARBUTTON" {
             return;
         }
@@ -795,9 +795,9 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x, y, aw, ah);
             out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
         }
-        self.template_widget(out, aspect, e, state, x, y, strings);
+        self.template_widget(out, aspect, TemplateSpot { e, state, x, y }, strings);
         if self.classes[i] == WidgetClass::TabButton {
-            self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
+            self.glinty_box(d, out, tint);
         }
         // The tab buttons' draw 0x4D0350 draws the parts first (0x4D036D) and then,
         // **when `data.dropshadow` is set** (`[this+0x144]`, bound at 0x4D00E0), the
@@ -1284,7 +1284,7 @@ impl LayoutScreen {
         )
         .max(0) as usize;
         let state = self.drawn_state(e, i, selected, hovered);
-        self.template_widget_at(out, aspect, e, &state, x, y, strings, Some(frame));
+        self.template_widget_at(out, aspect, TemplateSpot { e, state: &state, x, y }, strings, Some(frame));
     }
 
     // **None of these four is a registered class.** The only `*Rectangle*` string in
@@ -1335,7 +1335,7 @@ impl LayoutScreen {
         // **on the letters alone**; 0x4DAB00 (0x4CB0B4 / 0x4CB0F9). Off rest the draw leaves by
         // 0x4DA9D0 without the second half (0x4CB0FE), the depth stepped all the same.
         let header = (self.classes[i] == WidgetClass::Header).then(super::fe_depth::mask_begin);
-        self.template_widget(out, aspect, e, state, x, y, strings);
+        self.template_widget(out, aspect, TemplateSpot { e, state, x, y }, strings);
         // The header's glint, **0x4CB024…0x4CB0F6** — its colour is 0x4D87D0 of
         // the fade, so white at full (§4.25).
         if let Some(m) = header {
@@ -1411,9 +1411,9 @@ impl LayoutScreen {
     // 0,0 on all four screens that use one, so the strip lands in the screen's own
     // coordinates.
     pub(super) fn draw_radio_group(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, blank: &mut Vec<(String, String)>) {
-        let WidgetDraw { i, x, y, aspect, strings, accessor, .. } = d;
+        let WidgetDraw { i, .. } = d;
         let Some(g) = self.groups.get(&i) else { return };
-        out.extend(self.embedded(g, aspect, strings, accessor, blank, x, y));
+        out.extend(self.embedded(g, d, blank));
     }
 
     // `FETrackSmall2dSpline::draw` (0x4FCD80). The widget cycles through the events of
@@ -1822,7 +1822,7 @@ impl LayoutScreen {
     // the union on the `.lay` block carrying no `size=` of its own.
     pub(super) fn draw_account_thing(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, talpha, aspect, strings, selected, hovered, accessor, .. } = d;
-        self.template_widget(out, aspect, e, self.state_for(e, i, selected, hovered), x, y, strings);
+        self.template_widget(out, aspect, TemplateSpot { e, state: self.state_for(e, i, selected, hovered), x, y }, strings);
         let Some(f) = self.fonts.get("univers7b.ffn").or_else(|| self.font_for(e)) else { return };
         let Some(v) = accessor("Tournament.Data(CASH)") else { return };
         let mut cx = x + w - 1.0;
@@ -1853,20 +1853,8 @@ impl LayoutScreen {
     // "Please enter new control..." (0x51C6E5). §4.117. The arc of a key binding is the
     // arrow's direction around the circle: up 0, right 2, down 4, left 6 (0x51C173,
     // 0x51C1A3, 0x51C1C6, 0x51C18D), in place of a name, which 0x51C050 leaves empty.
-    #[allow(clippy::too_many_arguments)]
-    fn controller_setup_row(
-        &self,
-        out: &mut Vec<Sprite>,
-        aspect: f32,
-        e: &nfs_formats::lay::Element,
-        state: &str,
-        x: f32,
-        y: f32,
-        w: f32,
-        talpha: f32,
-        strings: &Strings,
-        accessor: &dyn Fn(&str) -> Option<String>,
-    ) {
+    fn controller_setup_row(&self, d: WidgetDraw<'_>, state: &str, out: &mut Vec<Sprite>) {
+        let WidgetDraw { e, x, y, w, talpha, aspect, strings, accessor, .. } = d;
         let acc = e.get("accessor").filter(|a| !a.is_empty());
         let (v, arc) = if state == "focused" {
             (strings.get(603).unwrap_or_default().to_string(), None)
@@ -1981,7 +1969,7 @@ impl LayoutScreen {
         // the bind, at the screen's open.
         let fade_zero = self.widget_progress() * 255 / TRANS_FULL == 0;
         match self.attr_num(e, "animate").unwrap_or(0.0) as i32 {
-            v @ 1..=5 => self.glinty_flourish(i, Some(0), &|_| fade_zero, v, out, aspect, x, y, gw as i32, gh as i32),
+            v @ 1..=5 => self.glinty_flourish(GlintySpot { i, x, y, w: gw as i32, h: gh as i32 }, Some(0), &|_| fade_zero, v, out, aspect),
             _ => {}
         }
     }
@@ -1995,14 +1983,14 @@ impl LayoutScreen {
     // 22 of the 24 shipped panels carry the template's own `color.value=0x8000ff00`
     // unchanged, a half-transparent green that is nowhere on screen in the game.
     pub(super) fn draw_panel(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, blank: &mut Vec<(String, String)>) -> bool {
-        let WidgetDraw { i, x, y, aspect, strings, accessor, .. } = d;
+        let WidgetDraw { i, .. } = d;
         // a closed panel — a tab not selected, or one the screen hid (0x4CEC50) after it was
         // loaded — draws nothing and is not a gap
         if self.closed.contains(&i) {
             return true;
         }
         let Some(g) = self.groups.get(&i) else { return false };
-        out.extend(self.embedded(g, aspect, strings, accessor, blank, x, y));
+        out.extend(self.embedded(g, d, blank));
         false
     }
 
@@ -2057,7 +2045,7 @@ impl LayoutScreen {
     // method (§4.155). *(This said "which this port has no focus or caret for" until
     // 2026-09-21.)*
     pub(super) fn draw_text_boxes(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { i, e, x, y, w, h, talpha, aspect, strings, selected, hovered, accessor } = d;
+        let WidgetDraw { i, e, x, y, w, h, talpha, aspect, strings: _, selected, hovered, accessor } = d;
         let state = self.state_for(e, i, selected, hovered);
         for (px, py, pw, ph, c) in self.rect_parts_in(e, state) {
             out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(c)));
@@ -2168,7 +2156,7 @@ impl LayoutScreen {
         // and 0x51CAD2 sends a disabled row to the highlight arm too. §4.117.
         if self.classes[i] == WidgetClass::ControllerSetup {
             // the text and the arc come first (0x51C9A9…0x51CAB2), the box over them
-            self.controller_setup_row(out, aspect, e, state, x, y, w, talpha, strings, accessor);
+            self.controller_setup_row(d, state, out);
             let lit = (state == "focused" || self.pressed_on(i, hovered)) && state != "disabled";
             if lit {
                 self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);

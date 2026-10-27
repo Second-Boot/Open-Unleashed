@@ -86,6 +86,8 @@ pub struct Gamepads {
     /// set by [`Gamepads::poll`] when a device that can rumble or has SDL haptic effects was
     /// connected; taken by [`Gamepads::take_ff_hotplug`]
     ff_hotplug: bool,
+    /// set by [`Gamepads::poll`] when any device was connected; taken by [`Gamepads::take_pad_hotplug`]
+    pad_hotplug: bool,
 }
 
 /// The last SDL error, for the log.
@@ -140,11 +142,12 @@ impl Devices {
             // a game in the background still reads its pad; no signal handlers of SDL's own
             SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, c"1".as_ptr());
             SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, c"1".as_ptr());
-            // macOS: leave the Xbox / PlayStation pads to the system's GameController framework
-            // (SDL's MFi driver, whose rumble is CoreHaptics); SDL's own HID driver would open the
-            // device itself. Wheels and pedals come through the IOKit joystick driver.
-            #[cfg(target_os = "macos")]
-            SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, c"0".as_ptr());
+            // macOS: SDL's own HID drivers (HIDAPI) take the Xbox / PlayStation / Switch pads they
+            // know, the GameController framework (SDL's MFi driver) the rest, the IOKit joystick
+            // driver wheels and pedals. PAD-FF (2026-10-27): with HIDAPI off every pad went through
+            // the MFi driver, whose rumble is CoreHaptics (four `CHHapticEngine`s, two
+            // `sendParameters` a call) — late and smeared on an Xbox pad, where HIDAPI
+            // writes the pad's own rumble report at once.
             if !SDL_Init(SUBSYSTEMS) {
                 return Err(sdl_error());
             }
@@ -209,8 +212,11 @@ impl Devices {
                 None
             };
             let count = |n: i32| n.max(0);
+            let path = SDL_GetJoystickPath(joy);
+            let path = if path.is_null() { String::new() } else { std::ffi::CStr::from_ptr(path).to_string_lossy().into_owned() };
             tracing::info!(
                 name = name.as_str(),
+                path = path.as_str(),
                 axes = count(SDL_GetNumJoystickAxes(joy)),
                 hats = count(SDL_GetNumJoystickHats(joy)),
                 buttons = count(SDL_GetNumJoystickButtons(joy)),
@@ -410,7 +416,7 @@ impl Gamepads {
                 None
             }
         };
-        Self { devices, stick_latch: [false; 2], rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false }
+        Self { devices, stick_latch: [false; 2], rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
     }
 
     /// Whether a device that can rumble or has SDL haptic effects was connected since the last call
@@ -419,6 +425,12 @@ impl Gamepads {
     /// player switches on mid-race — would otherwise never rumble.
     pub fn take_ff_hotplug(&mut self) -> bool {
         std::mem::take(&mut self.ff_hotplug)
+    }
+
+    /// Whether a device was connected since the last call (PORT-DEVIATION D44 item 9: the caller
+    /// gives untouched keyboard rows the pad's layout).
+    pub fn take_pad_hotplug(&mut self) -> bool {
+        std::mem::take(&mut self.pad_hotplug)
     }
 
     /// Whether a pad that can rumble is connected (`SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN`).
@@ -433,7 +445,7 @@ impl Gamepads {
         }
     }
 
-    /// A one-shot strong pulse.
+    /// A one-shot pulse of both motors.
     pub fn rumble_pulse(&mut self, level: f32, ms: u32) {
         if let Some(d) = self.devices.as_mut() {
             self.rumbler.pulse(d, level, ms);
@@ -553,6 +565,7 @@ impl Gamepads {
             if ty == SDL_EVENT_JOYSTICK_ADDED {
                 let which = unsafe { ev.jdevice.which };
                 d.open(which);
+                self.pad_hotplug = true;
                 // a force-feedback device arriving (a Bluetooth pad's MFi discovery finishes after
                 // the race has armed, or the player connects one mid-race): the caller re-arms
                 if d.list.iter().any(|x| x.id == which && (x.haptic.is_some() || x.can_rumble())) {

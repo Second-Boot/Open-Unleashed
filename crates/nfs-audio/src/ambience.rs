@@ -192,6 +192,15 @@ enum List {
     Animated,
 }
 
+/// The listener of one update: its position, the pan rows and `panBase` (see [`Ambience::update`]).
+#[derive(Clone, Copy)]
+struct Ear {
+    listener: [f32; 3],
+    side: [f32; 3],
+    forward: [f32; 3],
+    pan_base: u16,
+}
+
 #[derive(Default, Clone, Copy)]
 struct Slot {
     element: Option<(List, usize)>,
@@ -589,7 +598,6 @@ impl Ambience {
     /// `MIRROR`), and `pan_base` the angle 0x4A7A4E…0x4A7AAC hands 0x4AEF30: `pan_angle` of the
     /// player car's forward `car+0x3D0` dotted with the same two rows (not an offset — a
     /// direction).
-    #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, out: &AudioOutput, tick: u64, listener: [f32; 3], side: [f32; 3], forward: [f32; 3], pan_base: u16) {
         if self.ambient_level == 0 || self.elements.is_empty() {
             return;
@@ -619,7 +627,7 @@ impl Ambience {
                 continue;
             }
             let d = (dx * dx + dy * dy + dz * dz).sqrt();
-            self.update_element(out, List::Static, i, tick8, d, listener, [dx, dy, dz], (side, forward, pan_base));
+            self.update_element(out, (List::Static, i), tick8, d, [dx, dy, dz], Ear { listener, side, forward, pan_base });
         }
     }
 
@@ -629,7 +637,6 @@ impl Ambience {
     /// re-armed every frame rather than accumulated with jitter) and `tickDiv8 = (tick % 100) >>
     /// 3`, both distinct from the static loop's own `tick >> 3`. Call [`Ambience::sync_animated`]
     /// first each frame so `position`/`velocity` are this tick's.
-    #[allow(clippy::too_many_arguments)]
     pub fn update_animated(&mut self, out: &AudioOutput, tick: u64, listener: [f32; 3], side: [f32; 3], forward: [f32; 3], pan_base: u16) {
         if self.ambient_level == 0 {
             return;
@@ -649,13 +656,13 @@ impl Ambience {
                 continue;
             }
             let d = (dx * dx + dy * dy + dz * dz).sqrt();
-            self.update_element(out, List::Animated, i, tick8, d, listener, [dx, dy, dz], (side, forward, pan_base));
+            self.update_element(out, (List::Animated, i), tick8, d, [dx, dy, dz], Ear { listener, side, forward, pan_base });
         }
     }
 
     /// `Ambience_updateElement` 0x4AEAC0.
-    #[allow(clippy::too_many_arguments)]
-    fn update_element(&mut self, out: &AudioOutput, list: List, i: usize, tick8: i32, d: f32, listener: [f32; 3], rel: [f32; 3], (side, forward, pan_base): ([f32; 3], [f32; 3], u16)) {
+    fn update_element(&mut self, out: &AudioOutput, (list, i): (List, usize), tick8: i32, d: f32, rel: [f32; 3], ear: Ear) {
+        let Ear { listener, side, forward, pan_base } = ear;
         let e = self.list_ref(list)[i].clone();
         // 0x4AEAE1…0x4AEB28: `d > Range + 100` (`test ah, 0x41`), a PatchID out of the index or
         // negative, or an empty bank

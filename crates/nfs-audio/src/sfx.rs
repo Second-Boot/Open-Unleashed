@@ -10,6 +10,7 @@
 //!   `min(127·slipSum, 127)` (rear × 0.5), pitch 1.0. CONFIRMED.
 //! * Gear-shift click: engine bank slot 2 (`engine::EngineSound::play_shift`).
 
+use crate::ai_engine::Heard;
 use crate::mixer::{byte_gain, AudioOutput, Clip, ClipCache, PlayArgs, VoiceId, BEND_ROOT, LEVEL_MAX};
 use crate::voice_loop::{LoopCall, LoopVoice};
 use nfs_formats::bnk::Bnk;
@@ -151,6 +152,16 @@ pub struct LoopInput {
     pub wet: bool,
     /// `car+0x52C & 4`, the human
     pub human: bool,
+}
+
+/// The boost state [`CollisionSfx::turbo`] reads off the car: `car+0x54C`, the throttle byte, the engine
+/// speed and its redline.
+#[derive(Clone, Copy, Debug)]
+pub struct TurboState {
+    pub boost: f32,
+    pub throttle: u8,
+    pub rpm: f32,
+    pub redline: f32,
 }
 
 /// A car's sound queue `car+0x1110` / `car+0x110C` (0x40F020) and the loop-active bits
@@ -890,8 +901,8 @@ impl CollisionSfx {
     /// took the car's pan and no bend; both silent at volume 0, but the bend 0x20 holds for that
     /// first pass.)* The `0x52C & 0x40` kind's `((AmbientLevel · spl[5] · 85) >> 7) · v >> 14`
     /// (0x4AB073…0x4AB099) has no cop in this build.
-    #[allow(clippy::too_many_arguments)]
-    pub fn siren(&mut self, out: &AudioOutput, audio_slot: usize, on: bool, distance: f32, pan: u16, pitch_base: i32, ambient_level: u8) {
+    pub fn siren(&mut self, out: &AudioOutput, audio_slot: usize, on: bool, distance: f32, heard: Heard, ambient_level: u8) {
+        let Heard { pan, pitch_base } = heard;
         if !on {
             if let Some(id) = self.sirens.remove(&audio_slot) {
                 tracing::debug!(audio_slot, "siren release");
@@ -1028,8 +1039,8 @@ impl CollisionSfx {
     /// tiny car's doubling at 0x4AA906 is the engine record's only), the word `pitchBase >> 4`, and
     /// `level` the bend byte on the voice. *(Until 2026-09-27 the float `Clip::bend(level) ·
     /// doppler`.)*
-    #[allow(clippy::too_many_arguments)]
-    pub fn road_roll(&mut self, out: &AudioOutput, speed: f32, nibble: usize, a: i32, half: bool, pitch_base: i32, pan: u16) {
+    pub fn road_roll(&mut self, out: &AudioOutput, speed: f32, nibble: usize, a: i32, half: bool, heard: Heard) {
+        let Heard { pan, pitch_base } = heard;
         let master = (self.sfx_level, self.spl.road_roll());
         let slot = SLOT_ROAD_BASE + nibble.min(11);
         let v = road_v(speed, nibble);
@@ -1115,8 +1126,9 @@ impl CollisionSfx {
     /// `career.md` §11.4c) through `fistp` (0x80000000, `>> 4`) — not reproduced, not reachable.
     /// (2026-09-28, `career.md` §11.4c: the nine measured control words all have every exception
     /// mask bit set — IM DM ZM OM UM PM.)
-    #[allow(clippy::too_many_arguments)]
-    pub fn turbo(&mut self, out: &AudioOutput, boost: f32, throttle: u8, rpm: f32, redline: f32, base: i32, gain: i32, pitch_base: i32, pan: u16) {
+    pub fn turbo(&mut self, out: &AudioOutput, state: TurboState, base: i32, gain: i32, heard: Heard) {
+        let TurboState { boost, throttle, rpm, redline } = state;
+        let Heard { pan, pitch_base } = heard;
         let master = (self.engine_level, self.spl.turbo());
         let mut voice = self.turbo;
         if boost <= 0.1 || redline <= 0.0 {
@@ -1153,7 +1165,6 @@ impl CollisionSfx {
     /// bend byte `min(12.7 · mag, 127)` computed **only when the voice's slot changes** and
     /// latched in `0x5D17E8[voice]` (0x4A9654…0x4A968F), and the volume the plain
     /// `min(atten, 127)` (0x4A9821…0x4A9854) — not scaled by the slip as the player's is.
-    #[allow(clippy::too_many_arguments)]
     pub fn drain_ai(&mut self, out: &AudioOutput, audio_slot: usize, queue: &SfxQueue, distance: f32, view_0c: bool, pan: u16) {
         if queue.entries.is_empty() {
             return;

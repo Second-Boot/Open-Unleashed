@@ -4,8 +4,9 @@
 
 The keyboard defaults are the original's. Keys and gamepad controls can be changed in the game's own options
 (Options → Controls), where "Default" on a device restores its layout. A gamepad works only through these
-bindings: pick it in the device list and press "Default". On a standard pad (Xbox, PlayStation, Switch Pro)
-that gives a modern layout — left stick steers, RT throttle and LT brake (both analogue), A handbrake,
+bindings. On a standard pad (Xbox, PlayStation, Switch Pro) a profile whose controls were never changed gets
+the pad's layout by itself when the pad is connected; otherwise pick the pad in the device list and press
+"Default". The pad's layout is a modern one — left stick steers, RT throttle and LT brake (both analogue), A handbrake,
 B look back, X reset the car, Y camera, RB / LB shift up / down, Start pause, L3 horn, d-pad up lights,
 d-pad left / right turn signals, d-pad down hazards, right stick looks left / right. Wheels and other
 devices get the original's layout. In the menus the d-pad or left stick moves, A selects. Force feedback
@@ -76,7 +77,7 @@ in the pause menu or a replay. The race or the replay stands still while it is u
 | Tab, R | | the hint, reset the camera |
 | K, Esc, P, Backspace | B | leave |
 
-Pictures are saved as PNG to `Pictures/PorscheUnleashed` (`NFS_PHOTO_DIR` names another folder).
+Pictures are saved as PNG to `PorscheUnleashed` in the user's Pictures folder: `~/Pictures` on macOS, the Pictures folder Explorer shows on Windows (also when it was moved or OneDrive keeps it), `XDG_PICTURES_DIR` (else `~/Pictures`) on Linux. `NFS_PHOTO_DIR` names another folder.
 
 ## Menus
 

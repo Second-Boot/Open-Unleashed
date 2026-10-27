@@ -946,7 +946,7 @@ impl TrafficSet {
             // the placement's `Susp_update`s read `[0x606AC4]` (< 2: the compression block is skipped,
             // 0x499D15); the traffic bodies keep their own counter afterwards, as before
             let held = std::mem::replace(&mut b.game_tick, tick);
-            b.place_at_slice(grid, specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], off, false, false);
+            b.place_at_slice(grid, specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, off, false, false);
             b.game_tick = held;
             Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
         }
@@ -1735,7 +1735,7 @@ impl TrafficSet {
                 for w in &mut b.wheels {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
-                b.place_at_slice(g, specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, dir < 0.0);
+                b.place_at_slice(g, specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, Vec3::ZERO, false, dir < 0.0);
                 Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
                 // a fresh seat is a zone change: 0x499520 took the slice's vectors into the frame block
                 self.cars[i].frame = [sl.lateral, sl.up, sl.forward];
@@ -1925,7 +1925,7 @@ impl TrafficSet {
         let in_world = self.cars[i].active;
         Self::sync_in_one(&self.cars[i], &mut self.bodies[i]);
         let b = &mut self.bodies[i];
-        b.place_at_slice_from(g, specs, s1.centre, s0.centre, s1.forward.normalize_or_zero(), [s0.lateral, s0.up, s0.forward], Vec3::new(0.0, slot * 10.0, 0.0), false, false, in_world);
+        b.place_at_slice_from(g, specs, s1.centre, nfs_physics::vehicle::SliceFrame { centre: s0.centre, forward: s1.forward.normalize_or_zero(), raw: [s0.lateral, s0.up, s0.forward] }, Vec3::new(0.0, slot * 10.0, 0.0), nfs_physics::vehicle::PlaceFlags { opponent: false, flip: false, in_world });
         Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
     }
 
@@ -2048,7 +2048,7 @@ impl TrafficSet {
                 for w in &mut b.wheels {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
-                b.place_at_slice(g, specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
+                b.place_at_slice(g, specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
                 Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
                 let c = &mut self.cars[i];
                 c.velocity = c.orientation.row(2) * target;
@@ -2180,7 +2180,7 @@ mod tests {
         c.angular_velocity = Vec3::ZERO;
         set.sync_in(0);
         let specs = crate::police::test_specs();
-        set.bodies[0].place_at_slice(&grid, &specs, Vec3::new(5.0, h(5.0), 0.0), Vec3::Z, [Vec3::X, Vec3::Y, Vec3::Z], Vec3::new(0.0, 1.0, 0.0), false, false);
+        set.bodies[0].place_at_slice(&grid, &specs, nfs_physics::vehicle::SliceFrame { centre: Vec3::new(5.0, h(5.0), 0.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z] }, Vec3::new(0.0, 1.0, 0.0), false, false);
         set.sync_out(0);
         // `Car_ground` at 32 Hz and the integrators at 64 Hz, until the body has settled
         for tick in 0..256u64 {

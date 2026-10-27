@@ -206,6 +206,24 @@ type IdBuild = std::hash::BuildHasherDefault<IdHasher>;
 type MaterialMap<V> = HashMap<MaterialId, V, IdBuild>;
 type MaterialSet = std::collections::HashSet<MaterialId, IdBuild>;
 
+/// How a car is posed for one draw: its model-to-world matrix, the wheel spin, the steer and roll
+/// channels and the suspension's travel ([`CarModel::draw_items`]).
+#[derive(Clone, Copy, Debug)]
+pub struct CarPose {
+    pub car_to_world: Mat4,
+    pub wheel_spin: [f32; 4],
+    pub steer: [f32; 2],
+    pub roll: [f32; 4],
+    pub travel: [f32; 4],
+}
+
+impl CarPose {
+    /// The car at rest: no spin, steer, roll or travel (the front end's room and showroom cars).
+    pub fn still(car_to_world: Mat4) -> Self {
+        Self { car_to_world, wheel_spin: [0.0; 4], steer: [0.0; 2], roll: [0.0; 4], travel: [0.0; 4] }
+    }
+}
+
 /// The two work buffers of one [`CarModel::draw_items_into`]: a pass's items with their
 /// `body_order` keys, and the `(key, index)` pairs sorted to put them in the original's order.
 #[derive(Default)]
@@ -1850,8 +1868,7 @@ impl CarModel {
     /// ([`nfs_assets::car::blitter_texel`]), clipped to the page, and upload it — what 0x534480
     /// (the page as the destination), a blit and 0x443C80 (the page's refresh, 0x447AF0) do. The
     /// page stays written: a later blit lands over it, as on the original's surface.
-    #[allow(clippy::too_many_arguments)]
-    pub fn blit_page(&mut self, r: &mut Renderer, page: usize, src: &[u8], w: u32, h: u32, x: i64, y: i64) {
+    pub fn blit_page(&mut self, r: &mut Renderer, page: usize, src: &[u8], w: u32, h: u32, (x, y): (i64, i64)) {
         let (Some(p), Some(&tex)) = (self.damage_pages.get_mut(page), self.page_textures.get(page)) else { return };
         for row in 0..h as i64 {
             let py = y + row;
@@ -1892,16 +1909,16 @@ impl CarModel {
     /// mask ([`PartInfo::in_pass`]) in `Base+70` order (0x43C1B0's sort of that LOD's list), and
     /// the passes one after the other as 0x444E00 makes them — the driver, then the body, then the
     /// wheels.
-    pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], roll: [f32; 4], travel: [f32; 4], passes: &[CarPass]) -> Vec<DrawItem> {
+    pub fn draw_items(&self, pose: CarPose, passes: &[CarPass]) -> Vec<DrawItem> {
         let mut out = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
-        DRAW_SCRATCH.with(|s| self.draw_items_into(&mut out, &mut s.borrow_mut(), car_to_world, wheel_spin, steer, roll, travel, passes));
+        DRAW_SCRATCH.with(|s| self.draw_items_into(&mut out, &mut s.borrow_mut(), pose, passes));
         out
     }
 
     /// [`Self::draw_items`] appending to `out` with the caller's scratch buffers, so a frame's cars
     /// allocate nothing per car beyond `out` itself.
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_items_into(&self, out: &mut Vec<DrawItem>, scratch: &mut DrawScratch, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], roll: [f32; 4], travel: [f32; 4], passes: &[CarPass]) {
+    pub fn draw_items_into(&self, out: &mut Vec<DrawItem>, scratch: &mut DrawScratch, pose: CarPose, passes: &[CarPass]) {
+        let CarPose { car_to_world, wheel_spin, steer, roll, travel } = pose;
         // 0x4433D2 / 0x4433BC: `(−m·s, s, −s)` — `MODEL_TO_BODY` scaled, its x turned back in a
         // mirrored race; and the steer channels negated there (0x438471)
         let car_to_world = car_to_world * Mat4::from_scale(Vec3::new(if self.mirror { -self.scale } else { self.scale }, self.scale, self.scale));
@@ -2237,9 +2254,8 @@ impl CarModel {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], roll: [f32; 4], travel: [f32; 4], passes: &[CarPass], block: &LightBlock) -> Vec<DrawItem> {
-        let mut out = self.draw_items(car_to_world, wheel_spin, steer, roll, travel, passes);
+    pub fn draw_items_block(&self, pose: CarPose, passes: &[CarPass], block: &LightBlock) -> Vec<DrawItem> {
+        let mut out = self.draw_items(pose, passes);
         for it in &mut out {
             it.layer_light = self.material_light.get(&it.material).and_then(|l| block.layer_light(*l));
         }

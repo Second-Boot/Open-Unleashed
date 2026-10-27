@@ -370,6 +370,12 @@ impl InputState {
         };
         self.bindings.set_defaults(&rows, id_of);
     }
+    /// Whether the nineteen `Controller.*` rows are the keyboard's factory rows (0x51D1D0 on device
+    /// 0) — the player never changed them (PORT-DEVIATION D44 item 9).
+    pub fn rows_are_keyboard_defaults(&self, id_of: impl Fn(&str) -> Option<u16>) -> bool {
+        let rows = bindings::default_bindings(0, bindings::DeviceCaps::default(), 0);
+        bindings::CONTROLLER_ROWS.iter().zip(rows.iter()).all(|(r, b)| id_of(r).is_none_or(|id| self.bindings.get(id) == Some(b)))
+    }
     /// How many keys are down — 0x51C610 takes a key for a binding row only when exactly one is.
     pub fn keys_down_count(&self) -> usize {
         self.keys_down.len()
@@ -860,6 +866,22 @@ mod tests {
             assert_eq!((b.kind, b.index), (3, scancode(k).unwrap() as u32), "{a:?}");
         }
         assert_eq!(default_binding(KeyCode::Escape), None);
+    }
+
+    /// D44 item 9: the keyboard's factory rows are recognised as untouched; the pad's layout, or a
+    /// changed row, is not.
+    #[test]
+    fn untouched_keyboard_rows_are_recognised() {
+        let row = |n: &str| bindings::CONTROLLER_ROWS.iter().position(|r| *r == n).map(|i| 100 + i as u16);
+        let mut st = InputState::default();
+        st.set_pads(&[gamepad::pad_record(&gamepad::PadSnapshot::default())]);
+        st.default_controls(None, row);
+        assert!(st.rows_are_keyboard_defaults(row));
+        let mut changed = st.clone();
+        changed.bindings.by_id.get_mut(&100).unwrap().index ^= 1;
+        assert!(!changed.rows_are_keyboard_defaults(row));
+        st.default_controls(Some(0), row);
+        assert!(!st.rows_are_keyboard_defaults(row));
     }
 
     /// The modern pad layout (D44) on a standard pad at rest: every `Controller.*` row's binding.

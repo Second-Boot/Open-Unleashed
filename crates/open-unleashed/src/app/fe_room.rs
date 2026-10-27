@@ -614,7 +614,7 @@ impl App {
                 tracing::debug!(w = m.width, h = m.height, "victory room movie opened");
                 // the first frame, which 0x4E1EB0 decoded, is blitted on the first render
                 if let Some(r) = self.renderer.as_mut() {
-                    self.fe.room[0].1.blit_page(r, 5, &m.rgba(), m.width, m.height, 0, 0);
+                    self.fe.room[0].1.blit_page(r, 5, &m.rgba(), m.width, m.height, (0, 0));
                 }
                 self.fe.victory_movie = Some((m, now));
             }
@@ -622,7 +622,7 @@ impl App {
                 let stepped = m.tick(now.saturating_sub(*last) as f32);
                 *last = now;
                 if stepped && let Some(r) = self.renderer.as_mut() {
-                    self.fe.room[0].1.blit_page(r, 5, &m.rgba(), m.width, m.height, 0, 0);
+                    self.fe.room[0].1.blit_page(r, 5, &m.rgba(), m.width, m.height, (0, 0));
                 }
             }
         }
@@ -687,7 +687,7 @@ impl App {
                 r.set_projector_texture(Some(tex));
             }
             for (_, model) in &self.fe.room {
-                let mut its = model.draw_items_block(room_m, [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], &nfs_game::world::FRONT_END_PASSES, &room_light);
+                let mut its = model.draw_items_block(nfs_game::world::CarPose::still(room_m), &nfs_game::world::FRONT_END_PASSES, &room_light);
                 model.apply_projector(&mut its, shadow.map(|s| s.1));
                 items.extend(in_submission_order(its));
                 self.fe_lamp_items(model, room_m, ROOM_LAMPS, &mut items);
@@ -813,7 +813,7 @@ impl App {
             let Some(r) = self.renderer.as_mut() else {
                 return;
             };
-            rendered.push((slot, r.render_offscreen(&scene, &camera, w, h, reuse, None, None)));
+            rendered.push((slot, r.render_offscreen(&scene, &camera, nfs_renderer::OffscreenSpec { width: w, height: h, reuse, clear_colour: None, depth_far: None })));
         }
         if let Some(l) = self.fe.layout_preview.as_mut() {
             for (slot, tex) in rendered {
@@ -905,7 +905,7 @@ impl App {
             for (k, p) in &sections {
                 let m = &self.fe.room[*k].1;
                 let at = place(*p, 0.5);
-                let its = m.draw_items_block(if reflect { reflected(at) } else { at }, [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], passes_room, room_light);
+                let its = m.draw_items_block(nfs_game::world::CarPose::still(if reflect { reflected(at) } else { at }), passes_room, room_light);
                 items.extend(in_submission_order(its).into_iter().map(|mut it| {
                     it.mirrored = reflect;
                     it
@@ -1066,12 +1066,12 @@ impl App {
                 let wall = &mut self.fe.room[1].1;
                 for b in &blits {
                     let Some((img, misc)) = art.get(b.frame) else { continue };
-                    wall.blit_page(r, b.page, &flip(img), img.width, img.height, 0, 0);
+                    wall.blit_page(r, b.page, &flip(img), img.width, img.height, (0, 0));
                     if b.frame == 0
                         && let Some((mark, mm)) = art.get(if rev { 6 } else { 5 })
                     {
                         let (x, y) = track_marker_at(misc[0] as i16, img.width as u16, mm[0] as i16, mm[1] as i16, mark.width as u16, mir);
-                        wall.blit_page(r, b.page, &flip(mark), mark.width, mark.height, x, y);
+                        wall.blit_page(r, b.page, &flip(mark), mark.width, mark.height, (x, y));
                     }
                 }
             }
@@ -1082,9 +1082,9 @@ impl App {
         }
         use std::f32::consts::TAU;
         let place = |y: f32| Mat4::from_translation(Vec3::new(-pos[0], pos[1], pos[2])) * Mat4::from_rotation_x(xrot * TAU) * Mat4::from_rotation_y(-y * TAU);
-        let mut items = self.fe.room[0].1.draw_items_block(place(yrot), [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], &FRONT_END_PASSES, room_light);
+        let mut items = self.fe.room[0].1.draw_items_block(nfs_game::world::CarPose::still(place(yrot)), &FRONT_END_PASSES, room_light);
         for k in 0..4 {
-            items.extend(self.fe.room[1].1.draw_items_block(place(yrot + k as f32 * 0.25), [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], &FRONT_END_PASSES, room_light));
+            items.extend(self.fe.room[1].1.draw_items_block(nfs_game::world::CarPose::still(place(yrot + k as f32 * 0.25)), &FRONT_END_PASSES, room_light));
         }
         Some(items)
     }
@@ -1292,7 +1292,6 @@ fn reflected(place: Mat4) -> Mat4 {
 /// the car has one — `[R3DCar+0x700]`, set for every front-end car by 0x4D138A and cleared only by
 /// the garage's draw, 0x4E9D15), then the model 0x4432B0 — reflected (slot 3, 0x443490) when the
 /// draw was queued with `+0x471` (0x4D15F0, the dealership's first pass).
-#[allow(clippy::too_many_arguments)]
 fn fe_car_draw(
     car: &CarModel,
     place: Mat4,
@@ -1303,7 +1302,7 @@ fn fe_car_draw(
 ) -> Vec<nfs_renderer::DrawItem> {
     let mut out: Vec<nfs_renderer::DrawItem> = blob.and_then(|b| fe_blob_shadow(b, place, car.box_half)).into_iter().collect();
     let m = if reflect { reflected(place) } else { place };
-    out.extend(car.draw_items_block(m, [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], passes, light).into_iter().map(|mut it| {
+    out.extend(car.draw_items_block(nfs_game::world::CarPose::still(m), passes, light).into_iter().map(|mut it| {
         it.mirrored = reflect;
         it
     }));

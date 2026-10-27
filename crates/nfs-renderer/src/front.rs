@@ -17,7 +17,7 @@
 //! and the read-backs (`render_to_image`) are the one thing that does: they need
 //! the core in hand, so they first take it back (waiting for the frame in flight) and run the list.
 
-use crate::gpu::{Core, MaterialId, MeshId, TextureId};
+use crate::gpu::{Core, MaterialId, MeshId, OffscreenSpec, TextureId};
 use crate::{Camera, FakeSortMode, LensRead, MaterialDesc, MeshData, Scene, TextureData, Vertex};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -453,8 +453,8 @@ impl Renderer {
     /// `depth_far` is the far plane of the pass's own screen z — the scale of the state 0x18 depth
     /// bias: `None` for the main view's 700, the rear view's 65000 (0x4691D0). The pass is recorded
     /// in the command list and runs, in its place in the order, when the frame is encoded.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32, reuse: Option<TextureId>, clear_colour: Option<[f64; 4]>, depth_far: Option<f32>) -> TextureId {
+    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, spec: OffscreenSpec) -> TextureId {
+        let OffscreenSpec { width, height, reuse, clear_colour, depth_far } = spec;
         let (width, height) = (width.max(1), height.max(1));
         let id = match reuse.filter(|t| self.offscreen.get(&t.0).is_some_and(|(w, h)| *w == width && *h == height)) {
             Some(t) => t,

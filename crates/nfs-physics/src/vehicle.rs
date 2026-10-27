@@ -208,6 +208,34 @@ pub enum PropEvent {
     Bush,
 }
 
+/// The track slice a car is placed on ([`Vehicle::place_at_slice`]): its centre, its plain forward
+/// `F` and the raw frame rows `[lateral, up, forward]`.
+#[derive(Debug, Clone, Copy)]
+pub struct SliceFrame {
+    pub centre: Vec3,
+    pub forward: Vec3,
+    pub raw: [Vec3; 3],
+}
+
+/// What [`Vehicle::car_ground_body`] reads of the contact: the ground-height rate `dh`, the
+/// tracker's normal `n` and plane point `q` and the zone word `surf`.
+#[derive(Clone, Copy)]
+pub(crate) struct GroundContact {
+    pub(crate) dh: f32,
+    pub(crate) n: Vec3,
+    pub(crate) q: Vec3,
+    pub(crate) surf: usize,
+}
+
+/// The three switches of [`Vehicle::place_at_slice_from`]: an opponent's placement, the flipped
+/// direction and the in-world flag (`car+0x7F`).
+#[derive(Debug, Clone, Copy)]
+pub struct PlaceFlags {
+    pub opponent: bool,
+    pub flip: bool,
+    pub in_world: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vehicle {
     pub position: Vec3,
@@ -1546,9 +1574,8 @@ impl Vehicle {
     /// closed without a behaviour change. The one residual gap is the original's `max(1, ·)` clamp,
     /// which only bites a caller that resolves slice index 0 — this API takes `Vec3`s, not an
     /// index, so a caller would have to special-case it; no current caller ever targets slice 0.)*
-    #[allow(clippy::too_many_arguments)]
-    pub fn place_at_slice(&mut self, grid: &TriangleGrid, specs: &CarSpecs, centre: Vec3, slice_fwd: Vec3, slice_raw: [Vec3; 3], offset: Vec3, opponent: bool, flip: bool) {
-        self.place_at_slice_from(grid, specs, centre, centre, slice_fwd, slice_raw, offset, opponent, flip, true);
+    pub fn place_at_slice(&mut self, grid: &TriangleGrid, specs: &CarSpecs, slice: SliceFrame, offset: Vec3, opponent: bool, flip: bool) {
+        self.place_at_slice_from(grid, specs, slice.centre, slice, offset, PlaceFlags { opponent, flip, in_world: true });
     }
 
     /// [`Self::place_at_slice`] with the two nodes apart and the in-world flag: 0x49B090 seats the
@@ -1558,8 +1585,9 @@ impl Vehicle {
     /// `Susp_update`s and the `BodyHeight` drop only while `car+0x7F` is set — a car parked from
     /// purgatory at the race's first AI pass (`car+0x7F` still 0) is neither dropped nor draws
     /// (`in_world`). Every other caller passes the same node twice and `true`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn place_at_slice_from(&mut self, grid: &TriangleGrid, specs: &CarSpecs, seat: Vec3, centre: Vec3, slice_fwd: Vec3, slice_raw: [Vec3; 3], offset: Vec3, opponent: bool, flip: bool, in_world: bool) {
+    pub fn place_at_slice_from(&mut self, grid: &TriangleGrid, specs: &CarSpecs, seat: Vec3, slice: SliceFrame, offset: Vec3, flags: PlaceFlags) {
+        let SliceFrame { centre, forward: slice_fwd, raw: slice_raw } = slice;
+        let PlaceFlags { opponent, flip, in_world } = flags;
         let absolute = opponent && self.game_tick > TICK_RACE_START && offset != Vec3::ZERO;
         // the placement refreshes the stored world points itself (0x49B431, 0x49B483)
         self.point_rows = None;

@@ -739,7 +739,7 @@ impl CarAssets {
                     let soft = path == BlitPath::Blitter && !(page_fmt == page_bpp::ARGB8888 && fmt == nfs_formats::fsh::PixelFormat::Argb8888);
                     let (ox, oy) = if soft { (0, 0) } else { (ox, oy) };
                     let page = &mut pages[page_no - 1];
-                    blit(page, &src, w, h, x + ox, y + oy, path, &tints);
+                    blit(page, &src, w, h, (x + ox, y + oy), path, &tints);
                     if let Some((text, sec)) = text_page {
                         draw_entry_text(page, paths, text, sec, rect, &paint);
                     }
@@ -1167,8 +1167,7 @@ pub fn blitter_texel(bpp: i64, t: [u8; 4]) -> [u8; 4] {
 ///   not 0" through the blitter (0x570370 → 0x572F5B: an all-zero texel stays 0, any other gets
 ///   0x8000, so a coloured texel with alpha 0 turns opaque there).
 /// * **32** — kept as it is.
-#[allow(clippy::too_many_arguments)]
-fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, path: BlitPath, tints: &[[u8; 3]; 18]) {
+fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, (x, y): (i64, i64), path: BlitPath, tints: &[[u8; 3]; 18]) {
     for row in 0..h as i64 {
         let py = y + row;
         if py < 0 || py >= page.height as i64 {
@@ -1557,7 +1556,7 @@ mod page_format_tests {
         let tints = [[0; 3]; 18];
         let put = |bpp, src: [u8; 4], path| {
             let mut p = page(bpp);
-            blit(&mut p, &src, 1, 1, 0, 0, path, &tints);
+            blit(&mut p, &src, 1, 1, (0, 0), path, &tints);
             [p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3]]
         };
         // 4444: high nibbles, alpha too, read back as x·17
@@ -1595,7 +1594,7 @@ mod page_format_tests {
         assert_eq!(&out[4..8], &PALETTE_ENTRY_255);
         assert_eq!(&out[8..12], &[7, 7, 7, 255]);
         let mut p = page(1555);
-        blit(&mut p, &out[4..8], 1, 1, 0, 0, BlitPath::Palette, &tints);
+        blit(&mut p, &out[4..8], 1, 1, (0, 0), BlitPath::Palette, &tints);
         assert_eq!(p.rgba[3], 0);
     }
 

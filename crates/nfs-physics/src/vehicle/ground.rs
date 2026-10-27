@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// The LOD gate's answer ([`ground_due`]): the rate in Hz and the number of 32 Hz ticks.
+#[derive(Clone, Copy)]
+struct GroundRate {
+    rate_hz: f32,
+    n_ticks: i32,
+}
+
 impl Vehicle {
     /// `Roughness` 0x499730 (car, i) — per-wheel random road-height offset, CONFIRMED:
     /// amplitude and period by surface type, a new target drawn every `period` metres of travel and
@@ -268,8 +275,8 @@ impl Vehicle {
     ///
     /// `n_ticks` is the LOD gate's `nTicks` ([`ground_due`]): 1 for every racer, 1 / 2 / 4 for a
     /// cop, a traffic car or a smackable by its distance from the nearest racer.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn car_ground_body(&mut self, dh: f32, n: Vec3, q: Vec3, surf: usize, mass: f32, travel: Option<(f32, f32)>, grid: &TriangleGrid, n_ticks: i32, racer: bool) {
+    pub(crate) fn car_ground_body(&mut self, contact: GroundContact, mass: f32, travel: Option<(f32, f32)>, grid: &TriangleGrid, n_ticks: i32, racer: bool) {
+        let GroundContact { dh, n, q, surf } = contact;
         if self.min_height > 0.005 || self.tiny {
             self.velocity.y -= GRAVITY / 32.0 * self.gravity_scale * n_ticks as f32;
         }
@@ -404,7 +411,7 @@ impl Vehicle {
     pub(super) fn ground_contact(&mut self, grid: &TriangleGrid, specs: &CarSpecs) {
         let h = self.susp_update(grid, specs, false);
         let up = self.orientation.row(1);
-        self.car_ground_rest(h, up, grid, specs, 32.0, 1, true);
+        self.car_ground_rest(h, up, grid, specs, GroundRate { rate_hz: 32.0, n_ticks: 1 }, true);
     }
 
     /// `Car_ground` 0x49BD40 for a car whose `car+0xE20` it is but which is not a racer — a cop
@@ -419,7 +426,7 @@ impl Vehicle {
     pub fn ai_ground_step(&mut self, grid: &TriangleGrid, specs: &CarSpecs, rate_hz: f32, n_ticks: i32, police: bool) {
         let h = self.susp_update(grid, specs, police);
         let up = self.orientation.row(1);
-        self.car_ground_rest(h, up, grid, specs, rate_hz, n_ticks, false);
+        self.car_ground_rest(h, up, grid, specs, GroundRate { rate_hz, n_ticks }, false);
     }
 
     /// `Susp_update` 0x499A70 (car, &normalOut) → the ground height `(Σc/4).y`
@@ -705,8 +712,8 @@ impl Vehicle {
     /// `n_ticks` the LOD gate's answer ([`ground_due`]).
     /// `racer` is `car+0x52C & 1`, set on the human (0x105) and the opponents (0x10B) and on no
     /// cop, traffic car or smackable — in this port, a car stepped by [`Self::step32`].
-    #[allow(clippy::too_many_arguments)]
-    fn car_ground_rest(&mut self, h: f32, up: Vec3, grid: &TriangleGrid, specs: &CarSpecs, rate_hz: f32, n_ticks: i32, racer: bool) {
+    fn car_ground_rest(&mut self, h: f32, up: Vec3, grid: &TriangleGrid, specs: &CarSpecs, rate: GroundRate, racer: bool) {
+        let GroundRate { rate_hz, n_ticks } = rate;
         // ---- Car_ground 0x49BD40 from 0x49BDBD on (`RE/notes/suspension-collision.md` §4.2) ----
         // `Lod_shouldUpdate` 0x414B10 hands a racer the full rate: 0x417190 leaves `car+0x78` 0
         // for the human (`flags & 1`, 0x4171A5) and the octagonal distance to the nearest racer
@@ -744,7 +751,7 @@ impl Vehicle {
             (n.cross(z).normalize_or_zero(), z)
         };
         self.frame = Mat3::from_cols(x, n, z).transpose();
-        self.car_ground_body(dh, tn, tq, surf, specs.mass, Some((specs.probe_offset, specs.bump_travel)), grid, n_ticks, racer);
+        self.car_ground_body(GroundContact { dh, n: tn, q: tq, surf }, specs.mass, Some((specs.probe_offset, specs.bump_travel)), grid, n_ticks, racer);
     }
 }
 

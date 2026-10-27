@@ -69,6 +69,25 @@ impl StopHandle {
     }
 }
 
+/// What a voice start carries besides its handle ([`Shared::start_patch_as`]).
+struct PatchStart {
+    clip: Arc<Clip>,
+    volume: f32,
+    word: u16,
+    looping: bool,
+    sel: u8,
+    tabled: bool,
+}
+
+/// The unfinished voices as [`Shared::steal`] sees them, index-aligned: handle, held flag and
+/// place in `voices`.
+#[derive(Clone, Copy)]
+struct LiveVoices<'a> {
+    ids: &'a [VoiceId],
+    held: &'a [bool],
+    at: &'a [usize],
+}
+
 #[derive(Default)]
 struct Shared {
     voices: Vec<(VoiceId, Voice)>,
@@ -531,14 +550,14 @@ impl Shared {
     fn start_patch(&mut self, clip: Arc<Clip>, volume: f32, word: u16, looping: bool, sel: u8, tabled: bool) -> VoiceId {
         let id = VoiceId(self.next_id);
         self.next_id += 1;
-        self.start_patch_as(id, clip, volume, word, looping, sel, tabled);
+        self.start_patch_as(id, PatchStart { clip, volume, word, looping, sel, tabled });
         id
     }
 
     /// [`Shared::start_patch`] with the handle the game thread gave the start ([`AudioOutput`]
     /// numbers them in call order and queues the start, [`Cmd::Start`]).
-    #[allow(clippy::too_many_arguments)]
-    fn start_patch_as(&mut self, id: VoiceId, clip: Arc<Clip>, volume: f32, word: u16, looping: bool, sel: u8, tabled: bool) -> VoiceId {
+    fn start_patch_as(&mut self, id: VoiceId, patch: PatchStart) -> VoiceId {
+        let PatchStart { clip, volume, word, looping, sel, tabled } = patch;
         let g = self;
         if clip.records.is_empty() {
             // not a bank patch: one voice, no draw, the clip's own values scaled by `sel`
@@ -644,7 +663,7 @@ impl Shared {
             if !victims.is_empty() {
                 // streams sit after the voices in `live` and are never victims; `live` lists the
                 // voices in order, so a victim's index is its place among the unfinished voices
-                self.steal(&victims, &live_ids, &live_held, &live_at, need, priority, starting);
+                self.steal(&victims, LiveVoices { ids: &live_ids, held: &live_held, at: &live_at }, need, priority, starting);
             }
             let ch = |k: usize| live[k].1.max(1) as usize;
             let in_use = (0..live.len()).map(ch).sum::<usize>() - victims.iter().map(|&k| ch(k)).sum::<usize>() + need;
@@ -663,8 +682,8 @@ impl Shared {
     }
 
     /// The victims of [`Shared::allocate`] stopped (0x589B26): see there.
-    #[allow(clippy::too_many_arguments)]
-    fn steal(&mut self, victims: &[usize], live_ids: &[VoiceId], live_held: &[bool], live_at: &[usize], need: usize, priority: u8, starting: Option<VoiceId>) {
+    fn steal(&mut self, victims: &[usize], live: LiveVoices, need: usize, priority: u8, starting: Option<VoiceId>) {
+        let LiveVoices { ids: live_ids, held: live_held, at: live_at } = live;
         tracing::debug!(need, priority, stolen = victims.len(), "voice budget full: the lowest priority, oldest voice stolen");
         for &k in victims {
             let one = live_held[k] || Some(live_ids[k]) == starting;

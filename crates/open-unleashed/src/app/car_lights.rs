@@ -98,7 +98,7 @@ impl App {
     pub(crate) fn fe_lamp_items(&self, model: &CarModel, place: Mat4, slots: [(bool, f32); 14], items: &mut Vec<nfs_renderer::DrawItem>) {
         let (_, rot, pos) = place.to_scale_rotation_translation();
         let mut draws = Vec::new();
-        self.lamp_draws_in(model, pos, rot, 0.0, slots, true, &mut draws);
+        self.lamp_draws_in(model, (pos, rot), 0.0, slots, true, &mut draws);
         for d in draws {
             if let LampDraw::Glare(mut item) = d {
                 item.early = true;
@@ -185,14 +185,13 @@ impl App {
     /// layers are coords, colours, uv, texture, state and the draw (0x59F0A3…0x59F186), so
     /// `Headlights::LayerVertexLight_Ambient` is not on this path.
     pub(crate) fn lamp_draws(&self, model: &CarModel, pos: Vec3, rot: Quat, ground: f32, slots: [(bool, f32); 14], out: &mut Vec<LampDraw>) {
-        self.lamp_draws_in(model, pos, rot, ground, slots, false, out);
+        self.lamp_draws_in(model, (pos, rot), ground, slots, false, out);
     }
 
     /// [`Self::lamp_draws`] for a race (`front_end` false) or for the front end's 3D views, where
     /// `[0x65B928]` is set: no road reflection (0x43D47D's gate), no night beam (`[0x628A28]` is
     /// the race's weather word, 0x43DA88), and the view's planes are the front end's.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn lamp_draws_in(&self, model: &CarModel, pos: Vec3, rot: Quat, ground: f32, slots: [(bool, f32); 14], front_end: bool, out: &mut Vec<LampDraw>) {
+    pub(crate) fn lamp_draws_in(&self, model: &CarModel, (pos, rot): (Vec3, Quat), ground: f32, slots: [(bool, f32); 14], front_end: bool, out: &mut Vec<LampDraw>) {
         out.clear();
         let Some((mesh, material)) = self.glare_draw else {
             return;

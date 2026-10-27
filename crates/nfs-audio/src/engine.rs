@@ -430,7 +430,6 @@ impl EngineSound {
     /// mixed as slots 3…5 of the engine bank, `SfxLevel · game.spl[8]` (0x4A99C7…0x4A99E1). The
     /// voice is only (re)started when idle, so its volume is the one it started with. This port had
     /// slot 5 on every view at a fixed 0.6 until 2026-09-24.
-    #[allow(clippy::too_many_arguments)]
     pub fn horn(&mut self, out: &AudioOutput, on: bool, view: u16, distance: f32, pan: u16, sfx_level: u8) {
         let slot = horn_slot(view);
         // a playing voice is left alone — 0x4AACBF…0x4AACD6 returns before `Voice_play` while

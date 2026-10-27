@@ -75,13 +75,27 @@ fn wholly_pruned(eye: (f32, f32), forward: (f32, f32), h_deg: f32, far: f32, cen
     false
 }
 
+/// The camera of one sweep step: the eye and its basis, the tangents of the half field of view and the
+/// near / far distances.
+#[derive(Clone, Copy)]
+struct SweepView {
+    eye: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    up: Vec3,
+    tan_h: f32,
+    tan_v: f32,
+    near: f32,
+    far: f32,
+}
+
 /// The port's own per-item test, copied rather than exposed (`CullView::sphere_visible` is
 /// private to `nfs_game::world`): the true frustum (`0x539480`, far plane a fixed **700**,
 /// `RENDERING.md` "the camera object's 700 (0x4677FC)") AND `walk_item`'s own extra draw-distance
 /// test against the real per-slice `far` (`[0x6197CC]`) — the two together are the port's actual,
 /// combined per-item admit rule.
-#[allow(clippy::too_many_arguments)]
-fn true_visible(eye: Vec3, forward: Vec3, right: Vec3, up: Vec3, tan_h: f32, tan_v: f32, near: f32, far: f32, centre: Vec3, r: f32) -> bool {
+fn true_visible(view: &SweepView, centre: Vec3, r: f32) -> bool {
+    let SweepView { eye, forward, right, up, tan_h, tan_v, near, far } = *view;
     let rel = centre - eye;
     let depth = rel.dot(forward);
     let a = near - depth;
@@ -182,7 +196,7 @@ fn main() {
                     track_checks += 1;
                     let tan_h = h.to_radians().tan();
                     let tan_v = tan_h * 0.75;
-                    let item_true = true_visible(eye, forward, right, up, tan_h, tan_v, 1.0, far, *centre, *radius);
+                    let item_true = true_visible(&SweepView { eye, forward, right, up, tan_h, tan_v, near: 1.0, far }, *centre, *radius);
                     if !item_true {
                         continue;
                     }

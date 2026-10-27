@@ -168,6 +168,14 @@ pub struct LaneCar {
     pub is_racer: bool,
 }
 
+/// The two optional world views of [`LaneScratch::find_blockers_buffered`]: the cars' world positions
+/// (with the car's own) and the race-order places (with the car's own place).
+#[derive(Clone, Copy, Default)]
+pub struct BlockerOrder<'a> {
+    pub positions: Option<(glam::Vec3, &'a [glam::Vec3])>,
+    pub places: Option<(usize, &'a [usize])>,
+}
+
 /// The per-car scratch block `0x5E6658 … 0x5E66AC`: slot 0 = lane−1, 1 = current, 2 = lane+1.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LaneScratch {
@@ -228,7 +236,7 @@ impl LanePassCtx {
     /// race-order place `place`.
     pub fn find_blockers(&mut self, sc: &mut LaneScratch, table: &SliceTable, me: &LaneSelf, position: glam::Vec3, place: usize, pers: &Personality) {
         let fine_ok = self.fine_ok();
-        sc.find_blockers_buffered(&mut self.sorted, table, me, &self.cars, pers, fine_ok.then_some((position, self.positions.as_slice())), self.placed.then_some((place, self.places.as_slice())));
+        sc.find_blockers_buffered(&mut self.sorted, table, me, &self.cars, pers, BlockerOrder { positions: fine_ok.then_some((position, self.positions.as_slice())), places: self.placed.then_some((place, self.places.as_slice())) });
     }
 }
 
@@ -285,13 +293,13 @@ impl LaneScratch {
     /// `0x5E8B88[(car+0xEB0·i + n + car+0x528) mod n]` reads. Without them the walk falls back to
     /// a fresh sort on the slices of this tick (the TEST GLUE fallback described above).
     pub fn find_blockers_placed(&mut self, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality, positions: Option<(glam::Vec3, &[glam::Vec3])>, places: Option<(usize, &[usize])>) {
-        self.find_blockers_buffered(&mut Vec::new(), table, me, cars, pers, positions, places)
+        self.find_blockers_buffered(&mut Vec::new(), table, me, cars, pers, BlockerOrder { positions, places })
     }
 
     /// [`Self::find_blockers_placed`] with the walk's index buffer supplied by the caller
     /// ([`LanePassCtx`]), so a pass allocates nothing; the buffer's contents on entry are ignored.
-    #[allow(clippy::too_many_arguments)]
-    pub fn find_blockers_buffered(&mut self, sorted: &mut Vec<usize>, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality, positions: Option<(glam::Vec3, &[glam::Vec3])>, places: Option<(usize, &[usize])>) {
+    pub fn find_blockers_buffered(&mut self, sorted: &mut Vec<usize>, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality, order: BlockerOrder) {
+        let BlockerOrder { positions, places } = order;
         self.hard = [me.target_speed; 3];
         self.soft = [me.target_speed; 3];
         self.blocker = [None; 3];

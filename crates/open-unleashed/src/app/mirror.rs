@@ -207,7 +207,7 @@ impl App {
             // or sky-map pass on the cars in it. Its own far plane, 65000 (0x4691D0), scales its
             // depth bias and is the camera's clip
             r.set_mirror_view(true);
-            self.mirror_tex = Some(r.render_offscreen(&scene, &cam, w, h, self.mirror_tex, Some(sky), Some(65000.0)));
+            self.mirror_tex = Some(r.render_offscreen(&scene, &cam, nfs_renderer::OffscreenSpec { width: w, height: h, reuse: self.mirror_tex, clear_colour: Some(sky), depth_far: Some(65000.0) }));
             r.set_mirror_view(false);
         }
         self.scratch.mirror_items = scene.items;

@@ -56,6 +56,18 @@ mod movie;
 pub mod loading;
 pub mod nav;
 mod parts;
+use parts::TemplateSpot;
+
+/// Where a glinty flourish is drawn: the widget `i`, its corner and its size in pixels
+/// (`LayoutScreen::glinty_flourish`).
+#[derive(Clone, Copy)]
+struct GlintySpot {
+    i: usize,
+    x: f32,
+    y: f32,
+    w: i32,
+    h: i32,
+}
 mod picker;
 mod text_draw;
 mod transition;
@@ -2865,8 +2877,8 @@ impl LayoutScreen {
     /// `NFS5.GlintyRectangle` uses for its own 181 widgets — and this port draws those. Drawing
     /// one set and not the other would be the port disagreeing with itself, so it draws both; the
     /// gate is one uncertainty, not two, and it is `RE/AUDIT.md` §E's.
-    #[allow(clippy::too_many_arguments)]
-    fn glinty_box(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, i: usize, x: f32, y: f32, selected: Option<usize>, hovered: Option<usize>, tint: impl Fn([u8; 4]) -> [f32; 4]) {
+    fn glinty_box(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, tint: impl Fn([u8; 4]) -> [f32; 4]) {
+        let WidgetDraw { i, e, x, y, aspect, selected, hovered, .. } = d;
         let style = match self.attr_num(e, "glintybox") {
             Some(v) if v as i32 != -1 => v as i32,
             _ => return,
@@ -2913,7 +2925,7 @@ impl LayoutScreen {
         let combo = !matches!(e.class.as_str(), "NFS5.GOTOBUTTON" | "NFS5.TABBUTTON" | "NFS5.GRAPHICTABBUTTON");
         let may = |f: &mut glints::Flourish| f.button_may_start(disabled, hot, sel, focus, fade_zero);
         if (1..=5).contains(&style) {
-            self.glinty_flourish(i, if combo { None } else { Some(0) }, &may, style, out, aspect, x, y, gw as i32, gh as i32);
+            self.glinty_flourish(GlintySpot { i, x, y, w: gw as i32, h: gh as i32 }, if combo { None } else { Some(0) }, &may, style, out, aspect);
         }
     }
 
@@ -3905,8 +3917,8 @@ impl LayoutScreen {
     /// run starts only when the caller's `may_start` says so. `built` is the tick the object was
     /// made at — the screen's open for the ones a bind builds, the first draw for the combo
     /// family's, which its draw builds (0x4C5937).
-    #[allow(clippy::too_many_arguments)]
-    fn glinty_flourish(&self, i: usize, built: Option<i64>, may_start: &dyn Fn(&mut glints::Flourish) -> bool, animate: i32, out: &mut Vec<Sprite>, aspect: f32, px: f32, py: f32, w: i32, h: i32) {
+    fn glinty_flourish(&self, spot: GlintySpot, built: Option<i64>, may_start: &dyn Fn(&mut glints::Flourish) -> bool, animate: i32, out: &mut Vec<Sprite>, aspect: f32) {
+        let GlintySpot { i, x: px, y: py, w, h } = spot;
         let now = self.ticks() as i64;
         let run = self.step_glint(
             i,

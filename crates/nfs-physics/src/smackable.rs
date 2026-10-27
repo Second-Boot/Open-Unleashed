@@ -413,7 +413,7 @@ impl Smackable {
         b.cos_tilt = n.dot(b.orientation.row(1));
         let mass = b.sim_mass;
         let surf = (b.tracker.word & 0xF) as usize;
-        b.car_ground_body(dh, n, q, surf, mass, None, grid, n_ticks, false); // a smackable is no racer (`car+0x52C` 0x80)
+        b.car_ground_body(crate::vehicle::GroundContact { dh, n, q, surf }, mass, None, grid, n_ticks, false); // a smackable is no racer (`car+0x52C` 0x80)
     }
 
     /// `0x498FF0` (`+0xE2C`, 32 Hz, priority 0x28) for this prop: nothing while asleep; once

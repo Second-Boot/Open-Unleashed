@@ -157,7 +157,7 @@ impl Api for Direct {
     fn play(&mut self, c: &Arc<Clip>, vol: f32, looping: bool, sel: u8) -> VoiceId {
         let id = VoiceId(self.cfg_next_id);
         self.cfg_next_id += 1;
-        self.core.shared.start_patch_as(id, c.clone(), vol, 4096, looping, sel, true);
+        self.core.shared.start_patch_as(id, PatchStart { clip: c.clone(), volume: vol, word: 4096, looping, sel, tabled: true });
         for (_, v) in self.core.shared.voices.iter_mut().filter(|(i, _)| *i == id) {
             v.bend = 0x50u8 as i8;
             v.pan = pan_byte(0x2000);
@@ -393,7 +393,7 @@ fn the_callback_does_not_free_the_last_owner_of_a_clip() {
         .1
     };
     out.set_audio_quality(2);
-    // the quality change itself and the very first run — whose `publish` was the
+    // The quality change itself and the very first run — whose `publish` was the
     // first lock of the snapshot's mutex, which allocated its pthread mutex on macOS — allocate nothing
     assert_eq!(run(&mut core), 0, "the first run with the quality change");
     assert_eq!(run(&mut core), 0);
@@ -569,7 +569,7 @@ fn the_scripted_mix_is_pinned() {
 // stereo stream kept its channels.
 const PINNED_MIX: [u64; 5] = [0x43b06fd19d77e42a, 0x5611313e9eae8adc, 0x61c9988faa7a78f4, 0xbcbdd983ae7ffef3, 0x1516dd88399a42a2];
 
-/// REG-AUDIO2: a reported session — the output opened at `AUDIOQUALITY` 0 (32000 Hz, a fresh
+/// A reported session: the output opened at `AUDIOQUALITY` 0 (32000 Hz, a fresh
 /// profile's default) with the front end's song and loops playing, then the profile's 1 (22050
 /// Hz) seconds later. The mix must keep its service ticks: a fade, a release and a stream's end
 /// run at the new rate as at the first one. *(Before the fix the 32000 → 22050 switch under the

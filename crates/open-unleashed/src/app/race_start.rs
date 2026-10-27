@@ -1221,7 +1221,7 @@ impl App {
         {
             vehicle.game_tick = self.tick;
             let s = &t.slices[slice];
-            vehicle.place_at_slice(&world.collision, &self.specs, s.centre, s.forward, [s.lateral, s.up, s.forward], grid_offset(s, pos), false, false);
+            vehicle.place_at_slice(&world.collision, &self.specs, nfs_physics::vehicle::SliceFrame { centre: s.centre, forward: s.forward, raw: [s.lateral, s.up, s.forward] }, grid_offset(s, pos), false, false);
             self.car_pos = vehicle.draw_origin();
             self.prev_car_pos = self.car_pos;
         }
@@ -1236,7 +1236,7 @@ impl App {
                 if let Some(o) = self.road.opponents.get_mut(k) {
                     let s = &t.slices[sl];
                     o.vehicle.game_tick = self.tick;
-                    o.vehicle.place_at_slice(&world.collision, &o.specs, s.centre, s.forward, [s.lateral, s.up, s.forward], grid_offset(s, p), true, false);
+                    o.vehicle.place_at_slice(&world.collision, &o.specs, nfs_physics::vehicle::SliceFrame { centre: s.centre, forward: s.forward, raw: [s.lateral, s.up, s.forward] }, grid_offset(s, p), true, false);
                 }
             }
         }

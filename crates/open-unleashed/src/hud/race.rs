@@ -2,6 +2,50 @@
 
 use crate::*;
 
+/// What [`Hud::replay_bar`] draws: the pause and network flags, the bar's state and fade, the
+/// pointer and the seven tooltips.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplayBarDraw<'a> {
+    pub(crate) frozen: bool,
+    pub(crate) network: bool,
+    pub(crate) bar: &'a nfs_game::replay::BarState,
+    pub(crate) pct: i32,
+    pub(crate) cursor: Option<(f32, f32)>,
+    pub(crate) tips: &'a [&'a str; 7],
+}
+
+/// Everything one frame of [`Hud::sprites`] reads besides the aspect.
+#[derive(Clone, Copy)]
+pub(crate) struct HudFrame<'a> {
+    /// the `Display.ScreenLayout` preset's element positions (`0x41FB40`, [`SCREEN_LAYOUTS`])
+    pub(crate) layout: &'a HudLayout,
+    pub(crate) speed_kmh: f32,
+    pub(crate) rpm: f32,
+    pub(crate) tick: u64,
+    pub(crate) race: Option<&'a RaceProgress>,
+    /// `H321Go` 0x4184F0 returns before drawing anything when `FEGAME_TYPE [0x6573E8]` is 6, 7 or
+    /// 8 — the three **test drives** (dealer / used / owned, `modes.md` §0) — or when
+    /// `REPLAY [0x657424]` is set. The window itself is `[0x5B27D8] … [0x5B27E4]` = 256 … 448
+    /// ticks with the digit thresholds 256 / 320 / 384, which this port already had.
+    pub(crate) countdown: bool,
+    /// `HTime` 0x4316F0: the cone penalty added to the time — `+0xE4` (the knocked cones) ×
+    /// `FACTORYDRIVERTCONEPENALTY [0x657830]` (seconds, or −1 when the mission has none) × 64
+    pub(crate) time_penalty: i64,
+    /// `HTime` in `0xCCFF0000` (0x41CA60) instead of the display colour: a mission over its
+    /// damage limit (`0x434FA0(1)` on the live zones, 0x431710…0x431729) or the flash after a
+    /// cone (`+0xE0 = 16`, 0x431830)
+    pub(crate) time_alert: bool,
+    pub(crate) text: &'a HudText<'a>,
+    /// `HWrongWay` is up and in the visible half of its blink
+    pub(crate) wrong_way: bool,
+    /// the `+4` trays' shared slide (`TraySlide`)
+    pub(crate) slide: TraySlide,
+    /// `HTime`'s own: in a mission's playback it is drawn when the other trays are not (0x425A87)
+    pub(crate) time_slide: TraySlide,
+    /// `car+0xB24` once the player has finished (`car+0xB50 == 2`): the race time, frozen
+    pub(crate) finish_time: Option<u64>,
+}
+
 impl Hud {
     /// A blip's tint (the loop 0x433110, audited 2026-09-26). A racer takes its paint
     /// `[[car+0x558]+0x218]`, replaced by `0xFF202020` when **`(c & 0xFF0000) < 0x14`, `(c & 0xFF00)
@@ -75,8 +119,8 @@ impl Hud {
     /// with the replay pause `[0x606860]` (both flip on the pause cell and both are cleared as a
     /// playback starts, 0x413ECB / 0x426A89). The cells answer the pointer in
     /// `App::replay_bar_apply_press`, once per frame (`App::replay_bar_frame`).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn replay_bar(&self, out: &mut Vec<Sprite>, aspect: f32, frozen: bool, network: bool, bar: &nfs_game::replay::BarState, pct: i32, cursor: Option<(f32, f32)>, tips: &[&str; 7]) {
+    pub(crate) fn replay_bar(&self, out: &mut Vec<Sprite>, aspect: f32, draw: ReplayBarDraw<'_>) {
+        let ReplayBarDraw { frozen, network, bar, pct, cursor, tips } = draw;
         use nfs_game::replay::{bar_cell_at, cell_glyph_origin, BAR, BAR_CELL, BAR_FRAME, BAR_PLAY};
         let (cells, frame) = Hud::bar_geometry();
         let (fw, fh) = BAR_FRAME;
@@ -639,38 +683,8 @@ impl Hud {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn sprites(
-        &self,
-        aspect: f32,
-        // the `Display.ScreenLayout` preset's element positions (`0x41FB40`, [`SCREEN_LAYOUTS`])
-        layout: &HudLayout,
-        speed_kmh: f32,
-        rpm: f32,
-        tick: u64,
-        race: Option<&RaceProgress>,
-        // `H321Go` 0x4184F0 returns before drawing anything when `FEGAME_TYPE [0x6573E8]` is 6, 7 or
-        // 8 — the three **test drives** (dealer / used / owned, `modes.md` §0) — or when
-        // `REPLAY [0x657424]` is set. The window itself is `[0x5B27D8] … [0x5B27E4]` = 256 … 448
-        // ticks with the digit thresholds 256 / 320 / 384, which this port already had.
-        countdown: bool,
-        // `HTime` 0x4316F0: the cone penalty added to the time — `+0xE4` (the knocked cones) ×
-        // `FACTORYDRIVERTCONEPENALTY [0x657830]` (seconds, or −1 when the mission has none) × 64
-        time_penalty: i64,
-        // `HTime` in `0xCCFF0000` (0x41CA60) instead of the display colour: a mission over its
-        // damage limit (`0x434FA0(1)` on the live zones, 0x431710…0x431729) or the flash after a
-        // cone (`+0xE0 = 16`, 0x431830)
-        time_alert: bool,
-        text: &HudText,
-        // `HWrongWay` is up and in the visible half of its blink
-        wrong_way: bool,
-        // the `+4` trays' shared slide (`TraySlide`)
-        slide: TraySlide,
-        // `HTime`'s own: in a mission's playback it is drawn when the other trays are not (0x425A87)
-        time_slide: TraySlide,
-        // `car+0xB24` once the player has finished (`car+0xB50 == 2`): the race time, frozen
-        finish_time: Option<u64>,
-    ) -> Vec<Sprite> {
+    pub(crate) fn sprites(&self, aspect: f32, frame: HudFrame<'_>) -> Vec<Sprite> {
+        let HudFrame { layout, speed_kmh, rpm, tick, race, countdown, time_penalty, time_alert, text, wrong_way, slide, time_slide, finish_time } = frame;
         let mut out = Vec::new();
         // dials: speedometer tray and tach at the layout's own position, 128 px faces (hud.md §2/§6)
         let (sx, sy) = layout.speedometer;

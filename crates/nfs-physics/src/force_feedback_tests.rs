@@ -115,28 +115,28 @@ fn collision_jolt_values() {
     let c = car();
     // atan2(1, 1) = 0.125 turns → 22.5 → bare fistp ties to even = 22; magnitude 3 → duration
     // 30000 clamped to 100000, magnitude 3000 clamped to 5000 (0x41234C, 0x412368)
-    let out = ff.collision_jolt(&c, 0x40000, Vec3::new(1.0, 0.0, -1.0), 3.0, LV, false, 1000);
+    let out = ff.collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::new(1.0, 0.0, -1.0), magnitude: 3.0 }, LV, false, 1000);
     assert_eq!(
         out,
         vec![FfCommand::Jolt { magnitude: 5000, duration_us: 100_000, direction: 22, attack_level: 5000, attack_time: 50_000, fade_level: 5000, fade_time: 95_000, gain: 50 }]
     );
     // inside the re-arm window (14 ticks): nothing; after it: fires
-    assert!(ff.collision_jolt(&c, 0x40000, Vec3::new(1.0, 0.0, -1.0), 3.0, LV, false, 1013).is_empty());
-    let out = ff.collision_jolt(&c, 0x40000, Vec3::new(-1.0, 0.0, -1.0), 3.0, LV, false, 1014);
+    assert!(ff.collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::new(1.0, 0.0, -1.0), magnitude: 3.0 }, LV, false, 1013).is_empty());
+    let out = ff.collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::new(-1.0, 0.0, -1.0), magnitude: 3.0 }, LV, false, 1014);
     // atan2(−1, 1) = −0.125 → + 2 = 1.875 → 337.5 → 338 (ties to even)
     assert!(matches!(out[0], FfCommand::Jolt { direction: 338, .. }));
     // a big hit: duration 10000·mag, magnitude clamps at 10000; and the duration clamps at 500000
-    let out = ForceFeedback::new(true, false).collision_jolt(&c, 0x40000, Vec3::new(1.0, 0.0, -1.0), 20.0, LV, false, 0);
+    let out = ForceFeedback::new(true, false).collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::new(1.0, 0.0, -1.0), magnitude: 20.0 }, LV, false, 0);
     assert!(matches!(out[0], FfCommand::Jolt { magnitude: 10000, duration_us: 200_000, .. }));
-    let out = ForceFeedback::new(true, false).collision_jolt(&c, 0x40000, Vec3::new(1.0, 0.0, -1.0), 80.0, LV, false, 0);
+    let out = ForceFeedback::new(true, false).collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::new(1.0, 0.0, -1.0), magnitude: 80.0 }, LV, false, 0);
     assert!(matches!(out[0], FfCommand::Jolt { magnitude: 10000, duration_us: 500_000, .. }));
     // gates: below 1.0, a replay, no total level, no device, a collision level of 0
     let mut ff = ForceFeedback::new(true, false);
-    assert!(ff.collision_jolt(&c, 0x40000, Vec3::X, 0.9, LV, false, 0).is_empty());
-    assert!(ff.collision_jolt(&c, 0x40000, Vec3::X, 5.0, LV, true, 0).is_empty());
-    assert!(ff.collision_jolt(&c, 0x40000, Vec3::X, 5.0, FfLevels { total: 0, ..LV }, false, 0).is_empty());
-    assert!(ff.collision_jolt(&c, 0x40000, Vec3::X, 5.0, FfLevels { collision: 0, ..LV }, false, 0).is_empty());
-    assert!(ForceFeedback::new(false, false).collision_jolt(&c, 0x40000, Vec3::X, 5.0, LV, false, 0).is_empty());
+    assert!(ff.collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::X, magnitude: 0.9 }, LV, false, 0).is_empty());
+    assert!(ff.collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::X, magnitude: 5.0 }, LV, true, 0).is_empty());
+    assert!(ff.collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::X, magnitude: 5.0 }, FfLevels { total: 0, ..LV }, false, 0).is_empty());
+    assert!(ff.collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::X, magnitude: 5.0 }, FfLevels { collision: 0, ..LV }, false, 0).is_empty());
+    assert!(ForceFeedback::new(false, false).collision_jolt(&c, FfImpact { kind: 0x40000, body_point: Vec3::X, magnitude: 5.0 }, LV, false, 0).is_empty());
 }
 
 #[test]
@@ -145,9 +145,9 @@ fn scrape_at_a_standstill() {
     let mut ff = ForceFeedback::new(true, false);
     let mut c = car();
     c.speed = 0.0;
-    assert!(ff.collision_jolt(&c, 0x10000, Vec3::new(1.0, 0.0, -1.0), 5.0, LV, false, 0).is_empty());
+    assert!(ff.collision_jolt(&c, FfImpact { kind: 0x10000, body_point: Vec3::new(1.0, 0.0, -1.0), magnitude: 5.0 }, LV, false, 0).is_empty());
     c.speed = 3.0;
-    let out = ff.collision_jolt(&c, 0x10000, Vec3::new(1.0, 0.0, -1.0), 5.0, LV, false, 0);
+    let out = ff.collision_jolt(&c, FfImpact { kind: 0x10000, body_point: Vec3::new(1.0, 0.0, -1.0), magnitude: 5.0 }, LV, false, 0);
     assert!(matches!(out[0], FfCommand::Jolt { direction: 0, magnitude: 5000, duration_us: 100_000, .. }));
 }
 

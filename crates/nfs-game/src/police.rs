@@ -622,6 +622,23 @@ pub fn sector(v: f32, lo: f32, hi: f32) -> i32 {
     }
 }
 
+/// What one AI pass of [`Police`] reads of the world: the slice table, the game tick, the car the
+/// chase is after and the other cars on the road.
+#[derive(Clone, Copy)]
+struct ChaseScene<'a> {
+    table: &'a SliceTable,
+    tick: u64,
+    target: &'a ChaseTarget,
+    others: &'a [LaneCar],
+}
+
+/// A cop's error against its chase slot: the signed track gap and the lateral error.
+#[derive(Clone, Copy)]
+struct ChaseError {
+    gap: f32,
+    lateral_err: f32,
+}
+
 /// What the chase needs to know about the car it is after.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChaseTarget {
@@ -1214,7 +1231,7 @@ impl Police {
             let c = &mut self.cars[i];
             c.sync_body_in();
             let held = std::mem::replace(&mut c.body.game_tick, tick);
-            c.body.place_at_slice(grid, &c.specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], off, false, false);
+            c.body.place_at_slice(grid, &c.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, off, false, false);
             c.body.game_tick = held;
             c.sync_body_out();
         }
@@ -1238,7 +1255,7 @@ impl Police {
             let slot = (self.slot_base + i) as f32;
             let c = &mut self.cars[i];
             c.sync_body_in();
-            c.body.place_at_slice_from(g, &c.specs, s1.centre, s0.centre, s1.forward.normalize_or_zero(), [s0.lateral, s0.up, s0.forward], Vec3::new(0.0, slot * 10.0, 0.0), false, false, false);
+            c.body.place_at_slice_from(g, &c.specs, s1.centre, nfs_physics::vehicle::SliceFrame { centre: s0.centre, forward: s1.forward.normalize_or_zero(), raw: [s0.lateral, s0.up, s0.forward] }, Vec3::new(0.0, slot * 10.0, 0.0), nfs_physics::vehicle::PlaceFlags { opponent: false, flip: false, in_world: false });
             c.sync_body_out();
         }
         // (the table's entry only scales the draw: `1 + (rand16 * table[n]) >> 16`)
@@ -1439,7 +1456,7 @@ impl Police {
     /// tests' entry. The race runs [`Police::ai`] and [`Police::drive`] apart.
     /// Every cop runs on every call, as if due, with `[0x5E6654]` = [`TEST_AI_TICKS`].
     pub fn update(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar]) {
-        self.run(table, tick, target, others, None, &|_| Some(TEST_AI_TICKS), None);
+        self.run(ChaseScene { table, tick, target, others }, None, &|_| Some(TEST_AI_TICKS), None);
         self.drive(table, tick, None);
     }
 
@@ -1473,13 +1490,13 @@ impl Police {
     /// `grid` is the track's collision grid, for state 1's placement (`Car_placeAtSlice` 0x49B090).
     pub fn ai(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], humans: &[usize], rand16: &mut dyn FnMut() -> u32, grid: Option<&TriangleGrid>) {
         let (base, dist): (usize, Vec<f32>) = (self.slot_base, self.cars.iter().map(|c| c.racer_distance).collect());
-        self.run(table, tick, target, others, Some((humans, rand16)), &|i| crate::traffic::ai_pass_due(dist[i], false, tick, base + i), grid);
+        self.run(ChaseScene { table, tick, target, others }, Some((humans, rand16)), &|i| crate::traffic::ai_pass_due(dist[i], false, tick, base + i), grid);
     }
 
     /// The AI half with every cop due on every call, `[0x5E6654]` = [`TEST_AI_TICKS`], then
     /// [`Police::drive`] — the unit tests' entry with the searches.
     pub fn tick(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], humans: &[usize], rand16: &mut dyn FnMut() -> u32) {
-        self.run(table, tick, target, others, Some((humans, rand16)), &|_| Some(TEST_AI_TICKS), None);
+        self.run(ChaseScene { table, tick, target, others }, Some((humans, rand16)), &|_| Some(TEST_AI_TICKS), None);
         self.drive(table, tick, None);
     }
 
@@ -1643,7 +1660,7 @@ impl Police {
         let sl = &table.slices[s];
         c.slice = s;
         c.sync_body_in();
-        c.body.place_at_slice(grid, &c.specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, c.requested_dir < 0.0);
+        c.body.place_at_slice(grid, &c.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, Vec3::ZERO, false, c.requested_dir < 0.0);
         c.sync_body_out();
         c.frame = [sl.lateral, sl.up, sl.forward];
         c.body.point_rows = None;
@@ -1662,8 +1679,8 @@ impl Police {
         tracing::debug!(cop = i, slice = s, pos = ?c.position, "cop reset to slice (0x40F540)");
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], mut spawn: Option<(&[usize], &mut dyn FnMut() -> u32)>, due: &dyn Fn(usize) -> Option<i32>, grid: Option<&TriangleGrid>) {
+    fn run(&mut self, scene: ChaseScene, mut spawn: Option<(&[usize], &mut dyn FnMut() -> u32)>, due: &dyn Fn(usize) -> Option<i32>, grid: Option<&TriangleGrid>) {
+        let ChaseScene { table, tick, target, others } = scene;
         // `AIHigh+0x60`, the rank, is each cop's place in the perp's roster (`0x403C00`, run by the
         // cop itself when it claims the perp and on each of its state-4 ticks — [`Police::roster_bubble`]),
         // not a sort of all the chasers. (history: `game-history.md` §1.15)
@@ -1804,7 +1821,7 @@ impl Police {
                 // §27.8, the formation controller in full: compare the sector the cop is in with
                 // the one its formation slot wants, pick a speed to close the difference and bias
                 // the lateral aim toward the slot.
-                ChaseMode::CloseQuarters => speed = self.close_quarters(table, i, target, gap, lateral_err, ai_ticks, speed),
+                ChaseMode::CloseQuarters => speed = self.close_quarters(table, i, target, ChaseError { gap, lateral_err }, ai_ticks, speed),
                 // §27.9: the distance ladder is a cap on the 100 m/s base, and `hard` rams
                 ChaseMode::Pursue { hard } => {
                     let d = crate::traffic::oct_distance(self.cars[i].position, target.position);
@@ -1966,8 +1983,8 @@ impl Police {
     /// §27.8's formation controller (CLOSE-QUARTERS): the sector the cop is in against the one its
     /// slot wants, the speed that closes the difference (returned, from `speed`) and the lateral
     /// aim toward the slot.
-    #[allow(clippy::too_many_arguments)]
-    fn close_quarters(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, gap: f32, lateral_err: f32, ai_ticks: i32, mut speed: f32) -> f32 {
+    fn close_quarters(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, err: ChaseError, ai_ticks: i32, mut speed: f32) -> f32 {
+        let ChaseError { gap, lateral_err } = err;
         let lvl = self.cars[i].level.min(2);
         let dir = self.cars[i].dir;
         let (hw, hl) = (target.half_width, target.half_length);
@@ -2612,7 +2629,7 @@ impl Police {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
                 c.sync_body_in();
-                c.body.place_at_slice(g, &c.specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
+                c.body.place_at_slice(g, &c.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
                 c.sync_body_out();
                 c.frame = [sl.lateral, sl.up, sl.forward];
                 c.lateral = (c.position - sl.centre).dot(sl.lateral.normalize_or_zero());

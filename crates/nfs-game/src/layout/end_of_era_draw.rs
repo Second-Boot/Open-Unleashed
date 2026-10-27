@@ -20,6 +20,16 @@ pub(super) struct EndOfEraScreen {
     pub(super) movie: Option<MoviePlayer>,
 }
 
+/// Where and how `LayoutScreen::scaled_text` puts a line: the centre `x`, the top `y`, the horizontal
+/// scale and the colour.
+#[derive(Clone, Copy)]
+struct ScaledPen {
+    x: f32,
+    y: f32,
+    sx: f32,
+    color: [f32; 4],
+}
+
 impl LayoutScreen {
     /// Make this the end-of-era screen: the show `show` (built by `EndOfEra::build`), the packs
     /// the constructor loads (0x4FE4D8…0x4FECDD), `Univers20b.ffn` (0x4FD5B7) and the era's movie
@@ -162,7 +172,7 @@ impl LayoutScreen {
                 }
                 Draw::Text { text, x, y, argb: c, scale } => {
                     if let Some(f) = e.font.as_ref() {
-                        self.scaled_text(out, aspect, f, &text, x as f32, y as f32, scale, argb(c));
+                        self.scaled_text(out, aspect, f, &text, ScaledPen { x: x as f32, y: y as f32, sx: scale, color: argb(c) });
                     }
                 }
             }
@@ -172,8 +182,8 @@ impl LayoutScreen {
     /// 0x4DA350 with alignment 1 and the font's properties 2 and 3 (`+0xB4`, `+0xB8`) at
     /// `(sx, 1.0)` (0x536CE0): the pen's advances, the glyph offsets and widths are scaled by `sx`
     /// (0x53DAEE…0x53DCE3), the heights by 1; the line is centred on `x` by its scaled width.
-    #[allow(clippy::too_many_arguments)]
-    fn scaled_text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, x: f32, y: f32, sx: f32, color: [f32; 4]) {
+    fn scaled_text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, pen: ScaledPen) {
+        let ScaledPen { x, y, sx, color } = pen;
         let (glyphs, width) = f.place(s);
         let left = (x - width * sx * 0.5).round();
         let top = y.round();

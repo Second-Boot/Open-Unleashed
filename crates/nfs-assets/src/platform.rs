@@ -77,8 +77,8 @@ pub fn dev_game_root() -> Option<PathBuf> {
 /// PORT-DEVIATION D46 (photo mode): the folder the stills go to, `<the user's Pictures>/PorscheUnleashed`.
 ///
 /// * macOS: `~/Pictures`
-/// * Windows: `%USERPROFILE%\Pictures`, or `%OneDrive%\Pictures` when that is where the user's Pictures live
-///   (it exists and the plain one does not)
+/// * Windows: the Pictures known folder (`SHGetKnownFolderPath(FOLDERID_Pictures)`), so a folder moved by the
+///   user or by OneDrive is followed; `%USERPROFILE%\Pictures` only when the shell gives none
 /// * Linux and the rest: `XDG_PICTURES_DIR` of `~/.config/user-dirs.dirs` (`$XDG_CONFIG_HOME`), else `~/Pictures`
 ///
 /// Falls back to `./PorscheUnleashed` with no home. The folder is made by the caller. `NFS_PHOTO_DIR` (tests)
@@ -89,12 +89,7 @@ pub fn photo_dir() -> PathBuf {
     }
     let Some(home) = home_dir() else { return PathBuf::from("PorscheUnleashed") };
     let pictures = if cfg!(windows) {
-        let plain = home.join("Pictures");
-        let one = std::env::var_os("OneDrive").filter(|v| !v.is_empty()).map(|v| PathBuf::from(v).join("Pictures"));
-        match one {
-            Some(o) if !plain.is_dir() && o.is_dir() => o,
-            _ => plain,
-        }
+        known_pictures().unwrap_or_else(|| home.join("Pictures"))
     } else if cfg!(target_os = "macos") {
         home.join("Pictures")
     } else {
@@ -102,6 +97,38 @@ pub fn photo_dir() -> PathBuf {
         std::fs::read_to_string(conf.join("user-dirs.dirs")).ok().and_then(|t| xdg_pictures_dir(&t, &home)).unwrap_or_else(|| home.join("Pictures"))
     };
     pictures.join("PorscheUnleashed")
+}
+
+/// Windows: the user's Pictures folder as the shell knows it (Explorer's "Pictures"); `None` when the call fails.
+#[cfg(windows)]
+fn known_pictures() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHGetKnownFolderPath(id: *const Guid, flags: u32, token: *mut core::ffi::c_void, path: *mut *mut u16) -> i32;
+    }
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoTaskMemFree(p: *mut core::ffi::c_void);
+    }
+    // FOLDERID_Pictures {33E28130-4E1E-4676-835A-98395C3BC3BB}
+    const PICTURES: Guid = Guid(0x33E2_8130, 0x4E1E, 0x4676, [0x83, 0x5A, 0x98, 0x39, 0x5C, 0x3B, 0xC3, 0xBB]);
+    let mut raw: *mut u16 = core::ptr::null_mut();
+    // KF_FLAG_DEFAULT; the buffer is the caller's to free even when the call fails
+    let hr = unsafe { SHGetKnownFolderPath(&PICTURES, 0, core::ptr::null_mut(), &mut raw) };
+    let path = (hr >= 0 && !raw.is_null()).then(|| {
+        let len = (0..).take_while(|&i| unsafe { *raw.add(i) } != 0).count();
+        PathBuf::from(std::ffi::OsString::from_wide(unsafe { core::slice::from_raw_parts(raw, len) }))
+    });
+    unsafe { CoTaskMemFree(raw.cast()) };
+    path.filter(|p| p.is_absolute())
+}
+
+#[cfg(not(windows))]
+fn known_pictures() -> Option<PathBuf> {
+    None
 }
 
 /// `XDG_PICTURES_DIR="$HOME/Pictures"` of a `user-dirs.dirs` text, with `$HOME` / `${HOME}` taken for `home`;

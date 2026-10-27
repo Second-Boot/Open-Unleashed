@@ -581,9 +581,10 @@ impl App {
     /// `projector_at` and, with `sky = Some((origin, slice))`, the sky map (`CarModel::apply_projector`,
     /// `CarModel::apply_sky`).
     fn car_body_items(&self, model: &CarModel, block: Option<&nfs_game::world::LightBlock>, (m, spin, steer, roll, travel): (Mat4, [f32; 4], [f32; 2], [f32; 4], [f32; 4]), passes: &[nfs_game::world::CarPass], projector_at: Vec3, sky: Option<(Vec3, usize)>) -> Vec<nfs_renderer::DrawItem> {
+        let pose = nfs_game::world::CarPose { car_to_world: m, wheel_spin: spin, steer, roll, travel };
         let mut items = match block {
-            Some(b) => model.draw_items_block(m, spin, steer, roll, travel, passes, b),
-            None => model.draw_items(m, spin, steer, roll, travel, passes),
+            Some(b) => model.draw_items_block(pose, passes, b),
+            None => model.draw_items(pose, passes),
         };
         model.apply_projector(&mut items, self.projector_planes(projector_at));
         if let Some((origin, slice)) = sky {

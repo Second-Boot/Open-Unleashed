@@ -1,6 +1,16 @@
 //! `LayoutScreen` methods split out of the parent module (a move, no logic changed).
 
 use super::*;
+use super::widgets::WidgetDraw;
+
+/// A widget's template drawn in one state at one place ([`LayoutScreen::template_widget`]).
+#[derive(Clone, Copy)]
+pub(super) struct TemplateSpot<'a> {
+    pub(super) e: &'a nfs_formats::lay::Element,
+    pub(super) state: &'a str,
+    pub(super) x: f32,
+    pub(super) y: f32,
+}
 
 impl LayoutScreen {
     /// What one part of a widget actually covers: a `SHAPE`'s `.fsh` entry at its own pixel size,
@@ -385,8 +395,8 @@ impl LayoutScreen {
     /// An embedded layout's sprites, moved into the widget's own place. The offset is applied in
     /// the same normalised space [`place`](Self::place) maps into, so it carries the letterbox
     /// factor with it.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn embedded(&self, g: &LayoutScreen, aspect: f32, strings: &Strings, accessor: &dyn Fn(&str) -> Option<String>, blank: &mut Vec<(String, String)>, x: f32, y: f32) -> Vec<Sprite> {
+    pub(super) fn embedded(&self, g: &LayoutScreen, d: WidgetDraw<'_>, blank: &mut Vec<(String, String)>) -> Vec<Sprite> {
+        let WidgetDraw { x, y, aspect, strings, accessor, .. } = d;
         // an embedded layout is one of the 98 the sweep already walks on its own, so its gaps are
         // reported there and not again here — see the note on the background above
         let _ = &blank;
@@ -487,14 +497,13 @@ impl LayoutScreen {
     /// `SHAPE` parts, then its `TEXT` / `LOCALIZEDTEXT` parts — each where the template puts it,
     /// in the font and colour it names, and skipping any whose colour is fully transparent. That
     /// last rule is how a class carries several captions and shows one (`controls.md` §4.3).
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn template_widget(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, state: &str, x: f32, y: f32, strings: &Strings) {
-        self.template_widget_at(out, aspect, e, state, x, y, strings, None)
+    pub(super) fn template_widget(&self, out: &mut Vec<Sprite>, aspect: f32, spot: TemplateSpot<'_>, strings: &Strings) {
+        self.template_widget_at(out, aspect, spot, strings, None)
     }
 
     /// The same, with the `picture` part pinned to one entry of its pack — the animation of §4.53.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn template_widget_at(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, state: &str, x: f32, y: f32, strings: &Strings, frame: Option<usize>) {
+    pub(super) fn template_widget_at(&self, out: &mut Vec<Sprite>, aspect: f32, spot: TemplateSpot<'_>, strings: &Strings, frame: Option<usize>) {
+        let TemplateSpot { e, state, x, y } = spot;
         for (px, py, pw, ph, col) in self.state_rects(e, state) {
             out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
         }

@@ -69,6 +69,15 @@ pub enum FfCommand {
     Jolt { magnitude: i32, duration_us: i32, direction: i32, attack_level: i32, attack_time: i32, fade_level: i32, fade_time: i32, gain: i32 },
 }
 
+/// The contact [`ForceFeedback::collision_jolt`] turns into a jolt: `car+0x438 & 0xEFFF0000`, the
+/// contact point in body axes and `car+0x430`.
+#[derive(Debug, Clone, Copy)]
+pub struct FfImpact {
+    pub kind: u32,
+    pub body_point: Vec3,
+    pub magnitude: f32,
+}
+
 /// The five `FF.*` levels, 0…100 each (the accessors' range, default 50).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FfLevels {
@@ -438,8 +447,8 @@ impl ForceFeedback {
     /// gates (`car+0x52C & 0x400` clear, `car+0x430 > 0`). `kind` is `car+0x438 & 0xEFFF0000`,
     /// `body_point` the contact point `car+0x440` minus the car's position, in body axes
     /// (`R·d`, 0x4122A8…0x4122CB), `magnitude` `car+0x430`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn collision_jolt(&mut self, car: &FfCar, kind: u32, body_point: Vec3, magnitude: f32, levels: FfLevels, replay: bool, now: i32) -> Vec<FfCommand> {
+    pub fn collision_jolt(&mut self, car: &FfCar, impact: FfImpact, levels: FfLevels, replay: bool, now: i32) -> Vec<FfCommand> {
+        let FfImpact { kind, body_point, magnitude } = impact;
         let mut out = Vec::new();
         if !self.enabled || replay || levels.total == 0 {
             return out; // 0x41225C, 0x412269, 0x412276

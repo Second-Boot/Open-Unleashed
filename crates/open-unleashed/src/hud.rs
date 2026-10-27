@@ -5,6 +5,7 @@ use crate::*;
 mod geometry;
 mod screens;
 mod race;
+pub(crate) use race::{HudFrame, ReplayBarDraw};
 
 /// In-race HUD (`RE/notes/hud.md`, CONFIRMED): dial faces and needles from `nfs5.car` dial
 /// records (`speedK/tach.fsh` entry = style, `needle2/needle.fsh` entry = needle style), 128 px
