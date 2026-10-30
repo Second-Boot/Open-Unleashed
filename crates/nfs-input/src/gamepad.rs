@@ -419,6 +419,16 @@ impl Gamepads {
         Self { devices, stick_latch: [false; 2], rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
     }
 
+    /// PLATFORM GLUE (macOS): move SDL's event pump out of winit's handler into a run-loop observer
+    /// (see [`crate::runloop_pump`]). Call once on the main thread from the application; a no-op
+    /// without joystick support and on Windows / Linux.
+    pub fn pump_outside_handler(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.devices.is_some() && !crate::runloop_pump::install() {
+            tracing::warn!("run-loop observer for SDL's pump not installed: SDL is pumped inside the frame");
+        }
+    }
+
     /// Whether a device that can rumble or has SDL haptic effects was connected since the last call
     /// (PAD-HANG): the race arms force feedback once, at its start (0x4121B0), so a pad that
     /// arrives later — a Bluetooth pad whose GameController discovery ends after the arm, one the
@@ -558,9 +568,24 @@ impl Gamepads {
     /// navigation keys stay the port's own (PORT-DEVIATION D10).
     pub fn poll(&mut self, input: &mut InputState) {
         let Some(d) = self.devices.as_mut() else { return };
-        let mut ev = SDL_Event::default();
-        // SAFETY: SDL_PollEvent fills `ev`; each arm reads the union member its type names
-        while unsafe { SDL_PollEvent(&mut ev) } {
+        // macOS: SDL's pump runs the main run loop (see `runloop_pump`), so the app installs a run-loop
+        // observer that pumps outside winit's handler and parks the events; without one (tools, tests)
+        // the pump runs here. Elsewhere SDL is pumped here, as always.
+        #[cfg(target_os = "macos")]
+        let next_event = {
+            if !crate::runloop_pump::installed() {
+                crate::runloop_pump::pump();
+            }
+            crate::runloop_pump::next
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut next_event = || {
+            let mut ev = SDL_Event::default();
+            // SAFETY: SDL_PollEvent fills `ev`
+            unsafe { SDL_PollEvent(&mut ev) }.then_some(ev)
+        };
+        // SAFETY (below): each arm reads the union member its type names
+        while let Some(ev) = next_event() {
             let ty = SDL_EventType(unsafe { ev.r#type });
             if ty == SDL_EVENT_JOYSTICK_ADDED {
                 let which = unsafe { ev.jdevice.which };

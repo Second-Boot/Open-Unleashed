@@ -250,6 +250,7 @@ impl App {
             fe_ms_carry: 0.0,
             pause_ticks: 0.0,
             pause_offset: 0.0,
+            shot_settle_ms: 0.0,
             hud_clock_base: 0.0,
             hud_scale: std::cell::Cell::new(1.0),
             hud_keys: HudKeys::new(1, false, true),

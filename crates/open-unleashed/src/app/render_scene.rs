@@ -184,7 +184,7 @@ impl App {
         let mut spot_others: Vec<nfs_renderer::SpotLamp> = Vec::new();
         // ENHANCEMENT E15 (ENH-CONES): the original's beam strips of this view, faded once the spots are chosen
         let mut cone_log: Vec<crate::app::car_lights::BeamLog> = Vec::new();
-        let lamp_ms = (self.tick as f64 + self.pause_offset + self.pause_ticks) * 1000.0 / TICKS_PER_SEC_F64;
+        let lamp_ms = (self.tick as f64 + self.pause_offset + self.pause_ticks) * 1000.0 / TICKS_PER_SEC_F64 + self.shot_settle_ms;
         let fade = (lamp_ms / 1000.0).min(1.0) as f32;
         // The LOD pick, `R3DCar` slot 13 0x439F90, which the car's draw 0x4430A0 asks first
         // (0x443192): each car's class from its box on the screen `[0x657A48]` wide and `CARDETAIL`

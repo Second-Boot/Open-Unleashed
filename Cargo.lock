@@ -1212,6 +1212,7 @@ dependencies = [
 name = "nfs-input"
 version = "0.1.5"
 dependencies = [
+ "core-foundation-sys",
  "sdl3-sys",
  "tracing",
  "winit",

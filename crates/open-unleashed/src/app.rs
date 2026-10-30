@@ -214,6 +214,9 @@ pub(crate) struct App {
     /// the pauses so far folded in, so `tick + pause_offset + pause_ticks` is a clock that, like
     /// `[0x606AC8]`, never runs back when a pause ends
     pub(crate) pause_offset: f64,
+    /// **TEST GLUE** (`NFS_SHOT_SETTLE`, a `--screenshot` still): milliseconds added to the lamps' clock, as if that much
+    /// wall time of drawn frames had followed the still's tick; 0 otherwise
+    pub(crate) shot_settle_ms: f64,
     /// What `hud_clock` adds so that `[0x606AC8]` is **kept across a pass**: the clock it is set
     /// from, `[0x5E99B8]`, is zeroed only when a session installs the timer (0x4A4700 → 0x4A4752;
     /// 0x4A4760 removes it at the session's end) and runs on through every pass, and both the pass

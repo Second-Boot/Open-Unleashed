@@ -262,6 +262,8 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // macOS: SDL's pump runs the main run loop and must not run inside winit's handler
+        self.gamepads.pump_outside_handler();
         // `self.window` stays `None` for as long as the intro plays (`resume_inner`'s intro branch
         // returns before setting it) — a second `resumed` (winit's own contract allows more than
         // one on a suspend/resume platform) during the movies would otherwise fall through to

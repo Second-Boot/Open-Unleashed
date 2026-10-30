@@ -10,6 +10,8 @@
 pub mod bindings;
 pub mod ff;
 pub mod gamepad;
+#[cfg(target_os = "macos")]
+pub mod runloop_pump;
 
 use std::collections::HashSet;
 use winit::event::{ElementState, KeyEvent};

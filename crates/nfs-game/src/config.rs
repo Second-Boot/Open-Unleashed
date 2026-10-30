@@ -126,6 +126,8 @@ switches! {
     // TEST GLUE (PORT-DEVIATION D46, photo mode): a scripted still's photo-mode ops and the race-key script (`app/photo.rs`)
     nfs_photo = "NFS_PHOTO",
     nfs_race_keys = "NFS_RACE_KEYS",
+    // TEST GLUE: a scripted still taken as if that many milliseconds of frames had followed its tick (`app/scripted.rs`)
+    nfs_shot_settle = "NFS_SHOT_SETTLE",
     nfs_pa_input = "NFS_PA_INPUT",
     nfs_pa_trace = "NFS_PA_TRACE",
     nfs_pa_loops = "NFS_PA_LOOPS",
