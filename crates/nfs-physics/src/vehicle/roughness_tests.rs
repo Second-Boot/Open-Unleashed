@@ -17,7 +17,7 @@ fn roughness_by_surface_and_tilt() {
     for _ in 0..200 {
         let r = v.roughness(1);
         assert!(r.abs() <= 0.1 + 1e-6, "amplitude {r}");
-        seen.push(r);
+        seen.push(r as f32);
     }
     assert!(seen.iter().any(|r| *r != 0.0), "some offset is produced");
     // a tilted car gets none (cosTilt < 0.86)

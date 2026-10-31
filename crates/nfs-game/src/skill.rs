@@ -314,6 +314,18 @@ impl SkillTest {
         ev
     }
 
+    /// **TEST GLUE** (`NFS_PA_FINISH`, `pa_trace.rs`): the finish trigger's effect 0x4161FB…0x416226 on `tick` without the geometry
+    /// test, as [`Self::tick`]'s `kind == 1` arm does it.
+    pub fn force_finish(&mut self, tick: u64) -> Vec<SkillEvent> {
+        if self.finished || self.dnf {
+            return Vec::new();
+        }
+        self.finished = true;
+        let t = tick.saturating_sub(RACE_START_TICK);
+        self.time_ticks = Some(t);
+        vec![SkillEvent::Finish { time_ticks: t }]
+    }
+
     /// `HMissionSummary::evaluate` (§10) for a skill test: [`evaluate_mission`] with the race time
     /// `car+0xCD8 = car+0xB24` (99 999 after a DNF or with no finish taken). Returns (pass, the
     /// time the summary compared, penalty included).

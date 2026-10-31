@@ -3,6 +3,10 @@
 use crate::quadtree::Entry;
 use glam::Vec3;
 
+/// `[0x5B3E0C]` = `0x3F7FF972` (0.99990): the triangle patch normal's `y` ceiling, 0x485F90 (0x486010 compare,
+/// 0x486020 store of the same bits).
+const TRI_NORMAL_Y_CAP: f32 = f32::from_bits(0x3F7F_F972);
+
 /// Which patch ctor the original builds a `pr` primitive's shapes with (`RE/notes/
 /// suspension-collision.md` §1.2, `RE/STRUCTURES.md` §2): quad `0x4853C0` (4 vertex pointers —
 /// **one quad, two triangles, is one tree entry**) or triangle `0x485C50` (3 vertex pointers, one
@@ -140,9 +144,21 @@ impl PatchTracker {
         self.changed = self.patch != old;
         if let Some((a, b, c, w)) = self.patch {
             self.word = w & 0xFFFF;
-            let mut n = (b - a).cross(c - a).normalize_or_zero();
+            // 0x485F90: the edges are `f32` subtractions (0x485F99…0x485FD9), the cross 0x532880 (0x56E8F5, one rounding per
+            // component) of `(v0 − v2)` and `(v1 − v0)` — the same plane as `(b − a) × (c − a)`, the negation exact — and
+            // 0x5328D0 normalises with the reciprocal in the register
+            let mut n = crate::vehicle::x87::normalize_x87(crate::vehicle::x87::cross_x87(b - a, c - a));
             if n.y < 0.0 {
                 n = -n;
+            }
+            // The triangle patch's normal, `WTreeElem_Tri` vtbl+0x14 = 0x485F90 (what `Tracker::normal()`
+            // 0x474320 caches at `+0xC`): the normalised cross product, then — 0x486010…0x486020 —
+            // `if !(n.y < [0x5B3E0C]) { n.y = 0x3F7FF972 }`: the constant is that same bit pattern
+            // (0.99990), so a patch flatter than that stores `n.y = 0.9999` and the vector is no longer
+            // unit (`|n|` = 0.9999). Every flat patch's plane normal, `Car_placeAtSlice`'s up row and
+            // the `BodyHeight` plane test (0x49C27D) read it.
+            if n.y >= TRI_NORMAL_Y_CAP {
+                n.y = TRI_NORMAL_Y_CAP;
             }
             self.normal = n;
         } else {
@@ -161,7 +177,7 @@ impl PatchTracker {
     pub fn patch_height(&self, x: f32, z: f32) -> Option<f32> {
         let (p0, _, _, _) = self.patch?;
         let n = self.normal;
-        Some(p0.y - ((x - p0.x) * n.x + (z - p0.z) * n.z) / n.y)
+        Some(plane_height_x87(p0, n, x, z))
     }
 
     /// 0x499520, `Car_refreshGroundPlane`.
@@ -208,7 +224,7 @@ impl PatchTracker {
     pub fn plane_height(&self, x: f32, z: f32) -> f32 {
         let q = self.plane_point;
         let n = self.fallback_normal();
-        q.y - ((x - q.x) * n.x + (z - q.z) * n.z) / n.y
+        plane_height_x87(q, n, x, z)
     }
 
     /// The normal of that fallback plane — `car+0x3E8` when `car+0x3EC > 0.1` (`[0x5B2604]`,
@@ -218,6 +234,14 @@ impl PatchTracker {
     pub fn fallback_normal(&self) -> Vec3 {
         if self.plane_normal.y > 0.1 { self.plane_normal } else { Vec3::Y }
     }
+}
+
+/// 0x499C37…0x499C77 (patch) and 0x499C09…0x499C2E (kept plane): `((−((x − q.x)·n.x)) − (z − q.z)·n.z) / n.y + q.y`, a
+/// chain of `fsub` / `fmul` / `fdiv` / `fadd` in the register (control word 0x27F, 53-bit mantissa) with a single `fstp`
+/// to `f32`: evaluated in `f64`, rounded once (REFERENCE-2026-10-31-HUMAN-DRIFT.md).
+fn plane_height_x87(q: Vec3, n: Vec3, x: f32, z: f32) -> f32 {
+    let (dx, dz) = (f64::from(x) - f64::from(q.x), f64::from(z) - f64::from(q.z));
+    ((-(dx * f64::from(n.x)) - dz * f64::from(n.z)) / f64::from(n.y) + f64::from(q.y)) as f32
 }
 
 /// A patch's centre height, the key `findPatch` 0x473240 sorts by: the triangle's vtable +4
@@ -639,6 +663,22 @@ mod tests {
         assert!(g.ground(50.0, 10.0, 50.0, 20.0).is_none());
     }
 
+    /// 0x485F90: a triangle patch flatter than `[0x5B3E0C]` (0.9999) reports `n.y = 0.9999`, not unit.
+    #[test]
+    fn a_flat_triangle_patch_normal_is_capped_at_0_9999() {
+        let g = TriangleGrid::build(quad(1.5), 5.0);
+        let mut t = PatchTracker::default();
+        t.update_zone(&g, Vec3::new(0.5, 1.5, -3.0));
+        assert_eq!(t.normal.y.to_bits(), 0x3F7F_F972);
+        assert!(t.normal.x == 0.0 && t.normal.z == 0.0);
+        // a 10 % slope is under the cap and stays normalised
+        let (a, b, c) = (Vec3::new(-10.0, 0.0, -10.0), Vec3::new(10.0, 2.0, -10.0), Vec3::new(10.0, 2.0, 10.0));
+        let g = TriangleGrid::build(vec![Triangle::new(a, b, c, 7)], 5.0);
+        let mut t = PatchTracker::default();
+        t.update_zone(&g, Vec3::new(5.0, 1.0, -5.0));
+        assert!((t.normal.length() - 1.0).abs() < 1e-6);
+    }
+
     #[test]
     fn picks_nearest_surface() {
         let mut t = quad(0.0);
@@ -678,7 +718,8 @@ mod tests {
         // the first triangle (a, b, c) = (−10,−10), (10,−10), (10,10): centre (−10+10+10−10)/4 …
         assert!(t.changed && t.word == 7);
         assert_eq!(t.plane_point, Vec3::new(0.0, 1.5, -5.0));
-        assert_eq!(t.plane_normal, Vec3::Y);
+        // a flat patch's normal is capped at n.y = 0.9999 (0x486010 / [0x5B3E0C]), not (0, 1, 0)
+        assert_eq!(t.plane_normal, Vec3::new(0.0, TRI_NORMAL_Y_CAP, 0.0));
         // still inside the same triangle: nothing changes
         t.track(&g, Vec3::new(6.0, 2.0, -4.0));
         assert!(!t.changed);

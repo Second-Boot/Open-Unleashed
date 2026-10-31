@@ -178,7 +178,7 @@ fn override_specs(specs: &mut nfs_physics::specs::CarSpecs, sb: &std::collection
             .filter(|c| c.len() == 4)
             .map(|c| {
                 let mask = std::array::from_fn(|i| c[3] >> i & 1 != 0);
-                nfs_physics::specs::InstalledPart { kind: c[0] as u16, mask, scale: fl(c[1]), state: fl(c[2]), carried: fl(c[2]) }
+                nfs_physics::specs::InstalledPart { kind: c[0] as u16, mask, scale: fl(c[1]), condition: (1.5 - fl(c[1])) / 0.005, state: fl(c[2]), carried: fl(c[2]) }
             })
             .collect();
     }

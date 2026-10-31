@@ -1,0 +1,25 @@
+; PORT-DEVIATION D47 (not part of the original): spliced into graphics.lay at load (nfs_game::layout::load_one). The panel the
+; third sub-tab (display_tab.lay) selects - the port-own displayopts.lay, loaded like graphicsettings / advgraphics (a panel of
+; the full 640x480 area, up only while its tab is selected) - and the tab strip's third separator, one step left / down of the
+; original's (313,65 35 tall; 271,85 19 tall; 229,106 19 tall).
+[section.900]
+id=NFS5.Rectangle
+name=ID_RECTANGLE
+state=normal
+pos=229,106
+size=1,19
+color=0xff000000
+transon=LEFT
+transoff=SAME
+swrenderoff=
+
+[section.901]
+id=NFS5.PANEL
+name=ID_DISPLAYPANEL
+state=normal
+pos=0,0
+size=640,480
+color=0x8000ff00
+filename=displayopts
+transon=
+transoff=

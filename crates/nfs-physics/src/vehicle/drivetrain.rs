@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// `[0x5B4A64]`, 1/300 as an `f32` (0x49E4A9, 0x49E963): `engine wear / 300` is a multiply.
+const ENGINE_WEAR_PER_300: f32 = f32::from_bits(0x3B5A_740E);
+/// `[0x5B49D4]`, 1/6 as an `f32` (0x49EB55, 0x49EBE7).
+const SIXTH: f32 = f32::from_bits(0x3E2A_AAAB);
+
 impl Vehicle {
     /// The controller latch, which runs **ahead of** `Car_simulate` and outside it: for the human
     /// `Car_applyInput` 0x4991E0 (Sc32 prio 0x15) stores the bytes `car+0xD7C` / `+0xD7D`, the
@@ -294,13 +299,21 @@ impl Vehicle {
         // the shared word, measured live (`REFERENCE-2026-10-22-PA-TRACE.md`)
         let roll = self.rand16() as f32 * 1.525_878_9e-5;
         let vz = self.v_local.z;
-        let a_drag = specs.drag * vz * vz * vz * self.draft;
+        // 0x49E4C6…0x49E4FA: `((vz · drag) · vz) · vz` in the register, stored to `f32` (`[esp+0x1c]`); then `0x49D9B0`'s draft factor
+        // times that, stored once more (`[esp+0x18]`). Control word 0x27F (53-bit mantissa).
+        let a_drag = {
+            let raw = (f64::from(vz) * f64::from(specs.drag) * f64::from(vz) * f64::from(vz)) as f32;
+            (self.draft * f64::from(raw)) as f32
+        };
         let gear = self.gear;
         let neutral = gear == 1;
-        let rpm_target = if neutral || !rear_contact {
-            ((specs.redline + 250.0) * self.throttle).min(specs.redline + 250.0)
-        } else {
-            ((specs.redline + 100.0) * self.throttle).min(specs.redline + 100.0)
+        // 0x49E509…0x49E579 (and 0x49E542…0x49E575): `A = redline + 100` (`[0x5B242C]`; `+ 250` `[0x5B4A60]` in neutral or with the
+        // rear off the ground) stays in the register, `P = A · throttle` is compared with `A` there (`fcomp st(1)`, C0 = `P < A`),
+        // and the `f32` copy of the smaller is stored: `fst [esp+0x28]` of `P`, `fstp [esp+0x10]` of `A`.
+        let rpm_target = {
+            let a = f64::from(specs.redline) + if neutral || !rear_contact { 250.0 } else { 100.0 };
+            let prod = a * f64::from(self.throttle);
+            if prod < a { prod as f32 } else { a as f32 }
         };
         // The rev limiter of `physics.md` §4.1: crossing the redline pins the rpm just above it and
         // arms an ignition cut of a few ticks, whose length is a small random draw — longer at a
@@ -340,8 +353,9 @@ impl Vehicle {
         // block below, so on those paths it kept the previous tick's value.
         self.rear_spin = false;
         // `misfire = engineDamage/300 > rand01` (§4.3), drawn at the top of the routine (0x49E4BD)
-        let engine_wear = self.engine_wear(specs);
-        let misfire = engine_wear / 300.0 > roll;
+        let engine_wear = self.engine_wear_wide(specs);
+        // 0x49E4A9 `fmul [0x5B4A64]` (1/300 as an `f32`), `fcomp` against the draw: the product stays in the register
+        let misfire = engine_wear * f64::from(ENGINE_WEAR_PER_300) > f64::from(roll);
         // **The no-drive path, 0x49EF36…0x49F075**, entered in neutral, mid-shift or with the rear
         // off the ground (0x49E84F / 0x49E85D / 0x49E869):
         //
@@ -393,9 +407,13 @@ impl Vehicle {
         let ratio_gear = if self.shift_timer > 0 && !self.downshift_blip { self.prev_gear } else { gear };
         let rpm_wheel = specs.ratio_rpm_per_mps[ratio_gear] * vz;
         let rpm_c = self.rpm.clamp(0.0, specs.redline);
-        let t = specs.torque_at(rpm_c);
-        let gearbox_wear = self.gearbox_wear(specs);
-        let mut a_drive = t * specs.accel_per_torque[gear] * (1.0 - engine_wear / 300.0) * (1.0 - 0.005 * gearbox_wear);
+        let gearbox_wear = self.gearbox_wear_wide(specs);
+        // 0x49E8D4…0x49E974: the interpolated torque stays in the register up to `· accel_per_torque[gear]` and the
+        // `fstp [esp+0x18]`; `(1 − wear/300) ·` that is stored once more (0x49E974); `(1 − 0.005·gearboxWear) ·` that stays
+        // in the register — `a_drive` is carried unrounded (the "st0 carried through from 0x49E98C") into whichever arm follows.
+        let ts = (specs.torque_interp_wide(rpm_c) * f64::from(specs.accel_per_torque[gear])) as f32;
+        let a1 = ((1.0 - engine_wear * f64::from(ENGINE_WEAR_PER_300)) * f64::from(ts)) as f32;
+        let mut a_drive: f64 = (1.0 - gearbox_wear * f64::from(0.005f32)) * f64::from(a1);
         // `diff = target − |wheel rpm|` (0x49E9A7…0x49E9AD, `fsub st(1)`), zeroed when it is under
         // 125 (`[0x5B4A58]`, 0x49E9CA `test ah,1; je` skips at `>=`) **and the target is below
         // `redline − 300`** (0x49E9D7: `fld redline−300; fcomp target; test ah,0x41; jne` skips the
@@ -447,20 +465,22 @@ impl Vehicle {
             // `+0x864`) — all four for a car with any front drive (`specs[0x5C] > 0`, against 120),
             // the rear two otherwise (against 100) — and the raw throttle byte `[0xD7C]` divides,
             // floored at 0.3. The port had `100·(1 − throttle) + 100`.
+            // the whole `allow` chain stays in the register and is stored once (0x49EB44 `fstp [esp+0x28]`)
+            let d = |x: f32| f64::from(x);
             let drive = (15.0 * a_drive).abs();
             let base = if specs.front_drive > 0.0 {
                 // summed `+0xAB0 + +0x9EC + +0x928 + +0x864`, wheel 3 first (0x49EABE…0x49EAD0)
-                120.0 - (drive - (self.wheels[3].limit + self.wheels[2].limit + self.wheels[1].limit + self.wheels[0].limit))
+                120.0 - (drive - (((d(self.wheels[3].limit) + d(self.wheels[2].limit)) + d(self.wheels[1].limit)) + d(self.wheels[0].limit)))
             } else {
-                100.0 - (drive - (self.wheels[3].limit + self.wheels[2].limit))
+                100.0 - (drive - (d(self.wheels[3].limit) + d(self.wheels[2].limit)))
             };
             // the byte times `[0x5B4A54]` = 1/254 as a float (0x49EB0B), not a division
-            let allow = base / (self.throttle_raw as f32 * (1.0 / 254.0)).max(0.3) + (1.0 - throttle) * 100.0;
+            let allow = (base / (f64::from(self.throttle_raw) * d(f32::from_bits(0x3B81_0204))).max(d(0.3f32)) + (1.0 - d(throttle)) * 100.0) as f32;
             // 0x49EB2C…0x49EB61: a quick gearbox (`specs[0x54] ≤ 4` ticks) above first gear bleeds
             // a sixth of the slip off first, whichever branch follows
             // (both sixths are `fmul [0x5B49D4]` = 1/6 as a float, 0x49EB55 / 0x49EBE7)
             if specs.shift_ticks <= 4 && gear > 2 {
-                self.rpm -= slip * (1.0 / 6.0);
+                self.rpm = (f64::from(self.rpm) - f64::from(slip) * f64::from(SIXTH)) as f32; // 0x49EB51…0x49EB61: one chain, one `fstp`
             }
             // 0x49EB67: **on the throttle** (≥ 0.5) and not misfiring, the clutch pulls the revs
             // down hard — by `min(slip, allow)` — and the axle is marked spinning only when the
@@ -474,7 +494,7 @@ impl Vehicle {
                 }
                 self.rpm -= slip.min(allow);
             } else {
-                self.rpm -= slip * (1.0 / 6.0);
+                self.rpm = (f64::from(self.rpm) - f64::from(slip) * f64::from(SIXTH)) as f32; // 0x49EBE3…0x49EBF3
             }
         } else if diff < 0.0 {
             // **The three arms, read to the instruction 2026-09-26.** 0x49EBFE loads the local
@@ -499,9 +519,11 @@ impl Vehicle {
             if over {
                 a_drive = -a_drive;
             } else {
+                // 0x49EC90…0x49ECA9: `−(a · 4? · specs[0x98])` is stored to `f32` (`[esp+0x14]`); then
+                // `min(1 + 0.02·gearboxWear, 5)` (the register) times that stays unrounded
                 let k4 = if self.ignition_cut > 0 { 4.0 } else { 1.0 };
-                let neg = -(a_drive * k4 * specs.engine_brake);
-                a_drive = (gearbox_wear * 0.02 + 1.0).min(5.0) * neg;
+                let neg = (-(a_drive * k4 * f64::from(specs.engine_brake))) as f32;
+                a_drive = (gearbox_wear * f64::from(0.02f32) + 1.0).min(5.0) * f64::from(neg);
             }
             let cap = specs.mps_per_rpm[gear] * 81920.0;
             let step = if gear == 0 { (-slip).max(cap) } else { (-slip).min(cap) };
@@ -514,7 +536,7 @@ impl Vehicle {
             // the st0 becomes the drag `[esp+0x18]`, so the step returns `drag − drag` = 0 — the
             // car holds its speed. *(The port kept the drive here and took `|wheel rpm|`.)*
             self.rpm = rpm_wheel;
-            a_drive = a_drag;
+            a_drive = f64::from(a_drag);
         } else {
             // **Under the target, 0x49ED70…0x49EE52 — the driving arm.** A misfire takes 100 off
             // and the drive is 0 (0x49ED78…0x49ED8C). Otherwise a ladder of three:
@@ -534,11 +556,12 @@ impl Vehicle {
                 } else {
                     self.rpm = rpm_wheel;
                 }
-                a_drive *= throttle;
+                a_drive *= f64::from(throttle); // 0x49EDE8 `fmul [0x628FB0]` on the register
             }
             self.rpm = self.rpm.min(rpm_target);
             if self.rally {
-                a_drive = a_drive * 1.25 * (self.slip_tangent.abs() + 1.0).min(2.0);
+                // 0x49EE14…0x49EE52: `· 1.25 · min(|slip| + 1, 2)` on the register
+                a_drive = a_drive * f64::from(1.25f32) * (f64::from(self.slip_tangent.abs()) + 1.0).min(2.0);
             }
         }
         // 0x49EE54…0x49EEFB, revs below zero (`test ah,1; je` at `>= 0`): `t = −vL.z · 32`
@@ -550,22 +573,31 @@ impl Vehicle {
         // not pull away while the revs, now signed like the original's, sat below zero.)*
         if self.rpm < 0.0 {
             let t = -vz * 32.0;
-            let keep = (a_drive > 0.0 && t > 0.0 && a_drive - t > 0.0) || (a_drive < 0.0 && t < 0.0 && a_drive - t < 0.0);
+            let (a, t) = (a_drive, f64::from(t));
+            let keep = (a > 0.0 && t > 0.0 && a - t > 0.0) || (a < 0.0 && t < 0.0 && a - t < 0.0);
             if keep {
-                return a_drive - a_drag;
+                return (a - f64::from(a_drag)) as f32;
             }
             self.rpm = 0.0;
-            return t - a_drag;
+            return (t - f64::from(a_drag)) as f32;
         }
         self.rpm = self.rpm.min(1.25 * specs.redline);
         // 0x49EF02…0x49F0B9: the st0 each arm leaves, less the drag. The clutch arm's is the
-        // drive as it stands — no throttle factor (0x49EBDE / 0x49EBF9 jump straight here).
-        a_drive - a_drag
+        // drive as it stands — no throttle factor (0x49EBDE / 0x49EBF9 jump straight here). One rounding: the caller's
+        // `fstp [ebp-4]` (0x49F706).
+        (a_drive - f64::from(a_drag)) as f32
     }
 
     /// `LoadTransfer` 0x4A1900 (CONFIRMED).
+    ///
+    /// *Extended precision (2026-10-31, `RE/notes/REFERENCE-2026-10-31-HUMAN-DRIFT.md`).* Every chain of
+    /// `fmul` / `fdiv` / `fsub` between two `fstp`s stays in the 80-bit register: `g_eff` (0x4A1911…0x4A192A),
+    /// the limit `μ·share·g_eff·0.5` (0x4A198E…0x4A19E2 / 0x4A19ED…0x4A19FF) and the transfers `dz`, `dx`
+    /// (0x4A1A26…0x4A1A44, 0x4A1B06…0x4A1B22 — `dz` also stays unrounded through the throttle factor,
+    /// 0x4A1A9D, up to the four `fsub` / `fadd`s) are evaluated here in `f64` and rounded once to `f32`
+    /// where the original stores (the 64-bit mantissa differs from `f64` only in a double-rounding case).
     pub(super) fn load_transfer(&mut self, specs: &CarSpecs) {
-        let g_eff = self.frame.row(1).y * specs.grip * GRAVITY;
+        let g_eff = (f64::from(self.frame.row(1).y) * f64::from(specs.grip) * f64::from(GRAVITY)) as f32;
         let wet = self.wet_track;
         for (i, w) in self.wheels.iter_mut().enumerate() {
             // 0x4A1995 / 0x4A19C1: `wheel+0x80` = 1 / 0 with the table. *(Corrected 2026-09-26:
@@ -580,27 +612,39 @@ impl Vehicle {
                 (_, _, c) => c,
             };
             let mu = tbl[w.surface & 15][col];
-            let share = if i < 2 { specs.front_weight } else { 1.0 - specs.front_weight };
-            w.limit = mu * share * g_eff * 0.5;
+            // 0x4A19D2: `μ · specs[0xF0]`; rear 0x4A19ED…0x4A19F9: `μ · (1 − specs[0xF0])`, the difference unrounded
+            let share = if i < 2 { f64::from(specs.front_weight) } else { 1.0 - f64::from(specs.front_weight) };
+            w.limit = (f64::from(mu) * share * f64::from(g_eff) * 0.5) as f32;
         }
-        let mut dz = self.accel_local.z * specs.weight_transfer * (-1.0 / GRAVITY) * g_eff * (-0.2) / specs.transfer_div;
+        let ge = f64::from(g_eff);
+        let k = f64::from(-1.0 / GRAVITY);
+        let wt = f64::from(specs.weight_transfer);
+        // 0x4A1A26…0x4A1A44: `D54 · specs[0xF8] · [0x5B4A9C] · g_eff · [0x5B4A98] / specs[0x11C]`
+        let mut dz = f64::from(self.accel_local.z) * wt * k * ge * f64::from(-0.2f32) / f64::from(specs.transfer_div);
         // 0x4A1A20 `mov al, [car+0xD7F]; test al, al; … jbe` asks for the throttle **byte**
         // (not the pedal float, which an automatic swaps in reverse), and 0x4A1A4C…0x4A1A5D's
         // `test ah,0x41; jne` for `vL.z > 0`, strictly. *(Corrected 2026-09-26: the port had
         // `throttle > 0.0` and `vz >= 0`.)*
         if self.throttle_byte != 0 && self.v_local.z > 0.0 {
-            dz *= (1.0 - 10.0 * self.slip_tangent.abs()).max(0.0);
+            // 0x4A1A5F…0x4A1A9D: `max(1 − 10·|D C0|, 0)` (the factor is a register value too), `fmulp`
+            let f = 1.0 - f64::from(self.slip_tangent.abs()) * 10.0;
+            dz *= f.max(0.0);
         }
-        self.wheels[0].limit -= dz;
-        self.wheels[1].limit -= dz;
-        self.wheels[2].limit += dz;
-        self.wheels[3].limit += dz;
+        // 0x4A1A9F…0x4A1AD7: limits 0 / 1 lose `dz`, 2 / 3 gain it, one `fstp` each
+        let sub = |l: f32, d: f64| (f64::from(l) - d) as f32;
+        let add = |l: f32, d: f64| (f64::from(l) + d) as f32;
+        self.wheels[0].limit = sub(self.wheels[0].limit, dz);
+        self.wheels[1].limit = sub(self.wheels[1].limit, dz);
+        self.wheels[2].limit = add(self.wheels[2].limit, dz);
+        self.wheels[3].limit = add(self.wheels[3].limit, dz);
         if self.rally {
             self.wheels[0].limit *= 1.1;
             self.wheels[1].limit *= 1.1;
         }
-        let dx = self.accel_local.x * specs.weight_transfer * (-1.0 / GRAVITY) * g_eff * 0.2 / specs.transfer_div;
-        let dx2 = dx / specs.lateral_div;
+        // 0x4A1B06…0x4A1B22: `D4C · specs[0xF8] · [0x5B4A9C] · g_eff · [0x5B23F4] / specs[0x11C]` stays in the
+        // register for the sign test and the arms; `dx2 = dx / specs[0x130]` is stored (0x4A1B30)
+        let dx = f64::from(self.accel_local.x) * wt * k * ge * f64::from(0.2f32) / f64::from(specs.transfer_div);
+        let dx2 = (dx / f64::from(specs.lateral_div)) as f32;
         // 0x4A1B34 `fcom 0; test ah,0x41; jne 0x4A1B71` picks the arm by the sign of `dx`, and
         // `specs[0x130]` divides the **unloaded** side in both: `dx > 0` takes `dx'` off the
         // left pair (0, 2) and adds `dx` to the right (1, 3) (0x4A1B47…0x4A1B69, 0x4A1B9D);
@@ -608,26 +652,29 @@ impl Vehicle {
         // *(Corrected 2026-09-26: the port always took `dx` from the left and gave `dx'` to the
         // right, which is only the second arm; `physics.md` §5.1's "left −= dx / right += dx'
         // (sign by dx)" was read without the sign.)*
-        let (left, right) = if dx > 0.0 { (dx2, dx) } else { (dx, dx2) };
-        self.wheels[0].limit -= left;
-        self.wheels[2].limit -= left;
-        self.wheels[1].limit += right;
-        self.wheels[3].limit += right;
+        let (left, right) = if dx > 0.0 { (f64::from(dx2), dx) } else { (dx, f64::from(dx2)) };
+        self.wheels[0].limit = sub(self.wheels[0].limit, left);
+        self.wheels[2].limit = sub(self.wheels[2].limit, left);
+        self.wheels[1].limit = add(self.wheels[1].limit, right);
+        self.wheels[3].limit = add(self.wheels[3].limit, right);
         self.gravity_scale = GRAVITY_SCALE;
         let vz = self.v_local.z;
         if vz > 5.0 {
-            let aero = 1.0 - 0.005 * self.aero_wear(specs);
-            let df = specs.downforce_front * vz * aero;
-            let dr = specs.downforce_rear * vz * aero;
-            self.wheels[0].limit += df;
-            self.wheels[1].limit += df;
-            self.wheels[2].limit += dr;
-            self.wheels[3].limit += dr;
+            // 0x4A1BCB…0x4A1C35: `a = 1 − 0.005·aeroWear` (the getter's register), `df = (a·F_f)·vz`, `dr = (a·F_r)·vz` are
+            // unrounded; each `fadd [wheel limit]; fstp` rounds once (0x4A1BF5…0x4A1C2F) and `dr` stays in `st0`
+            let aero = 1.0 - self.aero_wear_wide(specs) * f64::from(0.005f32);
+            let vzw = f64::from(vz);
+            let df = aero * f64::from(specs.downforce_front) * vzw;
+            let dr = aero * f64::from(specs.downforce_rear) * vzw;
+            self.wheels[0].limit = (f64::from(self.wheels[0].limit) + df) as f32;
+            self.wheels[1].limit = (f64::from(self.wheels[1].limit) + df) as f32;
+            self.wheels[2].limit = (f64::from(self.wheels[2].limit) + dr) as f32;
+            self.wheels[3].limit = (f64::from(self.wheels[3].limit) + dr) as f32;
             // 0x4A1C35 `fld [car+0x3A0]; fcomp 0.939; test ah,0x41; jne 0x4A1C62` skips the add
             // when `cosTilt <= 0.939`, so the rear downforce presses an **upright** car down.
             // *(Corrected 2026-09-26: `physics.md` §5.1 and the port had `< 0.939`.)*
             if self.cos_tilt > UPRIGHT_COS_TILT {
-                self.gravity_scale += 8.0 * dr;
+                self.gravity_scale = (dr * 8.0 + f64::from(self.gravity_scale)) as f32;
             }
         }
         // No floor: 0x4A1C48…0x4A1C6B return straight after the downforce, so a limit the

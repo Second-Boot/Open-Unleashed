@@ -557,14 +557,17 @@ pub(crate) struct AudioState {
     pub(crate) fe_sfx: Option<nfs_audio::fesfx::FeSfx>,
 }
 
-/// The wall event `WallImpulse` 0x494000 leaves for 0x40F740, from the impact the wall pass just
-/// left (`Vehicle::impact`, the largest `j` of the call): a hit (`0x40008 + class`) when
-/// `j ≥ speedEst/8`, else a scrape (`0x40015 + class`) — the rule the player's one-shot takes.
+/// The wall event `WallImpulse` 0x494000 leaves for 0x40F740 (kind word `car+0x438`, written by
+/// the pass's last contact with `j > 0`: a hit `0x40008 + class` or, when `speedEst/8 > j`, a
+/// scrape `0x40015 + class` — `Vehicle::last_wall_scrape` / `last_wall_class`) at the magnitude
+/// of the slot `car+0x430` as the wall pass left it (`Vehicle::contact_mag`, the pass's
+/// `max(slot, best)` 0x49557D…0x495594); nothing writes the slot after it unless it also
+/// replaces the event.
 pub(crate) fn wall_sfx(b: &nfs_physics::vehicle::Vehicle) -> nfs_audio::sfx::QueuedSfx {
-    if b.impact >= b.speed() / 8.0 {
-        nfs_audio::sfx::QueuedSfx::WallHit { j: b.impact, class: b.last_wall_class }
+    if b.last_wall_scrape {
+        nfs_audio::sfx::QueuedSfx::WallScrape { mag: b.contact_mag, class: b.last_wall_class }
     } else {
-        nfs_audio::sfx::QueuedSfx::WallScrape { speed: b.speed(), class: b.last_wall_class }
+        nfs_audio::sfx::QueuedSfx::WallHit { mag: b.contact_mag, class: b.last_wall_class }
     }
 }
 

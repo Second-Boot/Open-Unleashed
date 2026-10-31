@@ -397,9 +397,10 @@ impl Shared {
             // the level byte (0x589DF0) · `[0x5C1788]` (f32 1/127) as an f32 (0x59697A)
             let vol = (v.level_byte() as f64 * (1.0f32 / 127.0) as f64) as f32;
             // in the output's order (the interleave 0x59BCE0 puts plane 1 first): a mono voice by
-            // the law, a stereo one channel by channel at its plane offset ([`stereo_gains`])
+            // the law, a stereo one channel by channel at its plane offset, its angle cleared by 0x5968F3, so the pan
+            // byte does not reach it ([`stereo_gains`])
             let p = voice_pan(v.pan, v.patch_pan, c.pan_scale);
-            let pg = if cc > 1 { stereo_gains(p) } else { pan_gains(p) };
+            let pg = if cc > 1 { stereo_gains() } else { pan_gains(p) };
             // N10 (0x598721): a hook call since the last block raised the ramp flag, changed or not
             if std::mem::take(&mut v.hook) {
                 v.gains.touch();

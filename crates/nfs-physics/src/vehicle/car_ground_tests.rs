@@ -42,12 +42,14 @@ fn place_at_slice_drops_the_body_onto_the_road() {
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
     v.set_car_body(pts, Vec3::new(0.91, 0.631, 2.1));
     v.game_tick = 0;
-    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 5.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z] }, Vec3::new(1.5, 0.5, 0.0), true, false);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 5.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z], end: None }, Vec3::new(1.5, 0.5, 0.0), true, false);
     assert!((v.position - Vec3::new(6.5, 0.631, 5.0)).length() < 1e-4, "{:?}", v.position);
     assert!((v.draw_origin().y).abs() < 1e-4);
-    assert_eq!(v.body_height, 0.0);
+    // the second `Susp_update` recomputes `BodyHeight` (0x49B4C2): ~0, not exactly 0 once the dot / plane chains run in extended
+    // precision (REFERENCE-2026-10-31-HUMAN-DRIFT.md)
+    assert!(v.body_height.abs() < 1e-6, "{}", v.body_height);
     v.game_tick = 0x1C1;
-    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 5.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z] }, Vec3::new(-2.0, 0.0, 7.0), true, true);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 5.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z], end: None }, Vec3::new(-2.0, 0.0, 7.0), true, true);
     assert!((v.position - Vec3::new(-2.0, 0.631, 7.0)).length() < 1e-4, "{:?}", v.position);
     assert!((v.orientation.row(2) - Vec3::NEG_Z).length() < 1e-5, "flipped: forward negated");
 }
@@ -72,8 +74,9 @@ fn place_at_trigger_stands_the_car_on_the_pad() {
     v.place_at_trigger(&grid, &specs, Vec3::new(-6.8, 0.0, 14.0), Vec3::new(0.0, 0.0, -1.0));
     assert!((v.position - Vec3::new(-6.8, 0.631, 14.0)).length() < 1e-4, "{:?}", v.position);
     assert!(v.draw_origin().y.abs() < 1e-4);
-    assert!((v.orientation.row(2) - Vec3::NEG_Z).length() < 1e-5, "forward = +0xC8");
-    assert!((v.orientation.row(1) - Vec3::Y).length() < 1e-5);
+    // up is the capped patch normal (n.y = 0.9999, 0x486010 / [0x5B3E0C]), so the frame is 1e-4 off unit
+    assert!((v.orientation.row(2) - Vec3::NEG_Z).length() < 5e-4, "forward = +0xC8");
+    assert!((v.orientation.row(1) - Vec3::Y).length() < 5e-4);
     assert_eq!(v.body_height, 0.0);
 }
 
@@ -259,17 +262,18 @@ fn a_placed_car_takes_the_raw_slice_frame() {
     let rows = |v: &Vehicle| (v.orientation.row(0), v.orientation.row(1), v.orientation.row(2));
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
     // centre on (x > z), the corner pushed 1.5 m along the built lateral across `x = z`
-    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 4.9), forward: fwd, raw: [lat, up, fwd] }, Vec3::new(1.5, 0.5, 0.0), false, false);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(5.0, 0.0, 4.9), forward: fwd, raw: [lat, up, fwd], end: None }, Vec3::new(1.5, 0.5, 0.0), false, false);
     assert_eq!(rows(&v), (lat, up, fwd));
     assert_eq!(v.frame, v.orientation);
     // flipped, from the other side of the line
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
-    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(4.9, 0.0, 5.0), forward: fwd, raw: [lat, up, fwd] }, Vec3::new(-1.5, 0.5, 0.0), false, true);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(4.9, 0.0, 5.0), forward: fwd, raw: [lat, up, fwd], end: None }, Vec3::new(-1.5, 0.5, 0.0), false, true);
     assert_eq!(rows(&v), (-lat, up, -fwd));
     // the same patch: the built frame (up = the patch normal, orthonormal)
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
-    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(20.0, 0.0, 0.0), forward: fwd, raw: [lat, up, fwd] }, Vec3::new(1.5, 0.5, 0.0), false, false);
-    assert_eq!(v.orientation.row(1), Vec3::Y);
+    v.place_at_slice(&grid, &specs, SliceFrame { centre: Vec3::new(20.0, 0.0, 0.0), forward: fwd, raw: [lat, up, fwd], end: None }, Vec3::new(1.5, 0.5, 0.0), false, false);
+    // up = the flat patch's normal, whose y 0x485F90 caps at 0x3F7FF972 (0x486010 / [0x5B3E0C])
+    assert_eq!(v.orientation.row(1), Vec3::new(0.0, f32::from_bits(0x3F7F_F972), 0.0));
     assert!((v.orientation.row(0).dot(v.orientation.row(2))).abs() < 1e-6);
 }
 

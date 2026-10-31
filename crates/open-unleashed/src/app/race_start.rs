@@ -1219,11 +1219,10 @@ impl App {
             self.car_rot = Quat::from_mat3(&vehicle.orientation.transpose()).normalize();
             self.prev_car_pos = self.car_pos;
         } else if self.skill.is_none()
-            && let (Some((slice, pos)), Some(t)) = (grid_place, &self.slices)
+            && let (Some((slice, _, off)), Some(t)) = (grid_place, &self.slices)
         {
             vehicle.game_tick = self.tick;
-            let s = &t.slices[slice];
-            vehicle.place_at_slice(&world.collision, &self.specs, nfs_physics::vehicle::SliceFrame { centre: s.centre, forward: s.forward, raw: [s.lateral, s.up, s.forward] }, grid_offset(s, pos), false, false);
+            vehicle.place_at_slice(&world.collision, &self.specs, t.frame(slice, false), off, false, false);
             self.car_pos = vehicle.draw_origin();
             self.prev_car_pos = self.car_pos;
         }
@@ -1234,11 +1233,10 @@ impl App {
         // from the shared word (measured: the stream stands 8 draws past `Rand_seed` at the first
         // `GameTick` of a one-car race, `REFERENCE-2026-10-22-PA-TRACE.md`), so the order counts.
         if let Some(t) = &self.slices {
-            for &(k, sl, p) in &opp_places {
+            for &(k, sl, _, off) in &opp_places {
                 if let Some(o) = self.road.opponents.get_mut(k) {
-                    let s = &t.slices[sl];
                     o.vehicle.game_tick = self.tick;
-                    o.vehicle.place_at_slice(&world.collision, &o.specs, nfs_physics::vehicle::SliceFrame { centre: s.centre, forward: s.forward, raw: [s.lateral, s.up, s.forward] }, grid_offset(s, p), true, false);
+                    o.vehicle.place_at_slice(&world.collision, &o.specs, t.frame(sl, false), off, true, false);
                 }
             }
         }

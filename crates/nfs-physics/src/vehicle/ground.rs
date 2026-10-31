@@ -13,7 +13,10 @@ impl Vehicle {
     /// `Roughness` 0x499730 (car, i) — per-wheel random road-height offset, CONFIRMED:
     /// amplitude and period by surface type, a new target drawn every `period` metres of travel and
     /// interpolated linearly in between. Returns 0 while the car is tilted (`cosTilt < 0.86`).
-    pub(super) fn roughness(&mut self, i: usize) -> f32 {
+    ///
+    /// Returns the value the original leaves in `st0` (0x49986C…0x49988A: `prev + (target − prev) · (phase / period)` in the
+    /// 53-bit register, control word 0x27F) — the caller adds the patch height and rounds once (0x499C84 `fadd`, 0x499C8E `fstp`).
+    pub(super) fn roughness(&mut self, i: usize) -> f64 {
         if self.cos_tilt < 0.86 {
             return 0.0;
         }
@@ -38,10 +41,12 @@ impl Vehicle {
             let w = &mut self.wheels[i];
             // `amp · [0x5B49D4] − r16 · amp · [0x5B253C]` (1/6, 2⁻¹⁶), in that order
             // (0x49982D…0x499864)
-            w.rough_target = amp * f32::from_bits(0x3E2A_AAAB) - r * amp * 1.525_878_9e-5;
+            // one register chain, one `fstp [ecx+0x830]`
+            w.rough_target = (f64::from(amp) * f64::from(f32::from_bits(0x3E2A_AAAB)) - f64::from(r) * f64::from(amp) * f64::from(1.525_878_9e-5f32)) as f32;
         }
         let w = &self.wheels[i];
-        w.rough_prev + (w.rough_target - w.rough_prev) * (w.rough_phase / period)
+        let (prev, target) = (f64::from(w.rough_prev), f64::from(w.rough_target));
+        prev + (target - prev) * (f64::from(w.rough_phase) / f64::from(period))
     }
 
     /// `BodyGroundCollide` 0x496610 + `GroundImpulse` 0x495F30 (`RE/notes/suspension-collision.md`
@@ -193,7 +198,13 @@ impl Vehicle {
         let pts = if upright { &pts[..pts.len().min(4)] } else { pts };
         let mut low = [1000.0f32; 4];
         for p in pts {
-            let d = (self.position + mt * *p - q).dot(n);
+            // the stored world point (0x49AE30: `f32(dot(p, row) + pos)`), `p − q` (0x532330) and the dot 0x532910 (0x49A98D…0x49A993)
+            let wp = Vec3::new(
+                (dot_x87_wide(*p, mt.row(0)) + f64::from(self.position.x)) as f32,
+                (dot_x87_wide(*p, mt.row(1)) + f64::from(self.position.y)) as f32,
+                (dot_x87_wide(*p, mt.row(2)) + f64::from(self.position.z)) as f32,
+            );
+            let d = dot_x87(n, wp - q);
             // 0x49A998…0x49AA0F: shift down from the first slot `d` is not above
             if let Some(k) = low.iter().position(|l| d <= *l) {
                 low[k..].rotate_right(1);
@@ -201,7 +212,9 @@ impl Vehicle {
             }
         }
         if upright {
-            let v = ((low[0] + low[1] + low[2] + low[3]) * 0.25 + low[0]) * 0.5;
+            // 0x49AA23…0x49AA40: `((((l3 + l2) + l1) + l0) · 0.25 + l0) · 0.5` in the register, one `fst` / `fstp`
+            let l = |x: f32| f64::from(x);
+            let v = (((((l(low[3]) + l(low[2])) + l(low[1])) + l(low[0])) * 0.25 + l(low[0])) * 0.5) as f32;
             self.body_height = v;
             self.min_height = v;
         } else {
@@ -278,7 +291,10 @@ impl Vehicle {
     pub(crate) fn car_ground_body(&mut self, contact: GroundContact, mass: f32, travel: Option<(f32, f32)>, grid: &TriangleGrid, n_ticks: i32, racer: bool) {
         let GroundContact { dh, n, q, surf } = contact;
         if self.min_height > 0.005 || self.tiny {
-            self.velocity.y -= GRAVITY / 32.0 * self.gravity_scale * n_ticks as f32;
+            // 0x49BE7F…0x49BE9F: `fild nTicks; fmul [0x5B4A20] (0.30625); fmul [car+0x84]` stays in the register, then
+            // `vy − that` with one rounding at the `fstp [esp+0x10]` (control word 0x27F: 53-bit mantissa)
+            let g = (f64::from(n_ticks) * f64::from(GRAVITY / 32.0)) * f64::from(self.gravity_scale);
+            self.velocity.y = (f64::from(self.velocity.y) - g) as f32;
         }
         // `car+0x35C` (0x49BEA9…0x49BF02), held for next tick's `Roughness`
         self.speed_est = self.horizontal_speed();
@@ -356,7 +372,7 @@ impl Vehicle {
             self.velocity.y = -self.velocity.y;
         }
         // `car+0x348` (0x49C14F…0x49C341, 0x5328D0)
-        self.travel_dir = if self.velocity == Vec3::ZERO { self.orientation.row(2) } else { self.velocity.normalize() };
+        self.travel_dir = if self.velocity == Vec3::ZERO { self.orientation.row(2) } else { normalize_x87(self.velocity) };
     }
 
     /// `flags & 1`, the human-driven car — in this port's fields, one that is neither AI-driven,
@@ -491,8 +507,15 @@ impl Vehicle {
         let SuspFrame { m, mt: _, up, s_sign, origin, point_mt: _ } = *body;
         // the world collision point `car+0x1DC + 12i` (0x49AE30: `pos + Σ p_k·M[k]`) of body
         // point i, which 0x49ABC0 left as wheel i's ground reference (0x499AD4…0x499B13)
-        let world_pt = origin + body.point_mt * body_pt;
-        let probe = world_pt + Vec3::new(0.0, specs.probe_offset * up.y, 0.0);
+        // `0x49AE66…0x49AEA6`: `f32(dot(p, row_i) + pos_i)`, the dot 0x532910 and the `fadd` of the position both in the register
+        let pm = body.point_mt;
+        let world_pt = Vec3::new(
+            (dot_x87_wide(body_pt, pm.row(0)) + f64::from(origin.x)) as f32,
+            (dot_x87_wide(body_pt, pm.row(1)) + f64::from(origin.y)) as f32,
+            (dot_x87_wide(body_pt, pm.row(2)) + f64::from(origin.z)) as f32,
+        );
+        // 0x499AFB…0x499B10: `fld specs[0x120]; fmul [car+0x374]; fadd [point.y]; fstp` — one rounding
+        let probe = Vec3::new(world_pt.x, (f64::from(specs.probe_offset) * f64::from(up.y) + f64::from(world_pt.y)) as f32, world_pt.z);
         // the wheel's tracker (0x499B64 `updateZone(probe, 1)`); its zone word — 0 with no
         // patch — is the wheel's surface `wheel+0x8C` on **both** branches (0x499B86…0x499BA7,
         // `RALLY` turning nibbles 1 and 10 into 2)
@@ -512,16 +535,17 @@ impl Vehicle {
             Some(h) => {
                 // road roughness (0x499730), added on the patch branch only; its speed is
                 // `car+0x35C` ([`Self::speed_est`]) — history: `physics-history.md` §2.1
-                let mut h = h + self.roughness(i);
+                let mut h = (f64::from(h) + self.roughness(i)) as f32;
                 // the front wheels' wobble from suspension damage (0x499C8B…0x499CC1):
                 // `SuspDamage(car)·sin(6.28318·(0.5·i + wheel+0x88))·(1/1500)` — 0x493BC0,
                 // `[0x5B23F0]` 0.5, `[0x5B4A08]` 6.28318, the double `[0x5B4A00]` 1/1500
                 if i < 2 {
-                    // the original's constant is 6.28318, not TAU
+                    // the original's constant is 6.28318, not TAU. The whole wobble is one register chain (0x499C95…0x499CC1):
+                    // `wear` (0x493BC0's `st0`), `(0.5·i + rot) · [0x5B4A08]` unrounded into `fsin`, `· wear`, `· 1/1500`, `+ h`, one `fstp`
                     #[allow(clippy::approx_constant)]
-                    let arg = (0.5 * i as f32 + self.wheels[i].rotation) * 6.283_18;
+                    let arg = (0.5 * i as f64 + f64::from(self.wheels[i].rotation)) * f64::from(6.283_18f32);
                     // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin, not std; original inline x87 `fsin` at 0x499CB3.
-                    h += self.suspension_wear(specs) * nfs_math::portable::sinf(arg) * (1.0 / 1500.0);
+                    h = (f64::from(h) + self.suspension_wear_wide(specs) * nfs_math::portable::sin(arg) * (1.0 / 1500.0)) as f32;
                 }
                 h
             }
@@ -590,16 +614,25 @@ impl Vehicle {
             // 0x49A11F / 0x49A163 takes the absolute value — and `(k·u')·M[1]` is added to
             // `susp.y` **after** the stiffness (0x49A1DA `fadd st(1)`). Anything else leaves the
             // 0.0 pushed at 0x499F60.
-            let mut lat = 0.0;
+            // Extended precision (control word 0x27F, `REFERENCE-2026-10-31-VYBLIP-CHAINS.md`): 0x5328D0 normalise and 0x532880 cross
+            // as in [`normalize_x87`] / [`cross_x87`]; `k` is `|0x532910(…)| · c` with the dot left in the register (0x49A108…0x49A137,
+            // 0x49A144…0x49A16F) and one `fstp [esp+0x28]`; `0x532360` scales the vector by the stored `k` (f32 products); the last dot
+            // 0x49A19B (`u'·k` with row 1) is not stored either — 0x49A1D0…0x49A1DC `fmul stiff; fadd st(1); fstp` rounds
+            // `stiff·v_y + lat` once.
+            let mut lat = 0.0f64;
             if vel.x.abs() > 0.01 && vel.z.abs() > 0.01 {
-                let u = Vec3::new(-vel.x, 0.0, -vel.z).normalize();
-                let u2 = n_i.cross(u).cross(n_i);
-                let k = if w.airborne { 0.066_666_67 * vel.dot(row0).abs() } else { 0.0625 * acc.dot(row0).abs() };
-                lat = (u2 * k).dot(up);
+                let u = normalize_x87(Vec3::new(-vel.x, 0.0, -vel.z));
+                let u2 = cross_x87(cross_x87(n_i, u), n_i);
+                let k = if w.airborne {
+                    (dot_x87_wide(vel, row0).abs() * f64::from(0.066_666_67f32)) as f32
+                } else {
+                    (dot_x87_wide(acc, row0).abs() * f64::from(0.0625f32)) as f32
+                };
+                lat = dot_x87_wide(u2 * k, up);
             }
             w.airborne = false;
             hangs = false;
-            susp_y = stiff * v_y + lat;
+            susp_y = (f64::from(stiff) * f64::from(v_y) + lat) as f32;
         }
         w.contact = !w.airborne;
         w.susp_y = susp_y;
@@ -610,9 +643,15 @@ impl Vehicle {
     /// [`Self::ground_normal`], `nAir = 4` for a steep one, and `car+0x418`.
     fn susp_ground_normal(&mut self, contacts: &[Vec3; 4], n_air: &mut i32) -> Vec3 {
         // ground normal from the contact points
-        let f = ((contacts[0] + contacts[1]) - (contacts[2] + contacts[3])) * 0.5;
-        let r = ((contacts[1] + contacts[3]) - (contacts[0] + contacts[2])) * 0.5;
-        let mut n = f.normalize_or_zero().cross(r.normalize_or_zero()).normalize_or_zero();
+        // 0x49A201…0x49A2BD: each component `((a + b) − (c + d)) · 0.5` in the register, one `fstp`
+        let comb = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            let e = |a: f32, b: f32, c: f32, d: f32| (((f64::from(a) + f64::from(b)) - (f64::from(c) + f64::from(d))) * 0.5) as f32;
+            Vec3::new(e(a.x, b.x, c.x, d.x), e(a.y, b.y, c.y, d.y), e(a.z, b.z, c.z, d.z))
+        };
+        let f = comb(contacts[1], contacts[0], contacts[3], contacts[2]);
+        let r = comb(contacts[3], contacts[1], contacts[2], contacts[0]);
+        // 0x49A32B…0x49A367: `0x5328D0` on `f` and `r`, `0x532880` cross, `0x5328D0` again (extended precision, `x87.rs`)
+        let mut n = normalize_x87(cross_x87(normalize_x87(f), normalize_x87(r)));
         // 0x49A36C…0x49A3CF: `*normalOut` gets `N`, negated when `N.y < 0`, but the `N.y < 0.5`
         // test that sets `nAir = 4` reads the stack copy **before** the negation (`[esp+0x30]`),
         // so a normal that pointed down (a car on its roof) always counts as all four wheels
@@ -643,8 +682,15 @@ impl Vehicle {
         } else if n_air < 4 {
             // 8, or 4 for `.TINYCAR` (0x49A438…0x49A44A)
             let div = if self.tiny { 4.0 } else { 8.0 };
-            let w_body = m * self.angular_velocity; // (pitch, yaw, roll) rates in body axes
-            let p_in = ((susp_y[2] + susp_y[3]) - (susp_y[0] + susp_y[1])) / div;
+            // 0x49A466…0x49A488: three dot products 0x532910 of ω with the body rows `car+0x364 / +0x370 / +0x37C`
+            // into `car+0xD64…+0xD6C` (pitch, yaw, roll rates in body axes); the roll dot stays on the x87 stack
+            // (0x49A48D `fst`) up to its use at 0x49A6F3. Extended precision (control word 0x27F): the chains below
+            // are evaluated in `f64` and stored once, `RE/notes/REFERENCE-2026-10-31-HUMAN-DRIFT.md`.
+            let w_roll_wide = dot_x87_wide(self.angular_velocity, m.row(2));
+            let w_body = Vec3::new(dot_x87(self.angular_velocity, m.row(0)), dot_x87(self.angular_velocity, m.row(1)), w_roll_wide as f32);
+            let d = |x: f32| f64::from(x);
+            // `((s2 + s3) − (s0 + s1)) / div`, which stays in the register (0x49A493…0x49A4B8)
+            let p_in = ((d(susp_y[2]) + d(susp_y[3])) - (d(susp_y[0]) + d(susp_y[1]))) / d(div);
             let a_l = self.accel_local.z;
             // `.TINYCAR` takes the gain unfiltered (0x49A522…0x49A53E, 0x49A647…0x49A655)
             // A cop (`car+0x52C & 0x20`, 0x49A4CD) clamps `aL` to ±10 (`[0x5B241C]`, `[0x5B49E8]`)
@@ -655,39 +701,42 @@ impl Vehicle {
             self.dive = if self.net_car {
                 0.0
             } else if police {
-                a_l.clamp(-10.0, 10.0) * specs.dive_gain * 0.125 + self.dive * 0.8
+                (d(a_l.clamp(-10.0, 10.0)) * d(specs.dive_gain) * 0.125 + d(self.dive) * d(0.8)) as f32
             } else if self.tiny {
                 specs.dive_gain * a_l
             } else {
-                0.8 * self.dive + specs.dive_gain * a_l * if a_l > 0.0 { 0.125 } else { 0.175 }
+                (d(specs.dive_gain) * d(a_l) * d(if a_l > 0.0 { 0.125 } else { 0.175 }) + d(self.dive) * d(0.8)) as f32
             };
-            let p = sign_clamp(p_in - self.dive, specs.pitch_clamp);
-            let r_in = ((susp_y[1] + susp_y[3]) - (susp_y[0] + susp_y[2])) / div;
+            // 0x49A599 `fsub [car+0xDC4]`, stored to `[esp+0x28]` (0x49A5AB `fst`), then the sign-first clamp
+            let p = sign_clamp((p_in - d(self.dive)) as f32, specs.pitch_clamp);
+            let r_in = ((d(susp_y[3]) + d(susp_y[1])) - (d(susp_y[2]) + d(susp_y[0]))) / d(div);
             // the cop's roll filter takes 0.15 (`[0x5B2638]`, 0x49A627…0x49A639), anyone else 0.25
             // a network car (`car+0xDAC`, 0x49A608 `test edx, edx`; 0x49A612 `mov [esi+0xDC8], 0; jmp 0x49A671`) holds the roll filter
             // at 0 as well — the dive's 0x49A4BE twin — and skips the filter
             self.roll_lp = if self.net_car {
                 0.0
             } else if police {
-                specs.roll_gain * self.accel_local.x * 0.15 + self.roll_lp * 0.8
+                (d(specs.roll_gain) * d(self.accel_local.x) * d(0.15) + d(self.roll_lp) * d(0.8)) as f32
             } else if self.tiny {
                 specs.roll_gain * self.accel_local.x
             } else {
-                0.8 * self.roll_lp + 0.25 * specs.roll_gain * self.accel_local.x
+                (d(specs.roll_gain) * d(self.accel_local.x) * d(0.25) + d(self.roll_lp) * d(0.8)) as f32
             };
             // the roll target is scaled by `1 − car+0xD7F · [0x5B49E0]` (1/1275, `0x3A4D9A67`): the
             // throttle **byte** as 0x49DD20 left it (0x49A671 `mov al, [esi+0xD7F]` / `fild`),
             // 0…254, so full throttle leaves 0.8 of it (0x49A671…0x49A693). History:
             // `physics-history.md` §2.4.
-            let thr = self.throttle_byte as f32 * f32::from_bits(0x3A4D_9A67);
-            let rr = sign_clamp(r_in + (1.0 - thr) * self.roll_lp, specs.roll_clamp);
+            let thr = d(self.throttle_byte as f32) * d(f32::from_bits(0x3A4D_9A67));
+            let rr = sign_clamp_wide(r_in + (1.0 - thr) * d(self.roll_lp), specs.roll_clamp);
             // `fld specs[0x114]; fmul [car+0xD64]; fmul [0x5B49DC]` (0.925), then `+ p`, in that
-            // order (0x49A6DC…0x49A6EB); the roll `D6C · specs[0x118] + r` (0x49A6F1…0x49A6F9);
-            // then `ClampAngVel`'s sibling 0x49BC80 clamps `D64` / `D68` / `D6C` to ±0.75 each
-            let wp = (specs.pitch_ret * w_body.x * 0.925 + p).clamp(-0.75, 0.75);
-            let wr = (specs.roll_ret * w_body.z + rr).clamp(-0.75, 0.75);
+            // order (0x49A6DC…0x49A6EB); the roll `D6C · specs[0x118] + r` (0x49A6F1…0x49A6F9) with
+            // the unrounded roll dot; then `ClampAngVel`'s sibling 0x49BC80 clamps `D64` / `D68` / `D6C` to ±0.75 each
+            let wp = ((d(specs.pitch_ret) * d(w_body.x) * d(0.925) + d(p)) as f32).clamp(-0.75, 0.75);
+            let wr = ((d(specs.roll_ret) * w_roll_wide + rr) as f32).clamp(-0.75, 0.75);
             let wy = w_body.y.clamp(-0.75, 0.75);
-            self.angular_velocity = mt * Vec3::new(wp, wy, wr);
+            // 0x49A711…0x49A744: `0x532A00` transposes the rows, three dots (0x532910) give ω back in world axes
+            let wb = Vec3::new(wp, wy, wr);
+            self.angular_velocity = Vec3::new(dot_x87(wb, m.col(0)), dot_x87(wb, m.col(1)), dot_x87(wb, m.col(2)));
             // 0x49A756…0x49A8A4: on two wheels — some wheel hangs but not a wheel on **each** side
             // (left = wheels 0 / 2, `car+0x83C` / `+0x9C4`; right = 1 / 3, `+0x900` / `+0xA88`) —
             // the body is shifted by `Mᵀ·v/32` (`[0x5B24B8]`), `v = (−2·sin(2π·wr)·halfW,
@@ -720,11 +769,13 @@ impl Vehicle {
         // `0x5E8E2C[]` for anyone else, which for a racer is itself (0); the player also has the
         // force flag `car+0x10B8` (0x406E7F). Every racer therefore runs at `rateHz = 32`,
         // `nTicks = 1` (0x5CC700 / 0x5CC71C at index 6); a cop takes the gate's answer.
-        let dh = (h - self.ground_h) * rate_hz;
+        // 0x49BDC5…0x49BDFA: `fld h; fsub [car+0x41C]; fimul rate` in the register, one rounding at the `fstp`
+        let dh = ((f64::from(h) - f64::from(self.ground_h)) * f64::from(rate_hz)) as f32;
         self.ground_h = h;
         // `car+0x2C & 0xF`, the car tracker's zone word (0x49BF96, 0x49C244)
         let surf = (self.tracker.word & 15) as usize;
-        self.cos_tilt = self.ground_normal.dot(up);
+        // 0x49BE15…0x49BE20: `car+0x3A0 = 0x532910(row1, N)` (the dot rounds once at the `fstp`)
+        self.cos_tilt = dot_x87(self.ground_normal, up);
         // the tilted arm's `BodyGroundCollide` takes the car tracker's normal (0x474420,
         // 0x49BFB3) and the patch centre `car+0x400` (0x49BF77); the ceiling rule `car+0x404`
         let (tn, tq) = (self.tracker.normal, self.tracker.plane_point);
@@ -743,12 +794,13 @@ impl Vehicle {
         let cos = self.cos_tilt;
         let (x, z) = if !racer && cos > 0.9 {
             (m0, m2)
-        } else if cos < 0.5 && m0.dot(n).abs() > 0.5 {
-            let x = n.cross(m2).normalize_or_zero();
-            (x, x.cross(n).normalize_or_zero())
+        } else if cos < 0.5 && dot_x87(m0, n).abs() > 0.5 {
+            // 0x49BB2E…0x49BB5E: 0x532880 cross (0x56E8F5, one rounding per component) and 0x5328D0 normalise
+            let x = normalize_x87(cross_x87(n, m2));
+            (x, normalize_x87(cross_x87(x, n)))
         } else {
-            let z = m0.cross(n).normalize_or_zero();
-            (n.cross(z).normalize_or_zero(), z)
+            let z = normalize_x87(cross_x87(m0, n));
+            (normalize_x87(cross_x87(n, z)), z)
         };
         self.frame = Mat3::from_cols(x, n, z).transpose();
         self.car_ground_body(GroundContact { dh, n: tn, q: tq, surf }, specs.mass, Some((specs.probe_offset, specs.bump_travel)), grid, n_ticks, racer);

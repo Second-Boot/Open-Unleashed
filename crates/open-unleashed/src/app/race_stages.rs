@@ -127,9 +127,11 @@ impl App {
                         // draws the pick (`AudioLoadTrack` 0x4A88A0 → 0x4AE4D0, 0x4A8A6D; the draws
                         // at 0x4AE65A…0x4AE739) before it remakes the sky (0x414EB0 → 0x4690A0 at
                         // 0x414F21 → 0x45DBD0 → the jitter 0x45F3C0, 0x45EADF). The port's sky
-                        // (`Sky::upload`, race_start.rs) is made right after this pick. Not modelled:
-                        // the sky pass 0 of the track load (0x468FB0 → 0x45DBD0(track, 0) at 0x4B6820,
-                        // before 0x414DB0 and the HUD's reseed); its draws are not read (APPROXIMATION)
+                        // (`Sky::upload`, race_start.rs) is made right after this pick. Not modelled,
+                        // and not needed: the sky pass 0 of the track load (0x468FB0 → 0x45DBD0(track, 0)
+                        // at 0x4B6820) draws the same jitter as the remake, but from a state that
+                        // 0x538110(time(0)) at 0x428C2D (the HUD factory, 0x4B6878) overwrites whole,
+                        // and the objects it builds are destroyed by the remake (`particles.md` §12)
                         let rng = &mut self.fe_rng;
                         m.start_race(a, &mut || rng.next_u32().wrapping_add(crate::app::audio::tick_count_ms()));
                     }
@@ -139,7 +141,7 @@ impl App {
     }
 
     /// Stage "cars" — steps 8 → 9: the grid pose, the player's seat, the opponents, the police and the traffic; hands back the slice table, the start frame and the player's grid slot.
-    pub(super) fn race_stage_grid(&mut self, renderer: &mut Renderer, world: &mut TrackWorld, car_env: nfs_game::world::CarEnv, driver_rand: &mut nfs_game::movie_overlay::CRand, factory_driver: bool) -> (Option<SliceTable>, glam::Mat3, Option<(usize, Vec3)>, Vec<(usize, usize, Vec3)>) {
+    pub(super) fn race_stage_grid(&mut self, renderer: &mut Renderer, world: &mut TrackWorld, car_env: nfs_game::world::CarEnv, driver_rand: &mut nfs_game::movie_overlay::CRand, factory_driver: bool) -> (Option<SliceTable>, glam::Mat3, Option<(usize, Vec3, Vec3)>, Vec<(usize, usize, Vec3, Vec3)>) {
         // start pose from the slice-based grid rule (pole position, single racer)
         // `<track>.jnc` carries the branch weights the AI's junction choice reads (`race-logic.md` §10)
         let table = SliceTable::from_crp(&self.track.crp, &self.track.crp_data).ok().map(|mut t| {
@@ -207,15 +209,15 @@ impl App {
         // (`NUMCARS` at the grid is the players and the kept traffic, 0x4B5079's fix-up on the launch's 8 + traffic)
         let grid_rule = nfs_game::race::GridRule { linear: self.linear_track(), derby_cars: self.net_launch.derby.then(|| n_cars + self.road.traffic_count) };
         // the player's `Grid_slot` slice and pose, for `Car_placeAtSlice` below
-        let mut grid_place: Option<(usize, Vec3)> = None;
+        let mut grid_place: Option<(usize, Vec3, Vec3)> = None;
         // the opponents' `Grid_slot` slices and poses (opponent index, slice, pose), placed after the
         // human's (`start_race`): `Cars_resetAll` 0x4110A0 resets the racers in registration order
-        let mut opp_places: Vec<(usize, usize, Vec3)> = Vec::new();
+        let mut opp_places: Vec<(usize, usize, Vec3, Vec3)> = Vec::new();
         let rot = match &table {
             Some(t) => {
-                let (pos, rot, slice) = grid_pose(t, start_scene, self.player_grid, n_cars, &grid_rule);
+                let (pos, rot, slice, grid_off) = grid_pose_with_offset(t, start_scene, self.player_grid, n_cars, &grid_rule);
                 self.car_pos = pos;
-                grid_place = Some((slice, pos));
+                grid_place = Some((slice, pos, grid_off));
                 let mut progress = RaceProgress::new(slice, t);
                 if self.linear_track() {
                     progress.set_linear(t, nfs_game::race::finish_slice(t, start_scene));
@@ -257,7 +259,7 @@ impl App {
                         None
                     };
                 if replaying && rec_resolved.is_none() && self.replay_net.is_none() && self.num_opponents > 0 {
-                    tracing::info!("replay: no opponent records in the setup, the opponents are drawn again (APPROXIMATION)");
+                    tracing::info!("replay: no opponent records in the setup, the opponents are drawn again (PORT-DEVIATION D22)");
                 }
                 let rec_plan: Option<Vec<(
                     nfs_formats::fedata::CarCatalogEntry,
@@ -559,7 +561,7 @@ impl App {
                         roll_gain_before = block_before.2, roll_gain = specs.roll_gain, top_speed_before = block_before.3, top_speed = specs.top_speed,
                         "opponent's stock parts / own parts and set-up folded (0x49CB50)"
                     );
-                    let (p, r, sl) = grid_pose(t, start_scene, g, n_cars, &grid_rule);
+                    let (p, r, sl, grid_off) = grid_pose_with_offset(t, start_scene, g, n_cars, &grid_rule);
                     let (linear, finish) = (self.linear_track(), nfs_game::race::finish_slice(t, start_scene));
                     let mut vehicle = Vehicle::new(p, r, &specs, model.half_track, model.wheel_radius);
                     vehicle.race_started = false;
@@ -590,7 +592,7 @@ impl App {
                     // `Car_placeAtSlice` 0x49B090 (0x41095C) — run in `start_race`, after the human's:
                     // `Cars_resetAll` 0x4110A0 resets the racers in registration order, and the
                     // placement's two `Susp_update`s draw their roughness from the shared word
-                    opp_places.push((self.road.opponents.len(), sl, p));
+                    opp_places.push((self.road.opponents.len(), sl, p, grid_off));
                     let mut model = model;
                     if car_tiny {
                         model.scale = 0.4;

@@ -307,7 +307,8 @@ mod tests {
         v.net_dead_reckon(&b, 100, &grid, &specs, None);
         assert!((v.position.x - 30.0).abs() < 1e-4, "snapped: {}", v.position.x);
         assert_eq!(v.velocity.z, 10.0);
-        assert_eq!(v.angular_velocity, Vec3::new(0.0, 0.25, 0.0));
+        // the yaw rate is turned by the frame, whose up row is the capped patch normal (n.y = 0.9999, 0x486010 / [0x5B3E0C])
+        assert!((v.angular_velocity - Vec3::new(0.0, 0.25, 0.0)).length() < 1e-4, "{:?}", v.angular_velocity);
     }
 
     /// The extrapolation is `P + v'·age/64` with the velocity turned by half the yaw: with no yaw

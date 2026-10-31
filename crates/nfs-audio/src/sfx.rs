@@ -96,10 +96,12 @@ pub const GROUP_BUSH: usize = 0x7C;
 /// sample. See [`SfxQueue`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueuedSfx {
-    /// 0x40F740, a wall hit (`0x40008 + class`): `j` the closing speed, `car+0x430 = 3·j`
-    WallHit { j: f32, class: u8 },
-    /// 0x40F740, a wall scrape (`0x40015 + class`): `car+0x430 = speedEst/4`
-    WallScrape { speed: f32, class: u8 },
+    /// 0x40F740, a wall hit (`0x40008 + class`) at `mag` = the slot `car+0x430` as the tick left
+    /// it ([`SfxQueue::push_impact`]: the pass's own `3·j` or an earlier writer's larger value)
+    WallHit { mag: f32, class: u8 },
+    /// 0x40F740, a wall scrape (`0x40015 + class`) at `mag` = the slot `car+0x430` as the tick
+    /// left it (the pass's own `3·speedEst/12`, or an earlier writer's larger value)
+    WallScrape { mag: f32, class: u8 },
     /// 0x40F740, CarBody × CarBody (`0x50003` with `car+0x434` a car): `car+0x430` = the effect
     CarCar { effect: f32 },
     /// 0x40F740, a car–car contact whose other body is a smackable: `car+0x438 = 0x50000 |
@@ -206,10 +208,27 @@ impl SfxQueue {
     /// ([`Self::commit_impact`]). Measured on the running original
     /// (`REFERENCE-2026-10-24-PA-AUDIOMIX.md`): a tick with a bush and a wall contact queues the
     /// bush alone (0x4A93C0 called once, idB 15), where the port queued both. *(Until 2026-10-24
-    /// each contact pushed its own event — the APPROXIMATION "an event per wall / prop / pair call
-    /// rather than 0x40F740's one per tick" of `sfx.md` §4.2.)* APPROXIMATION left: the gate takes
-    /// the standing event's own magnitude; a pair round's store that keeps the larger of two
-    /// values is not modelled across writers.
+    /// each contact pushed its own event — the approximation "an event per wall / prop / pair call
+    /// rather than 0x40F740's one per tick" of `sfx.md` §4.2.)*
+    ///
+    /// **Which writers keep a maximum (read 2026-10-31, `RE/notes/sfx.md` §4.2).** Only the wall
+    /// pass 0x495020 reads the standing slot. Per crossed edge it calls `WallImpulse` 0x494000,
+    /// which for `j > 0` writes the kind word `car+0x438` (0x49411E…0x4941DE) and answers
+    /// `3·|mag|` (0 for `j ≤ 0`, 0x49438A); the pass raises its local `best` (`[esp+0x1c]`, 0 at
+    /// 0x495031) to the answer (0x495538), stores the answer **plainly** into the slot only above
+    /// 20.0 (`[0x5B2470]`, 0x49554F → 0x49555D, then the crash response 0x494DF0 reads it back
+    /// at 0x494E36), and ends with `slot = max(slot, best)` (0x49557D…0x495594). So the slot the
+    /// tick's last wall contact leaves is `max(earlier writer or a plain over-20 store, best)`,
+    /// the kind and class those of the last contact with `j > 0`. Every other writer overwrites:
+    /// the ground 0x4960E6 / 0x496844, the prop 0x4984B8 (rescaled in place at 0x498575, not a
+    /// maximum), the bush / prop constants 0x498EF6 / 0x498F43, the pair rounds
+    /// 0x496B42…0x496C3E (whose "larger of two" is between values local to the round).
+    ///
+    /// The port keeps the slot's magnitude in `Vehicle::contact_mag` (ground, wall pass, props and
+    /// pairs write it in the original's order, `collide_walls` with the rule above) and the
+    /// event's kind here; the caller builds the wall event with that magnitude, so a wall contact
+    /// of 20 or less after a harder ground contact queues the wall's kind at the ground's
+    /// magnitude, and a later, weaker contact above 20 no longer replaces the pass's best.
     pub fn push_impact(&mut self, e: QueuedSfx) {
         self.pending = Some(e);
     }
@@ -229,8 +248,7 @@ impl SfxQueue {
     pub fn commit_impact(&mut self) {
         let Some(e) = self.pending.take() else { return };
         let mag = match e {
-            QueuedSfx::WallHit { j, .. } => 3.0 * j,
-            QueuedSfx::WallScrape { speed, .. } => speed * 0.25,
+            QueuedSfx::WallHit { mag, .. } | QueuedSfx::WallScrape { mag, .. } => mag,
             QueuedSfx::CarCar { effect } => effect,
             QueuedSfx::Smackable { effect, .. } => effect,
             QueuedSfx::Prop { impact, .. } => impact,
@@ -771,8 +789,7 @@ impl CollisionSfx {
 
     /// Wall hit with normal closing speed `j` (m/s) on a wall of material class `class`
     /// (0 metal, 1 wood, 2 snow, 3 ice, 4 earth, 5 rock): `vol = 3j/8`, level `64 + clamp(6.3·vol, 2, 63)`.
-    pub fn wall_hit(&mut self, out: &AudioOutput, j: f32, class: u8) {
-        let mag = 3.0 * j;
+    pub fn wall_hit(&mut self, out: &AudioOutput, mag: f32, class: u8) {
         if mag <= 1.5 {
             return;
         }
@@ -784,8 +801,7 @@ impl CollisionSfx {
 
     /// Wall scrape at speed `speed` (m/s) along a wall of material class `class`: `vol = speed/32`,
     /// level `clamp(76·vol, 2, 127)`.
-    pub fn wall_scrape(&mut self, out: &AudioOutput, speed: f32, class: u8) {
-        let mag = speed * 0.25;
+    pub fn wall_scrape(&mut self, out: &AudioOutput, mag: f32, class: u8) {
         if mag <= 1.5 {
             return;
         }
@@ -977,8 +993,8 @@ impl CollisionSfx {
         self.set_one_shot_pan(one_shot_pan);
         for e in queue.entries.iter().rev() {
             match *e {
-                QueuedSfx::WallHit { j, class } => self.wall_hit(out, j, class),
-                QueuedSfx::WallScrape { speed, class } => self.wall_scrape(out, speed, class),
+                QueuedSfx::WallHit { mag, class } => self.wall_hit(out, mag, class),
+                QueuedSfx::WallScrape { mag, class } => self.wall_scrape(out, mag, class),
                 QueuedSfx::CarCar { effect } => self.car_car(out, effect),
                 QueuedSfx::Smackable { effect, material } => self.car_smackable(out, effect, material),
                 QueuedSfx::Prop { impact, class } => self.prop_hit(out, impact, class),
@@ -1176,8 +1192,8 @@ impl CollisionSfx {
         for e in queue.entries.iter().rev() {
             tracing::debug!(audio_slot, event = ?e, distance, atten = self.atten, "ai sfx drain (0x4A73DE)");
             match *e {
-                QueuedSfx::WallHit { j, class } => self.wall_hit(out, j, class),
-                QueuedSfx::WallScrape { speed, class } => self.wall_scrape(out, speed, class),
+                QueuedSfx::WallHit { mag, class } => self.wall_hit(out, mag, class),
+                QueuedSfx::WallScrape { mag, class } => self.wall_scrape(out, mag, class),
                 QueuedSfx::CarCar { effect } => self.car_car(out, effect),
                 QueuedSfx::Smackable { effect, material } => self.car_smackable(out, effect, material),
                 QueuedSfx::Prop { impact, class } => self.prop_hit(out, impact, class),
@@ -1410,7 +1426,7 @@ mod tests {
         let mut q = SfxQueue::default();
         q.push_impact(QueuedSfx::CarCar { effect: 1.5 });
         q.commit_impact();
-        q.push_impact(QueuedSfx::WallHit { j: 0.4, class: 0 });
+        q.push_impact(QueuedSfx::WallHit { mag: 1.2, class: 0 });
         q.commit_impact();
         assert!(q.entries().is_empty());
         for _ in 0..9 {
@@ -1426,17 +1442,17 @@ mod tests {
     #[test]
     fn the_ticks_last_contact_is_its_one_collision_event() {
         let mut q = SfxQueue::default();
-        q.push_impact(QueuedSfx::WallScrape { speed: 28.0, class: 5 });
+        q.push_impact(QueuedSfx::WallScrape { mag: 7.0, class: 5 });
         q.push_impact(QueuedSfx::Bush);
         q.commit_impact();
         assert_eq!(q.entries(), &[QueuedSfx::Bush]);
         q.commit_impact();
         assert_eq!(q.entries().len(), 1, "the slot is cleared");
         q.clear();
-        q.push_impact(QueuedSfx::WallHit { j: 5.0, class: 0 });
+        q.push_impact(QueuedSfx::WallHit { mag: 15.0, class: 0 });
         q.push_ground_impact(QueuedSfx::Ground { effect: 20.0, nibble: 1 });
         q.commit_impact();
-        assert_eq!(q.entries(), &[QueuedSfx::WallHit { j: 5.0, class: 0 }]);
+        assert_eq!(q.entries(), &[QueuedSfx::WallHit { mag: 15.0, class: 0 }]);
         q.clear();
         q.push_ground_impact(QueuedSfx::Ground { effect: 20.0, nibble: 1 });
         q.commit_impact();
@@ -1457,7 +1473,7 @@ mod tests {
         let mut q = SfxQueue::default();
         q.push(QueuedSfx::Landing { closing: 10.0 });
         q.push(QueuedSfx::Crash);
-        q.push_impact(QueuedSfx::WallHit { j: 5.0, class: 0 });
+        q.push_impact(QueuedSfx::WallHit { mag: 15.0, class: 0 });
         q.push_impact(QueuedSfx::CarCar { effect: 4.0 });
         q.commit_impact();
         q.produce_loops(&LoopInput { front_slip: 1.0, ..input() }, || 0);

@@ -821,7 +821,7 @@ fn trigger_value(v: i16) -> i32 {
 /// (Y growing downward, as DirectInput's), **LT on `lZ`** and **RT on `lRz`** ([`trigger_value`]),
 /// mask 0x3F — two separate analogue triggers, both pressable at once, where DirectInput's own
 /// Xbox driver folds both into one `lZ`. *(Until PAD-MODERN the triggers were buttons 8 / 9 past
-/// three quarters of their travel, an APPROXIMATION; a profile that bound those buttons must be
+/// three quarters of their travel, an approximation; a profile that bound those buttons must be
 /// rebound.)* Buttons are the port's numbering ([`BUTTON_ORDER`]; PORT-DEVIATION D25) and
 /// `button_mask` is every one the standard mapping has (all but `C`, `Z` and the two trigger
 /// slots). The d-pad is the first hat.
@@ -847,7 +847,7 @@ pub fn pad_record(p: &PadSnapshot) -> PadRecord {
 /// device's HID report declares them (X, Y, Z, Rx, Ry, Rz, then sliders / dials), which is the
 /// order of `DIJOYSTATE`'s `lX lY lZ lRx lRy lRz rglSlider[0] rglSlider[1]`, so SDL axis `n` is
 /// DirectInput axis `n` and the axes past the sixth are the two sliders (`RE/notes/controls.md`
-/// §4.17; **APPROXIMATION**: the index equivalence is by the HID usage order, not read from the
+/// §4.17; **APPROXIMATION** (device behaviour: the HID report of a foreign device is not readable from any binary of ours; PORT-DEVIATION D25): the index equivalence is by the HID usage order, not read from the
 /// device's usages; a device that declares its axes in another order shows them in that order).
 /// Axes past the eighth, hats past the fourth and buttons past the 32nd do not fit the
 /// record and are dropped. SDL's raw axis values are used unscaled (centre 32768 of 0…65535).

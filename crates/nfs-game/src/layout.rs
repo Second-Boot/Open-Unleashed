@@ -3859,7 +3859,7 @@ impl LayoutScreen {
             // (RE/notes/REFERENCE-2026-10-18-srv-hit.md: measured on the original, GameSetup, GameCtrl,
             // Options). `nosize` is the widget's own `.lay` key, else the template default.
             //
-            // **Settled 2026-10-22 (was an APPROXIMATION).** A widget whose state draws no part at all
+            // **Settled 2026-10-22 (was an approximation).** A widget whose state draws no part at all
             // needs no skip of its own: an autosizing one has the empty union as its box (0x5253C0),
             // which 0x525A90 fails, and a fixed-size one (`autosize = 0`) keeps its `size.value` in
             // the original — the only state that zeroes the box regardless of size is `hidden`

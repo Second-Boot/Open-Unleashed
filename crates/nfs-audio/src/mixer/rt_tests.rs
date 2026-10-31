@@ -567,7 +567,9 @@ fn the_scripted_mix_is_pinned() {
 // (0x59BCE0 interleaves `[plane 1, plane 0]`, `pan::pan_gains`): every panned mono voice of the
 // script changed sides, its stereo voices take 127 a side at the centre (`pan::stereo_gains`), the
 // stereo stream kept its channels.
-const PINNED_MIX: [u64; 5] = [0x43b06fd19d77e42a, 0x5611313e9eae8adc, 0x61c9988faa7a78f4, 0xbcbdd983ae7ffef3, 0x1516dd88399a42a2];
+// Re-pinned for APPROX-AUDIO: a stereo voice's angle is cleared by 0x5968F3, so the pan byte no
+// longer moves its channels (the script's off-centre stereo one-shot).
+const PINNED_MIX: [u64; 5] = [0xbedde377127e90dc, 0x6cb66dece995a390, 0x95b408b945f4cf74, 0x07716ef1cbee24f0, 0x459fba894c08b99b];
 
 /// A reported session: the output opened at `AUDIOQUALITY` 0 (32000 Hz, a fresh
 /// profile's default) with the front end's song and loops playing, then the profile's 1 (22050

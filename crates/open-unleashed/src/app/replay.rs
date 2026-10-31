@@ -219,7 +219,7 @@ impl App {
             // `.TRANSMISSION` is the recording's (`carinfo+0xC` of the restored block, `player_automatic`); a file
             // from before the field takes the session's option (PORT-DEVIATION D22, logged below)
             let automatic = setup.transmission.unwrap_or_else(|| {
-                tracing::info!("replay: no .TRANSMISSION in the setup, the session's Car.Transmission option is used (APPROXIMATION)");
+                tracing::info!("replay: no .TRANSMISSION in the setup, the session's Car.Transmission option is used (PORT-DEVIATION D22)");
                 self.player_automatic()
             });
             // the car-info record of slot 0 `Replay_begin` 0x413CF0 restored: `.PARTINDEX`, `.PARTDAMAGE`, the
@@ -236,7 +236,7 @@ impl App {
                     self.specs.apply_setup(&c.setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
                 }
                 None => {
-                    tracing::info!("replay: no car record in the setup, the car is a fresh catalogue car (APPROXIMATION)");
+                    tracing::info!("replay: no car record in the setup, the car is a fresh catalogue car (PORT-DEVIATION D22)");
                     nfs_game::career::fold_fresh_car(&mut self.specs, &e.stock_parts, &table, &e.sim_family, automatic);
                 }
             }
@@ -270,7 +270,7 @@ impl App {
         self.mission = setup.mission.as_ref().and_then(|w| {
             let m = career_ui::MissionStart::from_replay_words(&self.paths, w, setup.scene);
             if m.is_none() {
-                tracing::info!("replay: the recorded mission matches no nfs5.fac record, no mission HUD (APPROXIMATION)");
+                tracing::info!("replay: the recorded mission matches no nfs5.fac record, no mission HUD (PORT-DEVIATION D22)");
             }
             m
         });
@@ -308,7 +308,7 @@ impl App {
         self.road.cop_count = if setup.fegame_type == Some(9) { 2 } else { 4 };
         match setup.camera.as_ref().filter(|c| !c.is_empty()) {
             Some(c) => self.camera_cycle = c.iter().map(|&v| v as u16).collect(),
-            None => tracing::info!(cycle = ?self.camera_cycle, "replay: no camera list in the setup, the last launch's stays (APPROXIMATION)"),
+            None => tracing::info!(cycle = ?self.camera_cycle, "replay: no camera list in the setup, the last launch's stays (PORT-DEVIATION D22)"),
         }
         // `DERBY` 0x1B and `NOCOLLISION` 0x29 are block words too: the smash-up cheat the race ran under (the
         // session's own bit comes back when the playback is left) and a positional network race's car-car pass
@@ -321,7 +321,7 @@ impl App {
             self.net_launch.nocollision = nc && setup.net.is_some();
         }
         if setup.race_type.is_none() || setup.fegame_type.is_none() {
-            tracing::info!(race_type = ?setup.race_type, fegame_type = ?setup.fegame_type, "replay: no RACE_TYPE / FEGAME_TYPE in the setup, a single race under the current Game.GameType (APPROXIMATION)");
+            tracing::info!(race_type = ?setup.race_type, fegame_type = ?setup.fegame_type, "replay: no RACE_TYPE / FEGAME_TYPE in the setup, a single race under the current Game.GameType (PORT-DEVIATION D22)");
         }
     }
 

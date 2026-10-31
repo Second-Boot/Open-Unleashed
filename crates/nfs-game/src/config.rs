@@ -130,6 +130,7 @@ switches! {
     nfs_shot_settle = "NFS_SHOT_SETTLE",
     nfs_pa_input = "NFS_PA_INPUT",
     nfs_pa_trace = "NFS_PA_TRACE",
+    nfs_pa_finish = "NFS_PA_FINISH",
     nfs_pa_loops = "NFS_PA_LOOPS",
     nfs_sky_level = "NFS_SKY_LEVEL",
     nfs_smack_ram = "NFS_SMACK_RAM",

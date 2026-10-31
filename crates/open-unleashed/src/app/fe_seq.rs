@@ -87,6 +87,29 @@ impl App {
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     self.bind_lists();
+                } else if let Some(n) = k.strip_prefix("kosel:").and_then(|n| n.parse::<usize>().ok()) {
+                    // `kosel:<row>` (tooling) — `Knockout.TrackNumber`'s selection (the round whose track
+                    // the next `Knockout.*` token sets), as a click on that row of `locationsetup` does
+                    if let Some(m) = self.fe.menu.as_mut() {
+                        m.ko_sel = n;
+                    }
+                } else if let Some(ms) = k.strip_prefix("frames:").and_then(|n| n.parse::<u64>().ok()) {
+                    // `frames:<ms>` (tooling) — the front end's own frames for that long, so a
+                    // timed screen (the end-of-era show, 0x4FF1F0) runs on to its next screen
+                    // before the keys after it (`wait:` draws no frame)
+                    let until = Instant::now() + Duration::from_millis(ms);
+                    while Instant::now() < until {
+                        // the show's tick (0x4FF180): back one screen when it is over, as the frame loop does
+                        if self.fe.layout_preview.as_ref().is_some_and(|l| l.end_of_era_leave()) {
+                            self.fe_back(0, event_loop);
+                            continue;
+                        }
+                        let now = Instant::now();
+                        self.frame_dt = (now - self.last_frame).as_secs_f32();
+                        self.last_frame = now;
+                        self.draw_frame();
+                        std::thread::sleep(Duration::from_millis(4));
+                    }
                 } else if let Some(ms) = k.strip_prefix("wait:").and_then(|n| n.parse::<u64>().ok()) {
                     // `wait:<ms>` (tooling) — the lobby's tick for that long: the
                     // session drains and the option records go out / come in

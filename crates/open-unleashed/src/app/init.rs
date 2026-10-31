@@ -258,6 +258,7 @@ impl App {
             bar_press: None,
             hud_key_script: std::env::var("NFS_HUD_KEYS_1").or_else(|_| std::env::var("NFS_HUD_KEYS")).map(|s| parse_hud_keys(&s).into()).unwrap_or_default(),
             race_order: Default::default(),
+            opp_sort_keys: Vec::new(),
             audio_paused: false,
             results_billboard: None,
             billboard_key: 0,

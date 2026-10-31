@@ -1227,11 +1227,10 @@ impl Police {
         for i in 0..self.cars.len() {
             let g = startingpos.get(i).copied().unwrap_or(0);
             let (slice, off) = crate::race::grid_slot_by(table, start, (g - 1) as u32, n, &rule, |s, d| crate::traffic::add_slices_on(table, linear, s, d));
-            let sl = table.slices[slice];
             let c = &mut self.cars[i];
             c.sync_body_in();
             let held = std::mem::replace(&mut c.body.game_tick, tick);
-            c.body.place_at_slice(grid, &c.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, off, false, false);
+            c.body.place_at_slice(grid, &c.specs, table.frame(slice, true), off, false, false);
             c.body.game_tick = held;
             c.sync_body_out();
         }
@@ -1255,7 +1254,7 @@ impl Police {
             let slot = (self.slot_base + i) as f32;
             let c = &mut self.cars[i];
             c.sync_body_in();
-            c.body.place_at_slice_from(g, &c.specs, s1.centre, nfs_physics::vehicle::SliceFrame { centre: s0.centre, forward: s1.forward.normalize_or_zero(), raw: [s0.lateral, s0.up, s0.forward] }, Vec3::new(0.0, slot * 10.0, 0.0), nfs_physics::vehicle::PlaceFlags { opponent: false, flip: false, in_world: false });
+            c.body.place_at_slice_from(g, &c.specs, s1.centre, nfs_physics::vehicle::SliceFrame { centre: s0.centre, forward: s1.forward.normalize_or_zero(), raw: [s0.lateral, s0.up, s0.forward], end: Some((table, 0)) }, Vec3::new(0.0, slot * 10.0, 0.0), nfs_physics::vehicle::PlaceFlags { opponent: false, flip: false, in_world: false });
             c.sync_body_out();
         }
         // (the table's entry only scales the draw: `1 + (rand16 * table[n]) >> 16`)
@@ -1660,7 +1659,7 @@ impl Police {
         let sl = &table.slices[s];
         c.slice = s;
         c.sync_body_in();
-        c.body.place_at_slice(grid, &c.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, Vec3::ZERO, false, c.requested_dir < 0.0);
+        c.body.place_at_slice(grid, &c.specs, table.frame(s, true), Vec3::ZERO, false, c.requested_dir < 0.0);
         c.sync_body_out();
         c.frame = [sl.lateral, sl.up, sl.forward];
         c.body.point_rows = None;
@@ -2219,7 +2218,7 @@ impl Police {
         let mut cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, st_road, bend) {
             aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, accel, brake)
         } else {
-            let grip = 1.0 + 0.0015 * aidrive::body_forward_speed(&st);
+            let grip = aidrive::grip_factor(&st);
             aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, rate_mul, accel, brake)
         };
         // `0x40A1D0` calls the stability assist 0x49F0C0 before it turns the force into the world acceleration, for every
@@ -2629,7 +2628,7 @@ impl Police {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
                 c.sync_body_in();
-                c.body.place_at_slice(g, &c.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
+                c.body.place_at_slice(g, &c.specs, table.frame(slice.min(table.slices.len() - 1), true), Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
                 c.sync_body_out();
                 c.frame = [sl.lateral, sl.up, sl.forward];
                 c.lateral = (c.position - sl.centre).dot(sl.lateral.normalize_or_zero());

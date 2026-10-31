@@ -37,10 +37,11 @@ mod ground;
 mod netcar;
 mod tuning;
 mod world_hits;
-mod x87;
+/// The x87 idioms of the physics step ([`x87`] has the list), shared with the AI drive of `nfs-game`.
+pub mod x87;
 pub use netcar::Block as NetBlock;
 use tuning::*;
-use x87::{fistp, sign_clamp, tyre_demand_clamp};
+use x87::{cross_x87, rotate_turns, sin_cos_turns_f32, dot_x87, dot_x87_wide, fistp, normalize_x87, sign_clamp_wide, sign_clamp, tyre_demand_clamp};
 
 /// [`Vehicle::race_state`], `car+0xB50` (the finish state). Every store is one of these three
 /// (the app's per-tick writes, simulate.rs / net.rs); nothing reads it from a file or the wire.
@@ -106,7 +107,9 @@ pub enum EngineArm {
 /// `set_wheel_steer` scales the lock to 17 (`y · 17 / max_steer`), so this undoes it. One function
 /// for the tyre and the renderer.
 pub fn steer_angle_256(max_steer: f32, steer: f32) -> f32 {
-    max_steer * steer / 17.0
+    // 0x4A20F3…0x4A211D: `specs[0xFC] · wheel+0xB4 · [0x5B4AA4]` (the f32 constant 0x3D70F0F1 = 1/17, a multiply, not a divide),
+    // one register chain, stored once
+    (f64::from(max_steer) * f64::from(steer) * f64::from(f32::from_bits(0x3D70_F0F1))) as f32
 }
 
 /// Under `RALLY` (`[0x6573F8]`) a surface nibble 1 or 10 reads as 2 — the body tracker's
@@ -122,6 +125,11 @@ pub(crate) fn rally_reads_as_two(nibble: usize, rally: bool) -> bool {
 pub fn norm_est(a: f32, b: f32) -> f32 {
     a.max(b) + 0.25 * a.min(b)
 }
+
+/// `[0x5BB2C8]`, the **double** `0.1591549515724182` (= 1 / 6.28318452835083, [`x87::TWO_PI_IMAGE`]) `0x532860` multiplies `fpatan` by to give turns.
+pub const TURN_PER_RAD_IMAGE: f64 = 0.1591549515724182;
+/// `[0x5B49B0]`, 1/12 as an `f32` (0x4A2516): the front lateral limit is `min(|lat|, 16) · load` times this, not a division.
+const ONE_TWELFTH: f32 = f32::from_bits(0x3DAA_AAAB);
 
 pub const DT32: f32 = 0.03125;
 pub const DT64: f32 = 0.015625;
@@ -210,11 +218,22 @@ pub enum PropEvent {
 
 /// The track slice a car is placed on ([`Vehicle::place_at_slice`]): its centre, its plain forward
 /// `F` and the raw frame rows `[lateral, up, forward]`.
-#[derive(Debug, Clone, Copy)]
-pub struct SliceFrame {
+#[derive(Clone, Copy)]
+pub struct SliceFrame<'a> {
     pub centre: Vec3,
     pub forward: Vec3,
     pub raw: [Vec3; 3],
+    /// The slice table and the slice index the caller placed on (`Car_placeAtSlice`'s `slice` argument): with it the
+    /// placement re-finds the tracker's slice at the final position as 0x474440 does and takes **that** slice's raw
+    /// vectors. `None` (tests, callers with no table) keeps `raw`.
+    pub end: Option<(&'a dyn EndSlice, usize)>,
+}
+
+/// What 0x474440 gives the placement (0x49B40C → 0x49AF70): the raw rows `[lateral, up, forward]` of the slice
+/// the tracker ends on. `seat` is the slice index of the call (0x49B090 seats the tracker on `max(1, seat)`,
+/// `setSlice` 0x473210 leaving `preferredSection = -1`, so 0x474440 is `findSlice(pos, seat)` 0x481400).
+pub trait EndSlice {
+    fn raw_at(&self, pos: Vec3, seat: usize) -> [Vec3; 3];
 }
 
 /// What [`Vehicle::car_ground_body`] reads of the contact: the ground-height rate `dh`, the
@@ -258,7 +277,7 @@ pub struct Vehicle {
     pub engine_arm: EngineArm,
     /// `DraftFactor` 0x49D9B0's result, which scales the drag. 1.0 = clean air; the caller sets it
     /// from the other racers each tick with [`draft_factor`].
-    pub draft: f32,
+    pub draft: f64,
     /// `car+0x54C` — the induction boost state 0..1 (0x49E6C4), which the turbo sound reads.
     pub boost: f32,
     /// The `rand16` the AI's start-gear shift timer takes (0x40C06F…0x40C09E, `4 + (r·8 >> 16)`),
@@ -525,6 +544,11 @@ pub struct Vehicle {
     /// (0x49557D…0x495594) for 0x40F740, whose kind-4 arm fires the sparks 0x43F4C0 over 1.5
     /// (0x40F944…0x40F9B9). Nothing in the physics reads it.
     pub last_wall_effect: f32,
+    /// Output only: whether the wall pass's last contact with `j > 0` was a scrape
+    /// (`speedEst/8 > j`, 0x4940FC → the `0x40015…` words) rather than a hit (`0x40008…`) — the
+    /// event word `car+0x438` `WallImpulse` 0x494000 leaves for 0x40F740. [`Self::last_wall_class`]
+    /// is that contact's class.
+    pub last_wall_scrape: bool,
     /// The body's own ground tracker `car+8` and the plane `car+0x3E8` / `car+0x400` 0x499520
     /// keeps from it ([`PatchTracker`]): 0x49AF70 runs it at the head of every physics tick
     /// ([`Self::step32`]); `Car_ground`'s tilted arm, the 8 m ceiling rule and `Susp_update`'s
@@ -661,6 +685,7 @@ impl Vehicle {
             pair_event: 0,
             last_contact: Vec3::ZERO,
             last_wall_effect: 0.0,
+            last_wall_scrape: false,
             contact_mag: 0.0,
             contact_kind: ContactKind::None,
             tracker: PatchTracker::new(Vec3::new(position.x, position.y - wheel_radius, position.z)),
@@ -814,7 +839,15 @@ impl Vehicle {
     /// step never runs — can have the same wheels. [`Self::steer_wheels_now`] is the convenience
     /// form that takes the values off the vehicle.
     pub fn set_wheel_steer(&mut self, specs: &CarSpecs, steer_int: f32, speed: f32, v_fwd: f32) {
-        let mut y = specs.max_steer;
+        // 0x49F5E4…0x49F6C4, one register chain (control word 0x27F) with a single `fstp` per wheel: `y = specs[0xFC]`, below 30 m/s
+        // times `1.75 − 0.025·speed` (`[0x5B36E8]`, `[0x5B4A2C]`), cut at 20 (`[0x5B2470]`: `20 > y` keeps `y`, otherwise 20 — no lower
+        // bound in the image), times `17 / specs[0xFC]` (`[0x5B4A80]`, the quotient unrounded); then
+        // `wheel0 = ((steer + specs[0x100]) · (1 − damage[0]·2⁻⁹) · y) · [0x5B4A78]` and likewise `(steer − specs[0x100])` with
+        // `damage[2]` (0x49F642…0x49F68F): the toe offset is added to the **steering value**, not to `y` (`fld st(1)` is the
+        // `fild` of the steer, 0x49F659 `fadd [specs+0x100]`; `physics.md` §4 had `(Y ± off)`), and `[0x5B4A78]` is the `f32` 1/127
+        // as a multiply. *(Corrected 2026-11-01: the port divided by 127 in `f32` steps and added the offset to `y`.)*
+        let ms = f64::from(specs.max_steer);
+        let mut y = ms;
         // **Below** 30 m/s, not above — `physics.md` had the condition inverted and the port
         // followed it. 0x49F5EA loads the speed, 0x49F5F0 compares it with `[0x5B2408]` = 30.0,
         // and 0x49F5FB's `test ah,1; je` **skips** the factor when C0 is clear, i.e. when
@@ -822,14 +855,22 @@ impl Vehicle {
         // and the lock is flat above that — a speed-sensitive rack. The old reading drove the
         // factor negative and took all the steering away at 250 km/h.
         if speed < 30.0 {
-            y *= 1.75 - 0.025 * speed;
+            y *= f64::from(1.75f32) - f64::from(speed) * f64::from(f32::from_bits(0x3CCC_CCCD));
         }
-        y = y.clamp(0.0, 20.0) * 17.0 / specs.max_steer;
-        let mut s0 = steer_int * (1.0 - self.damage[0] / 512.0) * (y + specs.steer_offset) / 127.0;
-        let mut s1 = steer_int * (1.0 - self.damage[2] / 512.0) * (y - specs.steer_offset) / 127.0;
+        if !(20.0 > y) {
+            y = 20.0;
+        }
+        y *= f64::from(17.0f32) / ms;
+        let k = f64::from(f32::from_bits(0x3B00_0000));
+        let inv127 = f64::from(f32::from_bits(0x3C01_0204));
+        let (st, off) = (f64::from(steer_int), f64::from(specs.steer_offset));
+        let mut s0 = ((st + off) * (1.0 - f64::from(self.damage[0]) * k) * y * inv127) as f32;
+        let mut s1 = ((st - off) * (1.0 - f64::from(self.damage[2]) * k) * y * inv127) as f32;
         if v_fwd > 80.0 {
-            s0 /= v_fwd * 0.0125;
-            s1 /= v_fwd * 0.0125;
+            // 0x49F697…0x49F6CA: `v · [0x5B4A84]` (0.0125) stays in the register as the divisor of both
+            let d = f64::from(v_fwd) * f64::from(f32::from_bits(0x3C4C_CCCD));
+            s0 = (f64::from(s0) / d) as f32;
+            s1 = (f64::from(s1) / d) as f32;
         }
         self.wheels[0].steer = s0;
         self.wheels[1].steer = s1;
@@ -854,7 +895,7 @@ impl Vehicle {
     /// Not modelled: the `.ABS` arm (0x4A2308 / 0x4A23CC — `carinfo+0x24` is 0 in every race,
     /// `physics.md` §5.4). `traction_control` stands for the AI-driven flag `car+0xDA8`, `tcs` for
     /// `.TRACTION` (`carinfo+0x20`), `rally` for `RALLY` (`[0x6573F8]`).
-    fn tyre(&mut self, i: usize, specs: &CarSpecs, tyre_damage: f32) {
+    fn tyre(&mut self, i: usize, specs: &CarSpecs, tyre_damage: f64) {
         let front = i < 2;
         let ai = self.traction_control;
         let rally = self.rally;
@@ -873,12 +914,10 @@ impl Vehicle {
         let ang = steer_angle_256(specs.max_steer, w.steer);
         let (mut u, mut v) = (w.slip_vel[0], w.slip_vel[2]);
         if ang != 0.0 {
-            let a = ang / 256.0 * TAU;
-            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin/cos, not std; original 0x5327E0 / 0x5327F0 (x87) at 0x4A2159 / 0x4A2163.
-            let (sn, cs) = nfs_math::portable::sin_cosf(a);
-            let (x, z) = (u, v);
-            u = x * cs - z * sn;
-            v = x * sn + z * cs;
+            // 0x4A2159 / 0x4A2163 with the image's 2π double [0x5BB2C0] (x87.rs); the pair is rotated in place
+            let (nu, nv) = rotate_turns(ang / 256.0, u, v);
+            u = nu;
+            v = nv;
             // The rotation is **in place** (0x4A2159…0x4A219x store back into `wheel+0x9C` / `+0xA4`): a steered
             // wheel keeps the slip velocity in the steered frame until the next `Car_physicsStep` recomputes it
             // (PA-TRACE item 7; the original's `su` / `sv` columns of the front wheels in s3).
@@ -909,7 +948,8 @@ impl Vehicle {
         // `1 − 0.005·d`) enters only `FrictionCircle` (0x4A1E62…0x4A1E84) and `Slide`
         // (0x4A1C77…0x4A1C95). *(Corrected 2026-09-26: the port used the damaged limit throughout.)*
         let lim0 = w.limit;
-        let limit = lim0 * (1.0 - 0.005 * tyre_damage);
+        // 0x4A1E62…0x4A1E84: `(1 − 0.005·damage) · wheel+0xAC` is one register chain and one `fstp [esp+0x14]`
+        let limit = ((1.0 - tyre_damage * f64::from(0.005f32)) * f64::from(lim0)) as f32;
         // §2.3 over-limit decision: lock (Slide) or clamp, for braking-type demands / handbrake only
         if (opposing && d.abs() > lim0) || (handbrake && !front && vz.abs() > 0.5) {
             let lock = if handbrake {
@@ -925,17 +965,25 @@ impl Vehicle {
             if lock {
                 // §4 Slide: kinetic friction opposing the slip velocity, no back-rotation (original)
                 let (a, b) = (u.abs(), v.abs());
-                let comb = norm_est(a, b);
-                let lim2 = limit * (1.0 - 1.0 / k_class);
-                w.slip = if comb > limit { (comb - limit) / 4.0 } else { 0.0 };
+                // Register chains of `Slide` 0x4A1C70 (control word 0x27F): `comb = max + ¼·min` stays in `st0`
+                // (0x4A1CD3…0x4A1CEE) with only a copy stored (`fst [esp+0xC]`, 0x4A1CF5); `lim2 = limit − limit/k`
+                // is one chain, one `fstp` (0x4A1CFF…0x4A1D0E); the slip `((comb − limit) + 3·old)·¼` takes the
+                // unrounded `comb` (0x4A1D1D…0x4A1D37; `old` is the 0 set above); `|comb| > 0.01` tests the register
+                // (0x4A1D70…0x4A1D7F) and `s = lim2 / comb` divides by the **stored** `f32` comb (0x4A1D92); `s` stays
+                // unrounded into `Flat = s·U`, `Flon = s·V` (0x4A1D96…0x4A1DAA), one `fstp` each.
+                let (aw, bw) = (f64::from(a), f64::from(b));
+                let comb_wide = if aw > bw { 0.25 * bw + aw } else { bw + 0.25 * aw };
+                let comb = comb_wide as f32;
+                let lim2 = (f64::from(limit) - f64::from(limit) / f64::from(k_class)) as f32;
+                w.slip = if comb_wide > f64::from(limit) { ((comb_wide - f64::from(limit)) * 0.25) as f32 } else { 0.0 };
                 w.slip = (0.1 * w.slip).min(1.0);
                 // 0x4A1D70…0x4A1D96: `s = LIM2 / comb` above 0.01, and at or below it the `|U|`
                 // still on the stack; then `Flat = s·U`, `Flon = s·V` (0x4A1D96…0x4A1DAA) with no
                 // clamp. *(Corrected 2026-09-26: the port took `s = 0` and clamped each component
                 // to twice its slip speed, a "safety net" with no counterpart in the binary.)*
-                let s = if comb > 0.01 { lim2 / comb } else { a };
-                w.lateral = s * u;
-                w.longitudinal = s * v;
+                let s = if comb_wide > f64::from(0.01f32) { f64::from(lim2) / f64::from(comb) } else { aw };
+                w.lateral = (s * f64::from(u)) as f32;
+                w.longitudinal = (s * f64::from(v)) as f32;
                 w.locked = true;
                 w.sliding = true;
                 w.demand = d;
@@ -944,33 +992,54 @@ impl Vehicle {
             d = tyre_demand_clamp(d, lim0);
         }
         w.demand = d;
-        // §2.4 lateral force from the slip angle (1/256 turn)
-        let lat = if v == 0.0 {
+        // §2.4 lateral force from the slip angle (1/256 turn). Extended precision (control word 0x27F, 53-bit mantissa), read at
+        // 0x4A2441…0x4A26C0: `0x532860` is `fpatan · [0x5BB2C8]` (the **double** 0.1591549515724182 = 1 / 6.28318452835083, not
+        // 1/τ), the branch arithmetic `(±0.5 − a) · 256` stays in the register and only `fst [esp+0x10]` stores a rounded copy.
+        let lat_wide: f64 = if v == 0.0 {
             0.0
         } else {
-            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable atan2, not std; original x87 atan2 in the slip block 0x4A1D96…0x4A1DAA.
-            let a = nfs_math::portable::atan2f(u, -0.5 * v) / TAU; // turns
+            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable atan2, not std; original x87 `fpatan` in 0x532860.
+            let a = nfs_math::portable::atan2(f64::from(u), f64::from(-0.5 * v)) * TURN_PER_RAD_IMAGE;
             256.0 * if v < 0.0 { a } else if u > 0.0 { 0.5 - a } else if u < 0.0 { -0.5 - a } else { a }
         };
+        let lat = lat_wide as f32;
         // 0x4A24E8 branches on `wheel+0xC0`, which is **not** a sliding flag: 0x410BB2 (car init)
         // and 0x49E345 (reset) set it to 1 for wheels 0 and 1 and 0 for wheels 2 and 3 and nothing
         // in the image ever writes it again, so it selects the lateral curve **by axle**. The front
-        // pair follows `min(|lat|, 16)·load/12`, the rear `min(|lat|, 2)·load·0.5` with a floor of
-        // one unit — a deliberate understeer bias of about six to one at small slip
-        // (`physics.md` §5.2).
+        // pair follows `min(|lat|, 16)·load·(1/12)` (`[0x5B49B0]`, a multiply by the `f32` 1/12), the rear
+        // `min(|lat|, 2)·load·0.5` with a floor of one unit — a deliberate understeer bias of about six to one at
+        // small slip (`physics.md` §5.2). The limit `F` stays in the register (the front's `|lat|` too, unrounded; the rear's
+        // `|lat|` is stored to `f32` first, 0x4A25FA) and `lateral = clamp(u, ±|F|)` is stored once (0x4A25BB, 0x4A25E8,
+        // 0x4A2684, 0x4A26B6).
+        let clamp_to = |f: f64| -> f32 {
+            let ff = f.abs();
+            if u > 0.0 {
+                if f64::from(u) > ff { ff as f32 } else { u }
+            } else if f64::from(u) <= -ff {
+                (-ff) as f32
+            } else {
+                u
+            }
+        };
         if front {
-            let f = lat.signum() * lat.abs().min(16.0) * lim0 / 12.0;
-            w.lateral = if u.abs() + v.abs() < 32.0 { u.signum() * u.abs().min(f.abs()) } else { f };
+            let m = lat_wide.abs().min(16.0);
+            let mag = (m * f64::from(lim0)) * f64::from(ONE_TWELFTH);
+            let f = if lat < 0.0 { -mag } else { mag };
+            w.lateral = if f64::from(u.abs()) + f64::from(v.abs()) < 32.0 { clamp_to(f) } else { f as f32 };
         } else {
-            let m = if lat.abs() <= 1.0 { 1.0 } else { lat.abs().min(2.0) };
-            let f = lat.signum() * m * lim0 * 0.5;
-            w.lateral = u.signum() * u.abs().min(f.abs());
+            let la = lat_wide.abs() as f32;
+            let m = if la <= 1.0 { 1.0 } else { la.min(2.0) };
+            let mag = (f64::from(m) * f64::from(lim0)) * 0.5;
+            let f = if lat < 0.0 { -mag } else { mag };
+            w.lateral = clamp_to(f);
         }
         w.longitudinal = d;
-        // §3 friction circle
-        let lon_w = w.longitudinal.abs() * if rally { 0.5 } else { 0.9 };
-        let lat_a = w.lateral.abs();
-        let comb = norm_est(lat_a, lon_w);
+        // §3 friction circle (`FrictionCircle` 0x4A1DC0). 0x4A1E14…0x4A1E5C: `|lon| · 0.9` (`[0x5B25E8]`, the `f32`; 0.5 under RALLY)
+        // stays in the register, `comb = max + 0.25·min` is one chain, one `fstp [esp+0x18]`.
+        let lon_w = f64::from(w.longitudinal.abs()) * f64::from(if rally { 0.5f32 } else { 0.9f32 });
+        let lat_a = f64::from(w.lateral.abs());
+        let comb_wide = if lat_a > lon_w { lat_a + 0.25 * lon_w } else { lon_w + 0.25 * lat_a };
+        let comb = comb_wide as f32;
         let spin = (w.longitudinal.abs() > limit && throttle_byte > 0x80) || (!front && rear_spin);
         let k = if !front && spin { 4.0 } else { k_class };
         // 0x4A1F25 tests `comb > LIM` alone; `comb > 0` is the port's own guard, for a case **never observed**
@@ -993,16 +1062,22 @@ impl Vehicle {
         if comb > limit && comb > 0.0 {
             let hard = (tcs && !front && slip_tangent.abs() < 0.15) || (ai && (w.zone > 1 || class == 2));
             if hard {
-                let s = limit / comb;
+                // 0x4A1F91…0x4A1FCB: `s = limit / comb` stays in the register; `lateral` / `longitudinal` = `s · (that)`, one `fstp` each
+                let s = f64::from(limit) / f64::from(comb);
                 w.slip = 0.0;
                 if gear > 2 || ai {
-                    w.lateral *= s;
+                    w.lateral = (s * f64::from(w.lateral)) as f32;
                 }
-                w.longitudinal *= s;
+                w.longitudinal = (s * f64::from(w.longitudinal)) as f32;
             } else {
-                let e = (comb - limit).min(limit) / k;
-                let s = (limit - e) / comb;
-                w.slip = (3.0 * w.slip + (if front { 0.5 } else { 12.0 }) * (comb - limit)) / 4.0;
+                // 0x4A1FD6…0x4A2057: `X = comb − limit` and `X / k` in the register, `limit / k` rounded to `f32` when it is the smaller
+                // (`fst [esp+0xc]`, reloaded), `s = (limit − e) / comb` stored to `f32`; the slip is `(old·3 + X·c) · ¼` in the register
+                let x = f64::from(comb) - f64::from(limit);
+                let xk = x / f64::from(k);
+                let lk = f64::from(limit) / f64::from(k);
+                let e = if lk > xk { xk } else { f64::from(lk as f32) };
+                let s = ((f64::from(limit) - e) / f64::from(comb)) as f32;
+                w.slip = ((f64::from(w.slip) * 3.0 + x * if front { 0.5 } else { 12.0 }) * 0.25) as f32;
                 w.lateral *= s;
                 w.longitudinal *= s;
             }
@@ -1019,12 +1094,10 @@ impl Vehicle {
         }
         w.sliding = w.slip > 0.5;
         if ang != 0.0 {
-            let a = -ang / 256.0 * TAU;
-            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin/cos, not std; original 0x5327E0 / 0x5327F0 (x87) at 0x4A2159 / 0x4A2163.
-            let (sn, cs) = nfs_math::portable::sin_cosf(a);
-            let (x, z) = (w.lateral, w.longitudinal);
-            w.lateral = x * cs - z * sn;
-            w.longitudinal = x * sn + z * cs;
+            // 0x4A2717…0x4A2774 (`[0x5B4AA0]` = −1/256): the same rotation back, by −angle
+            let (nx, nz) = rotate_turns(-ang / 256.0, w.lateral, w.longitudinal);
+            w.lateral = nx;
+            w.longitudinal = nz;
         }
     }
 
@@ -1137,8 +1210,15 @@ impl Vehicle {
     /// `Car_physicsStep` 0x49F160 up to 0x49F270: the body-frame velocities `car+0xD58` /
     /// `+0xD64` and the slip tangent `car+0xDC0`. Returns `car+0xD58…+0xD60`.
     fn body_frame_velocity(&mut self, m: Mat3) -> Vec3 {
-        self.v_local = m * self.velocity;
-        self.w_local = m * self.angular_velocity;
+        // 0x49F1E6…0x49F256: six calls of the dot product 0x532910 (`fld/fmul` x3, `faddp` x2 in the 80-bit
+        // register, one rounding at the `fstp` to `car+0xD58…+0xD6C`) over the physics frame's rows
+        // `car+0x490 / +0x49C / +0x4A8`: [`dot_x87`] sums in f64, not f32 term by term.
+        self.v_local = Vec3::new(dot_x87(self.velocity, m.row(0)), dot_x87(self.velocity, m.row(1)), dot_x87(self.velocity, m.row(2)));
+        self.w_local = Vec3::new(
+            dot_x87(self.angular_velocity, m.row(0)),
+            dot_x87(self.angular_velocity, m.row(1)),
+            dot_x87(self.angular_velocity, m.row(2)),
+        );
         let vl = self.v_local;
         // **Signed, not `|vz|`.** 0x49F25C loads `car+0xD60` with no `fabs` and 0x49F262 compares
         // it with `[0x5B2400]` = 5.0; 0x49F270's `test ah,0x41; jne` zeroes the ratio when
@@ -1152,13 +1232,19 @@ impl Vehicle {
     /// velocities (×−16) with the yaw/roll term; `speed` is `car+0x35C` ([`Self::speed_est`]).
     fn contact_patch_slip(&mut self, specs: &CarSpecs, vl: Vec3, speed: f32) {
         // contact-patch slip velocities (×−16) with the yaw/roll term
-        let yaw = specs.yaw_lever * self.angular_velocity.y * 32.0 * -0.5;
+        // Extended precision (0x49F2A8…0x49F321): `yaw = lever · ω.y · 32 · −0.5` and `roll = (speed ± …) · yaw · c` are register
+        // chains with one `fstp` (`[ebp+8]`), evaluated in `f64`.
+        let yaw = f64::from(specs.yaw_lever) * f64::from(self.angular_velocity.y) * 32.0 * -0.5;
         // 0x49F2F0 compares the speed with `[0x5B241C]` = 10.0 and 0x49F301's `je` goes to the
         // **`+70 … ×0.0125`** arm when `speed >= 10`, while the fall-through at 0x49F303 is
         // `+30 … ×0.025` for `speed < 10`. (Both give `1.0·yaw` at exactly 10, so the curve is
         // continuous either way and only the branch order tells them apart; history:
         // `physics-history.md` §1.3.)
-        let roll = if speed < 10.0 { (speed + 30.0) * yaw * 0.025 } else { (speed + 70.0) * yaw * 0.0125 };
+        let roll = if speed < 10.0 {
+            ((f64::from(speed) + 30.0) * yaw * f64::from(0.025f32)) as f32
+        } else {
+            ((f64::from(speed) + 70.0) * yaw * f64::from(0.0125f32)) as f32
+        };
         for (i, w) in self.wheels.iter_mut().enumerate() {
             let lat = -16.0 * vl.x + if i < 2 { roll } else { -roll };
             w.slip_vel = [lat, -16.0 * vl.y, -16.0 * vl.z];
@@ -1184,10 +1270,12 @@ impl Vehicle {
         let mut noise_term = 0.0f32; // `[ebp+8]`, left 0 on a tick that is not a multiple of 4 (0x49F430)
         if self.game_tick.is_multiple_of(4) {
             let r = self.rand16();
-            let mut noise = self.suspension_wear(specs) * (r as f32 * 1.525_878_9e-5 - 0.5) * 0.5;
+            // 0x49F476…0x49F495: `wear` (register) `· (rand · [0x5B253C] − 0.5) · 0.5`, one `fstp`; 0x49F4AB…0x49F4BA
+            // `noise · speed · [0x5B49EC]` one chain on the stored noise
+            let mut noise = (self.suspension_wear_wide(specs) * (f64::from(r) * f64::from(1.525_878_9e-5f32) - 0.5) * 0.5) as f32;
             let hs = speed;
             if hs < 15.0 {
-                noise = noise * hs * 0.066_666_67;
+                noise = (f64::from(noise) * f64::from(hs) * f64::from(0.066_666_67f32)) as f32;
             }
             noise_term = noise;
             pull += noise;
@@ -1202,7 +1290,8 @@ impl Vehicle {
     /// `Car_physicsStep` with ground contact: the brake force, `LoadTransfer` and each wheel's
     /// demand from the drive split (0x49F7E4…0x49F894); clears the tyre forces.
     fn wheel_demands(&mut self, specs: &CarSpecs, vl: Vec3, a_drive: f32) {
-        let mut a_brake = specs.brake_decel * self.brake * (1.0 - 0.005 * self.brakes_wear(specs));
+        // 0x49F752…0x49F76D: `(1 − 0.005·wear) · brake_decel · pedal` in the register, one `fstp [ebp+8]`
+        let mut a_brake = ((1.0 - self.brakes_wear_wide(specs) * f64::from(0.005f32)) * f64::from(specs.brake_decel) * f64::from(self.brake)) as f32;
         a_brake = a_brake.min(vl.z.abs() * 32.0);
         let sign = -vl.z.signum();
         let a_brake = a_brake * if vl.z == 0.0 { 0.0 } else { sign };
@@ -1223,12 +1312,19 @@ impl Vehicle {
         // exactly 0 (a car on its side to the last bit) or an exact cancellation with `dz`; a
         // zero or negative-sum tick was not seen in 84 s of races (the three goldens and a 60 s
         // alps race) either.
-        let share = |x: f32, s: f32| if s == 0.0 { 0.0 } else { x / s };
-        let (fs, rs) = (l0 + l1, l2 + l3);
-        self.wheels[0].demand = share(a_drive * f * l0, fs) + 0.5 * a_bf;
-        self.wheels[1].demand = share(l1 * f * a_drive, fs) + 0.5 * a_bf;
-        self.wheels[2].demand = share((1.0 - f) * l2 * a_drive, rs) + 0.5 * (a_brake - a_bf);
-        self.wheels[3].demand = share((1.0 - f) * l3 * a_drive, rs) + 0.5 * (a_brake - a_bf);
+        // 0x49F7E4…0x49F8D5: each share `a · f · L / (L_pair)` is one register chain (the product left to right, the pair sum
+        // `L + L'` kept as it came, the `fdiv`) and one `fstp` to `wheel+0xA8`; then `+ ½·a_bf` / `+ ½·(a_brake − a_bf)`
+        // is added to that stored `f32` in the register and stored again (0x49F8A1…0x49F8E1).
+        let d = |x: f32| f64::from(x);
+        let fs_wide = d(l1) + d(l0);
+        let rs_wide = d(l2) + d(l3);
+        let half_front = 0.5 * d(a_bf);
+        let half_rear = 0.5 * (d(a_brake) - d(a_bf));
+        let sh = |x: f64, s: f64| if s == 0.0 { 0.0f32 } else { (x / s) as f32 };
+        self.wheels[0].demand = (d(sh(d(a_drive) * d(f) * d(l0), fs_wide)) + half_front) as f32;
+        self.wheels[1].demand = (d(sh(d(l1) * d(f) * d(a_drive), fs_wide)) + half_front) as f32;
+        self.wheels[2].demand = (d(sh((1.0 - d(f)) * d(l2) * d(a_drive), rs_wide)) + half_rear) as f32;
+        self.wheels[3].demand = (d(sh((1.0 - d(f)) * d(l3) * d(a_drive), rs_wide)) + half_rear) as f32;
         for w in &mut self.wheels {
             w.lateral = 0.0;
             w.longitudinal = 0.0;
@@ -1239,7 +1335,7 @@ impl Vehicle {
     fn axle_tyres(&mut self, specs: &CarSpecs, front_contact: bool, rear_contact: bool) {
         // 0x493980, the tyre figure: the zones and the part list do not change inside the step, so
         // the four tyres share one evaluation
-        let tyre_damage = if front_contact || rear_contact { self.tyres_wear(specs) } else { 0.0 };
+        let tyre_damage = if front_contact || rear_contact { self.tyres_wear_wide(specs) } else { 0.0 };
         if front_contact {
             self.tyre(0, specs, tyre_damage);
             self.tyre(1, specs, tyre_damage);
@@ -1254,16 +1350,24 @@ impl Vehicle {
     /// forces, and the yaw torque it returns.
     fn tyre_force_sums(&mut self, specs: &CarSpecs) -> f32 {
         let w = &self.wheels;
-        let fx: f32 = w.iter().map(|w| w.lateral).sum();
-        let fz: f32 = w.iter().map(|w| w.longitudinal).sum();
-        self.accel_local = Vec3::new(fx, 0.0, fz * specs.inv_grip);
+        let d = |x: f32| f64::from(x);
+        // Extended precision (REFERENCE-2026-10-31-HUMAN-DRIFT.md): 0x49F941…0x49F9E3 keep the sums in the 80-bit
+        // register, evaluated here in `f64`. The rear pair's lateral sum is stored once (`[ebp+8]`, 0x49F980) and
+        // is an `f32` below. `car+0xD4C = f32((l1 + l0) + [ebp+8])` (0x49F983…0x49F992); `car+0xD54` is the
+        // longitudinal sum `((lo3 + lo2) + lo1) + lo0` (0x49F941…0x49F968) times `specs[0x1BC]`, rounded once (0x49F994).
+        let rear_lat = (d(w[3].lateral) + d(w[2].lateral)) as f32;
+        let fx = ((d(w[1].lateral) + d(w[0].lateral)) + d(rear_lat)) as f32;
+        let fz = (((d(w[3].longitudinal) + d(w[2].longitudinal)) + d(w[1].longitudinal)) + d(w[0].longitudinal)) * d(specs.inv_grip);
+        self.accel_local = Vec3::new(fx, 0.0, fz as f32);
         // yaw torque, 0x49F9A0…0x49F9E3 re-read 2026-09-26: `A − B` with
         // `A = ((w1.lat + w0.lat) − (w2.lat + w3.lat)) · specs[0x1B8]` and
         // `B = ((w2.long + w0.long) − w1.long − w3.long) · specs[0x1B8]` (the wheels' `+0x90` /
         // `+0x98` at 0x848 / 0x850, 0x90C / 0x914, 0x9D0 / 0x9D8, 0xA94 / 0xA9C) — the sum is
-        // exact; MEDIUM only on the sign conventions the tyre model gives `+0x90` / `+0x98`
-        ((w[1].lateral + w[0].lateral) - (w[2].lateral + w[3].lateral)) * specs.inv_yaw_lever
-            - ((w[2].longitudinal + w[0].longitudinal) - w[1].longitudinal - w[3].longitudinal) * specs.inv_yaw_lever
+        // exact; MEDIUM only on the sign conventions the tyre model gives `+0x90` / `+0x98`.
+        // `A` subtracts the stored `[ebp+8]`; `A` and `B` stay in the register up to the `fsubp` and the `fstp` (0x49F9E3).
+        let a = ((d(w[1].lateral) + d(w[0].lateral)) - d(rear_lat)) * d(specs.inv_yaw_lever);
+        let b = (((d(w[2].longitudinal) + d(w[0].longitudinal)) - d(w[1].longitudinal)) - d(w[3].longitudinal)) * d(specs.inv_yaw_lever);
+        (a - b) as f32
     }
 
     /// Stability assist 0x49F0C0 (called at 0x49F9EC), history in `physics-history.md` §1.8.
@@ -1294,10 +1398,12 @@ impl Vehicle {
             return;
         }
         if vl.x.abs() > 1.0 || self.orientation.row(1).y < SLOPE_UP_Y {
-            self.accel_local.x += SLOPE_PUSH_X * self.orientation.row(0).y;
+            // 0x49F13F…0x49F151: `M[0].y · [0x5B4A68]` stays in the register into `fadd [car+0xD4C]; fstp` (one rounding)
+            self.accel_local.x = (f64::from(SLOPE_PUSH_X) * f64::from(self.orientation.row(0).y) + f64::from(self.accel_local.x)) as f32;
         }
         if self.brake_byte < 0x40 {
-            self.accel_local.z += SLOPE_PUSH_Z * self.orientation.row(2).y;
+            // 0x49F0EC…0x49F0FE: likewise `M[2].y · [0x5B2438]` + `car+0xD54`, one rounding
+            self.accel_local.z = (f64::from(SLOPE_PUSH_Z) * f64::from(self.orientation.row(2).y) + f64::from(self.accel_local.z)) as f32;
         }
     }
 
@@ -1305,20 +1411,28 @@ impl Vehicle {
     /// / angular-velocity step, the filters `+0xE08` / `+0xE04` and the `RALLY` drag.
     fn integrate_forces(&mut self, m: Mat3, torque_y: f32) {
         let local = self.accel_local;
-        let acc = m.transpose() * local;
+        // 0x49F9E6 `0x532A00` transposes the frame into `[ebp-0x58]`; 0x49F9F6…0x49FA4F then take six dot
+        // products 0x532910 (one rounding each, [`dot_x87`]) of `car+0xD4C` / `(0, torque, 0)` with its rows.
+        let acc = Vec3::new(dot_x87(local, m.col(0)), dot_x87(local, m.col(1)), dot_x87(local, m.col(2)));
         self.accel_world = acc;
-        let angacc = m.transpose() * Vec3::new(0.0, torque_y, 0.0);
+        let tq = Vec3::new(0.0, torque_y, 0.0);
+        let angacc = Vec3::new(dot_x87(tq, m.col(0)), dot_x87(tq, m.col(1)), dot_x87(tq, m.col(2)));
+        // 0x49FA54 `fst [car+0xD3C]` leaves the third dot in the register: the yaw-axis `z` step below uses it unrounded
+        let angacc_z_wide = dot_x87_wide(tq, m.col(2));
         self.velocity += acc * DT32;
+        // 0x49FAB2…0x49FAFC: `fld a; fmul 1/32; fadd w; fstp w` (the product by a power of two is exact, one rounding at the store)
         self.angular_velocity.x += angacc.x * DT32;
-        self.angular_velocity.z += angacc.z * DT32;
-        // the yaw step is 1/48 of the angular acceleration, 1/32 for `.TINYCAR` (0x49FAD4)
-        self.angular_velocity.y += angacc.y * if self.tiny { 1.0 / 32.0 } else { 1.0 / 48.0 };
-        self.lateral_filtered = 0.25 * self.accel_local.x + 0.75 * self.lateral_filtered;
-        self.long_filtered = 0.9 * self.long_filtered + 0.1 * self.accel_local.z;
+        self.angular_velocity.z = (angacc_z_wide * f64::from(DT32) + f64::from(self.angular_velocity.z)) as f32;
+        // the yaw step is 1/48 of the angular acceleration, 1/32 for `.TINYCAR` (0x49FAD4): `fmul [0x5B4A74]` and the `fadd` share one rounding
+        let k = if self.tiny { DT32 } else { 1.0 / 48.0 };
+        self.angular_velocity.y = (f64::from(angacc.y) * f64::from(k) + f64::from(self.angular_velocity.y)) as f32;
+        // 0x49FAFE…0x49FB34: `a·0.25 + lf·0.75` and `lf·0.9 + a·0.1` are one register chain each, a single `fstp`
+        self.lateral_filtered = (f64::from(self.accel_local.x) * 0.25 + f64::from(self.lateral_filtered) * 0.75) as f32;
+        self.long_filtered = (f64::from(self.long_filtered) * f64::from(0.9f32) + f64::from(self.accel_local.z) * f64::from(0.1f32)) as f32;
         // 0x49FB3A: under `RALLY` the velocity loses `0.002 · min(|car+0xDC0|, 5)` of itself
-        // each step (0x532360 over `car+0x33C`, `[0x5B2400]` 5, `[0x5B4A30]` 0.002)
+        // each step (0x532360 over `car+0x33C`, `[0x5B2400]` 5, `[0x5B4A30]` 0.002); `1 − …` is one chain (0x49FB73…0x49FB81)
         if self.rally {
-            self.velocity *= 1.0 - 0.002 * self.slip_tangent.abs().min(5.0);
+            self.velocity *= (1.0 - f64::from(self.slip_tangent.abs().min(5.0)) * f64::from(0.002f32)) as f32;
         }
     }
 
@@ -1379,15 +1493,18 @@ impl Vehicle {
             // `vL.z / circ` (0x4A280E), then `· [0x5B2828]` = 1/64
             // 0x4A2799 (`car+0xDAC == 1`): a remote car's wheels turn by `car+0x35C / circumference`,
             // the locked flag not consulted
+            // The quotient stays in `st0` (0x4A27B7 / 0x4A2814 `fdiv`, 0x4A281F…0x4A2829 `fld ratio; fmul circ; fdivr rpm` with
+            // the product unrounded) through `fmul [0x5B2828]` and `fadd [wheel+0x840]` to the one `fstp` (0x4A282F…0x4A2837).
+            let circ = f64::from(specs.circumference);
             let turns = if self.net_car {
-                self.speed_est / specs.circumference
+                f64::from(self.speed_est) / circ
             } else if driven && self.gear != 1 && specs.ratio_rpm_per_mps[self.gear] != 0.0 {
-                self.rpm / (specs.ratio_rpm_per_mps[self.gear] * specs.circumference)
+                f64::from(self.rpm) / (f64::from(specs.ratio_rpm_per_mps[self.gear]) * circ)
             } else {
-                vz / specs.circumference
+                f64::from(vz) / circ
             };
             if self.net_car || !wh.locked {
-                wh.rotation = (turns * (1.0 / 64.0) + wh.rotation).rem_euclid(1.0);
+                wh.rotation = ((turns * f64::from(1.0f32 / 64.0) + f64::from(wh.rotation)) as f32).rem_euclid(1.0);
             }
         }
     }
@@ -1414,8 +1531,18 @@ impl Vehicle {
         // while awake (`Smackable::integrate`, `car+0x7D`), and its `car+0x80` starts at 0 (no placement
         // writes 0x20: `Car_reset`'s smackable branch 0x4107A1 skips 0x410430), so its first renormalisation
         // is the 256th awake step and then every 32nd.
+        // 0x49B9FC (this step's `0x49AE30`) rebuilds the stored world collision points from the rows the step just made, every step;
+        // the 256th / 32nd step then orthonormalises (0x4A4810, below it) *after* that, so the `Susp_update` that follows it probes
+        // from the raw rows ([`Self::point_rows`]; the 64 Hz step in between would refresh them). A network car keeps its own
+        // store ([`Self::net_points`]).
+        if !self.net_car {
+            self.point_rows = None;
+        }
         self.orient_countdown = self.orient_countdown.wrapping_sub(1);
         if self.orient_countdown == 0 {
+            if !self.net_car {
+                self.point_rows = Some(self.orientation);
+            }
             self.renormalise();
             self.orient_countdown = 0x20;
         }
@@ -1586,7 +1713,7 @@ impl Vehicle {
     /// purgatory at the race's first AI pass (`car+0x7F` still 0) is neither dropped nor draws
     /// (`in_world`). Every other caller passes the same node twice and `true`.
     pub fn place_at_slice_from(&mut self, grid: &TriangleGrid, specs: &CarSpecs, seat: Vec3, slice: SliceFrame, offset: Vec3, flags: PlaceFlags) {
-        let SliceFrame { centre, forward: slice_fwd, raw: slice_raw } = slice;
+        let SliceFrame { centre, forward: slice_fwd, raw: slice_raw, end } = slice;
         let PlaceFlags { opponent, flip, in_world } = flags;
         let absolute = opponent && self.game_tick > TICK_RACE_START && offset != Vec3::ZERO;
         // the placement refreshes the stored world points itself (0x49B431, 0x49B483)
@@ -1598,7 +1725,15 @@ impl Vehicle {
         let n = self.tracker.normal;
         let lat = n.cross(slice_fwd).normalize_or_zero();
         let fwd = lat.cross(n).normalize_or_zero();
-        self.position = if absolute { offset } else { centre + lat * offset.x + n * offset.y + fwd * offset.z };
+        self.position = if absolute {
+            offset
+        } else {
+            // 0x49B3B7…0x49B3F2: each coordinate is `centre + dot(Mᵀ row, offset)` where the dot (0x532910 → 0x56E8D1) sums the
+            // three f32 products in the x87's 80-bit registers and is stored once as f32 (0x49B354), then added to the centre
+            // (`fadd`, stored as f32). Evaluated here in f64 (exact products, one rounding to f32), not as f32 term by term.
+            let dot = |a: f32, b: f32, c: f32| (f64::from(a) * f64::from(offset.x) + f64::from(b) * f64::from(offset.y) + f64::from(c) * f64::from(offset.z)) as f32;
+            Vec3::new(centre.x + dot(lat.x, n.x, fwd.x), centre.y + dot(lat.y, n.y, fwd.y), centre.z + dot(lat.z, n.z, fwd.z))
+        };
         let s = if flip { -1.0 } else { 1.0 };
         self.orientation = Mat3::from_cols(lat * s, n, fwd * s).transpose();
         self.frame = self.orientation;
@@ -1609,16 +1744,15 @@ impl Vehicle {
         // and the physics frame `car+0x490`, lateral and forward negated under `flip`. So a placed car
         // starts in the raw slice frame, and its first re-orthonormalisation (`car+0x80`) turns it
         // (0.45° of heading on the alps grid, measured live). *(Corrected 2026-10-22 by the live trace: the
-        // port kept the frame built at 0x49B22F.)* The vectors are the slice the caller placed on;
-        // 0x49AF70's 0x474440 re-finds the tracker's slice at the final position, which differs only
-        // when the offset crosses a slice boundary — APPROXIMATION, not traced.
+        // port kept the frame built at 0x49B22F.)* The vectors are those of the slice 0x49AF70's
+        // 0x474440 finds at the final position (`SliceFrame::end`; `raw` when the caller has no table).
         // 0x49AF70 (the only caller of that 0x499520 here) returns at once while `car+0x7F` is clear (0x49AF75…0x49AF7A):
         // a car parked from purgatory at the race start keeps the orthonormal frame 0x49B22F built; and the raw vectors
         // are those of the slice the tracker ends on (`Tracker::update` 0x474440 at the final position — slice 0 for the
         // purgatory park at a retire, live alps tick 1260: forward `(0.0848, 0.0091, −0.9964)`, the slice-0 record's, not slice 1's).
         if in_world && self.tracker.track(grid, self.position) {
-            let [rl, ru, rf] = slice_raw;
-            self.orientation = Mat3::from_cols(rl * s, ru, rf * s).transpose();
+            // 0x474440 at the final position (`car+0x330`), seated on `max(1, slice)` (0x49B09F)
+            let [rl, ru, rf] = end.map_or(slice_raw, |(t, seat)| t.raw_at(self.position, seat));            self.orientation = Mat3::from_cols(rl * s, ru, rf * s).transpose();
             self.frame = self.orientation;
         }
         if !in_world {
@@ -1727,8 +1861,8 @@ impl Vehicle {
     /// only a quarter of the way to `M·(MᵀM)^(−½)`: the error falls by about ¾ a pass, 0.32 over
     /// the four, and the matrix is never made exactly orthonormal. *(Corrected 2026-09-26: the
     /// port rebuilt the rows by Gram–Schmidt from the forward axis, exactly orthonormal.)* The
-    /// order of the three products inside each element is the port's (0x532470 sums them in an
-    /// order of its own per element).
+    /// three products of each element are summed in f64 and rounded once (0x532470, the 80-bit
+    /// register; the order inside the register is not carried).
     pub fn renormalise(&mut self) {
         self.orientation = renormalise_matrix(self.orientation);
     }
@@ -1743,7 +1877,8 @@ pub fn renormalise_matrix(m: Mat3) -> Mat3 {
         let mut d = [[0.0; 3]; 3];
         for i in 0..3 {
             for j in 0..3 {
-                d[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+                // 0x532470: three `fmul` / two `faddp` in the 80-bit register, one rounding at the `fstp`
+                d[i][j] = (f64::from(a[i][0]) * f64::from(b[0][j]) + f64::from(a[i][1]) * f64::from(b[1][j]) + f64::from(a[i][2]) * f64::from(b[2][j])) as f32;
             }
         }
         d
@@ -1794,10 +1929,26 @@ mod tests;
 pub fn orientation_step(orientation: Mat3, w_turns: Vec3) -> Mat3 {
     let w = w_turns;
     // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable rotations, not glam/std; original RotY/RotX/RotZ 0x532600 / 0x5325A0 / 0x532660 (x87) at 0x49B880…0x49B977.
-    let rot = nfs_math::portable::mat3_rotation_z(w.z * TAU) * nfs_math::portable::mat3_rotation_y(w.y * TAU) * nfs_math::portable::mat3_rotation_x(w.x * TAU);
-    // rows are body axes in world space: rotate each row
+    // the angle in turns goes through the image's own `2π` double [0x5BB2C0] (6.28318452835083, x87.rs), `sin` / `cos` stored to `f32`
+    let ((sx, cx), (sy, cy), (sz, cz)) = (sin_cos_turns_f32(w.x), sin_cos_turns_f32(w.y), sin_cos_turns_f32(w.z));
+    let rx = Mat3::from_cols(Vec3::X, Vec3::new(0.0, cx, sx), Vec3::new(0.0, -sx, cx));
+    let ry = Mat3::from_cols(Vec3::new(cy, 0.0, -sy), Vec3::Y, Vec3::new(sy, 0.0, cy));
+    let rz = Mat3::from_cols(Vec3::new(cz, sz, 0.0), Vec3::new(-sz, cz, 0.0), Vec3::Z);
+    // 0x532470 forms every element as three `fmul` and two `faddp` in the 80-bit register, one rounding at the `fstp`
+    // ([`dot_x87`]); the chain is `T = M_x·M_y` (0x49B968), `Δ = T·M_z` (0x49B991): in glam's transposed convention
+    // `Rz·(Ry·Rx)`, the product of the last two rounded first.
+    let rot = mat3_mul_x87(rz, mat3_mul_x87(ry, rx));
+    // rows are body axes in world space: rotate each row (0x49B9A6 `car+0x364 = car+0x364 · Δ`, same 0x532470)
     let m = orientation;
-    Mat3::from_cols(rot * m.row(0), rot * m.row(1), rot * m.row(2)).transpose()
+    let rows = [m.row(0), m.row(1), m.row(2)];
+    let out = |r: Vec3| Vec3::new(dot_x87(r, rot.row(0)), dot_x87(r, rot.row(1)), dot_x87(r, rot.row(2)));
+    Mat3::from_cols(out(rows[0]), out(rows[1]), out(rows[2])).transpose()
+}
+
+/// `a · b` (glam order) with every element a [`dot_x87`] of a row of `a` and a column of `b`.
+fn mat3_mul_x87(a: Mat3, b: Mat3) -> Mat3 {
+    let c = |j: usize| Vec3::new(dot_x87(a.row(0), b.col(j)), dot_x87(a.row(1), b.col(j)), dot_x87(a.row(2), b.col(j)));
+    Mat3::from_cols(c(0), c(1), c(2))
 }
 
 /// `Lod_shouldUpdate` 0x414B10 as `Car_ground` 0x49BD40 calls it (0x49BD6B…0x49BD8C,
@@ -1883,25 +2034,34 @@ pub fn body_points_setup(points: &mut [Vec3]) {
     points[..4].copy_from_slice(&slots);
 }
 
-pub fn draft_factor(position: Vec3, forward: Vec3, forward_speed: f32, others: &[Vec3]) -> f32 {
+/// `DraftFactor` 0x49D9B0, returning `st0` = `1 − best` (0x49DAD6 `fld 1; fsub [best]`) unrounded; `best` is the `f32` slot
+/// `[esp+0xC]`. Per other racer (0x49D9D6…0x49DAC3): `d = other − me` (0x532330, `f32`), `dist` = 0x532B20 stored to `f32`
+/// (0x49DA1F), skipped at `v/3 <= dist` (`vz · [0x5B2680]`, the `f32` 1/3) or `dist <= 0.1`; `d` normalised (0x5328D0) and
+/// dotted with the heading (0x532910) — the dot stays in `st0` for `cos > [0x5B4A48]` (the `f32` 0.991) and for
+/// `(1 − dist·3/vz) · (((cos − 0.991) · [0x5B4A44]) · 0.5)`, `[0x5B4A44]` = 0x42DE38E4 = 111.11111 (the port had 111.1), one chain
+/// stored to `best` when `best <= v` (0x49DAB2 `fcomp`, `je` skips only when `best > v`).
+pub fn draft_factor(position: Vec3, forward: Vec3, forward_speed: f32, others: &[Vec3]) -> f64 {
     if forward_speed <= 15.0 {
         return 1.0;
     }
     let mut best = 0.0f32;
     for o in others {
         let d = *o - position;
-        let dist = d.length();
-        if forward_speed * (1.0 / 3.0) <= dist || dist <= 0.1 {
+        let dist = x87::dot_x87_wide(d, d).sqrt() as f32;
+        if forward_speed * f32::from_bits(0x3EAA_AAAB) <= dist || dist <= 0.1 {
             continue;
         }
-        let cos = (d / dist).dot(forward);
-        if cos <= 0.991 {
+        let cos = x87::dot_x87_wide(x87::normalize_x87(d), forward);
+        if cos <= f64::from(0.991f32) {
             continue;
         }
-        let v = (1.0 - 3.0 * dist / forward_speed) * (cos - 0.991) * 111.1 * 0.5;
-        best = best.max(v);
+        let t = 1.0 - f64::from(dist) * 3.0 / f64::from(forward_speed);
+        let v = (t * (((cos - f64::from(0.991f32)) * f64::from(f32::from_bits(0x42DE_38E4))) * 0.5)) as f32;
+        if best <= v {
+            best = v;
+        }
     }
-    1.0 - best
+    1.0 - f64::from(best)
 }
 
 #[cfg(test)]

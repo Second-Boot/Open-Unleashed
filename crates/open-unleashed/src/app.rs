@@ -253,6 +253,8 @@ pub(crate) struct App {
     /// `0x5E8B88[]` — the race-order array every car is registered in (the human, the opponents,
     /// the cops, the traffic), re-sorted at the end of every even tick (`nfs_game::race_order`)
     pub(crate) race_order: nfs_game::race_order::RaceOrder,
+    /// The opponents' `car+0xAF8 − car+0xB20` as the even tick began, before this tick's own progress write: what `0x417710`'s sort at the end of the tick reads (`App::tick_race_order`)
+    pub(crate) opp_sort_keys: Vec<f32>,
     /// whether the audio has been put into its pause state (0x4AB150 / 0x4AB200)
     pub(crate) audio_paused: bool,
     /// The results page whose billboard is open (not closing) this frame, set by `rebuild_scene`.

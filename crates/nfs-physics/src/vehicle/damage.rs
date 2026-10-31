@@ -20,12 +20,34 @@ impl Vehicle {
     /// Returns the sum and the number of parts matched. *(Until 2026-09-26 the port used one mask
     /// per group — the family's first part of the type — and one summed scale and offset.)*
     pub fn part_sum(&self, specs: &crate::specs::CarSpecs, kinds: &[u16]) -> (f32, u32) {
-        let (mut sum, mut n) = (0.0f32, 0u32);
+        let (sum, n) = self.part_sum_wide(specs, kinds, 0.0);
+        (sum as f32, n)
+    }
+
+    /// [`Self::part_sum`] as the getters leave it, in `st0` (control word 0x27F): the scale `1.5 − 0.005·cond`, the zone mean
+    /// (zones added in the register, `fidiv` of the count) and `mean · scale + state` are unrounded, and the running sum starts
+    /// from `start` (0, or the engine's zone 1, 0x4938AE) — no `fstp` anywhere in 0x4938A0 / 0x493980 / 0x493A10 / 0x493AA0 /
+    /// 0x493B30 / 0x493BC0, the callers take the register.
+    pub fn part_sum_wide(&self, specs: &crate::specs::CarSpecs, kinds: &[u16], start: f64) -> (f64, u32) {
+        let (mut sum, mut n) = (start, 0u32);
         for p in specs.parts.iter().filter(|p| kinds.contains(&p.kind)) {
-            sum += p.scale * self.part_damage(&p.mask) + p.state;
+            let scale = f64::from(1.5f32) - f64::from(p.condition) * f64::from(0.005f32);
+            sum += self.part_damage_wide(&p.mask) * scale + f64::from(p.state);
             n += 1;
         }
         (sum, n)
+    }
+
+    /// [`Self::part_damage`] in the register (0x493903…0x49391B).
+    pub fn part_damage_wide(&self, mask: &[bool; 10]) -> f64 {
+        let (mut sum, mut n) = (0.0f64, 0);
+        for (d, m) in self.damage.iter().zip(mask.iter()) {
+            if *m {
+                sum += f64::from(*d);
+                n += 1;
+            }
+        }
+        if n > 1 { sum / f64::from(n) } else { sum }
     }
 
     /// The mean zone damage under one part's mask (the inner loop of the getters, 0x493903…0x49391B).
@@ -45,35 +67,65 @@ impl Vehicle {
     /// 0x4938E2), so it is `(zone1 + Σ part terms) / (1 + n)` and always divides (0x493946). The
     /// misfire, the drive force and HTextDamage's "drivetrain" row read it.
     pub fn engine_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        let (sum, n) = self.part_sum(specs, &[part_kind::ENGINE]);
-        (self.damage[ZONE_ENGINE] + sum) / (1 + n) as f32
+        self.engine_wear_wide(specs) as f32
+    }
+
+    /// [`Self::engine_wear`] in the register (0x4938A0 returns `st0`; its callers 0x49E4A9 / 0x49E963 multiply it on).
+    pub fn engine_wear_wide(&self, specs: &crate::specs::CarSpecs) -> f64 {
+        let (sum, n) = self.part_sum_wide(specs, &[part_kind::ENGINE], f64::from(self.damage[ZONE_ENGINE]));
+        sum / f64::from(1 + n)
     }
 
     /// `0x493A10`, the brakes figure: the type-2 part terms summed, no outer division.
     pub fn brakes_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        self.part_sum(specs, &[part_kind::BRAKES]).0
+        self.brakes_wear_wide(specs) as f32
+    }
+
+    /// [`Self::brakes_wear`] as 0x493A10 leaves it, in `st0`.
+    pub fn brakes_wear_wide(&self, specs: &crate::specs::CarSpecs) -> f64 {
+        self.part_sum_wide(specs, &[part_kind::BRAKES], 0.0).0
     }
 
     /// `0x493AA0`, the gearbox figure: the type-3 part terms summed, no outer division.
     pub fn gearbox_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        self.part_sum(specs, &[part_kind::GEARBOX]).0
+        self.gearbox_wear_wide(specs) as f32
+    }
+
+    /// [`Self::gearbox_wear`] as 0x493AA0 leaves it, in `st0`.
+    pub fn gearbox_wear_wide(&self, specs: &crate::specs::CarSpecs) -> f64 {
+        self.part_sum_wide(specs, &[part_kind::GEARBOX], 0.0).0
     }
 
     /// `0x493B30`, the aero figure: the type-6 part terms summed, no outer division.
     pub fn aero_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        self.part_sum(specs, &[part_kind::AERO]).0
+        self.aero_wear_wide(specs) as f32
+    }
+
+    /// [`Self::aero_wear`] as 0x493B30 leaves it, in `st0`.
+    pub fn aero_wear_wide(&self, specs: &crate::specs::CarSpecs) -> f64 {
+        self.part_sum_wide(specs, &[part_kind::AERO], 0.0).0
     }
 
     /// `0x493980`, the tyre figure: the type-9 part terms summed, no outer division.
     pub fn tyres_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        self.part_sum(specs, &[part_kind::TYRES]).0
+        self.tyres_wear_wide(specs) as f32
+    }
+
+    /// [`Self::tyres_wear`] as 0x493980 leaves it, in `st0`.
+    pub fn tyres_wear_wide(&self, specs: &crate::specs::CarSpecs) -> f64 {
+        self.part_sum_wide(specs, &[part_kind::TYRES], 0.0).0
     }
 
     /// `0x493BC0`, the suspension figure: the part terms of types 4, 5 and 8 summed, then divided by
     /// their count when it is above 1 (0x493C78…0x493C7E).
     pub fn suspension_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        let (w, n) = self.part_sum(specs, &part_kind::SUSPENSION);
-        if n > 1 { w / n as f32 } else { w }
+        self.suspension_wear_wide(specs) as f32
+    }
+
+    /// [`Self::suspension_wear`] in `st0` (0x493BC0; the callers 0x499C95 and 0x49F476 multiply it on).
+    pub fn suspension_wear_wide(&self, specs: &crate::specs::CarSpecs) -> f64 {
+        let (w, n) = self.part_sum_wide(specs, &part_kind::SUSPENSION, 0.0);
+        if n > 1 { w / f64::from(n) } else { w }
     }
 
     /// `0x493960`, the steering figure: `(zone2 + zone0) · 0.5` (`car+0x4EC`, `+0x4E4`, `[0x5B23F0]`).

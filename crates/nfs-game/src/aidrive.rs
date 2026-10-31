@@ -20,6 +20,7 @@
 use crate::race::SliceTable;
 use glam::{Mat3, Vec3};
 use nfs_formats::trafcfg::{AiPhysics, TrafficConfig};
+use nfs_physics::vehicle::x87::dot_x87;
 
 /// The state of one AI-driven car the model reads and writes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,17 +146,25 @@ fn fistp(v: f32) -> i32 {
 /// `0x408F20` — the heading error in **turns**, in −0.5..0.5. Positive means the car points to the
 /// right of where it wants to go.
 pub fn heading_error(car: &AiCarState, aim: Vec3) -> f32 {
+    use nfs_physics::vehicle::TURN_PER_RAD_IMAGE;
     let fwd = car.orientation.row(2);
-    // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable atan2, not std; original heading error 0x408F20.
-    let a = if car.sense >= 0.0 { nfs_math::portable::atan2f(fwd.x, fwd.z) } else { nfs_math::portable::atan2f(-fwd.x, -fwd.z) } / std::f32::consts::TAU;
-    let b = nfs_math::portable::atan2f(aim.x, aim.z) / std::f32::consts::TAU;
-    let mut e = a - b;
+    // 0x408FFD…0x40903D: `0x532860(x, z)` = `fpatan · [0x5BB2C8]` (the **double** 0.1591549515724182 = 1 / 6.28318452835083, not
+    // 1/τ — PORT-DEVIATION D1: portable atan2), the heading's copy stored to `f32` (`fst [esp+0x28]`, `fstp car+0x1054`)
+    // and the aim's (0x40905A) kept in the register; `e = a_f32 − b` (0x40905F `fld a; fsub st(1)`), `+1` below `−0.5`
+    // (`[0x5B2448]`, 0x409068…0x409075) or `−1` above `0.5` (0x40908F…0x40909C), one `fstp car+0x1038`.
+    let a = if car.sense >= 0.0 {
+        nfs_math::portable::atan2(f64::from(fwd.x), f64::from(fwd.z))
+    } else {
+        nfs_math::portable::atan2(f64::from(-fwd.x), f64::from(-fwd.z))
+    } * TURN_PER_RAD_IMAGE;
+    let b = nfs_math::portable::atan2(f64::from(aim.x), f64::from(aim.z)) * TURN_PER_RAD_IMAGE;
+    let mut e = f64::from(a as f32) - b;
     if e < -0.5 {
         e += 1.0;
     } else if e > 0.5 {
         e -= 1.0;
     }
-    e
+    e as f32
 }
 
 /// `0x409570` — is the car out of control? `road` is the slice's A/B road extents. The speed floor
@@ -213,12 +222,14 @@ pub fn road_bend_steps(table: &SliceTable, slice: usize, steps: i32) -> f32 {
 
 /// `car+0xD58` — the body-frame lateral speed.
 pub fn body_lateral_speed(car: &AiCarState) -> f32 {
-    car.velocity.dot(car.orientation.row(0))
+    // 0x408F39…0x408F3E: the dot 0x532910 (`fmul` ×3, `faddp` ×2 in the register), one `fstp [car+0xD58]`
+    dot_x87(car.velocity, car.orientation.row(0))
 }
 
 /// `car+0xD60` — the body-frame forward speed.
 pub fn body_forward_speed(car: &AiCarState) -> f32 {
-    car.velocity.dot(car.orientation.row(2))
+    // 0x408F5D…0x408F64 (`car+0xD60`)
+    dot_x87(car.velocity, car.orientation.row(2))
 }
 
 /// The body-frame command the controllers produce: a lateral and forward force and a yaw torque.
@@ -249,29 +260,55 @@ pub fn brake_light(counter: u8, braking: Option<bool>, ticks: u8) -> u8 {
 /// `0x409720` — the out-of-control controller, in full.
 pub fn out_of_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f32, accel_rate: f32, brake_force: f32) -> DriveCommand {
     let wrong_way = car.dir * car.speed < 0.0 && car.sense >= 0.0;
-    // desired angular velocity from the heading error, then the lateral velocity that goes with it
-    let mut dav = (-2.0 * cfg.dangle_to_dav * heading_err).clamp(-cfg.max_dav, cfg.max_dav);
+    // Register chains of `0x409720` (control word 0x27F): `dav = (err · [0x5E6D58]) · −2` (0x40978E…0x40979A) is clamped to
+    // `±max_dav` **in the register** (`fcom`: kept below the bound, else the bound) and stays unrounded through the rest of the
+    // routine; `dlv = 10 · dav` is compared unrounded but stored to `f32` (`fst [esp+0x20]`, 0x4097D4…0x4097DA) and then clamped
+    // as a stored value to `±max_dlvel` (0x4097DE…0x40980F) and `±speed_est` (0x409811…0x409847); under `vel_limit_range`
+    // (0x409849…0x4098B6) `dlv` is clamped to the **unrounded** `|lat_factor · speed_est|` (the bound stored as `f32` when it
+    // wins) and `dav` to the `f32` `|ang_factor · speed_est|` (0x4098B8…0x409907); `aa = −((yaw − dav) · [0x5E6D60])`
+    // takes the unrounded `dav` (0x40991E…0x40992E), `la = −((lat − dlv) · [0x5E6D50])` the stored `dlv` (0x4099A2…0x4099B4).
+    let up = |x: f64, m: f64| if x < m { x } else { m };
+    let dn = |x: f64, m: f64| if x > -m { x } else { -m };
+    let mut dav = dn(up(-2.0 * f64::from(heading_err) * f64::from(cfg.dangle_to_dav), f64::from(cfg.max_dav)), f64::from(cfg.max_dav));
+    let dlv_w = 10.0 * dav;
+    let mut dlv = dlv_w as f32;
+    if !(dlv_w < f64::from(cfg.max_dlvel)) {
+        dlv = cfg.max_dlvel;
+    }
+    if !(dlv > -cfg.max_dlvel) {
+        dlv = -cfg.max_dlvel;
+    }
     // …and then to ±`car+0xEC4`, the speed estimate. Both halves are real: 0x409811 is
     // `min(dlv, speed_est)` and **0x40982C is `max(dlv, −speed_est)`** — `traffic.md` §27.14 called
     // that second one "a compiler no-op" and it is not, because `max_dlvel` can exceed the estimate
     // and leave `dlv` below `−speed_est` for the first clamp to pass through. Corrected 2026-09-21.
-    let mut dlv = (10.0 * dav).clamp(-cfg.max_dlvel, cfg.max_dlvel).clamp(-car.speed_est, car.speed_est);
+    if car.speed_est <= dlv {
+        dlv = car.speed_est;
+    }
+    if !(dlv > -car.speed_est) {
+        dlv = -car.speed_est;
+    }
     if car.speed.abs() < cfg.vel_limit_range {
-        let l = (cfg.lat_vel_limit_factor * car.speed_est).abs();
-        dlv = dlv.clamp(-l, l);
+        let l = (f64::from(cfg.lat_vel_limit_factor) * f64::from(car.speed_est)).abs();
+        if !(f64::from(dlv) < l) {
+            dlv = l as f32;
+        }
+        if !(f64::from(dlv) > -l) {
+            dlv = (-l) as f32;
+        }
         let a = (cfg.ang_vel_limit_factor * car.speed_est).abs();
-        dav = dav.clamp(-a, a);
+        dav = dn(up(dav, f64::from(a)), f64::from(a));
     }
     // `car+0x10AC == 2 → dav *= 5` (0x40990F) is **not** modelled, because it cannot fire: that
     // `cmp` is the only reference to `car+0x10AC` anywhere in the image and nothing writes it, so it
     // holds the zero `Car_tObj`'s allocation left there.
-    let yaw_rate = car.angular_velocity.dot(car.orientation.row(1));
-    let mut aa = -(yaw_rate - dav) * cfg.dav_to_aa;
+    let yaw_rate = dot_x87(car.angular_velocity, car.orientation.row(1)); // 0x408F7D…0x408F8A (`car+0xD68`)
+    let mut aa = (-((f64::from(yaw_rate) - dav) * f64::from(cfg.dav_to_aa))) as f32;
     if car.speed.abs() > 18.0 {
         aa *= 0.5;
     }
     aa = aa.clamp(-car.max_yaw_acc, car.max_yaw_acc);
-    let la = (-(body_lateral_speed(car) - dlv) * cfg.dlvel_to_clacc).clamp(-car.max_lat_acc, car.max_lat_acc);
+    let la = (-((f64::from(body_lateral_speed(car)) - f64::from(dlv)) * f64::from(cfg.dlvel_to_clacc)) as f32).clamp(-car.max_lat_acc, car.max_lat_acc);
     // **Longitudinal, read out in full 2026-09-21** (0x4099F0…0x409B0E). The target:
     //
     // * reversing (`car+0x104C == −1`) with **no aim point at all** — all three of `car+0x1064…+0x106C`
@@ -389,6 +426,12 @@ pub fn reverse_trim(gear: &mut Gear, now: i64, lateral: f32, lateral_target: f32
     (target_speed.clamp(-20.0, 20.0), 0.0)
 }
 
+/// `(1 + 0.0015 · car+0xD60) · car+0x10BC` of `0x409C70` (0x409D1A…0x409D32, `[0x5B2634]` the `f32` 0.0015): one register chain,
+/// one `fstp`; `car+0x10BC` is 1.0 here (see [`in_control_command`]).
+pub fn grip_factor(car: &AiCarState) -> f32 {
+    (f64::from(body_forward_speed(car)) * f64::from(0.0015f32) + 1.0) as f32
+}
+
 /// `0x409C70` — the in-control controller (§27.14).
 ///
 /// The surprise here is that the lateral half is **not** a lane-position controller. The lane error
@@ -402,25 +445,41 @@ pub fn reverse_trim(gear: &mut Gear, now: i64, lateral: f32, lateral_target: f32
 /// `grip` is `(1 + 0.0015·forwardSpeed) · car+0x10BC`, the post-collision ramp; `boost` is
 /// `car+0x108C` when it exceeds 1.
 pub fn in_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f32, aim: Vec3, grip: f32, boost: f32, accel_rate: f32, brake_force: f32) -> DriveCommand {
-    let d = aim.normalize_or_zero();
+    // 0x409C93…0x409CE5: `car+0x102C` normalised by 0x5328D0 (the reciprocal in the register, one rounding per component), the
+    // perpendicular `(z, y, −x)` and `velocity · perp` through 0x532910, `· dir` (`fimul car+0xEB0`) stored to `f32` (0x409D06)
+    let d = nfs_physics::vehicle::x87::normalize_x87(aim);
     // the desired direction rotated a quarter turn in the ground plane
     let perp = Vec3::new(d.z, d.y, -d.x);
-    let k = if boost > 1.0 { boost } else { 1.0 };
+    let k = if boost > 1.0 { f64::from(boost) } else { 1.0 };
     // `grip` is §27.14's `gripK` **less its second factor**: the original is
     // `(1 + 0.0015·car+0xD60) · car+0x10BC`, and `car+0x10BC` is the post-collision recovery ramp
     // 0x40A900 winds down, which this port does not model — it is 1.0 for an undamaged car, and the
     // cases that move it ((ii) the scripted spin, (iii) the cop-collision window) are not ported
-    // either.
-    let (a, b) = (grip * car.max_lat_acc * k, grip * cfg.dlvel_to_clacc * k);
-    let lateral = (-car.velocity.dot(perp) * b).clamp(-a, a);
+    // either. 0x409D1A…0x409D32 is one chain with one `fstp` ([`grip_factor`]).
+    // 0x409E81…0x409EB2: `a = (grip · car+0x1084) · boost`, `b = ([0x5E6D24] · grip) · boost` stay in the register.
+    let (a, b) = (f64::from(grip) * f64::from(car.max_lat_acc) * k, f64::from(cfg.dlvel_to_clacc) * f64::from(grip) * k);
+    // 0x40A032…0x40A06C: `(−dir) · (dot · dir)` is `−dot_f32` (`dir` = ±1), `· b` rounded once, then `a` (unrounded) as the bound:
+    // kept below it, otherwise `a` stored as `f32`; and the same against `−a`
+    let dot = f64::from(dot_x87(car.velocity, perp));
+    let mut lateral = (-dot * b) as f32;
+    if !(f64::from(lateral) < a) {
+        lateral = a as f32;
+    }
+    if !(f64::from(lateral) > -a) {
+        lateral = (-a) as f32;
+    }
 
-    let mut dav = (-2.0 * cfg.dangle_to_dav * heading_err).clamp(-cfg.max_dav, cfg.max_dav);
+    // 0x409EB8…0x40A002 as in the out-of-control controller: `dav` stays unrounded in the register through `±max_dav` and
+    // (inside `vel_limit_range`) `±|ang_factor · speed_est|` (the `f32` product), and `aa = −((yaw − dav) · [0x5E6D34])`
+    let up = |x: f64, m: f64| if x < m { x } else { m };
+    let dn = |x: f64, m: f64| if x > -m { x } else { -m };
+    let mut dav = dn(up(-2.0 * f64::from(heading_err) * f64::from(cfg.dangle_to_dav), f64::from(cfg.max_dav)), f64::from(cfg.max_dav));
     if car.speed.abs() < cfg.vel_limit_range {
         let l = (cfg.ang_vel_limit_factor * car.speed_est).abs();
-        dav = dav.clamp(-l, l);
+        dav = dn(up(dav, f64::from(l)), f64::from(l));
     }
-    let yaw_rate = car.angular_velocity.dot(car.orientation.row(1));
-    let yaw = (-(yaw_rate - dav) * cfg.dav_to_aa).clamp(-car.max_yaw_acc, car.max_yaw_acc);
+    let yaw_rate = dot_x87(car.angular_velocity, car.orientation.row(1)); // 0x408F7D…0x408F8A (`car+0xD68`)
+    let yaw = ((-((f64::from(yaw_rate) - dav) * f64::from(cfg.dav_to_aa))) as f32).clamp(-car.max_yaw_acc, car.max_yaw_acc);
 
     // the throttle window is a plain comparison of the route-signed speeds, with no dead band and no
     // gear factor (`traffic.md` §27.14 (x)) — but it carries the same two gates the out-of-control
@@ -446,13 +505,17 @@ pub fn in_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f32, a
 /// it is scaled by `min(0.15 · |D60|, 1)` (`[0x5B2638]`, 0x40A437…0x40A459). The port damped the
 /// component along the body's up axis by the post-step speed until 2026-10-22.
 pub fn integrate(car: &mut AiCarState, cmd: &DriveCommand, dt: f32) {
-    let right = car.orientation.row(0);
-    let fwd = car.orientation.row(2);
-    let up = car.orientation.row(1);
+    let m = car.orientation;
     // `car+0xD60`, written by 0x408F20 from the velocity the controllers saw
     let d60 = body_forward_speed(car);
-    car.velocity += (right * cmd.lateral + fwd * cmd.forward) * dt;
-    car.angular_velocity += up * (cmd.yaw * dt);
+    // 0x40A20F…0x40A258: `car+0xD40…D48` = three dots 0x532910 of `car+0xD4C` (lateral, 0, forward) with the transposed rows (one
+    // rounding each); 0x40A301…0x40A349: `v += dt · that` is `fld dt; fmul; fadd v; fstp`, one rounding (control word 0x27F).
+    // 0x40A2AD…0x40A3C0 the same for `ω += dt · Mᵀ·car+0xD34` with the yaw command in `car+0xD38`.
+    let local = Vec3::new(cmd.lateral, 0.0, cmd.forward);
+    let ang = Vec3::new(0.0, cmd.yaw, 0.0);
+    let step = |v: f32, a: Vec3, c: Vec3| (f64::from(dt) * f64::from(dot_x87(a, c)) + f64::from(v)) as f32;
+    car.velocity = Vec3::new(step(car.velocity.x, local, m.col(0)), step(car.velocity.y, local, m.col(1)), step(car.velocity.z, local, m.col(2)));
+    car.angular_velocity = Vec3::new(step(car.angular_velocity.x, ang, m.col(0)), step(car.angular_velocity.y, ang, m.col(1)), step(car.angular_velocity.z, ang, m.col(2)));
     if d60.abs() < 1.0 {
         car.angular_velocity.y = 0.0;
     } else {

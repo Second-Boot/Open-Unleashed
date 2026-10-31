@@ -1310,12 +1310,15 @@ fn traffic_and_cops_on_a_shared_ring_keep_their_draws_and_poses() {
     // (0x4010E7) and the placement arm its discarded step (0x40419B), the chase tracker's reset is mirrored
     // (0x403660), the brake force is `11 · pers[+0x20]` and the lateral limit `specs[0xF4] · 9.8`, the cops'
     // slice / `car+0xED0` / `car+0xEC0` follow the tracker and 0x417800, the stability assist 0x49F0C0 reaches the cop's force, a lit cop skips 0x401A00
-    assert_eq!(a, (23541, 12645, 4455510520046766344));
+    // Re-baselined 2026-10-31 (HUMAN-DRIFT): the bodies' force step runs its register chains in extended precision; the draws (rng words) are unchanged, only the pose digest moves.
+    // Re-baselined again 2026-10-31 (VYBLIP-CHAINS): `Car_ground`, `Susp_update`, the engine and the AI drive's integrator keep more chains in the register, the tracker's patch normal is 0x485F90's; rng words unchanged, the pose digest moves.
+    // Re-baselined again 2026-11-01 (VYBLIP-REST): the AI controllers 0x409720 / 0x409C70 and the heading error 0x408F20 keep their chains in the register (and the heading uses the image's 1/2π double); rng words unchanged.
+    assert_eq!(a, (23541, 12645, 10771498167489642823));
     // with the real places and positions the cops' fine gaps (0x40E860) and the traffic's blocker
     // caps differ from the slice-gap fallback, and since PA-TRAFFIC3 the trajectories they feed no
     // longer happen to meet the same draws: the variant is pinned on its own
     assert_eq!(shared_ring_digest(true), b, "deterministic");
-    assert_eq!(b, (23541, 12645, 7698492423931635218));
+    assert_eq!(b, (23541, 12645, 14681573139977744209));
 }
 
 /// Timing of the shared-ring scenario (`cargo test -p nfs-game --lib -- --ignored --nocapture ring_timing`):

@@ -274,7 +274,7 @@ pub fn sdl_saturation(di: i32) -> u16 {
     (sdl_level(di.clamp(0, 10000)) as u16) * 2
 }
 
-/// Microseconds as SDL's milliseconds, rounded to the nearest (**APPROXIMATION**: SDL's effect times
+/// Microseconds as SDL's milliseconds, rounded to the nearest (**APPROXIMATION**, host API granularity, PORT-DEVIATION D24: SDL's effect times
 /// are whole milliseconds, DirectInput's microseconds — a period of 1e6/35 µs becomes 29 ms).
 fn ms(us: i32) -> u32 {
     (us.max(0) as u32).saturating_add(500) / 1000
@@ -311,7 +311,7 @@ pub fn sdl_effect(call: &DiCall, wheel: bool) -> Option<SdlEffect> {
             for (i, (offset, coef)) in [x, y].into_iter().enumerate() {
                 // DICONDITION {lOffset, lPositiveCoefficient = lNegativeCoefficient = dwPositiveSaturation =
                 // dwNegativeSaturation = coef, lDeadBand 0} (0x4125F5…0x4126F4); the gain scales the
-                // coefficients and saturations (APPROXIMATION: DirectInput's own application of dwGain
+                // coefficients and saturations (APPROXIMATION, device driver behaviour with no readable source, PORT-DEVIATION D24: DirectInput's own application of dwGain
                 // to a condition is the driver's)
                 let k = gained(coef, gain);
                 c.center[i] = sdl_level(offset);
@@ -324,7 +324,7 @@ pub fn sdl_effect(call: &DiCall, wheel: bool) -> Option<SdlEffect> {
         }
         DiCall::Constant { magnitude, duration_us, direction, attack_level, attack_time, fade_level, fade_time, gain } => {
             // 0x533910 clamps the duration to 1 500 000 µs; the fade time `dur − mag` (0x412DE2) can be
-            // negative, a huge DWORD to DirectInput — 0 here (APPROXIMATION: SDL's field is unsigned)
+            // negative, a huge DWORD to DirectInput — 0 here (APPROXIMATION, host API, PORT-DEVIATION D24: SDL's field is unsigned)
             let dur = duration_us.clamp(0, 1_500_000);
             SdlEffect::Constant(SDL_HapticConstant {
                 r#type: SDL_HAPTIC_CONSTANT,

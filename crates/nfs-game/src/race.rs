@@ -65,6 +65,16 @@ pub const JUNCTION_RADIUS: f32 = 20.0;
 /// at the car's own radius, which is what separates one branch from another.
 pub const BRANCH_WINDOW: f32 = 1044.0;
 
+/// 0x474440 for the placement: `setSlice` 0x473210 leaves `preferredSection = -1`, so the tracker (seated on
+/// `max(1, seat)`, 0x49B09F) is re-found by `findSlice` 0x481400 at the car's final position.
+impl nfs_physics::vehicle::EndSlice for SliceTable {
+    fn raw_at(&self, pos: Vec3, seat: usize) -> [Vec3; 3] {
+        let at = self.track_slice(pos, seat.max(1).min(self.slices.len().saturating_sub(1)), None);
+        let sl = &self.slices[at];
+        [sl.lateral, sl.up, sl.forward]
+    }
+}
+
 impl SliceTable {
     pub fn from_crp(crp: &Crp, data: &[u8]) -> Result<Self, String> {
         let simd = crp.level.iter().find(|e| e.is_level(b"SimD")).ok_or("Could not find sim data in data group (no SimD)")?;
@@ -187,6 +197,14 @@ impl SliceTable {
         // route above is what carries the reversal; `backwards` records it for them.
         t.backwards = !t.backwards;
         t
+    }
+
+    /// The placement's view of slice `slice` (`Vehicle::place_at_slice`): centre, forward (`normalised` for the
+    /// callers that unit it, 0x49B090's `F`), the raw rows, and this table for 0x474440's re-find at the final position.
+    pub fn frame(&self, slice: usize, normalised: bool) -> nfs_physics::vehicle::SliceFrame<'_> {
+        let sl = &self.slices[slice];
+        let forward = if normalised { sl.forward.normalize_or_zero() } else { sl.forward };
+        nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward, raw: [sl.lateral, sl.up, sl.forward], end: Some((self, slice)) }
     }
 
     fn d2(&self, i: usize, p: Vec3) -> f32 {
@@ -428,8 +446,9 @@ impl SliceTable {
         Some(((slice - seg.first) as f32 / len) * (f1 - f0) + f0)
     }
 
-    /// APPROXIMATION (a slice no segment or node covers — tables built by hand in tests): the route
-    /// position over the lap length.
+    /// TEST GLUE (was an APPROXIMATION; settled 2026-10-31): a slice no segment or node covers
+    /// exists only in the tables a test builds by hand, in none of the 15 shipped tracks
+    /// (`every_shipped_slice_has_a_section_fraction`) — the route position over the lap length.
     fn frac_by_route(&self, slice: usize) -> f32 {
         let p = self.route_pos.get(slice).copied().unwrap_or(0);
         if self.backwards {
@@ -586,7 +605,12 @@ impl RaceProgress {
 
     pub fn new(start_slice: usize, table: &SliceTable) -> Self {
         let p = table.frac(start_slice);
-        Self { slice: start_slice, progress: p, prev_progress: p, start_progress: p, start_slice, ..Default::default() }
+        // `car+0xB24` (the lap start tick) is a constant store of the race-state clear 0x40F0B0 (`mov [eax+0x50], 0x1C0`
+        // with `eax = car+0xAD4`, 0x40F0D8), which `Car_reset` 0x410730 calls first (0x41073C) for every car of
+        // `Cars_resetAll` 0x4110A0 — 448 = the countdown's length, not a tick the lap block wrote (the live read agrees: 448 at
+        // tick 1149 of a tournament, a knockout and a skill-test race, before any lap). So the first lap is timed
+        // `tick − 448` (0x41662A…0x416631: `+0xB28[+0xB20] = tick − +0xB24`), from the green light, not from tick 0
+        Self { slice: start_slice, progress: p, prev_progress: p, start_progress: p, start_slice, lap_start_tick: 448, ..Default::default() }
     }
 
     /// `Car_raceInit` 0x410979…0x410A0A on a point-to-point track (`LINEAR_TRACK [0x657494]`): the
@@ -628,6 +652,26 @@ impl RaceProgress {
         self.account(table, prev_slice, forward, tick, num_laps)
     }
 
+    /// **TEST GLUE** (`NFS_PA_FINISH`, `app/pa_trace.rs`) for a circuit: the lap counter `car+0x530` set to `n` from outside, and
+    /// 0x416310's block `if +0xB20 != +0x530` (0x416612…0x416643: the lap timed into `+0xB28[+0xB20]`, `+0xB24 = tick`) with the finish
+    /// 0x4166FF…0x416838 (`+0xB20 >= [0x6573F0]`: `+0xB14 = tick`, `+0xAF8 = (float)+0xB20 + frac`). [`Self::account`] runs the lap
+    /// only on a counted line crossing, so the original's own `gdb` write of the counter needs this arm on a circuit (a point-to-point
+    /// track finishes through `account`'s `new > finish` once `laps` is set). The slice is the one the tracker holds now, not the
+    /// tick's own re-find (a difference in the human's rank progress of at most one slice, never in the save).
+    pub fn force_lap_counter(&mut self, table: &SliceTable, n: u32, tick: u64, num_laps: u32) {
+        if self.finished {
+            return;
+        }
+        self.laps = n;
+        self.lap_times.push(tick.saturating_sub(self.lap_start_tick));
+        self.lap_start_tick = tick;
+        if n >= num_laps {
+            self.finished = true;
+            self.progress = n as f32 + table.frac(self.slice);
+            self.tick = tick;
+        }
+    }
+
     /// The progress half of [`Self::update_tracked`] on the slice the tracker already holds: an AI
     /// opponent's slice is re-found by 0x49AF70 at the head of its `AIState_Racing::update`
     /// (0x40CA27, before the decisions 0x40B650 / 0x40BFE0), at the position the odd tick left, and
@@ -655,7 +699,7 @@ impl RaceProgress {
             if new != self.prev_progress {
                 if new > finish {
                     self.laps += 1;
-                    self.lap_times.push(tick - self.lap_start_tick);
+                    self.lap_times.push(tick.saturating_sub(self.lap_start_tick));
                     self.lap_start_tick = tick;
                     lap_done = true;
                     if self.laps >= num_laps {
@@ -672,7 +716,7 @@ impl RaceProgress {
                 self.unlaps -= 1;
             } else {
                 self.laps += 1;
-                self.lap_times.push(tick - self.lap_start_tick);
+                self.lap_times.push(tick.saturating_sub(self.lap_start_tick));
                 self.lap_start_tick = tick;
                 lap_done = true;
                 if self.laps >= num_laps {
@@ -899,6 +943,13 @@ pub fn grid_slot_by(table: &SliceTable, start: usize, grid_pos: u32, n: u32, rul
 /// `grid_pos` 0 = pole (`.STARTINGPOS − 1`), `n` racers. Returns (position, orientation rows
 /// x/up/forward, slice).
 pub fn grid_pose(table: &SliceTable, start_scene: Option<&Scene>, grid_pos: u32, n: u32, rule: &GridRule) -> (Vec3, Mat3, usize) {
+    let (pos, rot, slice, _) = grid_pose_with_offset(table, start_scene, grid_pos, n, rule);
+    (pos, rot, slice)
+}
+
+/// [`grid_pose`] and `Grid_slot`'s slice-local offset `{lateral, 0.5, 0}` itself, which `Car_placeAtSlice` 0x49B090 takes as its
+/// argument (0x41095C): the placement must be handed that exact float, not one read back from the world pose.
+pub fn grid_pose_with_offset(table: &SliceTable, start_scene: Option<&Scene>, grid_pos: u32, n: u32, rule: &GridRule) -> (Vec3, Mat3, usize, Vec3) {
     let start = start_slice(table, start_scene, rule.linear);
     let (slice, off) = grid_slot(table, start, grid_pos, n, rule);
     let s = &table.slices[slice];
@@ -907,7 +958,7 @@ pub fn grid_pose(table: &SliceTable, start_scene: Option<&Scene>, grid_pos: u32,
     let up = s.up.normalize();
     let right = up.cross(fwd).normalize();
     let up = fwd.cross(right).normalize();
-    (pos, Mat3::from_cols(right, up, fwd).transpose(), slice)
+    (pos, Mat3::from_cols(right, up, fwd).transpose(), slice, off)
 }
 
 #[cfg(test)]
@@ -1097,6 +1148,20 @@ fn two_branch_table() -> SliceTable {
         }
         assert_eq!(p.laps, 0);
         assert_eq!(p.unlaps, 0);
+    }
+
+    #[test]
+    fn the_first_lap_is_timed_from_the_green_light() {
+        // `car+0xB24` = 448 from `Car_reset`'s clear 0x40F0B0 (0x40F0D8): the first lap is `tick − 448`, not `tick`
+        let t = ring(100);
+        let mut p = RaceProgress::new(2, &t);
+        assert_eq!(p.lap_start_tick, 448);
+        p.force_lap_counter(&t, 1, 1150, 2);
+        assert_eq!(p.lap_times, vec![702]);
+        assert!(!p.finished, "one lap of two");
+        p.force_lap_counter(&t, 2, 1500, 2);
+        assert!(p.finished && p.lap_times == vec![702, 350]);
+        assert!(p.progress >= 2.0);
     }
 
     #[test]
@@ -1476,5 +1541,24 @@ mod ranking_tests {
         assert_eq!(derby_outcome(&fresh, 0, 1), DerbyOutcome::Wins, "a lone racer wins at once (0 < 0 fails)");
         // a car whose own eight zones are over is out before the count is looked at
         assert_eq!(derby_outcome(&z, 2, 3), DerbyOutcome::Out);
+    }
+
+    /// Every slice of every shipped track lies in a junction-graph segment whose two end nodes exist, so
+    /// 0x481B70's section walk answers and `SliceTable::frac` never takes its route-position fallback
+    /// (`frac_by_route`, only for tables a test builds by hand).
+    #[test]
+    fn every_shipped_slice_has_a_section_fraction() {
+        let Ok(paths) = nfs_assets::GamePaths::locate() else {
+            eprintln!("skipping: no game data");
+            return;
+        };
+        for name in nfs_assets::track::TrackAssets::list(&paths) {
+            let Ok(a) = nfs_assets::track::TrackAssets::load(&paths, &name) else { continue };
+            let Ok(t) = super::SliceTable::from_crp(&a.crp, &a.crp_data) else { continue };
+            for s in 0..t.slices.len() {
+                assert!(t.section_frac(s).is_some(), "{name}: slice {s} of {} has no section fraction", t.slices.len());
+            }
+            eprintln!("{name}: {} slices covered", t.slices.len());
+        }
     }
 }

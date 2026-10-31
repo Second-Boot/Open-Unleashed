@@ -7,6 +7,7 @@
 //!   car reads the packet doubled (`Car_applyInput` 0x4992CF), as [`Controls`] carries it. The same
 //!   file drives the original: a gdb breakpoint at 0x499211 (after the replay hook, before
 //!   `car+0xD8A = [0x5E9664]`) writes the bytes for the human car.
+//! * `NFS_PA_FINISH=<tick>` — the human's lap counter set to 1 at the start of that tick ([`force_finish`]), a career race ending at a known moment.
 //! * `NFS_PA_TRACE=<file>` — one row per tick at the start of [`App::simulate`] (the state the
 //!   previous tick left, as the original's `GameTick` 0x414FF0 entry sees it): the human car and
 //!   every opponent, in the columns the gdb script writes from the car record (`RE/STRUCTURES.md`).
@@ -41,6 +42,35 @@ pub(crate) fn input(tick: u64, controls: Controls) -> Controls {
         None if !s.is_empty() => Controls { command: 0, ..Controls::default() },
         None => controls,
     }
+}
+
+/// TEST GLUE: `NFS_PA_FINISH=<tick>` — at the start of that `gGameTick` the human car's lap counter `car+0x530`
+/// is set to 1, so 0x416310's own finish block runs on that tick (the original's side: a gdb write of the same
+/// dword at the same tick, `pa_fin_gdb.py`), a career race ends at a known moment without driving the lap
+/// (`RE/notes/REFERENCE-2026-10-31-PA-SAVNET2.md`).
+///
+/// `NFS_PA_FINISH=<tick>:0` writes the race's own lap total (`[0x6573F0]`, the gdb side's `PA_LAPS=0`), for a session whose races differ.
+/// `NFS_PA_FINISH=<tick>:<laps>` writes `<laps>` instead of 1 (a 2-lap knockout round needs the counter at its lap count,
+/// `race-logic.md` §3: the finish block fires when `+0x530` reaches `NUM_LAPS`).
+pub(crate) fn finish_lap_counter(tick: u64) -> Option<u32> {
+    finish_spec().filter(|&(t, _)| t == tick).map(|(_, n)| n)
+}
+
+/// TEST GLUE: `NFS_PA_FINISH` is also the Factory Driver skill test's finish at a fixed tick: the finish trigger's own effect
+/// (0x4161FB…0x416226: state 2, `car+0xB14 = tick`, `car+0xB24 = tick − 448`) without driving the course (the original's side:
+/// `pa_end_gdb.py` with `PA_MODE=skill` writes the same three dwords at the `GameTick` entry of the same tick).
+pub(crate) fn skill_finish_now(tick: u64) -> bool {
+    finish_spec().is_some_and(|(t, _)| t == tick)
+}
+
+fn finish_spec() -> Option<(u64, u32)> {
+    static T: OnceLock<Option<(u64, u32)>> = OnceLock::new();
+    *T.get_or_init(|| {
+        let s = nfs_game::config::cfg().nfs_pa_finish.as_str()?;
+        let mut it = s.trim().split(':');
+        let t = it.next()?.parse().ok()?;
+        Some((t, it.next().and_then(|n| n.parse().ok()).unwrap_or(1)))
+    })
 }
 
 /// TEST GLUE: `NFS_PA_LOOPS=<file>` — the player's loop entries the odd tick's drain hands 0x4A93C0

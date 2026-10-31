@@ -939,14 +939,13 @@ impl TrafficSet {
         for i in 0..self.cars.len().min(self.bodies.len()) {
             let g = startingpos.get(i).copied().unwrap_or(0);
             let (slice, off) = crate::race::grid_slot_by(table, start, (g - 1) as u32, n, rule, |s, d| self.add_slices(table, s, d));
-            let sl = table.slices[slice];
             let Some(specs) = self.car_specs.get(i).or(self.specs.as_ref()) else { continue };
             Self::sync_in_one(&self.cars[i], &mut self.bodies[i]);
             let b = &mut self.bodies[i];
             // the placement's `Susp_update`s read `[0x606AC4]` (< 2: the compression block is skipped,
             // 0x499D15); the traffic bodies keep their own counter afterwards, as before
             let held = std::mem::replace(&mut b.game_tick, tick);
-            b.place_at_slice(grid, specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, off, false, false);
+            b.place_at_slice(grid, specs, table.frame(slice, true), off, false, false);
             b.game_tick = held;
             Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
         }
@@ -1090,6 +1089,10 @@ impl TrafficSet {
             // Live: monaco1's second traffic car, the `eden4` bus, left purgatory on the same tick as
             // alps' non-bus car with the same delay draw.)
             self.cars[i].respawn_ticks = 1 + self.rng.below(delay) as i32;
+            // 0x4060F3…0x4060FE, after the ctor (so after its delay draw): `Car_placeAtSlice(car, 0,
+            // {0, 100, 0}, 1)` — the first AI pass parks the car again, 100 m above slice 0 (the
+            // 0x42C80000 stored at 0x40605B), whichever slot it is
+            self.park_at(i, table, grid, 100.0);
             self.purgatory_countdown(i, tick, ai_ticks);
             return false;
         }
@@ -1626,7 +1629,7 @@ impl TrafficSet {
                 aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, rate, brake_force)
             } else {
                 // `grip` is the post-collision ramp, 1.0 for an undamaged car
-                let grip = 1.0 + 0.0015 * aidrive::body_forward_speed(&st);
+                let grip = aidrive::grip_factor(&st);
                 aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, 1.0, rate, brake_force)
             };
             tracing::trace!(car = i, err, ooc = aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road, bend), lat = st.lateral, lat_t = st.lateral_target, speed = st.speed, yaw = st.angular_velocity.y, cmd_lat = cmd.lateral, cmd_yaw = cmd.yaw, aim = ?aim, v = ?st.velocity, maxlat = st.max_lat_acc, "traffic drive");
@@ -1735,7 +1738,7 @@ impl TrafficSet {
                 for w in &mut b.wheels {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
-                b.place_at_slice(g, specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, Vec3::ZERO, false, dir < 0.0);
+                b.place_at_slice(g, specs, table.frame(s, true), Vec3::ZERO, false, dir < 0.0);
                 Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
                 // a fresh seat is a zone change: 0x499520 took the slice's vectors into the frame block
                 self.cars[i].frame = [sl.lateral, sl.up, sl.forward];
@@ -1915,17 +1918,23 @@ impl TrafficSet {
     /// (live: car 1 retired at tick 1260 took two draws before its delay, 0x499856 ×2 then
     /// 0x40DEAE; `REFERENCE-2026-10-22-PA-TRAFFIC3.md`). Without a body (the unit tests) nothing runs.
     fn park(&mut self, i: usize, table: &SliceTable, grid: Option<&nfs_physics::collision::TriangleGrid>) {
+        let y = (self.slot_base + i) as f32 * 10.0;
+        self.park_at(i, table, grid, y);
+    }
+
+    /// `Car_placeAtSlice(car, 0, {0, y, 0}, 1)` on the parked car: `y` = `10 · slot` for the purgatory
+    /// ctor 0x40DE10, 100 for `AIHigh_Traffic` state 0 (0x4060F6, see `ai_state`).
+    fn park_at(&mut self, i: usize, table: &SliceTable, grid: Option<&nfs_physics::collision::TriangleGrid>, y: f32) {
         let (Some(g), Some(specs)) = (grid, self.car_specs.get(i).or(self.specs.as_ref())) else { return };
         if i >= self.bodies.len() || table.slices.len() < 2 {
             return;
         }
         // the tracker on the clamped slice 1, the pose on slice 0's node
         let (s0, s1) = (table.slices[0], table.slices[1]);
-        let slot = (self.slot_base + i) as f32;
         let in_world = self.cars[i].active;
         Self::sync_in_one(&self.cars[i], &mut self.bodies[i]);
         let b = &mut self.bodies[i];
-        b.place_at_slice_from(g, specs, s1.centre, nfs_physics::vehicle::SliceFrame { centre: s0.centre, forward: s1.forward.normalize_or_zero(), raw: [s0.lateral, s0.up, s0.forward] }, Vec3::new(0.0, slot * 10.0, 0.0), nfs_physics::vehicle::PlaceFlags { opponent: false, flip: false, in_world });
+        b.place_at_slice_from(g, specs, s1.centre, nfs_physics::vehicle::SliceFrame { centre: s0.centre, forward: s1.forward.normalize_or_zero(), raw: [s0.lateral, s0.up, s0.forward], end: None }, Vec3::new(0.0, y, 0.0), nfs_physics::vehicle::PlaceFlags { opponent: false, flip: false, in_world });
         Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
     }
 
@@ -2048,7 +2057,7 @@ impl TrafficSet {
                 for w in &mut b.wheels {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
-                b.place_at_slice(g, specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward.normalize_or_zero(), raw: [sl.lateral, sl.up, sl.forward] }, Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
+                b.place_at_slice(g, specs, table.frame(slice, true), Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
                 Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
                 let c = &mut self.cars[i];
                 c.velocity = c.orientation.row(2) * target;
@@ -2180,7 +2189,7 @@ mod tests {
         c.angular_velocity = Vec3::ZERO;
         set.sync_in(0);
         let specs = crate::police::test_specs();
-        set.bodies[0].place_at_slice(&grid, &specs, nfs_physics::vehicle::SliceFrame { centre: Vec3::new(5.0, h(5.0), 0.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z] }, Vec3::new(0.0, 1.0, 0.0), false, false);
+        set.bodies[0].place_at_slice(&grid, &specs, nfs_physics::vehicle::SliceFrame { centre: Vec3::new(5.0, h(5.0), 0.0), forward: Vec3::Z, raw: [Vec3::X, Vec3::Y, Vec3::Z], end: None }, Vec3::new(0.0, 1.0, 0.0), false, false);
         set.sync_out(0);
         // `Car_ground` at 32 Hz and the integrators at 64 Hz, until the body has settled
         for tick in 0..256u64 {

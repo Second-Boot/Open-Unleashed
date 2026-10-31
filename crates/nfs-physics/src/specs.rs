@@ -29,6 +29,9 @@ pub struct InstalledPart {
     pub mask: [bool; 10],
     /// `1.5 − 0.005·part+0x60` (the condition %), `[0x5B246C]` / `[0x5B3284]`.
     pub scale: f32,
+    /// `part+0x60`, the condition the getters recompute `1.5 − 0.005·condition` from in the register on every call
+    /// (0x4938D9…0x4938EC): [`Self::scale`] is its `f32` rounding, the wide chains read this.
+    pub condition: f32,
     /// `part+0x164` as the race reads it: [`Self::carried`] less the unfold of the body damage
     /// the car brought in ([`Self::unfold`]).
     pub state: f32,
@@ -40,7 +43,7 @@ pub struct InstalledPart {
 
 impl InstalledPart {
     pub fn new(kind: u16, mask: [bool; 10], condition: f32, state: f32) -> Self {
-        Self { kind, mask, scale: 1.5 - 0.005 * condition, state, carried: state }
+        Self { kind, mask, scale: 1.5 - 0.005 * condition, condition, state, carried: state }
     }
 
     /// **`0x493CF0(car, 1)`** at 0x41088B, the end of `Car_raceInit` — every pass, so the live race,
@@ -76,7 +79,7 @@ pub fn fallback_parts() -> Vec<InstalledPart> {
         (part_kind::TYRES, corners),
     ]
         .into_iter()
-        .map(|(kind, mask)| InstalledPart { kind, mask, scale: 1.5, state: 0.0, carried: 0.0 })
+        .map(|(kind, mask)| InstalledPart { kind, mask, scale: 1.5, condition: 0.0, state: 0.0, carried: 0.0 })
         .collect()
 }
 
@@ -294,6 +297,18 @@ impl CarSpecs {
         torque_at(&self.torque, rpm)
     }
 
+    /// The torque lookup of `Engine_update` 0x49E8D4…0x49E94B as the register leaves it: `idx = _ftol(rpm · 0.002)`, then
+    /// `T[idx] + (rpm − 500·idx) · 0.002 · (T[idx+1] − T[idx])` with every step in the 53-bit register (control word 0x27F),
+    /// no rounding to `f32` before the caller's `· accel_per_torque[gear]` and `fstp`. The `min(19)` is the port's guard.
+    pub fn torque_interp_wide(&self, rpm: f32) -> f64 {
+        let r = f64::from(rpm.max(0.0));
+        let k = f64::from(0.002f32);
+        let idx = ((r * k) as usize).min(19);
+        let frac = (r - 500.0 * idx as f64) * k;
+        let (t0, t1) = (f64::from(self.torque[idx]), f64::from(self.torque[idx + 1]));
+        t0 + frac * (t1 - t0)
+    }
+
     /// **The purchased parts, folded into the block** — `0x49CB50 … 0x49D28A`, the first half of
     /// `CarSim_applyParts`. CONFIRMED, read instruction by instruction 2026-09-21.
     ///
@@ -453,11 +468,16 @@ impl CarSpecs {
     pub fn apply_setup(&mut self, setup: &[f32; 17], automatic: bool) {
         self.applied_setup = Some(*setup);
         // 0x49D290
-        let pf = (fixed16(setup[0]) * 0.02 + 1.0) * 0.5;
-        let pr = (fixed16(setup[1]) * 0.02 + 1.0) * 0.5;
-        self.top_speed /= (pf + pr + 3.0) * 0.2;
-        self.downforce_front *= pf;
-        self.downforce_rear *= pr;
+        // *Extended precision (2026-10-31, `RE/notes/REFERENCE-2026-10-31-HUMAN-DRIFT.md`).* The block below runs at the
+        // race's control word 0x27F (53-bit mantissa, measured), every statement is a register chain with one `fstp`
+        // to `f32`: evaluated here in `f64`, rounded once where the original stores. Constants are the image's.
+        let fx = |v: f32| f64::from(fixed16(v));
+        let (c_002, c_02) = (f64::from(f32::from_bits(0x3CA3_D70A)), f64::from(f32::from_bits(0x3E4C_CCCD)));
+        let pf = (fx(setup[0]) * c_002 + 1.0) * 0.5; // stays in the register
+        let pr = ((fx(setup[1]) * c_002 + 1.0) * 0.5) as f32; // 0x49D2D8 `fstp [esp+0x20]`
+        self.top_speed = (f64::from(self.top_speed) / ((f64::from(pr) + pf + 3.0) * c_02)) as f32;
+        self.downforce_front = (pf * f64::from(self.downforce_front)) as f32;
+        self.downforce_rear = (f64::from(pr) * f64::from(self.downforce_rear)) as f32;
         // 0x49D32E, then the slot loop 0x49D346 — slot 1 (neutral) is skipped
         self.final_drive += fixed16(setup[16]);
         // `Gear0` is the reverse ratio and `Gear1 … Gear6` are first to sixth, so slider 9 + n
@@ -471,31 +491,38 @@ impl CarSpecs {
         // 0x49D3CF
         self.steer_offset += fixed16(setup[5]);
         // 0x49D3F3 — shock rate, read three times
-        let shock = fixed16(setup[6]);
-        self.transfer_div = (shock + 2.0) * self.transfer_div * (1.0 / 3.0);
-        self.grip *= (self.transfer_div + 9.0) * 0.1;
-        self.pitch_ret += (1.0 - shock) * 0.2;
-        self.roll_ret += (1.0 - shock) * 0.2;
-        self.roll_gain /= (self.transfer_div + 1.0) * 0.5;
-        // 0x49D4CB — suspension travel, also read three times
-        let travel = fixed16(setup[4]) * 0.001;
-        self.bump_travel += travel;
-        self.grip *= travel + 1.0;
-        self.roll_gain /= travel + 1.0;
+        let shock = fx(setup[6]);
+        let c_third = f64::from(f32::from_bits(0x3EAA_AAAB)); // [0x5B2680]
+        let c_tenth = f64::from(f32::from_bits(0x3DCC_CCCD)); // [0x5B49B4]
+        self.transfer_div = ((shock + 2.0) * f64::from(self.transfer_div) * c_third) as f32;
+        let td = f64::from(self.transfer_div);
+        self.grip = ((td + 9.0) * c_tenth * f64::from(self.grip)) as f32;
+        self.pitch_ret = (((1.0 - shock) * c_02) + f64::from(self.pitch_ret)) as f32;
+        self.roll_ret = (((1.0 - shock) * c_02) + f64::from(self.roll_ret)) as f32;
+        self.roll_gain = (f64::from(self.roll_gain) / ((td + 1.0) * 0.5)) as f32;
+        // 0x49D4CB — suspension travel, also read three times (`[0x5B3060]` = 0.001f)
+        let c_milli = f64::from(f32::from_bits(0x3A83_126F));
+        let travel = fx(setup[4]) * c_milli;
+        self.bump_travel = (travel + f64::from(self.bump_travel)) as f32;
+        self.grip = ((travel + 1.0) * f64::from(self.grip)) as f32;
+        self.roll_gain = (f64::from(self.roll_gain) / (travel + 1.0)) as f32;
         // 0x49D555 — ride height, an overwrite
-        self.probe_offset = fixed16(setup[3]) * 0.001;
-        self.roll_gain /= self.probe_offset * 6.0 + 1.0;
-        // 0x49D597 — the tyre pressures
-        let mut a = fixed16(setup[7]) * (1.0 / 30.0);
-        let mut b = fixed16(setup[8]) * (1.0 / 30.0);
+        self.probe_offset = (fx(setup[3]) * c_milli) as f32;
+        self.roll_gain = (f64::from(self.roll_gain) / (f64::from(self.probe_offset) * 6.0 + 1.0)) as f32;
+        // 0x49D597 — the tyre pressures (`[0x5B3F30]` = 1/30f, `[0x5B3354]` = 0.90909088 = the image's 10/11): `a`, `b` stay
+        // in the register through the grip and front-weight chains (0x49D5BB…0x49D62C)
+        let c_30 = f64::from(f32::from_bits(0x3D08_8889));
+        let c_1011 = f64::from(f32::from_bits(0x3F68_BA2E));
+        let mut a = fx(setup[7]) * c_30;
+        let mut b = fx(setup[8]) * c_30;
         if a < 1.0 {
-            a *= 0.909_091;
+            a *= c_1011;
         }
         if b < 1.0 {
-            b *= 0.909_091;
+            b *= c_1011;
         }
-        self.grip = (a + b + 8.0) * self.grip * 0.1;
-        self.front_weight *= (2.0 * a / (a + b) + 1.0) * 0.5;
+        self.grip = (((a + b) + 8.0) * f64::from(self.grip) * c_tenth) as f32;
+        self.front_weight = (((2.0 * a / (a + b)) + 1.0) * 0.5 * f64::from(self.front_weight)) as f32;
         self.rebuild_tables(automatic);
     }
 

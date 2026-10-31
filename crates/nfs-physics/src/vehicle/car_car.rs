@@ -186,6 +186,19 @@ pub fn collide_cars_with(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: 
     collide_pair(a, mass_a, b, mass_b, walls).map(|(ea, eb)| ea.max(eb))
 }
 
+/// The pair as `0x498FF0` makes it (0x49912B…0x49912D): `push ebp` (the car already in the list
+/// `0x628CDC[]`), `push ebx` (the car whose pass this is), `call 0x4980D0` — so **A is the car
+/// being processed (the later one in `0x5E8B34` order) and B the earlier one**. [`box_contact`]
+/// tests B's faces and corners first and the contact point and normal depend on which box is
+/// which (alps, human beside the AI car at the start: the original's pair at tick 798 is
+/// A = slot 1, B = slot 0, and its point `(-171.105, 2.0948, 154.4005)` is reproduced only in that
+/// order — `RE/notes/REFERENCE-2026-10-31-CARCONTACT.md`). Arguments and the answer are in the
+/// listing's order: `earlier` first, the answer is (earlier's, later's) `car+0x430`; the walls
+/// between the rounds run later car first, as 0x4980D0 does for A then B.
+pub fn collide_pair_ordered(earlier: &mut Vehicle, mass_earlier: f32, later: &mut Vehicle, mass_later: f32, walls: &mut dyn FnMut(&mut Vehicle)) -> Option<(f32, f32)> {
+    collide_pair(later, mass_later, earlier, mass_earlier, walls).map(|(la, ea)| (ea, la))
+}
+
 /// [`collide_cars_with`], answering each body's own impact `car+0x430` from the last impulse
 /// (A's, B's) — what each car's post-impact pass 0x410280 then reads for itself. Both are 0 when
 /// the boxes overlapped but the first impulse found the pair separating.
@@ -193,6 +206,30 @@ pub fn collide_pair(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, 
     if !near(a, b) {
         return None;
     }
+    // 0x499103…0x499126: for **every** pair inside the broad phase — touching or not — 0x498FF0 scales both cars' `car+0x388…0x390`
+    // by `0x40C90FDB` (the `f32` 2π) with the vector scale 0x532360 (`fmul` + `fstp` per component), runs 0x4980D0 on the rad/s spin
+    // (the box test 0x497B10, the impulse 0x496860, the walls 0x495020 / 0x498DE0 between the rounds, `Damage` inside the solver) and
+    // scales back by `0x3E22F981` (the `f32` 0.15915494) at 0x499132…0x499149 — so a pair that never touches still has its spin
+    // rounded twice, ~2 ulp lower (`orig_co1` human at tick 1: `ω.x` 0xBCA136EF in the original, 0xBCA136F1 before this).
+    scale_spin(a, f32::from_bits(0x40C9_0FDB));
+    scale_spin(b, f32::from_bits(0x40C9_0FDB));
+    let out = collide_rad(a, mass_a, b, mass_b, walls);
+    scale_spin(a, f32::from_bits(0x3E22_F981));
+    scale_spin(b, f32::from_bits(0x3E22_F981));
+    // ClampAngVel 0x4964D0 for both cars when 0x4980D0 returns (0x499152 / 0x499158)
+    let clamp = |w: Vec3, lim: f32| w.clamp(Vec3::splat(-lim), Vec3::splat(lim));
+    a.angular_velocity = clamp(a.angular_velocity, a.ang_limit());
+    b.angular_velocity = clamp(b.angular_velocity, b.ang_limit());
+    out
+}
+
+/// 0x532360 on `car+0x388`: each component `x · s` rounded to `f32`.
+fn scale_spin(v: &mut Vehicle, s: f32) {
+    v.angular_velocity = Vec3::new(v.angular_velocity.x * s, v.angular_velocity.y * s, v.angular_velocity.z * s);
+}
+
+/// `0x4980D0` on spins already in rad/s.
+fn collide_rad(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, walls: &mut dyn FnMut(&mut Vehicle)) -> Option<(f32, f32)> {
     let (pt, ni) = separate(a, mass_a, b, mass_b)?;
     // the first impulse's answer is not tested (0x498109 → 0x49810E): the walls follow regardless
     let mut effect = pair_impulse(a, mass_a, b, mass_b, pt, ni).unwrap_or((0.0, 0.0));
@@ -205,11 +242,6 @@ pub fn collide_pair(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, 
         walls(a);
         walls(b);
     }
-    // ClampAngVel 0x4964D0 once the pair is done — 0x498FF0 calls it for both cars when 0x4980D0
-    // returns (0x499152 / 0x499158)
-    let clamp = |w: Vec3, lim: f32| w.clamp(Vec3::splat(-lim), Vec3::splat(lim));
-    a.angular_velocity = clamp(a.angular_velocity, a.ang_limit());
-    b.angular_velocity = clamp(b.angular_velocity, b.ang_limit());
     Some(effect)
 }
 
@@ -236,15 +268,14 @@ pub fn collide_pair(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, 
 /// `car+0x430` is **above** 80 (`test ah, 0x41` — at exactly 80 it is 1.5), while the linear
 /// ×1.25 takes 80 itself (0x496C4A…0x496C5A, `test ah, 1`). The port had `≥ 80` for both.
 fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: Vec3, ni: Vec3) -> Option<(f32, f32)> {
-    // `CarCarImpulse` 0x496860, symmetric and with no special case for traffic; the solver works in
-    // rad/s, so the stored turns/s angular velocities are scaled by 2π around it exactly as 0x498FF0
-    // does. `ni` points from B toward A.
+    // `CarCarImpulse` 0x496860, symmetric and with no special case for traffic; the solver works on the rad/s spin
+    // [`collide_pair`] has scaled by 2π (0x498FF0). `ni` points from B toward A.
     // `car+0x358` = 1/mass (0x49B652); the port's kg masses are never below 1
     let (inv_a, inv_b) = (1.0 / mass_a.max(1e-6), 1.0 / mass_b.max(1e-6));
     let (inv6_a, inv6_b) = (inv_a / 6.0, inv_b / 6.0);
     let (r_a, r_b) = (pt - a.position, pt - b.position);
     let (c_a, c_b) = (r_a.cross(ni), r_b.cross(ni));
-    let (w_a, w_b) = (a.angular_velocity * TAU, b.angular_velocity * TAU);
+    let (w_a, w_b) = (a.angular_velocity, b.angular_velocity);
     let vrel = b.velocity.dot(ni) - a.velocity.dot(ni) - w_a.dot(c_a) + w_b.dot(c_b);
     let den = 0.5 * (c_a.length_squared() * inv6_a + c_b.length_squared() * inv6_b + inv_b + inv_a);
     let mut j = if den > 1e-9 { vrel / den } else { 0.0 };
@@ -304,7 +335,7 @@ fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: 
         // rad/s spin (the original's own `Damage` entry reads 2π times the turns/s that the tick
         // ends with — a live sign hit: (2.50, 1.43, 5.06) at the call, (0.40, 0.23, 0.81) after —
         // `RE/notes/REFERENCE-2026-10-17-SIGN.md`); it is converted back to turns/s as 0x498FF0
-        // does when the pair returns, and the clamp waits for the whole pair (`collide_cars_with`).
+        // does when the pair returns, and the scale back and the clamp wait for the whole pair (`collide_pair`).
         a.angular_velocity = w_a;
         b.angular_velocity = w_b;
         // 0x496F1E / 0x496F25: `word car+0x418` steps for both bodies
@@ -333,8 +364,6 @@ fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: 
         let dn = if ni == Vec3::ZERO { Vec3::Y } else { (a.position - b.position).normalize() };
         a.damage_by_normal(eff_a, dn, 2, mass_a);
         b.damage_by_normal(eff_b, -dn, 2, mass_b);
-        a.angular_velocity /= TAU;
-        b.angular_velocity /= TAU;
         Some((eff_a, eff_b))
     }
 }
@@ -356,7 +385,7 @@ mod tests {
         sign.smackable = true;
         let mut car = Vehicle::bare(Vec3::new(-157.82, 2.2570, 196.0780), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
         car.velocity = Vec3::new(-5.1303, -0.85415, -12.8956);
-        car.angular_velocity = Vec3::new(-0.035889, 0.0000917, 0.0061115) / TAU;
+        car.angular_velocity = Vec3::new(-0.035889, 0.0000917, 0.0061115); // rad/s: the solver runs between the two scalings of 0x498FF0
         let pt = Vec3::new(-158.23468, 1.9708, 194.00198);
         let ni = Vec3::new(-0.369168, -0.0465407, -0.928197);
         pair_impulse(&mut sign, ma, &mut car, mb, pt, ni).unwrap();

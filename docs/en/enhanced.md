@@ -14,7 +14,7 @@ other.
 - **F12** switches everything between your settings and the original, live — handy for comparing.
 - From the command line: `NFS_ENH=off` starts as the original, `NFS_ENH=all` with everything on.
 
-The settings are kept in `enhancements.json` in the saves folder.
+The settings are kept in `enhancements.json` in the saves folder; the five display rows (frame output, frame-rate limit, MSAA, anisotropic filtering, render scale) are kept in `display.json` next to it.
 
 ## What is there
 

@@ -45,6 +45,8 @@ impl App {
                     let (set, class) = nfs_game::remaster::auto_set(renderer.gpu_class());
                     tracing::info!(gpu_class = ?class, enhancements = %set.describe(), "first run: enhancement set chosen by the GPU class (ENH-LITE)");
                     self.enh = set;
+                    // PORT-DEVIATION D47: a stored display.json still decides the five display rows
+                    nfs_game::display_opts::adopt(&mut self.enh, false, false);
                 }
                 renderer.set_enhancements(self.enh);
                 // ENHANCEMENT ENH-UPSCALER: the options panel is generated from this set
@@ -363,6 +365,20 @@ impl App {
                 // `bind_screen_widgets()` run again now that the panel exists
                 if tab_clicked {
                     self.bind_screen_widgets();
+                }
+                // **TEST GLUE** (PORT-DEVIATION D47, not the original's): `NFS_DISPLAY_LIVE=<token>:<delta>[,…]` steps display options
+                // (`msaa:1`, `render_scale:-1`) as a click on their rows of the enhancements panel would (`enh_step` of the row's
+                // entry: renderer, `enhancements.json` + `display.json`, the combos' text), so a scripted run can check the live path
+                // without a pointer
+                if let Some(v) = std::env::var("NFS_DISPLAY_LIVE").ok().filter(|v| !v.is_empty()) {
+                    for part in v.split(',') {
+                        if let Some((tok, d)) = part.split_once(':').and_then(|(t, d)| Some((t.trim(), d.trim().parse::<i32>().ok()?))) {
+                            if let Some(i) = nfs_game::display_opts::REGISTRY.iter().position(|e| e.token == tok) {
+                                let sw = nfs_game::display_opts::ENH_SWITCHES[i];
+                                self.enh_step(&format!("{}{}", nfs_game::remaster::ACCESSOR_PREFIX, sw.token()), d);
+                            }
+                        }
+                    }
                 }
                 // diagnostic (tooling): `NFS_FE_CLICKS=x,y;x,y;…` presses and releases the left
                 // button at each design point in turn, through the same handler a real click takes

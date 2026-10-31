@@ -138,3 +138,34 @@ fn the_logged_48_degree_sign_hit_takes_the_cars_nose_face() {
     let (_, n) = separate(&mut sign, 0.625, &mut car, 9.0).expect("overlap");
     assert!((n - nose).length() < 1e-5, "last normal {n:?}");
 }
+
+/// The live pair of tick 798 (alps, `fe_opp_only`: human second on the grid beside the AI car; the
+/// original's 0x4980D0 entry and 0x496860 arguments read by gdb, `REFERENCE-2026-10-31-CARCONTACT.md`):
+/// A = slot 1 (the later car), B = slot 0 — the contact point is the original's
+/// `(-171.1049347, 2.0948160, 154.4005432)`, the normal A's first row; with the cars the other way
+/// round `0x496FD0` answers another point (`y` 0.87) and another normal.
+#[test]
+fn the_pair_of_a_late_car_beside_an_early_one_is_the_originals() {
+    let mk = |p: [f32; 3], r: [f32; 9], v: [f32; 3]| {
+        let m = Mat3::from_cols(Vec3::new(r[0], r[1], r[2]), Vec3::new(r[3], r[4], r[5]), Vec3::new(r[6], r[7], r[8])).transpose();
+        let mut c = Vehicle::bare(Vec3::from(p), m, 0.0, 10.3125, 0.0, 0.0);
+        c.half_extents = Vec3::new(0.9099649, 0.6313215, 2.1037109);
+        c.velocity = Vec3::from(v);
+        c
+    };
+    let slot1 = || mk([-172.3643341, 1.3882728, 153.0485992], [-0.9699522, -0.0163588, 0.2427447, -0.0274712, 0.9987200, -0.0424639, -0.2417395, -0.0478565, -0.9691603], [-6.4040337, -1.2673054, -26.1208439]);
+    let slot0 = || mk([-169.6573181, 1.5818422, 156.2153320], [-0.9640267, -0.0065273, 0.2657246, -0.0203691, 0.9985726, -0.0493682, -0.2650231, -0.0530049, -0.9627841], [-6.8117352, -1.5674286, -24.8149719]);
+    let (mut a, mut b) = (slot1(), slot0());
+    let (pt, n) = separate(&mut a, 10.3125, &mut b, 10.3125).unwrap();
+    assert!((pt - Vec3::new(-171.1049347, 2.0948160, 154.4005432)).abs().max_element() < 2e-5, "{pt:?}");
+    assert!((n - a.orientation.row(0)).length() < 1e-6, "{n:?}");
+    // collide_pair_ordered hands A the later car: the same pair given as (earlier, later)
+    let (mut early, mut late) = (slot0(), slot1());
+    let mut ref_a = slot1();
+    let mut ref_b = slot0();
+    let want = collide_pair(&mut ref_a, 10.3125, &mut ref_b, 10.3125, &mut |_| {}).unwrap();
+    let got = collide_pair_ordered(&mut early, 10.3125, &mut late, 10.3125, &mut |_| {}).unwrap();
+    assert_eq!(got, (want.1, want.0));
+    assert_eq!(early.velocity, ref_b.velocity);
+    assert_eq!(late.velocity, ref_a.velocity);
+}

@@ -45,7 +45,7 @@ use nfs_assets::{GamePaths, car::{CarAssets, Paint}, track::TrackAssets};
 use nfs_game::layout::{ListCell, ListRow, TrackMapEvent};
 use nfs_game::{
     lanes::{LaneCar, lane_of, lane_span},
-    race::{RaceProgress, SliceTable, grid_pose},
+    race::{RaceProgress, SliceTable, grid_pose_with_offset},
     racecar::{Controller, RaceCar},
     records::{Records, format_ticks, format_time_dword},
     skill::{SkillEvent, SkillTest},
@@ -311,7 +311,7 @@ fn run() -> Result<()> {
             specs.apply_setup(&c.setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
         } else {
             if replay_setup.is_some() {
-                tracing::info!("replay: no car record in the setup, the car is a fresh catalogue car (APPROXIMATION)");
+                tracing::info!("replay: no car record in the setup, the car is a fresh catalogue car (PORT-DEVIATION D22)");
             }
             if std::env::var_os("NFS_PA_FE0").is_some() {
                 // TEST GLUE `NFS_PA_FE0` (the trace against the original, `app/pa_trace.rs`): the car an
@@ -401,6 +401,10 @@ fn run() -> Result<()> {
     // ENHANCEMENT framework (branch `remaster`): the switches — `NFS_ENH` over `enhancements.json`
     // over the default — and the mode (`NFS_ENH=off` is the hard original: no front-end additions)
     let (mut enh, enh_mode) = nfs_game::remaster::load();
+    // PORT-DEVIATION D47 on the enhanced game: the five display rows (E6 frame output, E22 frame-rate limit, E1 MSAA, E2 anisotropic,
+    // E3 render scale) keep their values in `display.json` (`nfs_game::display_opts`); `NFS_ENH` set = that set decides
+    let env_chosen = std::env::var_os("NFS_ENH").is_some_and(|v| !v.is_empty());
+    nfs_game::display_opts::adopt(&mut enh, env_chosen, nfs_game::remaster::settings_path().exists());
     // the previous start died = safe mode (`guard::begin`, run at the top: the plain GPU device); here also every enhancement off,
     // unless an explicit NFS_ENH names a set
     if guard::safe() && std::env::var_os("NFS_ENH").is_none_or(|v| v.is_empty()) {
@@ -595,7 +599,7 @@ fn run() -> Result<()> {
         let rs = replay_setup.as_ref()?;
         let m = career_ui::MissionStart::from_replay_words(&paths, rs.mission.as_ref()?, rs.scene);
         if m.is_none() {
-            tracing::info!("replay: the recorded mission matches no nfs5.fac record, no mission HUD (APPROXIMATION)");
+            tracing::info!("replay: the recorded mission matches no nfs5.fac record, no mission HUD (PORT-DEVIATION D22)");
         }
         m
     });

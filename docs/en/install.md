@@ -47,7 +47,7 @@ Network races use **UDP port 9442**.
 | Linux | `$XDG_DATA_HOME/PorscheUnleashed`, else `~/.local/share/PorscheUnleashed` |
 
 Career saves are written as the original writes them (`SaveData/…sav`). `open-unleashed.log` in the same folder records
-each start — attach it when you report a problem. `NFS5_SAVE_DIR=<folder>` points the saves elsewhere.
+each start — attach it when you report a problem. `display.json` there holds the five display rows of the enhancements tab (frame output, frame rate limit, MSAA, anisotropic filtering, render scale; delete it to get the defaults back; in a safe-mode start those choices are ignored once). `NFS5_SAVE_DIR=<folder>` points the saves elsewhere.
 
 ## If something goes wrong
 

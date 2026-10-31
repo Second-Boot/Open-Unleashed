@@ -86,9 +86,12 @@ impl AudioOutput {
     /// [`Self::play_stream`] of a **mono** source at the request's pan byte `+7` through the
     /// library's stereo law (`pan_gains`): 0x5612A0 stores the byte in `voice+0x1F` and its
     /// angle `(p − 0x40) << 8` in `voice+0x14` (0x561414…0x561424, 0x5614B7). Only the voice chat
-    /// asks for one (0x493496: byte 0). APPROXIMATION: the stream voice's patch pan `voice+0x3E`
-    /// (0x561451, from the stream format's parse 0x58A4B0, not read) is taken as the centre 0x40,
-    /// which leaves the byte as it is ([`voice_pan`]).
+    /// asks for one (0x493496: byte 0). The stream voice's patch pan `voice+0x3E` is the centre 0x40: 0x561451
+    /// stores `byte [descriptor+4]` (`mov cl, [ebp+4]`), the descriptor the caller cleared with
+    /// 0x561900, which writes `+4 = 0x40` (0x561916), and the voice chat changes nothing in it
+    /// between 0x49349B and 0x4934B3. *(0x58A4B0, called at 0x561398, only returns the voice-slot
+    /// range `[0x6B48DD]` / `[0x6B49A4]` for 0x5898F0, not a pan.)* The byte is left as it is
+    /// ([`voice_pan`]).
     pub fn play_stream_panned(&self, src: Arc<StreamSource>, volume: f32, pan: u8) -> VoiceId {
         self.start_stream(src, volume, pan::pan_gains(pan))
     }

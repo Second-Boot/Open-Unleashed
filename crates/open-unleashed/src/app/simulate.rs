@@ -104,6 +104,17 @@ impl App {
     pub(crate) fn simulate(&mut self) {
         // TEST GLUE: `NFS_PA_TRACE`, the state the last tick left (`pa_trace.rs`)
         self.pa_trace_tick();
+        // TEST GLUE: `NFS_PA_FINISH`, the human's lap counter set at a fixed tick (`pa_trace.rs`)
+        if let Some(r) = self.race.as_mut() {
+            // `<tick>:0` is the race's own lap total (the gdb side's `PA_LAPS=0` reads `[0x6573F0]`), for a series whose rounds differ
+            match (super::pa_trace::finish_lap_counter(self.tick).map(|n| if n == 0 { self.num_laps } else { n }), self.slices.as_ref()) {
+                // a circuit: the block `+0xB20 != +0x530` of 0x416310 (the lap timed, the finish at 0x4166FF), which the
+                // port's `account` runs only on a counted line crossing
+                (Some(n), Some(t)) if r.linear.is_none() => r.force_lap_counter(t, n, self.tick, self.num_laps),
+                (Some(n), _) => r.laps = n,
+                _ => {}
+            }
+        }
         // TEST GLUE: the tick for the audio's debug lines
         nfs_audio::TRACE_TICK.store(self.tick, std::sync::atomic::Ordering::Relaxed);
         self.game_tick();
@@ -332,6 +343,11 @@ impl App {
             // 0x32 `+0xE30` (0x410280, the post-impact pass). So the player steps after every AI
             // decision of the tick, which therefore sees the player as the tick began.
             //
+            // **What `0x417710` will sort on** (AI-STEER-COPS, `REFERENCE-2026-10-31-AI-STEER-COPS.md`): `car+0xAF8` is written by the progress pass 0x4169B0 *after*
+            // `0x417800` of the same even tick (the orig_co1 trace: the human's `+0xAF8` steps at 526 and the places change only at 528; an opponent and the human that cross a
+            // slice in the same tick never swap), so the sort reads the values the previous even tick wrote. The port writes the opponents' progress in the AI pass
+            // and in `tick_opponent_grounds`, before the sort — keep the values as the tick began.
+            self.opp_sort_keys = self.road.opponents.iter().map(|o| o.progress.progress - o.progress.lap_times.len() as f32).collect();
             self.tick_ai_opponents(&ctx, &mut st);
             self.tick_ai_police(&ctx);
             self.tick_ai_traffic(&ctx, &mut st);
@@ -1759,7 +1775,8 @@ impl App {
             };
             // 0x416170: `car+0xDB0 == 0 && car+0x1100 < 4`
             let about_to_reset = v.engine_alive == 0 && v.reset_countdown < 4;
-            let events = sk.tick(self.tick, &probe, about_to_reset);
+            // TEST GLUE: `NFS_PA_FINISH` also finishes a skill test at a fixed tick (`pa_trace.rs`)
+            let events = if super::pa_trace::skill_finish_now(self.tick) { sk.force_finish(self.tick) } else { sk.tick(self.tick, &probe, about_to_reset) };
             for e in events {
                 match e {
                     SkillEvent::Checkpoint { sequence, chime } => {
@@ -2031,7 +2048,7 @@ impl App {
                     match who {
                         HumanCar::Local => {
                             if let Some((ea, eb)) =
-                                nfs_physics::vehicle::collide_pair(v, player_mass, b, c.mass, &mut racer_walls)
+                                nfs_physics::vehicle::collide_pair_ordered(v, player_mass, b, c.mass, &mut racer_walls)
                             {
                                 ai_hits.push((AudioCar::Traffic(i), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
                                 ground_event = None;
@@ -2056,7 +2073,7 @@ impl App {
                         }
                         HumanCar::Seat(oi) => {
                             let o = &mut self.road.opponents[oi];
-                            if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(
+                            if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair_ordered(
                                 &mut o.vehicle,
                                 o.specs.mass * opp_k[oi],
                                 b,
@@ -2090,7 +2107,7 @@ impl App {
                 if let Some(pol) = self.road.police.as_mut() {
                     for (pi, p) in pol.cars.iter_mut().enumerate().filter(|(_, p)| p.active) {
                         let p_mass = p.mass * tiny_k;
-                        if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(&mut p.body, p_mass, b, c.mass, &mut racer_walls) {
+                        if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair_ordered(&mut p.body, p_mass, b, c.mass, &mut racer_walls) {
                             c.collisions += 1;
                             p.sync_body_out();
                             ai_hits.push((AudioCar::Police(pi), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
@@ -2101,7 +2118,7 @@ impl App {
                 // …and the traffic cars before it, whose bodies hold their own pass's state
                 let mut touched = Vec::new();
                 for (j, (dc, db)) in done_cars.iter_mut().zip(done_bodies.iter_mut()).enumerate().filter(|(_, (dc, _))| dc.active) {
-                    if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(db, dc.mass, b, c.mass, &mut racer_walls) {
+                    if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair_ordered(db, dc.mass, b, c.mass, &mut racer_walls) {
                         dc.collisions += 1;
                         c.collisions += 1;
                         touched.push(j);
@@ -2165,7 +2182,7 @@ impl App {
                 if !no_carcol {
                     let cop_mass = c.mass * tiny_k;
                     if let Some((ea, eb)) =
-                        nfs_physics::vehicle::collide_pair(v, player_mass, &mut c.body, cop_mass, &mut racer_walls)
+                        nfs_physics::vehicle::collide_pair_ordered(v, player_mass, &mut c.body, cop_mass, &mut racer_walls)
                     {
                         tracing::debug!(cop = i, ea, eb, "player hit a cop");
                         ground_event = None;
@@ -2174,16 +2191,16 @@ impl App {
                         self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::CarCar { effect: ea });
                     }
                     for (oi, o) in self.road.opponents.iter_mut().enumerate() {
-                        if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(&mut o.vehicle, o.specs.mass * opp_k[oi], &mut c.body, cop_mass, &mut racer_walls) {
+                        if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair_ordered(&mut o.vehicle, o.specs.mass * opp_k[oi], &mut c.body, cop_mass, &mut racer_walls) {
                             ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
                             ai_hits.push((AudioCar::Police(i), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
                         }
                     }
                     for (di, d) in done.iter_mut().enumerate().filter(|(_, d)| d.active) {
-                        // the earlier cop is A (it was processed first); its body holds its
+                        // the earlier cop is the listed car (B of 0x4980D0, `collide_pair_ordered`); its body holds its
                         // kinematic state from its own pass
                         let d_mass = d.mass * tiny_k;
-                        if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(&mut d.body, d_mass, &mut c.body, cop_mass, &mut racer_walls) {
+                        if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair_ordered(&mut d.body, d_mass, &mut c.body, cop_mass, &mut racer_walls) {
                             d.sync_body_out();
                             ai_hits.push((AudioCar::Police(di), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
                             ai_hits.push((AudioCar::Police(i), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
@@ -2267,20 +2284,20 @@ impl App {
                 }
                 if !no_carcol {
                     for d in done.iter().copied() {
-                        // A = the car done earlier (`d`), B = this one (`who`)
+                        // the listed car is `d` (B of 0x4980D0), this one (`who`) is A: `collide_pair_ordered`
                         let mass_of = |h: H, opp: &[RaceCar]| match h {
                             H::Local => player_mass,
                             H::Seat(k) => opp[k].specs.mass * opp_k[k],
                         };
                         let (ma, mb) = (mass_of(d, &self.road.opponents), mass_of(who, &self.road.opponents));
                         let hit = match (d, who) {
-                            (H::Local, H::Seat(b)) => nfs_physics::vehicle::collide_pair(v, ma, &mut self.road.opponents[b].vehicle, mb, &mut racer_walls),
-                            (H::Seat(a), H::Local) => nfs_physics::vehicle::collide_pair(&mut self.road.opponents[a].vehicle, ma, v, mb, &mut racer_walls),
+                            (H::Local, H::Seat(b)) => nfs_physics::vehicle::collide_pair_ordered(v, ma, &mut self.road.opponents[b].vehicle, mb, &mut racer_walls),
+                            (H::Seat(a), H::Local) => nfs_physics::vehicle::collide_pair_ordered(&mut self.road.opponents[a].vehicle, ma, v, mb, &mut racer_walls),
                             (H::Seat(a), H::Seat(b)) => {
                                 let (lo, hi) = (a.min(b), a.max(b));
                                 let (head, tail) = self.road.opponents.split_at_mut(hi);
                                 let (ca, cb) = if a < b { (&mut head[lo].vehicle, &mut tail[0].vehicle) } else { (&mut tail[0].vehicle, &mut head[lo].vehicle) };
-                                nfs_physics::vehicle::collide_pair(ca, ma, cb, mb, &mut racer_walls)
+                                nfs_physics::vehicle::collide_pair_ordered(ca, ma, cb, mb, &mut racer_walls)
                             }
                             (H::Local, H::Local) => None,
                         };
@@ -2337,14 +2354,14 @@ impl App {
                     continue;
                 }
                 let o_mass = o.specs.mass * opp_k[oi];
-                if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(v, player_mass, &mut o.vehicle, o_mass, &mut racer_walls) {
+                if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair_ordered(v, player_mass, &mut o.vehicle, o_mass, &mut racer_walls) {
                     ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
                     ground_event = None;
                     // the player's own `car+0x430` (A)
                     self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::CarCar { effect: ea });
                 }
                 for (di, d) in done.iter_mut().enumerate() {
-                    if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(&mut d.vehicle, d.specs.mass * opp_k[di], &mut o.vehicle, o_mass, &mut racer_walls) {
+                    if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair_ordered(&mut d.vehicle, d.specs.mass * opp_k[di], &mut o.vehicle, o_mass, &mut racer_walls) {
                         ai_hits.push((AudioCar::Opponent(di), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
                         ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
                     }
@@ -2510,7 +2527,6 @@ impl App {
             .collect();
         let from = if behind { r.start_slice } else { r.slice };
         let slice = free_reset_slice(t, &w.collision, from, &occupied);
-        let sl = &t.slices[slice];
         // 0x40F694 → 0x49E220 before the placement: the drivetrain, the controller bytes and the
         // wheels' suspension / roughness state are cleared, so the placement's two `Susp_update`s
         // start from them (the s4 trace's body height after the reset)
@@ -2518,7 +2534,7 @@ impl App {
         // 0x40F6DE: the human's offset is zero — `Car_placeAtSlice` 0x49B090 puts the
         // origin on the slice centre and drops the body onto the road (`place_at_slice`),
         // dir `car+0xEAC` (+1 along this port's lap)
-        v.place_at_slice(&w.collision, specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward, raw: [sl.lateral, sl.up, sl.forward] }, Vec3::ZERO, false, false);
+        v.place_at_slice(&w.collision, specs, t.frame(slice, false), Vec3::ZERO, false, false);
         // 0x40F727…: `car+0x33C…+0x344` = 0, then 0x40F400: the spin and `+0x418` the placement's
         // `Susp_update` left
         v.velocity = Vec3::ZERO;
@@ -2668,7 +2684,7 @@ impl App {
                         .map_or(Vec3::ZERO, |p| Vec3::new(p[0], sl.centre.y, p[1]));
                     if exchange_seat.is_some() || net_human {
                         // a human's reset (0x40F6DE: offset zero, `car+0x52C & 8` clear), the player's own block
-                        o.vehicle.place_at_slice(&w.collision, &o.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward, raw: [sl.lateral, sl.up, sl.forward] }, Vec3::ZERO, false, false);
+                        o.vehicle.place_at_slice(&w.collision, &o.specs, t.frame(slice, false), Vec3::ZERO, false, false);
                         o.vehicle.velocity = Vec3::ZERO;
                         o.vehicle.angular_velocity = Vec3::ZERO;
                         o.vehicle.airborne_count = 0;
@@ -2678,7 +2694,7 @@ impl App {
                         o.vehicle.reset_countdown = 0;
                     } else {
                     o.vehicle.reset_to(o.vehicle.position, o.vehicle.orientation);
-                    o.vehicle.place_at_slice(&w.collision, &o.specs, nfs_physics::vehicle::SliceFrame { centre: sl.centre, forward: sl.forward, raw: [sl.lateral, sl.up, sl.forward] }, line, true, false);
+                    o.vehicle.place_at_slice(&w.collision, &o.specs, t.frame(slice, false), line, true, false);
                     // 0x40F711…0x40F724: the velocity, then 0x40F400 the spin and `+0x418`
                     o.vehicle.velocity = Vec3::ZERO;
                     o.vehicle.angular_velocity = Vec3::ZERO;
@@ -2769,7 +2785,7 @@ impl App {
         // the lane passes and the cops read during the next tick pair.
         if self.slices.is_some() {
             let keys: Vec<f32> = std::iter::once(self.race.as_ref().map_or(0.0, |r| r.progress - r.lap_times.len() as f32))
-                .chain(self.road.opponents.iter().map(|o| o.progress.progress - o.progress.lap_times.len() as f32))
+                .chain(self.road.opponents.iter().enumerate().map(|(i, o)| self.opp_sort_keys.get(i).copied().unwrap_or(o.progress.progress - o.progress.lap_times.len() as f32)))
                 .chain(self.road.police.iter().flat_map(|p| p.cars.iter().map(|c| if c.active { c.progress } else { 0.0 })))
                 .chain(self.road.traffic.iter().flat_map(|tr| tr.cars.iter().map(|c| if c.active { c.progress } else { 0.0 })))
                 .collect();
@@ -4020,13 +4036,4 @@ fn reset_blockers(police: Option<&nfs_game::police::Police>, traffic: Option<&Tr
         .chain(traffic.into_iter().flat_map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| c.slice)))
         .chain(props.slices().iter().copied())
         .collect()
-}
-
-/// `Grid_slot` 0x410580's slice-local offset `{lateral, 0.5, 0}` (0x41070F…0x410718) for
-/// `Vehicle::place_at_slice` (0x49B090), read back from `grid_pose`'s `centre + lateral·x +
-/// up·0.5` so the lateral rule stays in one place (`nfs_game::race::grid_pose`).
-pub(crate) fn grid_offset(s: &nfs_game::race::Slice, pos: Vec3) -> Vec3 {
-    let d = pos - s.centre - s.up * 0.5;
-    let x = d.dot(s.lateral) / s.lateral.length_squared().max(1e-6);
-    Vec3::new(x, 0.5, 0.0)
 }

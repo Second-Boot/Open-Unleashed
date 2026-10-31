@@ -73,7 +73,6 @@ impl Vehicle {
                 _ => None,
             });
             let Some((n2, q, class)) = walls.segment_hit(from, p, candidates) else { continue };
-            self.last_wall_class = class;
             // 0x495506: `car+0x440 = p`, the corner, after `WallImpulse` whatever it answered
             self.last_contact = p;
             let n = Vec3::new(n2.x, 0.0, n2.y);
@@ -91,13 +90,22 @@ impl Vehicle {
             let push = push * 1.05;
             let j = -self.velocity.dot(n);
             if j <= 0.0 {
+                // `WallImpulse` 0x494000 answers 0.0 (0x49438A…0x49439F) before it touches the
+                // event word, the velocity or the class: this contact adds nothing to the pass
                 continue;
             }
+            // the event word `car+0x438` (0x49411E…0x4941DE) is written inside `WallImpulse` by
+            // every contact that gets past `j > 0`, from the edge word `[0x628C88]` (0x495421, set
+            // for this crossing) — so the pass's last such contact decides the class and whether
+            // it is a hit or a scrape, not the last crossing and not the largest `j`
+            self.last_wall_class = class;
             // 0x4940F0…0x4941EC: the magnitude `WallImpulse` answers with is `j` for a hit
             // (`speedEst/8 ≤ j`) and `speedEst/12` (`[0x5B49B0]`) for a scrape, `speedEst` being
             // `car+0x35C` from before the impulse
             let speed_est = self.horizontal_speed();
-            let mag = if speed_est * 0.125 > j { speed_est * (1.0 / 12.0) } else { j };
+            let scrape = speed_est * 0.125 > j;
+            let mag = if scrape { speed_est * (1.0 / 12.0) } else { j };
+            self.last_wall_scrape = scrape;
             self.velocity += n * (1.1 * j);
             self.position += push;
             for w in &mut self.wheels {
@@ -112,6 +120,10 @@ impl Vehicle {
             // response (0x494964).
             let effect = (3.0 * mag).abs();
             if effect > 20.0 {
+                // 0x49555D: `car+0x430 = this contact's value` — a plain store over whatever an
+                // earlier writer left (0x494DF0 reads it back at 0x494E36); the pass's end keeps
+                // the larger of it and `best` (below)
+                self.contact_mag = effect;
                 self.damage_by_normal(effect, n, 1, self.collision_mass);
             }
             max_j = max_j.max(j);

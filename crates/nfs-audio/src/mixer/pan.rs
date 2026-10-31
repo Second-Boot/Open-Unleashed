@@ -137,18 +137,19 @@ pub(super) fn pan_gains(p: u8) -> [f32; 2] {
     [c1, c0]
 }
 
-/// The output gains of a **stereo** voice's two channels at pan byte `p`: the software pan
-/// 0x596890 runs once per channel of the strip, at the voice's angle plus the offset
-/// `[0x6B4A14 + 2·(k + 4·n)]` for channel `k` of `n` (0x59690A…0x596917) — for `n = 2`
-/// **0xC000** and **0x4000** (read on the running original, 2026-10-24) — so at the centre the
-/// source's first channel lands on plane 1 alone (the frame's first sample) and its second on
-/// plane 0 (the second), each at the full 127. Answers `[gain of channel 0 into the first sample,
-/// gain of channel 1 into the second]`. APPROXIMATION: off the centre each channel also feeds the
-/// other plane (its own angle's other entry); the port's voice mixes channel `k` into output `k`
-/// only — no race voice is stereo (counted 2026-10-24), the music streams are centred.
-pub(super) fn stereo_gains(p: u8) -> [f32; 2] {
-    let a = byte_angle(p);
-    [plane_gains(a.wrapping_add(0xC000))[1], plane_gains(a.wrapping_add(0x4000))[0]]
+/// The output gains of a **stereo** voice's two channels: the software pan 0x596890 runs once per
+/// channel `k` of the strip's `n`, and for `n = 2` with two output channels (`[0x6B48DC] == 2`)
+/// it first **clears the voice's angle** (`cmp al, 2 ; cmp byte [0x6B48DC], 2 ; mov dword [ecx], 0`,
+/// 0x5968E6…0x5968F3: `ecx` = the strip's stored angle `[voice + 0xC + 4k]`) and hands 0x58E290 only
+/// the offset `[0x6B4A14 + 2·(k + 4·n)]` — **0xC000** for channel 0 and **0x4000** for channel 1
+/// (read on the running original, 2026-10-24; the pan byte never reaches a stereo voice). At those
+/// exact angles the table (0x58E0E0) holds the full 127 for the channel's own plane and 0 for the
+/// other (`plane_gains(0xC000)` = `[0, 1]`, `plane_gains(0x4000)` = `[1, 0]`), so channel 0
+/// lands on plane 1 alone (the frame's first sample) and channel 1 on plane 0 (the second) — the
+/// "other plane" entry of each pair is 0 and a channel feeds no other. Answers `[gain of
+/// channel 0 into the first sample, gain of channel 1 into the second]`, whatever the pan.
+pub(super) fn stereo_gains() -> [f32; 2] {
+    [plane_gains(0xC000)[1], plane_gains(0x4000)[0]]
 }
 
 #[cfg(test)]
@@ -215,11 +216,14 @@ mod pan_tests {
     }
 
     #[test]
-    fn a_centred_stereo_voice_keeps_its_channels_at_full_level() {
-        use super::stereo_gains;
+    fn a_stereo_voice_keeps_its_channels_at_full_level_whatever_the_pan() {
+        use super::{plane_gains, stereo_gains};
         // 0x596890 at the offsets 0xC000 / 0x4000 (`[0x6B4A24]`, `[0x6B4A26]`): each channel on
         // its own plane at 127, the first on plane 1 = the frame's first sample (0x59BCE0)
-        assert_eq!(stereo_gains(0x40), [1.0, 1.0]);
+        assert_eq!(stereo_gains(), [1.0, 1.0]);
+        // and no cross feed: each channel's other plane entry is 0 (the pair's second entry)
+        assert_eq!(plane_gains(0xC000)[0], 0.0);
+        assert_eq!(plane_gains(0x4000)[1], 0.0);
         // not the mono law's 95/127 a centred mono voice takes on each side
         assert!((pan_gains(0x40)[0] - 95.0 / 127.0).abs() < 1e-6);
     }

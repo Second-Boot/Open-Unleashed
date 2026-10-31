@@ -598,6 +598,13 @@ pub fn opponent_car_image(tables: &CareerTables, o: &OpponentCarSave) -> SavedCa
     c.set_field_u32(car::PACKAGE_NUM, o.package);
     c.set_field_u32(car::DECAL_NUM, o.decal as u32);
     c.set_field_u8(car::OWNED, 1);
+    // 0x4EED2D…0x4EED8D (the end of `FECar::init`): the neutral set-up — 50, 50, 50, 0, 0, 0, 1, 30, 30, zeros —
+    // at `+0x6D0`, copied to the backup at `+0x714`; the original's own `OpponentCar.Car` images carry it
+    // (`REFERENCE-2026-10-31-PA-SAVNET2.md`)
+    for (i, v) in crate::career::CAR_SETUP_DEFAULT.iter().enumerate() {
+        c.set_field_u32(car::SETUP + i * 4, v.to_bits());
+        c.set_field_u32(car::SETUP_BACKUP + i * 4, v.to_bits());
+    }
     // fit_stock only depends on `car_id`; an id absent from the catalogue leaves every list empty
     // (`OwnedCar::fit_stock`'s own early return), matching a blank `image` above.
     let stocked = OwnedCar::construct(tables, o.car_id, 0, 0);
@@ -1232,6 +1239,18 @@ mod tests {
         let s = SaveFile { parts_market: Some(recs), ..SaveFile::default() };
         let back = career_from_sav(&SaveFile::parse(&s.write()).unwrap(), &tables);
         assert_eq!(back.spares, c.spares[..2]);
+    }
+
+    /// A drawn opponent car is built by `FECar::init`, whose tail (0x4EED2D…0x4EED8D) writes the neutral
+    /// set-up at `+0x6D0` and its backup at `+0x714` — the original's own `OpponentCar.Car` images carry it.
+    #[test]
+    fn an_opponent_car_image_carries_the_neutral_setup() {
+        let tables = CareerTables { raw: Default::default(), tracks: vec![], tournaments: vec![], parts: vec![], personalities: vec![], missions: vec![], strings: Default::default(), catalog: vec![], package_count: 0 };
+        let c = opponent_car_image(&tables, &OpponentCarSave::default());
+        for (i, v) in crate::career::CAR_SETUP_DEFAULT.iter().enumerate() {
+            assert_eq!(c.field_u32(car::SETUP + i * 4), v.to_bits(), "setup {i}");
+            assert_eq!(c.field_u32(car::SETUP_BACKUP + i * 4), v.to_bits(), "backup {i}");
+        }
     }
 
     /// PA-SRV2: `Chronicle.Year` is the chronicle screen's range index (0 in the original's fresh
