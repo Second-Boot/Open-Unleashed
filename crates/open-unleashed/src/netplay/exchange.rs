@@ -23,10 +23,9 @@ impl NetPlay {
     pub(super) fn server_tick(&mut self) -> Vec<String> {
         use nfs_net::exchange::Out;
         let mut log = Vec::new();
-        if !self.server.started {
+        if !self.host.server.started {
             return log;
         }
-        let players: Vec<usize> = self.room.players.iter().filter_map(|p| usize::try_from(p.id).ok()).filter(|i| *i < 8).collect();
         let now = self.now();
         // 0x48B959…0x48B963: a frame the link does not take (no packet free, 0x595C58) stays and ends
         // the list loop; `spent` is what this call has already promised each link
@@ -43,7 +42,7 @@ impl NetPlay {
             }
             ok
         };
-        let outs = self.server.tick(now, &players, &mut can);
+        let outs = self.host.tick(&self.room, now, &mut can);
         for o in outs {
             match o {
                 Out::Beat { now } => self.dispatch(vec![(To::All, nfs_net::exchange::beat(now))]),
@@ -62,9 +61,9 @@ impl NetPlay {
                     self.net.remove_peer(slot as u32 - 1);
                     self.slots.clear(slot);
                     self.in_race &= !(1u8 << slot);
-                    self.server.out_of_race(slot);
-                    self.server.leave(slot);
-                    self.dispatch(vec![(To::All, room::player_out(slot as i32))]);
+                    self.host.exchange_leave(slot as i32);
+                    let gone = self.host.player_out(slot as i32);
+                    self.dispatch(vec![gone]);
                 }
             }
         }
@@ -129,7 +128,7 @@ impl NetPlay {
         let now = self.now();
         if let Some(b) = self.exch.sender.sample(s, me, now) {
             if self.is_host() {
-                self.server.input(0, b);
+                self.host.server.input(0, b);
             } else if let Err(e) = self.net.send_game(&b) {
                 tracing::debug!(error = %e, "input packet not sent");
             }

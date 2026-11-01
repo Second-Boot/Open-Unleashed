@@ -216,8 +216,9 @@ pub struct OwnedCar {
     #[serde(default)]
     pub part_state: Vec<(i16, f32)>,
     /// The car's setup (`carsetup.lay`), in `CAR_SETUP_NAMES` order — the 17 floats the original
-    /// keeps at `FECar+0x6D0` with a backup at `+0x714` (`layouts.md`). Nothing in the game reads
-    /// them back, so they change nothing; the port keeps them so the screen and the save match.
+    /// keeps at `FECar+0x6D0` with a backup at `+0x714` (`layouts.md`). The screen edits them
+    /// ([`Self::step_setup`], [`Self::set_setup_index`]) and they reach the physics through the race
+    /// set-up (0x4EF179 → 0x4A5400 → 0x49D290, `CarSpecs::apply_setup`).
     #[serde(default = "default_setup")]
     pub setup: [f32; 17],
     /// `FECar+0x714`, the copy `SAVESETTINGS` takes (0x4EF4E0) and `LOADSETTINGS` restores
@@ -264,6 +265,49 @@ impl Default for Trim {
 }
 
 impl OwnedCar {
+    /// Put setting `i` on index `index` of its list — the accessor's index setter 0x4BC240 clamps it
+    /// to `0 ..= count − 1`, and the commit 0x4F14B0 stores [`car_setup_value`] of the result on the
+    /// car. The port holds the screen's working value in `setup` itself: nothing reads `setup`
+    /// between an edit and the commit (the screen's destructor 0x4F1A00, `SAVESETTINGS` 0x4F1A30 and
+    /// `TESTDRIVECHECK` 0x4F1A90 all commit, and `LOADSETTINGS` / `DEFAULTSETTINGS` overwrite it).
+    pub fn set_setup_index(&mut self, i: usize, index: i32) {
+        let (_, count) = car_setup_index(i, self.setup[i]);
+        self.setup[i] = car_setup_value(i, index.clamp(0, (count - 1).max(0)));
+    }
+
+    /// One press of a `CARSETTINGBUTTON` (`step` ±1) or a pad Left / Right: the combo adds the
+    /// widget's step to the accessor's current index (0x4C6CFF…0x4C6D10), clamped by 0x4BC240 — no wrap.
+    pub fn step_setup(&mut self, i: usize, delta: i32) {
+        let (cur, _) = car_setup_index(i, self.setup[i]);
+        self.set_setup_index(i, cur.saturating_add(delta));
+    }
+
+    /// **0x4F14B0**, the commit: each of the 17 accessors' value (0x4B9C40, [`car_setup_value`]) is
+    /// stored on the car. The accessors were loaded from the car by 0x4F1080 ([`car_setup_index`]),
+    /// so a value never edited comes back on the step grid too (a loaded 50.3 becomes 50).
+    pub fn commit_setup(&mut self) {
+        for i in 0..self.setup.len() {
+            self.setup[i] = car_setup_value(i, car_setup_index(i, self.setup[i]).0);
+        }
+    }
+
+    /// `SAVESETTINGS` (0x4F1A30): the sliders are committed (0x4F14B0), then `FECar` 0x4EF4E0
+    /// copies the 17 floats over the backup `+0x714`.
+    pub fn save_setup(&mut self) {
+        self.commit_setup();
+        self.setup_backup = self.setup;
+    }
+
+    /// `LOADSETTINGS` (0x4F1A50): 0x4EF4C0 copies the backup over the 17 floats, the screen re-reads them (0x4F1080).
+    pub fn load_setup(&mut self) {
+        self.setup = self.setup_backup;
+    }
+
+    /// `DEFAULTSETTINGS` (0x4F1A70): 0x4EF500 writes the constructor's defaults, the screen re-reads them.
+    pub fn default_setup(&mut self) {
+        self.setup = CAR_SETUP_DEFAULT;
+    }
+
     pub fn new(car_id: u16, paint_set: u8, purchase_price: u32) -> Self {
         Self { car_id, paint_set, trim: Trim::default(), custom: [None; 4], parts: Vec::new(), stock: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price, asking_price: None, offer: None }
     }
@@ -611,6 +655,16 @@ pub fn car_setup_index(i: usize, v: f32) -> (i32, i32) {
     let count = ((max - min) / step + 0.5) as i32;
     let index = ((v - min) / step).round() as i32;
     (index.clamp(0, (count - 1).max(0)), count)
+}
+
+/// The value the set-up accessor reports for index `index` of setting `i`: 0x4B9C40 —
+/// `index · step + min` (the x87 product and sum stored once to a float) and the same zero snap
+/// as the text (`−1e−4 < v < 1e−7` → 0). This is what 0x4F14B0 copies onto the car for each of the
+/// 17 (`FECar+0x6D0 …`). CONFIRMED (RE/notes/layouts.md, "How a set-up value is edited").
+pub fn car_setup_value(i: usize, index: i32) -> f32 {
+    let (min, _, step, _) = CAR_SETUP_RANGE[i];
+    let v = (f64::from(index) * f64::from(step) + f64::from(min)) as f32;
+    if v > -1e-4 && v < 1e-7 { 0.0 } else { v }
 }
 
 /// What `FECar`'s constructor writes into that block (0x4EED2D…0x4EED80). CONFIRMED.
@@ -3380,6 +3434,88 @@ mod tests {
         ];
         for &(family, year, want) in cases {
             assert_eq!(part_family_of(family, year), want, "{family} {year}");
+        }
+    }
+
+    fn setup_car() -> OwnedCar {
+        OwnedCar { car_id: 76, paint_set: 0, trim: Trim::default(), custom: [None; 4], parts: vec![], stock: vec![], mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price: 0, asking_price: None, offer: None }
+    }
+
+    #[test]
+    fn a_set_up_arrow_moves_one_index_and_stores_index_times_step_plus_min() {
+        let mut c = setup_car();
+        // BrakeBias 30..70 step 1: 50 is index 20
+        c.step_setup(2, 1);
+        assert_eq!(c.setup[2], 51.0);
+        c.step_setup(2, -1);
+        c.step_setup(2, -1);
+        assert_eq!(c.setup[2], 49.0);
+        // SteeringToe -5..5 step 0.1: a stock 0 is index 50; one step is 0.1
+        c.step_setup(5, 1);
+        assert!((c.setup[5] - 0.1).abs() < 1e-5, "{}", c.setup[5]);
+        // a zero is snapped, never -0.00 (0x4B9C40)
+        c.step_setup(5, -1);
+        assert_eq!(c.setup[5], 0.0);
+        assert!(c.setup[5].is_sign_positive());
+    }
+
+    #[test]
+    fn the_set_up_clamps_at_both_ends_and_the_registered_maximum_is_one_step_out_of_reach() {
+        let mut c = setup_car();
+        for _ in 0..200 {
+            c.step_setup(0, 1);
+        }
+        // FDownForce 0..100 step 1: count 100, so the last index is 99
+        assert_eq!(c.setup[0], 99.0);
+        for _ in 0..200 {
+            c.step_setup(0, -1);
+        }
+        assert_eq!(c.setup[0], 0.0);
+        c.set_setup_index(2, 10_000);
+        assert_eq!(c.setup[2], 69.0);
+        c.set_setup_index(2, -5);
+        assert_eq!(c.setup[2], 30.0);
+        assert_eq!(c.setup[1], 50.0, "the other settings are untouched");
+    }
+
+    #[test]
+    fn save_load_and_defaults_copy_the_block_as_0x4ef4e0_0x4ef4c0_0x4ef500_do() {
+        let mut c = setup_car();
+        c.step_setup(2, 5);
+        c.step_setup(6, -3);
+        let edited = c.setup;
+        // cancel without saving: the backup (the defaults) comes back
+        c.load_setup();
+        assert_eq!(c.setup, CAR_SETUP_DEFAULT);
+        c.setup = edited;
+        c.save_setup();
+        assert_eq!(c.setup_backup, edited);
+        c.step_setup(2, 1);
+        assert_ne!(c.setup, c.setup_backup);
+        c.load_setup();
+        assert_eq!(c.setup, edited);
+        c.default_setup();
+        assert_eq!(c.setup, CAR_SETUP_DEFAULT);
+        assert_eq!(c.setup_backup, edited, "defaults do not touch the backup");
+    }
+
+    #[test]
+    fn the_commit_puts_every_value_on_its_step_grid() {
+        let mut c = setup_car();
+        c.setup[0] = 50.3;
+        c.commit_setup();
+        assert_eq!(c.setup[0], 50.0);
+        assert_eq!(c.setup[1..], CAR_SETUP_DEFAULT[1..], "grid values stay");
+    }
+
+    #[test]
+    fn an_edited_value_reads_back_as_the_same_index() {
+        for i in 0..17 {
+            let (_, count) = car_setup_index(i, CAR_SETUP_DEFAULT[i]);
+            for idx in [0, 1, count / 2, count - 1] {
+                let v = car_setup_value(i, idx);
+                assert_eq!(car_setup_index(i, v).0, idx, "setting {i} index {idx}");
+            }
         }
     }
 }

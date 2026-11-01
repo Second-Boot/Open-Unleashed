@@ -157,8 +157,6 @@ impl App {
         }
         if save {
             remaster::save(&e);
-            // PORT-DEVIATION D47: the five display rows' values live in display.json
-            nfs_game::display_opts::follow(&e);
             crate::guard::clear_safe();
         }
         tracing::info!(enhancements = %e.describe(), saved = save, "enhancements changed");

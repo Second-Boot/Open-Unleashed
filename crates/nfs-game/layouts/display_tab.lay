@@ -1,5 +1,5 @@
 ; PORT-DEVIATION D47 (not part of the original): spliced into GraphicsTabs.lay at load (nfs_game::layout::load_one). The third
-; sub-tab of Options > graphics, «дополнительно» / «advanced», one step left / down of «дополнительная» (152,47 -> 110,68 ->
+; sub-tab of Options > graphics, «улучшения» / «enhancements», one step left / down of «дополнительная» (152,47 -> 110,68 ->
 ; 68,89), whose panel is ID_DISPLAYPANEL (display_graphics.lay). Same widget, width and art as the two original buttons; the
 ; tab strip itself is the original's.
 [section.900]

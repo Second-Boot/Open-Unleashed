@@ -45,8 +45,6 @@ impl App {
                     let (set, class) = nfs_game::remaster::auto_set(renderer.gpu_class());
                     tracing::info!(gpu_class = ?class, enhancements = %set.describe(), "first run: enhancement set chosen by the GPU class (ENH-LITE)");
                     self.enh = set;
-                    // PORT-DEVIATION D47: a stored display.json still decides the five display rows
-                    nfs_game::display_opts::adopt(&mut self.enh, false, false);
                 }
                 renderer.set_enhancements(self.enh);
                 // ENHANCEMENT ENH-UPSCALER: the options panel is generated from this set
@@ -367,16 +365,15 @@ impl App {
                     self.bind_screen_widgets();
                 }
                 // **TEST GLUE** (PORT-DEVIATION D47, not the original's): `NFS_DISPLAY_LIVE=<token>:<delta>[,…]` steps display options
-                // (`msaa:1`, `render_scale:-1`) as a click on their rows of the enhancements panel would (`enh_step` of the row's
-                // entry: renderer, `enhancements.json` + `display.json`, the combos' text), so a scripted run can check the live path
-                // without a pointer
+                // (`E1:1` MSAA, `E3:-1` render scale) as a click on their rows of the enhancements panel would (`enh_step`: renderer,
+                // `enhancements.json`, the combos' text), so a scripted run can check the live path without a pointer; the token `f12`
+                // is the window's F12
                 if let Some(v) = std::env::var("NFS_DISPLAY_LIVE").ok().filter(|v| !v.is_empty()) {
                     for part in v.split(',') {
-                        if let Some((tok, d)) = part.split_once(':').and_then(|(t, d)| Some((t.trim(), d.trim().parse::<i32>().ok()?))) {
-                            if let Some(i) = nfs_game::display_opts::REGISTRY.iter().position(|e| e.token == tok) {
-                                let sw = nfs_game::display_opts::ENH_SWITCHES[i];
-                                self.enh_step(&format!("{}{}", nfs_game::remaster::ACCESSOR_PREFIX, sw.token()), d);
-                            }
+                        if part.trim().eq_ignore_ascii_case("f12") {
+                            self.enh_toggle_all();
+                        } else if let Some((tok, d)) = part.split_once(':').and_then(|(t, d)| Some((t.trim(), d.trim().parse::<i32>().ok()?))) {
+                            self.enh_step(&format!("{}{tok}", nfs_game::remaster::ACCESSOR_PREFIX), d);
                         }
                     }
                 }

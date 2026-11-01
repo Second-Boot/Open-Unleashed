@@ -254,7 +254,7 @@ impl App {
     /// slots 0x28 and 0x24 (0x4D0B90 reads both to place the knob). The index is what a group
     /// button (0x507690: the earliest year, slot 11) or the slider (0x4D0F20, slot 0x2c) last set,
     /// clamped to `0 … count − 1` like the setter 0x4BC240.
-    fn chronicle_year_index(&self) -> (i32, i32) {
+    pub(crate) fn chronicle_year_index(&self) -> (i32, i32) {
         let (earliest, cursor) = self.chronicle_year_range();
         let count = cursor - 1948 + 1;
         let idx = self.fe.chronicle_year_idx.unwrap_or(earliest - 1948);

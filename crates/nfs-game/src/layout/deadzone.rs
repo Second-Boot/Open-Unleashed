@@ -82,6 +82,12 @@ impl LayoutScreen {
         let half = (w as i32 / 2).max(1);
         let v = ((px as i32 - x0 as i32 - half).abs() * 128 / half).clamp(0, 0x80);
         let n = (self.attr_num(e, "hackindex").unwrap_or(0.0) as usize).min(7);
+        self.deadzone_store(n, region, v);
+    }
+
+    /// The tail of the setter: the arm's clamp (`deadzone_clamp`), then the accessor's own range — shared by the
+    /// pointer's drag and the pad's steps (PAD-SLIDERS).
+    fn deadzone_store(&mut self, n: usize, region: u32, v: i32) {
         let pad = self.pad_sel;
         if self.deadzone.len() <= pad {
             self.deadzone.resize(pad + 1, DEADZONE_DEFAULT);
@@ -90,6 +96,49 @@ impl LayoutScreen {
         // `SetSelection` 0x4BC240, which keeps it within the range's 0x80 rows: 0…127
         let c = deadzone_clamp(region, v, self.deadzone[pad][n]);
         self.deadzone[pad][n] = [c[0].min(127), c[1].min(127)];
+    }
+
+    /// **PORT-DEVIATION D54 (PAD-SLIDERS)**: the pad's step on the dead-zone bar `index` (flattened): the active
+    /// handle pair (`.Min` or `.Max`, [`Self::deadzone_pad_toggle`]) moves `delta` units of the 0…128 scale outwards
+    /// (positive) or inwards, through the setter's own clamp. Answers whether the bar is there.
+    pub fn deadzone_pad_step(&mut self, index: usize, delta: i32) -> bool {
+        if let Some((k, j)) = self.route(index) {
+            return self.groups.get_mut(&k).is_some_and(|g| g.deadzone_pad_step(j, delta));
+        }
+        let Some(e) = self.layout.elements.get(index) else { return false };
+        if e.class != "NFS5.DEADZONE" {
+            return false;
+        }
+        let n = (self.attr_num(e, "hackindex").unwrap_or(0.0) as usize).min(7);
+        let (region, which) = if self.dz_pad_max { (4, 1) } else { (3, 0) };
+        let cur = self.deadzone.get(self.pad_sel).copied().unwrap_or(DEADZONE_DEFAULT)[n][which];
+        self.deadzone_store(n, region, cur + delta);
+        true
+    }
+
+    /// The pad's A on a dead-zone bar: the other handle pair (`.Min` <-> `.Max`).
+    pub fn deadzone_pad_toggle(&mut self) {
+        self.set_dz_pad_max(!self.dz_pad_max);
+    }
+
+    fn set_dz_pad_max(&mut self, v: bool) {
+        self.dz_pad_max = v;
+        for g in self.groups.values_mut() {
+            g.set_dz_pad_max(v);
+        }
+    }
+
+    /// The pad's active handle of the dead-zone bar `index`: the point on the handle on the right of the centre
+    /// (the one a rise of the value moves right), at the bar's middle — a click there is the mouse's grab of it.
+    pub fn deadzone_pad_point(&self, index: usize) -> Option<(f32, f32)> {
+        let e = self.layout.elements.get(index)?;
+        let (x0, y0) = self.position_of(e);
+        let (w, h) = self.box_of(e, 0);
+        let half = (w as i32 / 2).max(1);
+        let n = (self.attr_num(e, "hackindex").unwrap_or(0.0) as usize).min(7);
+        let dz = self.deadzone.get(self.pad_sel).copied().unwrap_or(DEADZONE_DEFAULT)[n];
+        let v = dz[usize::from(self.dz_pad_max)];
+        Some((x0 + (half + v * half / 128) as f32, y0 + h * 0.5))
     }
 
     /// The bar the pointer pressed on, and which handle — `FEDeadZone`'s slot 5, **0x51BB60**: it

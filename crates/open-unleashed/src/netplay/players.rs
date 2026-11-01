@@ -46,7 +46,8 @@ impl NetPlay {
     /// room object's to pass on straight away. Nothing is sent before the session has given us an
     /// id (0x48D9B0's gate).
     pub fn say(&mut self, text: &str, empty: &str) {
-        if self.id == u8::MAX {
+        // 0x48D9B0's gate is the link; a lobby member has no id yet and chats all the same (`lobby.md` §5.4)
+        if self.id == u8::MAX && !(self.inet.is_some() && self.established()) {
             return;
         }
         let to = self
@@ -289,6 +290,14 @@ impl NetPlay {
     /// target `0xC6 (9)` "Ejected by host" (0x491746…0x49174D), frees it (0x4925A0) and tells
     /// everyone `0xB1`. Answers whether a player was ejected.
     pub fn eject(&mut self, player: i32) -> bool {
+        // a lobby link: the room is the server's — the creator's request is the `0xB1 (id)` of 0x48D8A0 sent over the link
+        // (`lobby.md` §7.7: the server sends the target `0xC6 9`, frees it and tells the room), nothing to send to a peer of ours
+        if self.inet.is_some() {
+            if !self.has_authority() || player < 0 || player == self.room.me {
+                return false;
+            }
+            return self.net.send_game(&room::player_out(player)).is_ok();
+        }
         if !self.is_host() || player <= 0 {
             return false;
         }
@@ -299,7 +308,8 @@ impl NetPlay {
         self.slots.clear(player as usize);
         self.in_race &= !(1u8 << player);
         let was_in = self.in_room(player);
-        self.dispatch(vec![(To::All, room::player_out(player))]);
+        let gone = self.host.player_out(player);
+        self.dispatch(vec![gone]);
         if was_in {
             self.describe_room_to_all();
         }

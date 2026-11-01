@@ -402,15 +402,29 @@ impl Join {
     /// pointer `payload + 0x28`); whether it is set on a game's session was not traced, the stub 0x508E70
     /// that the create passes returns 0 and cannot be it.
     pub fn original(request: u32, to: Addr, own: Addr, identity: &[u8]) -> Self {
+        Self::with_account(request, to, own, record::PLAYER_TEXT, identity)
+    }
+
+    /// The same record with another **account field** (`rec+0x14`, 52 bytes up to the identity at `+0x48`): 0x48AA10 writes `param_5`
+    /// there, then `"~" + param_8` when the password is not empty. A LAN joiner's is `Player`; a signed-on client's is
+    /// `c<account>~<password>` (`lobby.md` §2.1, [`crate::lobby::account_field`]).
+    pub fn with_account(request: u32, to: Addr, own: Addr, account: &[u8], identity: &[u8]) -> Self {
         let mut rec = vec![0u8; record::SIZE + 4];
         rec[..20].copy_from_slice(&own.0);
-        rec[record::PLAYER..record::PLAYER + record::PLAYER_TEXT.len()].copy_from_slice(record::PLAYER_TEXT);
+        let a: Vec<u8> = account.iter().copied().take_while(|&c| c != 0).take(record::IDENTITY - record::PLAYER - 1).collect();
+        rec[record::PLAYER..record::PLAYER + a.len()].copy_from_slice(&a);
         // the field is 20 bytes with its NUL
         let t = identity.iter().take_while(|&&c| c != 0).take(record::IDENTITY_LEN - 1);
         for (o, b) in rec[record::IDENTITY..record::IDENTITY + record::IDENTITY_LEN].iter_mut().zip(t) {
             *o = *b;
         }
         Self { request, from: to, name: [0; 16], record: rec }
+    }
+
+    /// The account field of a record (`rec+0x14`, up to its NUL).
+    pub fn account(&self) -> &[u8] {
+        let f = self.record.get(record::PLAYER..record::IDENTITY).unwrap_or(&[]);
+        &f[..f.iter().position(|&c| c == 0).unwrap_or(f.len())]
     }
 
     /// The identity text of a record (`rec+0x48`, up to its NUL).

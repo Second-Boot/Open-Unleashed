@@ -82,14 +82,19 @@ impl App {
                 }
                 return;
             }
-            // list B: the merged accessor's own index moves into the catalogue half too — B is
-            // still flat here (`combo_rows`'s own `zMergedList.Car` arm doc), so `row`/`cur` need
-            // no `selectable_index` conversion in this branch specifically
-            if let Some(m) = self.fe.menu.as_mut() {
+            // list B: `B.slot11(row − A.count)` (0x4F49F0) — the catalogue index is `row − a`. B is
+            // still flat here (`combo_rows`'s own `zMergedList.Car` arm doc), so no `selectable_index`
+            // conversion. The step is taken from the catalogue's own index `car_idx`, which
+            // `set_accessor` moves, not from the merged row `cur`: with a garage row current, `cur`
+            // is that row and the difference landed `car_idx` on another car (a click on the
+            // catalogue's 911 S gave the 914/4)
+            let Some(at) = self.fe.menu.as_mut().map(|m| {
                 m.car_garage = false;
-            }
-            let cur = cur.unwrap_or(0);
-            self.set_accessor(name, row as i32 - cur as i32);
+                m.car_idx
+            }) else {
+                return;
+            };
+            self.set_accessor(name, (row - a) as i32 - at as i32);
             return;
         }
         let cur = cur.unwrap_or(0);

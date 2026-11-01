@@ -292,6 +292,8 @@ impl App {
                     }
                 }
             }
+            // the layout screens' pad keys (D54) are not the developer menu's
+            MenuKey::Play | MenuKey::Options | MenuKey::Quit | MenuKey::TabPrev | MenuKey::TabNext => {}
         }
     }
 }

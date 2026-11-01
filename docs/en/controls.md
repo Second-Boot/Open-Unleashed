@@ -9,9 +9,26 @@ the pad's layout by itself when the pad is connected; otherwise pick the pad in 
 "Default". The pad's layout is a modern one — left stick steers, RT throttle and LT brake (both analogue), A handbrake,
 B look back, X reset the car, Y camera, RB / LB shift up / down, Start pause, L3 horn, d-pad up lights,
 d-pad left / right turn signals, d-pad down hazards, right stick looks left / right. Wheels and other
-devices get the original's layout. In the menus the d-pad or left stick moves, A selects. Force feedback
+devices get the original's layout. In the menus the pad works on its own (see below). Force feedback
 is used where the system and the pad support it. The keyboard keeps working beside a pad: an action bound to the
 pad still answers its default key, unless that key is bound to another action.
+
+In the front end a standard pad drives the screens without a mouse: the d-pad or left stick moves to the nearest control in that direction
+(inside an open drop-down or a list it moves the rows), and the cursor follows the selection.
+
+| Pad | Front end |
+|---|---|
+| d-pad / left stick | move to the next control; in a drop-down or a list, the rows; on a slider or a bar (volume, force feedback, gamma, the dead-zone handles, the chronicle's year) Left / Right change the value (hold to repeat) |
+| A | press the control (open a drop-down, pick its row, change the car or the track, switch a tab, answer a dialog's button); on a dead-zone bar, switch between its inner and outer handle; in the colour editor, "ok" |
+| B | back (as the keyboard's B); closes an open drop-down; answers a dialog "no"; in the colour editor, "cancel" |
+| Y | the bottom bar's options |
+| Start | the bottom bar's race button, where the screen can start a race |
+| View / Back | exit (asks first) |
+| LB / RB | the previous / next tab; in the colour editor, darker / brighter |
+
+In the colour editor the d-pad moves the picked point over the wheel (Left / Right the hue, Up / Down the saturation).
+
+The arrow keys work the same way. Typing a name still needs the keyboard.
 
 On a standard pad the race's dialogs and the replay bar have their own keys, which act only while a dialog or the bar
 is up (never while driving): d-pad / left stick picks, A answers, B goes back.

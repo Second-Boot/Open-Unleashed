@@ -5,7 +5,8 @@
 ; like graphicsettings.lay / advgraphics.lay (no screen of its own, the Options oval behind).
 ; Built from widget types the original's display.lay uses. The rows (a caption label + a level
 ; combo bound to Enh.<token>) and the page button are NOT in this file: they are generated from the
-; switch registry (nfs_renderer::ENHANCEMENT_REGISTRY) and appended at load, so adding a registry
+; switch registry (nfs_renderer::ENHANCEMENT_REGISTRY) and inserted after section 0 at load (ahead of
+; the backgrounds, which would take their clicks: remaster::with_rows), so adding a registry
 ; entry adds a row. Strings are the port's own table (ids 900000 and up), not FEStrings.loc.
 [section.0]
 id=REAL.BLACK_640x480

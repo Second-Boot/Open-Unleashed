@@ -20,20 +20,49 @@ impl App {
             // right-aligned 4 left of `ID_SEVERPOS` with the name 4 right of it, the players
             // (`[+0x48]`) at `ID_PLAYERPOS` and the ping (`min(ping, 9999)`, blank when negative)
             // at `ID_PINGPOS`; `ID_GAMEPOS`'s `[+0x3C] >> 16` is not something a `'d'` carries.
+            "Comms.ServerList" if self.internet_session() => {
+                // the entry server's `0xB8` rows (`lobby.md` §4): number, name, games, players, ping — only those whose echo came back
+                let n = self.net.session.as_ref()?;
+                let rows: Vec<ListRow> = n
+                    .server_rows()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (_, r))| ListRow::Columns(server_cells(i, r.name, Some(r.games), u32::from(r.players), Some(r.ping))))
+                    .collect();
+                let sel = n.internet().map_or(0, |i| i.sel_server);
+                Some((rows, Some(sel)))
+            }
+            "Comms.GamesList" if self.internet_session() => {
+                // `0xB4` games (0x4BA030, internet: `Comms.GameMode` 0): number and name, the player count, track, mode, version
+                let n = self.net.session.as_ref()?;
+                let text = |id: u32| self.fe.strings.get(id).map_or_else(|| "Not Found".to_string(), str::to_string);
+                let cell = |anchor: &str, dx: f32, text: String| ListCell { align: None, anchor: anchor.into(), dx, text, fade: 0xFF };
+                let rows: Vec<ListRow> = n
+                    .game_rows()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mode = POSITIONAL_OPTIONS.get(usize::from(r.mode)).map_or_else(String::new, |id| text(*id));
+                        ListRow::Columns(vec![
+                            cell("ID_GAMEPOS", -4.0, format!("{}", i + 1)),
+                            cell("ID_GAMEPOS", 4.0, r.name),
+                            cell("ID_TRACKPOS", -4.0, format!("{}", r.players)),
+                            cell("ID_TRACKPOS", 4.0, text(u32::from(r.track_id) + 0x28)),
+                            cell("ID_MODEPOS", 4.0, mode),
+                            cell("ID_VERPOS", 4.0, r.version),
+                        ])
+                    })
+                    .collect();
+                let sel = n.internet().map_or(0, |i| i.sel_game);
+                Some((rows, Some(sel)))
+            }
             "Comms.ServerList" => {
                 let l = self.net.lobby.as_ref()?;
-                let cell = |anchor: &str, dx: f32, text: String| ListCell { align: None, anchor: anchor.into(), dx, text, fade: 0xFF };
                 let rows = l
                     .rows()
                     .into_iter()
                     .enumerate()
-                    .map(|(i, r)| {
-                        let mut cells = vec![cell("ID_SEVERPOS", -4.0, format!("{}", i + 1)), cell("ID_SEVERPOS", 4.0, r.name), cell("ID_PLAYERPOS", 0.0, format!("{}", r.players))];
-                        if let Some(p) = r.ping {
-                            cells.push(cell("ID_PINGPOS", 0.0, format!("{p}")));
-                        }
-                        ListRow::Columns(cells)
-                    })
+                    .map(|(i, r)| ListRow::Columns(server_cells(i, r.name, None, r.players, r.ping)))
                     .collect();
                 Some((rows, Some(l.sel)))
             }
@@ -856,5 +885,44 @@ impl App {
         let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
         let Some(owned) = c.career.garage.get(idx) else { return true };
         owned.part_state.iter().any(|(id, _)| c.tables.parts.iter().any(|p| p.id == *id && p.kind == cat))
+    }
+}
+
+/// One row of `Comms.ServerList` — **0x4B9780**: the row number (`%d`, align 2 at `ID_SEVERPOS` − 4: `push 2` before 0x4D63E0, `sub eax, 4` at
+/// 0x4B9918), the name (align 0, + 4: 0x4B9946), the games (`entry+0x3C >> 16`, align 2, − 4: 0x4B997B), the players (`entry+0x48`, align 2,
+/// − 4: 0x4B99A9) and the ping (`min(ping, 9999)`, align 2, − 4: 0x4B9A00; only when it is above −1, 0x4B99E4). A negative offset is the
+/// right alignment ([`ListCell::dx`]). `games` is `None` for a LAN session, which carries no such count.
+pub(crate) fn server_cells(index: usize, name: String, games: Option<u16>, players: u32, ping: Option<u32>) -> Vec<ListCell> {
+    let cell = |anchor: &str, dx: f32, text: String| ListCell { align: None, anchor: anchor.into(), dx, text, fade: 0xFF };
+    let mut cells = vec![cell("ID_SEVERPOS", -4.0, format!("{}", index + 1)), cell("ID_SEVERPOS", 4.0, name)];
+    if let Some(g) = games {
+        cells.push(cell("ID_GAMEPOS", -4.0, format!("{g}")));
+    }
+    cells.push(cell("ID_PLAYERPOS", -4.0, format!("{players}")));
+    if let Some(p) = ping {
+        cells.push(cell("ID_PINGPOS", -4.0, format!("{}", p.min(9999))));
+    }
+    cells
+}
+
+#[cfg(test)]
+mod server_row_tests {
+    use super::*;
+
+    /// The x each cell is drawn at and its alignment, from the tag positions of `serverlist.lay` (design points: `ID_SEVERPOS` 100,
+    /// `ID_GAMEPOS` 386, `ID_PLAYERPOS` 453, `ID_PINGPOS` 524) the way the widget draw applies the offset (sign = alignment).
+    #[test]
+    fn the_numbers_end_four_left_of_their_tags_and_the_name_starts_four_right() {
+        let x = |a: &str| match a {
+            "ID_SEVERPOS" => 100.0,
+            "ID_GAMEPOS" => 386.0,
+            "ID_PLAYERPOS" => 453.0,
+            _ => 524.0,
+        };
+        let cells = server_cells(0, "Name".into(), Some(2), 3, Some(12345));
+        let at: Vec<(f32, bool, &str)> = cells.iter().map(|c| (x(&c.anchor) + c.dx, c.dx.is_sign_negative(), c.text.as_str())).collect();
+        assert_eq!(at, [(96.0, true, "1"), (104.0, false, "Name"), (382.0, true, "2"), (449.0, true, "3"), (520.0, true, "9999")]);
+        // the games column is absent for a LAN row, the ping when unknown
+        assert_eq!(server_cells(0, "n".into(), None, 1, None).len(), 3);
     }
 }

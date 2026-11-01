@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 mod barrier;
 mod cars;
 mod exchange;
+mod internet;
 mod keys;
 mod launch;
 mod lobby;
@@ -44,7 +45,10 @@ mod session;
 mod deadreck_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod lobby_tests;
 
+pub use internet::*;
 pub use keys::*;
 pub use lobby::*;
 pub use remote::*;
@@ -261,8 +265,6 @@ pub struct NetPlay {
     pings: HashMap<i32, PlayerPing>,
     /// `net+0x148` — the last measured round trip, which every request carries.
     net148: u32,
-    /// The host's `peer+0xB0` per player id: what each player last reported (−1 until it has).
-    reported: HashMap<i32, i32>,
     /// `player+0x4C`, the race index 0x4B4DA0 handed each player of the room (0x4B4EBC, 0x4B4ED2),
     /// as `(player id, index)`; empty before a launch. The record of a player who has left the room
     /// goes with it (0x48F46F), the numbers of the others stay.
@@ -271,8 +273,9 @@ pub struct NetPlay {
     /// 0x48EB20, the ring, the receiver 0x48F0DC, the clock and the tick counters — and `net+0x128 +
     /// 4·i`, the round trip 0x490140's non-positional arm reads (`network.md` §11.13, §11.17).
     pub exch: nfs_net::exchange::Client,
-    /// The host's room object's half of the same (0x48B6B0 …): the frames it builds and sends.
-    server: nfs_net::exchange::Server,
+    /// The host's room object's protocol side (`nfs_net::host`): its half of the input exchange (0x48B6B0 …) and the pings the
+    /// players reported (`peer+0xB0`).
+    host: nfs_net::host::HostSide,
     /// Whether this race runs by input exchange (set by [`NetPlay::exchange_race_frame`]).
     exchange: bool,
     /// Whether the race's tick clock is the room's (a network race through [`NetPlay::exchange_race_frame`], **positional or not**):
@@ -302,6 +305,8 @@ pub struct NetPlay {
     tick_override: Option<u32>,
     /// `net+0x14`: the voice chat (0x4931C0 on the create / join paths, `network.md` §11.40).
     pub voice: nfs_audio::voicechat::VoiceChat,
+    /// The internet lobby link's extra state (`internet.rs`); `None` for a LAN session.
+    inet: Option<Box<Internet>>,
 }
 
 /// **0x490140**'s answer: how a racer's connection looks. `HPosition`'s row badge takes its colour
@@ -412,9 +417,4 @@ pub struct BarrierRun {
 /// One turn of 0x587CE0 per 1/64 s of real time.
 const POLL_PERIOD: Duration = Duration::from_micros(15_625);
 
-/// `room+0x70`, the 24-bit value of the room's `0xB4` (0x48BAA0 pushes it, 0x48BBBE): the room's session number. It is the manager's counter
-/// `[mgr+0x150]` (0x491CF5 sets it to −1) incremented by 0x490AF0 (`& 0x7FFFFF`) until no room (`+0x70`, lists `+0x174` / `+0x178`) and no
-/// player (`+0xAC`, list `+0x164`) already has it, and stored by the room's constructor 0x48B9B0 (0x48B9D7, the argument 0x491402 / 0x491A07
-/// computes). The first room of a session skips 0 because the host's own player (id 0) is in the list, so its value is **1** — the value of every
-/// capture (one room per run). HIGH: the player list's identity at 0x490B0E was read, not run; a port host creates one room per session.
-const ROOM_ID: i32 = 1;
+const ROOM_ID: i32 = nfs_net::host::FIRST_ROOM_ID;

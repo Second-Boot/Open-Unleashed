@@ -637,6 +637,11 @@ impl App {
                 && self.pages.open_tick.is_some_and(|t0| self.tick >= t0 + wait)
             {
                 tracing::info!(target: "open_unleashed::app::race_start", tick = self.tick, page = ?self.result_pages().get(n as usize), "diagnostic: the scripted run stops on the result page");
+                // **TEST GLUE** `NFS_RESULTS_SHOT=<file.png>`: the still of that page, for a run that goes on to the front end
+                // afterwards (`NFS_FE_KEYS_AFTER`), where `--screenshot` would end the program
+                if let Ok(path) = std::env::var("NFS_RESULTS_SHOT") {
+                    self.write_race_still(&path);
+                }
                 break;
             }
             // a scripted run's iteration is a frame of one tick
@@ -716,7 +721,25 @@ impl App {
             self.player_grid_override = None;
             self.stop_race_audio();
             self.fe.menu = Some(menu);
+            // **TEST GLUE** `NFS_FE_KEYS_AFTER=<tokens>` (tooling): the race is left as `end_finished_race` leaves it
+            // (race mode off, replay saved, simulation shut down) so the front end is live again
+            let keys_after = std::env::var("NFS_FE_KEYS_AFTER").ok();
+            if keys_after.is_some() {
+                self.leave_race_mode();
+                self.save_replay();
+                self.replay_session_end();
+                self.sim_shutdown();
+            }
             self.fe_after_race(false);
+            // **TEST GLUE** `NFS_FE_KEYS_AFTER=<tokens>` (tooling): the `NFS_FE_KEYS` tokens run on the screen the race came
+            // back to (a network race: the room, then `b` for `0xBA` to the lobby ...); the run goes on in the front end
+            // and ends at the tokens' own `exit`
+            if let Some(spec) = keys_after {
+                for k in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    self.fe_scripted_key(k, event_loop);
+                }
+                return false;
+            }
         }
         if self.screenshot.is_none() {
             // The original saves the replay from the race de-init chain after *every* race,
@@ -874,25 +897,7 @@ impl App {
             return;
         }
         let out = format!("{path}.t{}.png", self.tick);
-        // **TEST GLUE**: a scripted run draws no frames, and the mirror's texture is made by the frame's
-        // pass (`render_mirror`, before the main view) — without it the still carried the empty tray. The
-        // first still makes the texture and rebuilds the scene so the HUD holds it; later ones refresh it
-        // in place ([`Self::take_screenshot`] does the same).
-        if self.rear_mirror.is_some() {
-            let first = self.mirror_tex.is_none();
-            self.render_mirror();
-            if first {
-                self.rebuild_scene();
-            }
-        }
-        let (w, h, _) = shot_geometry();
-        let cam = self.render_camera(); // ENHANCEMENT E29
-        if let Some(r) = self.renderer.as_mut()
-            && let Ok(rgba) = r.render_to_image(&self.scene, &cam, w, h)
-        {
-            image::save_buffer(&out, &rgba, w, h, image::ColorType::Rgba8).expect("write png");
-            tracing::info!(path = out, tick = self.tick, eye = ?self.camera.position, target = ?self.camera.target, view = self.camera_view(), "NFS_SHOT_TICKS: still written");
-        }
+        self.write_race_still(&out);
         // **TEST GLUE** (ENH-SAVE) `NFS_ENH_LIVE=<tick>:<E-token>:<delta>,…`: right after that tick's still, the same step the
         // panel's combo makes (`enh_step`, which saves like the panel does), then the same tick again as
         // `<prefix>.t<tick>.live.png` — a live change inside one run, the same frame before and after
@@ -929,6 +934,29 @@ impl App {
                     image::save_buffer(name, &rgba, w, h, image::ColorType::Rgba8).expect("write png");
                 }
             }
+        }
+    }
+
+    /// **TEST GLUE** — the race frame as it stands, written to `out` (the part of [`Self::shot_at_tick`] that draws it).
+    pub(crate) fn write_race_still(&mut self, out: &str) {
+        // **TEST GLUE**: a scripted run draws no frames, and the mirror's texture is made by the frame's
+        // pass (`render_mirror`, before the main view) — without it the still carried the empty tray. The
+        // first still makes the texture and rebuilds the scene so the HUD holds it; later ones refresh it
+        // in place ([`Self::take_screenshot`] does the same).
+        if self.rear_mirror.is_some() {
+            let first = self.mirror_tex.is_none();
+            self.render_mirror();
+            if first {
+                self.rebuild_scene();
+            }
+        }
+        let (w, h, _) = shot_geometry();
+        let cam = self.render_camera(); // ENHANCEMENT E29
+        if let Some(r) = self.renderer.as_mut()
+            && let Ok(rgba) = r.render_to_image(&self.scene, &cam, w, h)
+        {
+            image::save_buffer(&out, &rgba, w, h, image::ColorType::Rgba8).expect("write png");
+            tracing::info!(path = out, tick = self.tick, eye = ?self.camera.position, target = ?self.camera.target, view = self.camera_view(), "NFS_SHOT_TICKS: still written");
         }
     }
 }

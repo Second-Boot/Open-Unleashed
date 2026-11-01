@@ -401,10 +401,6 @@ fn run() -> Result<()> {
     // ENHANCEMENT framework (branch `remaster`): the switches — `NFS_ENH` over `enhancements.json`
     // over the default — and the mode (`NFS_ENH=off` is the hard original: no front-end additions)
     let (mut enh, enh_mode) = nfs_game::remaster::load();
-    // PORT-DEVIATION D47 on the enhanced game: the five display rows (E6 frame output, E22 frame-rate limit, E1 MSAA, E2 anisotropic,
-    // E3 render scale) keep their values in `display.json` (`nfs_game::display_opts`); `NFS_ENH` set = that set decides
-    let env_chosen = std::env::var_os("NFS_ENH").is_some_and(|v| !v.is_empty());
-    nfs_game::display_opts::adopt(&mut enh, env_chosen, nfs_game::remaster::settings_path().exists());
     // the previous start died = safe mode (`guard::begin`, run at the top: the plain GPU device); here also every enhancement off,
     // unless an explicit NFS_ENH names a set
     if guard::safe() && std::env::var_os("NFS_ENH").is_none_or(|v| v.is_empty()) {

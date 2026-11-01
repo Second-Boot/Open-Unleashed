@@ -358,6 +358,14 @@ impl LayoutScreen {
         Some(picker_rects(x, y, x + w, y + h))
     }
 
+    /// The open editor's "ok" and "cancel" buttons' centres, in design coordinates (the pad's way out of the
+    /// editor, PORT-DEVIATION D54: it cannot drag the wheel, but it can take the colour as it is or leave).
+    pub fn picker_button_centres(&self) -> Option<((f32, f32), (f32, f32))> {
+        let r = self.picker_geometry()?;
+        let c = |(l, t, r, b): (f32, f32, f32, f32)| ((l + r) * 0.5, (t + b) * 0.5);
+        Some((c(r[rect::E_LEFT]), c(r[rect::E_RIGHT])))
+    }
+
     /// Where the pointer is in the open picker, `[this+0x218]` — 5 when it is nowhere in it.
     pub fn picker_region(&self) -> u32 {
         match (self.picker_geometry(), self.cursor) {
@@ -435,6 +443,20 @@ impl LayoutScreen {
             _ => {}
         }
         false
+    }
+
+    /// **PORT-DEVIATION D54 (PAD-SLIDERS)**: the pad's move in the open editor, by the units the pointer's drag would
+    /// cover: `dh` along rect C (the hue, left to right), `ds` up it (the saturation), `dl` along rect A (the luminance),
+    /// each in fractions of the rect and kept within 0…1 as the pointer's edges keep them; then the press's own tail
+    /// (`commit_well`). Answers whether the editor is up.
+    pub fn picker_step(&mut self, dh: f32, ds: f32, dl: f32) -> bool {
+        if self.picker_geometry().is_none() {
+            return false;
+        }
+        let (h, s, l) = self.picker.hsl;
+        self.picker.hsl = ((h + dh).clamp(0.0, 1.0), (s + ds).clamp(0.0, 1.0), (l + dl).clamp(0.0, 1.0));
+        self.commit_well();
+        true
     }
 
     /// The tail every press and move runs: pack the three floats and write the selected well

@@ -67,6 +67,15 @@ impl App {
             Some(o) => o.parts.iter().map(|p| *p as u32).collect(),
             None => entry.stock_parts.iter().map(|p| *p as u32).collect(),
         };
+        // **TEST GLUE** `NFS_TEST_OWN_PARTS=<ids,...>` / `NFS_TEST_OWN_SETUP=<17 floats,...>` (tooling, LOBBY-AC3): the car this
+        // machine launches with carries these parts / sliders in its record - and, because the race folds the machine's own car from
+        // the record it sent (`race_start.rs`), it really races with them: an honest tuned car for the lobby server's anti-cheat checks
+        // (a catalogue car has no upgrades to send, and the scripted entry has no garage with any)
+        let parts = std::env::var("NFS_TEST_OWN_PARTS").ok().map_or(parts, |v| v.split(',').filter_map(|p| p.trim().parse::<i16>().ok()).map(|p| p as u32).collect());
+        let setup = match std::env::var("NFS_TEST_OWN_SETUP").ok().map(|v| v.split(',').filter_map(|p| p.trim().parse::<f32>().ok()).collect::<Vec<_>>()) {
+            Some(v) if v.len() == 17 => std::array::from_fn(|i| fixed(v[i])),
+            _ => setup,
+        };
         let index = |name: &str| self.choice_index(name).map_or(0, |(i, _)| i as u32);
         Some(nfs_net::launchcar::OwnCar {
             driver: u32::from(self.career.as_ref().map_or(nfs_game::save::DEFAULT_PICTURE, |c| c.profile.picture)),
@@ -140,7 +149,18 @@ impl App {
         if !self.on_lobby_screen() {
             return;
         }
-        let Some((me, host)) = self.net.session.as_ref().filter(|n| n.established()).and_then(|n| Some((n.my_slot()?, n.is_host()))) else { return };
+        // **The join screen's tick, 0x50A883…0x50A89C**: with the connection up and our id ≥ 0, `0x48CAA0` (the first record of
+        // `net+0x260` is us) says we host now — `0x4D2100("creategame", 0, 0)`, offset 0, not recorded. On a LAN a joiner never
+        // becomes the first (its host leaving tears the session down); on a lobby link it is the host's migration by list order
+        // (`lobby.md` §7.4: the creator leaving hands the room to the next player), and the screen turns into the create screen.
+        if self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("joingame"))
+            && self.net.session.as_ref().is_some_and(|n| n.established() && n.first_player_is_us())
+        {
+            tracing::info!(target: "netplay", "join screen's tick (0x50A883): the first record of the room is us - creategame (0x4D2100)");
+            self.fe_open("creategame", 0, false);
+            return;
+        }
+        let Some((me, host)) = self.net.session.as_ref().filter(|n| n.established()).and_then(|n| Some((n.my_slot()?, n.has_authority()))) else { return };
         let car = self.net_own_car();
         let first = !self.net.lobby_sent;
         let changed = !first && (setsel || car.as_ref().map(|c| (c.0, c.1.clone())) != self.net.lobby_car);
@@ -184,7 +204,7 @@ impl App {
     /// first) sends nothing. So a joiner who was READY is not READY when the lobby comes back after
     /// the race, and the host's PLAYGAME gate (`everyone_ready`) closes with it.
     pub(crate) fn net_join_screen_gone(&mut self) {
-        let Some((me, host)) = self.net.session.as_ref().filter(|n| n.established()).and_then(|n| Some((n.my_slot()?, n.is_host()))) else { return };
+        let Some((me, host)) = self.net.session.as_ref().filter(|n| n.established()).and_then(|n| Some((n.my_slot()?, n.has_authority()))) else { return };
         if host {
             return;
         }
@@ -222,7 +242,7 @@ impl App {
     /// which returns at once — the call goes on, as the port's does (read NM, 2026-09-30; until then this said
     /// "the original's is modal"). ESC in the waits: [`crate::netplay::KeyRing`].
     pub(crate) fn net_playgame(&mut self) -> bool {
-        let Some((me, host)) = self.net.session.as_ref().filter(|n| n.established()).and_then(|n| Some((n.my_slot()?, n.is_host()))) else {
+        let Some((me, host)) = self.net.session.as_ref().filter(|n| n.established()).and_then(|n| Some((n.my_slot()?, n.has_authority()))) else {
             return true;
         };
         let mut ready = self.net.session.as_ref().is_some_and(|n| n.slots.slot[me].ready);
@@ -419,7 +439,13 @@ impl App {
             return;
         }
         let Some(name) = self.fe.layout_name.clone() else { return };
-        let count = self.net.lobby.as_ref().map_or(0, |l| l.rows().len());
+        let inet_count = |s: &Self, servers: bool| {
+            s.net.session.as_ref().filter(|n| n.is_internet()).map(|n| if servers { n.server_rows().len() } else { n.game_rows().len() })
+        };
+        let count = match inet_count(self, name.eq_ignore_ascii_case("serverlist")) {
+            Some(c) => c,
+            None => self.net.lobby.as_ref().map_or(0, |l| l.rows().len()),
+        };
         let link = self.net.lobby.is_some() || self.net.session.as_ref().is_some_and(|n| n.established());
         // the buttons, by name: (widget name, enabled)
         let rules: Vec<(&str, bool)> = match name.to_ascii_lowercase().as_str() {
@@ -449,8 +475,9 @@ impl App {
         }
     }
 
-    /// **`accountlogin.lay`'s three buttons** (`FEMainScreen`; the lobby service they speak to no longer exists:
-    /// `porsche-entry.earacing.com` and `login.earacing.com` answer NXDOMAIN, `network.md` §11.15).
+    /// **`accountlogin.lay`'s three buttons** (`FEMainScreen`). The original's lobby service is gone (`porsche-entry.earacing.com` and
+    /// `login.earacing.com` answer NXDOMAIN, `network.md` §11.15); the port's SIGNON speaks the original's lobby protocol
+    /// (`lobby.md`) to [`netplay::lobby_address`] — **PORT-DEVIATION D55**.
     ///
     /// * `CLEARACCOUNTINFO` 0x50DD00: slot 0x44 of the `COMMS.ACCOUNTID` and `COMMS.PASSWORD` accessors — their text
     ///   is emptied;
@@ -477,18 +504,20 @@ impl App {
                 }
             }
             "SIGNON" => {
-                let who = self.player_name.to_string();
-                match netplay::NetPlay::start("signon:", &who) {
-                    Ok(n) => {
-                        tracing::info!("SIGNON (0x5109B0): 0x48E1A0(net, 1, 0, porsche-entry.earacing.com) — the lobby service is gone");
-                        self.net.session = Some(n);
-                        self.net.join_notified = false;
-                    }
-                    Err(e) => tracing::warn!(error = %e, "SIGNON: no socket"),
-                }
+                // 0x5109B0: the two boxes' texts (`COMMS.ACCOUNTID`, `COMMS.PASSWORD`) and the profile name go into the link's
+                // identity, and the link to `Primary Address` opens (`lobby.md` §3.2)
+                let (account, password) = self
+                    .fe
+                    .layout_preview
+                    .as_ref()
+                    .map(|l| (l.input_text("COMMS.ACCOUNTID"), l.input_text("COMMS.PASSWORD")))
+                    .unwrap_or_default();
+                tracing::info!("SIGNON (0x5109B0): 0x48E1A0(net, 1, 0, Primary Address)");
+                self.net.signon = Some((account, password));
+                self.signon_connect();
             }
             _ => {
-                let url = "http://login.earacing.com";
+                let url = netplay::REGISTER_URL;
                 tracing::info!(url, "REGISTERUSER (0x510990): the front end exits and the registration page is opened (0x4A5EA0)");
                 if !NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) {
                     #[cfg(target_os = "macos")]
@@ -521,6 +550,7 @@ impl App {
     /// screen's slot 0xB4, or 0x4D23F0(0)) — here the dialog's answer does both (`DialogFor::NetFail`).
     pub(crate) fn comm_tick(&mut self) {
         use nfs_net::room::comm_state as cs;
+        self.signon_tick();
         if self.vehicle.is_some() || self.fe.layout_preview.is_none() {
             return;
         }
@@ -560,6 +590,19 @@ impl App {
         tracing::info!(state = st, notice, "comm state notice (0x509550)");
         self.net.join_notified = true;
         self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, notice, [0, 0], DialogFor::NetFail);
+        // an internet link (`lobby.md` §3.3, §9): with a game request pending (`net+0xC6`) the refusals 9 / 10 / 11 leave the link up and
+        // put the state back to `0xE`; every other error tears the link down (0x48E790) behind the dialog
+        let internet = self.net.session.as_ref().map(|n| (n.is_internet(), n.game_pending()));
+        if let Some((true, pending)) = internet {
+            if pending && matches!(st, cs::EJECTED | cs::WRONG_VERSION | cs::FULL) {
+                if let Some(n) = self.net.session.as_mut() {
+                    n.restore_state();
+                }
+                self.net.join_notified = false;
+            } else {
+                self.fe_session_leave();
+            }
+        }
     }
 
     /// **`SETMODENET`'s update check** (0x510D80 → 0x4A56E0 on the object at 0x655A30; `network.md` §11.22).

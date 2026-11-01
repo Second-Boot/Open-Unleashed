@@ -38,7 +38,67 @@ impl App {
                 }
             }
             _ => {
-                if let Some(n) = k.strip_prefix("goto:").and_then(|n| n.parse::<usize>().ok()) {
+                if let Some(name) = k.strip_prefix("pad:") {
+                    // **TEST GLUE** `pad:<key>` (D54) — a pad key of the front end's scheme through the same
+                    // `MenuKey` the real pad queue maps to (`up down left right a b y start view lb rb`), after the
+                    // screen has settled as a player would wait for it
+                    let key = match name {
+                        "up" => Some(MenuKey::Up),
+                        "down" => Some(MenuKey::Down),
+                        "left" => Some(MenuKey::Left),
+                        "right" => Some(MenuKey::Right),
+                        "a" => Some(MenuKey::Enter),
+                        "b" => Some(MenuKey::Back),
+                        "y" => Some(MenuKey::Options),
+                        "start" => Some(MenuKey::Play),
+                        "view" => Some(MenuKey::Quit),
+                        "lb" => Some(MenuKey::TabPrev),
+                        "rb" => Some(MenuKey::TabNext),
+                        _ => None,
+                    };
+                    let settle = |app: &mut Self| {
+                        for _ in 0..60 {
+                            if let Some(l) = app.fe.layout_preview.as_mut() {
+                                l.advance_transition(16);
+                            }
+                            if let Some(b) = app.fe.layout_bottom.as_mut() {
+                                b.advance_transition(16);
+                            }
+                        }
+                    };
+                    settle(self);
+                    if let Some(key) = key {
+                        self.menu_key(key, event_loop);
+                        settle(self);
+                    }
+                    let (hover, open) = self.fe.layout_preview.as_ref().map_or((None, None), |l| (l.hovered(), l.open_combo()));
+                    if name == "list" {
+                        tracing::info!(strips = ?self.fe.layout_preview.as_ref().map(|l| l.tab_strips()), "NFS_FE_KEYS pad strips");
+                        let t: Vec<String> = self.fe.layout_preview.as_ref().map(|l| l.pad_targets().iter().map(|t| format!("{}:{}:{:?}@{:.0},{:.0} {:.0}x{:.0}", t.index, t.row, t.kind, t.x, t.y, t.w, t.h)).collect()).unwrap_or_default();
+                        tracing::info!(targets = ?t, "NFS_FE_KEYS pad list");
+                        // the colour boxes' custom rows (a pad check of the editor picks one with `pick:<widget>:<row>`)
+                        let combos: Vec<(usize, Option<String>)> = self.fe.layout_preview.as_ref().map(|l| l.combo_sliders().into_iter().map(|w| (w.index, w.accessor)).collect()).unwrap_or_default();
+                        let customs: Vec<(usize, Option<usize>, Option<usize>)> = combos
+                            .into_iter()
+                            .filter_map(|(i, a)| {
+                                let (rows, _) = self.combo_rows(&a?)?;
+                                Some((i, rows.iter().position(|r| matches!(r, ListRow::CustomColour(_))), Some(rows.len())))
+                            })
+                            .collect();
+                        tracing::info!(?customs, "NFS_FE_KEYS pad customs");
+                    }
+                    // the values the drag widgets set, for the scripted checks (PAD-SLIDERS): the garage car's set-up, the
+                    // dead-zone pairs, the five volume levels, the chronicle year, the colour editor's hue / saturation / luminance
+                    let setup = self.career.as_ref().and_then(|c| c.career.garage.get(c.car_sel.min(c.career.garage.len().saturating_sub(1))).map(|o| o.setup));
+                    let a = &self.snd.audio_settings;
+                    let levels = [a.music_level, a.sfx_level, a.engine_level, a.speech_level, a.ambient_level];
+                    let dz = self.fe.layout_preview.as_ref().map(|l| l.deadzone_values());
+                    let hsl = self.fe.layout_preview.as_ref().filter(|l| l.open_picker().is_some()).map(|l| l.picker().hsl);
+                    let mut ranges: Vec<_> = self.choices.iter().filter(|(k, _)| k.to_lowercase().contains("force") || k.to_lowercase().contains("ff") || k.to_lowercase().contains("gamma")).collect();
+                    ranges.sort();
+                    tracing::info!(?ranges, ?setup, ?levels, ?dz, ?hsl, year = ?self.fe.chronicle_year_idx, gamma = ?self.range_value("Graphics.GammaCorrection"), "NFS_FE_KEYS pad values");
+                    tracing::info!(pad = name, target = ?self.fe.pad_target, ?hover, ?open, cursor = ?self.fe.cursor, "NFS_FE_KEYS pad");
+                } else if let Some(n) = k.strip_prefix("goto:").and_then(|n| n.parse::<usize>().ok()) {
                     self.fe.layout_sel = n;
                     self.layout_key(MenuKey::Enter, event_loop);
                 } else if let Some((name, off)) = k.strip_prefix("open:").and_then(|r| r.rsplit_once(':')) {
@@ -126,6 +186,15 @@ impl App {
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     self.bind_lists();
+                } else if let Some(t) = k.strip_prefix("gametype:").and_then(|t| t.parse::<u8>().ok()) {
+                    // **TEST GLUE** `gametype:<n>` (tooling, LOBBY-AC3) - `Game.GameType` as the `SETTYPE*` button writes it
+                    // (3 = `SETTYPEMULTIPLAYER`, `input.rs`), with the rebuild of the track and car lists that follows (0x4F3E40:
+                    // `rebuild_track_lists`). A scripted entry at `--fe=accountlogin` never passes that button, so the network game's
+                    // track list (every `nfs5.trk` record, 0x4FBC94 / 0x4FBDE2) would be the single player's unlocked subset and
+                    // a circuit could not be chosen on `creategame`.
+                    self.fe.game_type = t;
+                    self.rebuild_track_lists();
+                    self.bind_lists();
                 } else if let Some((acc, d)) = k.strip_prefix("step:").and_then(|r| r.rsplit_once(':')).and_then(|(a, d)| Some((a.to_string(), d.parse::<i32>().ok()?))) {
                     // `step:<accessor>:<delta>` (tooling) — a combo's arrow (`set_accessor`),
                     // in order with the keys around it (`Comms.PlayerList`'s selection)
@@ -158,6 +227,23 @@ impl App {
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     self.bind_lists();
+                } else if k == "exit" {
+                    // **TEST GLUE** `exit` (tooling) — end the scripted run after the keys before it
+                    event_loop.exit();
+                } else if let Some(path) = k.strip_prefix("shot:") {
+                    // **TEST GLUE** `shot:<file.png>` (tooling) — one real front-end frame (at the fixed 1/60 s step of
+                    // `NFS_FE_SEQ`) written to the file, in order with the keys around it, so a scripted walk through
+                    // the screens can leave a still at each of its steps
+                    self.frame_dt = 1.0 / 60.0;
+                    self.draw_frame();
+                    let scene = self.scene.clone();
+                    let (w, h) = (shot_geometry().0, shot_geometry().1);
+                    if let Some(r) = self.renderer.as_mut()
+                        && let Ok(rgba) = r.render_to_image(&scene, &self.camera, w, h)
+                    {
+                        image::save_buffer(path, &rgba, w, h, image::ColorType::Rgba8).expect("png");
+                        tracing::info!(path, "NFS_FE_KEYS shot written");
+                    }
                 } else if let Some(text) = k.strip_prefix("dialog:") {
                     // `dialog:<text>` (tooling) - type `text` after what an input
                     // dialog holds and answer it "yes", as Return would once its tick
@@ -227,6 +313,8 @@ impl App {
                     if let Some(l) = self.fe.layout_preview.as_mut() {
                         l.script_cursor(Some((x, y)));
                     }
+                    // the real `CursorMoved` runs the drag steps too (session.rs), so a scripted drag does
+                    self.fe_apply_combo_drag();
                 } else if tok == "down" || tok == "up" {
                     self.fe_left_button(event_loop, tok == "down");
                 } else {

@@ -421,7 +421,8 @@ impl App {
             N::Down => (1, 1),
             N::Aux => (6, 1),
             N::Back => (3, 1),
-            N::Alt => return false,
+            // D54's front-end keys (Start, View, the shoulders) mean nothing here
+            N::Alt | N::Start | N::View | N::Prev | N::Next => return false,
         };
         if !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)) || self.hud.is_none() {
             return false;

@@ -77,6 +77,8 @@ pub struct Gamepads {
     devices: Option<Devices>,
     /// the left stick's X / Y past [`MENU_STICK`] at the last motion event (the front end's keys)
     stick_latch: [bool; 2],
+    /// the held direction / shoulder key of the front end's pad scheme (PAD-SLIDERS)
+    menu_hold: crate::MenuHold,
     rumbler: crate::ff::Rumbler,
     rumble_test: Option<RumbleTest>,
     /// the pads' records of the frame, reused (`poll` runs every frame)
@@ -416,7 +418,7 @@ impl Gamepads {
                 None
             }
         };
-        Self { devices, stick_latch: [false; 2], rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
+        Self { devices, stick_latch: [false; 2], menu_hold: Default::default(), rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
     }
 
     /// PLATFORM GLUE (macOS): move SDL's event pump out of winit's handler into a run-loop observer
@@ -610,6 +612,14 @@ impl Gamepads {
                     && let Some(k) = menu_button(SDL_GamepadButton(i32::from(b.button)), &d.list[i].face)
                 {
                     input.pad_menu.push(k);
+                    self.menu_hold.press(k, std::time::Instant::now());
+                }
+            } else if ty == SDL_EVENT_GAMEPAD_BUTTON_UP {
+                let b = unsafe { ev.gbutton };
+                if let Some(i) = d.pad_index(b.which)
+                    && let Some(k) = menu_button(SDL_GamepadButton(i32::from(b.button)), &d.list[i].face)
+                {
+                    self.menu_hold.release(k);
                 }
             } else if ty == SDL_EVENT_GAMEPAD_AXIS_MOTION {
                 let a = unsafe { ev.gaxis };
@@ -627,11 +637,17 @@ impl Gamepads {
                 let v = unit(a.value);
                 let now = v.abs() > MENU_STICK;
                 if now && !self.stick_latch[i] {
-                    input.pad_menu.push(if v < 0.0 { neg } else { pos });
+                    let k = if v < 0.0 { neg } else { pos };
+                    input.pad_menu.push(k);
+                    self.menu_hold.press(k, std::time::Instant::now());
+                } else if !now && self.stick_latch[i] {
+                    self.menu_hold.release(neg);
+                    self.menu_hold.release(pos);
                 }
                 self.stick_latch[i] = now;
             }
         }
+        input.pad_menu_repeat.extend(self.menu_hold.due(std::time::Instant::now()));
         // a sustained rumble change held back by the rate limit goes out once its interval is over
         self.rumbler.flush(d);
         let mut records = std::mem::take(&mut self.records_buf);
@@ -728,6 +744,15 @@ pub fn menu_button(b: SDL_GamepadButton, face: &[SDL_GamepadButton; 4]) -> Optio
         Alt
     } else if b == face[3] {
         Aux
+    } else if b == SDL_GAMEPAD_BUTTON_START {
+        // PORT-DEVIATION D54 (the front end's pad scheme): Start races, View exits, the shoulders turn the tabs
+        Start
+    } else if b == SDL_GAMEPAD_BUTTON_BACK {
+        View
+    } else if b == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER {
+        Prev
+    } else if b == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER {
+        Next
     } else {
         return None;
     })
@@ -1161,8 +1186,12 @@ mod tests {
         // PAD-END2: Y and X are the in-race dialogs' second answer and the replay bar's save
         assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_NORTH, &f), Some(MenuNav::Alt));
         assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_WEST, &f), Some(MenuNav::Aux));
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, &f), None);
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_START, &f), None);
+        // D54: Start / View and the shoulders are the front end's bottom-bar and tab keys
+        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_START, &f), Some(MenuNav::Start));
+        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_BACK, &f), Some(MenuNav::View));
+        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, &f), Some(MenuNav::Prev));
+        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, &f), Some(MenuNav::Next));
+        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_LEFT_STICK, &f), None);
     }
 
     /// SDL3: the port's `A B Y X` (South, East, North, West) are found by the labels SDL reports, as

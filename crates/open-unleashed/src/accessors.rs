@@ -790,8 +790,8 @@ impl App {
                 let sel = self.fe.resolution_sel.min(modes.len().saturating_sub(1));
                 modes.get(sel).map_or_else(String::new, |(w, h, d)| format!("{w} x {h} x {d}"))
             }
-            // the car-setup screen: the 17 floats the original keeps on the car and reads back
-            // nowhere (`RE/notes/layouts.md`), so the port shows them and changes nothing
+            // the car-setup screen: the 17 floats the original keeps on the garage car
+            // (`FECar+0x6D0`, `RE/notes/layouts.md`); `set_accessor` writes them
             b if nfs_game::career::CAR_SETUP_NAMES.contains(&b) => {
                 let c = career?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));

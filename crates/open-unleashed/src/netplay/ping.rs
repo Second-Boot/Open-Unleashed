@@ -39,11 +39,8 @@ impl NetPlay {
     /// for the room's player with the asked id the sender is answered `0xC3(id, that player's
     /// peer+0xB0)` (0x4916B7…0x4916BC).
     pub(super) fn ping_request(&mut self, from: i32, p: room::Ping) {
-        self.reported.insert(from, p.word);
-        if self.room.player(p.id).is_some() {
-            let word = self.reported.get(&p.id).copied().unwrap_or(-1);
-            self.dispatch(vec![(To::Player(from), room::Ping { id: p.id, word }.encode())]);
-        }
+        let out = self.host.ping(&self.room, from, p);
+        self.dispatch(out);
     }
 
     /// **0x48F527…0x48F574 → 0x490600**: the player with the asked id (`+0x40`) takes the answer:

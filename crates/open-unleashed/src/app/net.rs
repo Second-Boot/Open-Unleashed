@@ -712,7 +712,7 @@ impl App {
     /// first when none is (0x4FBF70's rule for a machine that does not host, `hud.md`) —, the rest
     /// are the direction / traffic / laps rows.
     pub(crate) fn net_sync_options(&mut self) {
-        let Some(host) = self.net.session.as_ref().map(|n| n.is_host()) else { return };
+        let Some(host) = self.net.session.as_ref().map(|n| n.has_authority()) else { return };
         if host {
             let Some((opts, circuit)) = self.net_track_options() else { return };
             let positional = self.net.session.as_ref().is_some_and(|n| n.positional);
@@ -842,7 +842,7 @@ impl App {
     /// run the barrier 0x48D6A0, after which a player's table holds the host's records. What the
     /// launch settled goes to `net.race`, which `start_from_layout` reads.
     pub(crate) fn net_launch_sync(&mut self) {
-        let host = self.net.session.as_ref().is_some_and(|n| n.is_host());
+        let host = self.net.session.as_ref().is_some_and(|n| n.has_authority());
         let mut settings = if host { self.net_launch_settings() } else { None };
         // 0x4EEDA0's record for the player (kind 1) — every machine builds it and the walk sends it
         let own_car = self.net_own_launch_car();
@@ -1010,7 +1010,7 @@ impl App {
             n.positional = r.positional;
         }
         if let Some(list) = r.playlist.as_ref()
-            && !self.net.session.as_ref().is_some_and(|n| n.is_host())
+            && !self.net.session.as_ref().is_some_and(|n| n.has_authority())
         {
             self.set_cd_playlist(list.iter().map(|i| *i as usize).collect());
         }
@@ -1042,6 +1042,20 @@ impl App {
     /// `DIAL` has no modem behind it here, and `ENTER` on the server list only moves the cursor,
     /// since what the original's server list connects *to* is the lobby service of §1.
     pub(crate) fn network_callback(&mut self, cb: &str, _event_loop: &ActiveEventLoop) {
+        // the internet lobby (`lobby.md`): the link is the session, the lists its own
+        if self.internet_session() {
+            match cb {
+                "ENTER" => {
+                    self.lobby_enter_server();
+                    return;
+                }
+                "JOIN" => {
+                    self.lobby_join();
+                    return;
+                }
+                _ => {}
+            }
+        }
         let opened = match cb {
             // `CREATE` on the games screens (0x509E40, registered at 0x509D53 for `local` and
             // `udpip`) raises the game-name dialog; on the peer-to-peer screen (0x50B140) it goes
@@ -1491,6 +1505,13 @@ pub(crate) struct Network {
     pub(crate) connect_pending: bool,
     /// `[this+0x289]`: that `joingame` has been opened (once)
     pub(crate) connect_opened: bool,
+    /// **The internet lobby sign-on** (`accountlogin`'s SIGNON 0x5109B0): the account and password typed, kept for the entry server's
+    /// re-connect and for ENTER's second link (the original keeps them in `net+0x58` / `+0x98`)
+    pub(crate) signon: Option<(String, String)>,
+    /// the name the persona dialog (821) was answered with: the retry connects under it (0x509905…0x509978)
+    pub(crate) persona: Option<String>,
+    /// SIGNON's `[this+0x294]`: `accountlogin` opens `serverlist` once the link is in (0x510457)
+    pub(crate) signon_latch: bool,
 }
 
 /// The race a network launch settled - the host's own choices, or what a player heard in the

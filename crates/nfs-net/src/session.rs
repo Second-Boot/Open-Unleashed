@@ -181,6 +181,9 @@ pub struct Net {
     /// service (case 182 of 0x491010) and is not run for a LAN / direct join (`network.md` §11.28).
     /// `None` (a test's bare session) lets everyone in.
     pub identity_gate: Option<String>,
+    /// Host only: how many joiners the slot table admits at most. The LAN host's is [`MAX_JOINER_SLOTS`] (a room of eight); a
+    /// dedicated lobby host holds every lobby member on one `Net` and raises it (the table is `limit` entries, the mask 32 bits).
+    pub slot_cap: u32,
     /// The send queue in front of the pool, a client's only road for reliable game messages
     /// ([`crate::outbox`], 0x48AD70 / 0x48AE30). A host's room sends on each link itself.
     pub outbox: crate::outbox::Outbox,
@@ -213,6 +216,7 @@ impl Net {
             slot: None,
             relay: true,
             identity_gate: None,
+            slot_cap: MAX_JOINER_SLOTS,
             conns: std::collections::BTreeMap::new(),
             outbox: crate::outbox::Outbox::new(),
             // det-allow: transport timeouts, not simulation state
@@ -244,6 +248,7 @@ impl Net {
             slot: None,
             relay: false,
             identity_gate: None,
+            slot_cap: MAX_JOINER_SLOTS,
             conns: std::collections::BTreeMap::new(),
             outbox: crate::outbox::Outbox::new(),
             // det-allow: transport timeouts, not simulation state
@@ -330,6 +335,11 @@ impl Net {
     /// `name~version~game` text) at `rec+0x48`. Repeating the call while no `'a'` has come repeats the
     /// same request number, as 0x588130's loop does.
     pub fn join(&mut self, host: SocketAddr, identity: &[u8]) -> io::Result<()> {
+        self.join_account(host, comm::record::PLAYER_TEXT, identity)
+    }
+
+    /// [`Net::join`] with an account field other than `Player` (a signed-on lobby client's `c<account>~<password>`).
+    pub fn join_account(&mut self, host: SocketAddr, account: &[u8], identity: &[u8]) -> io::Result<()> {
         self.host = Some(host);
         let request = match self.join_req {
             Some(r) => r,
@@ -340,7 +350,7 @@ impl Net {
             }
         };
         let to = record_of(host).unwrap_or_default();
-        let j = Join::original(request, to, self.record()?, identity);
+        let j = Join::with_account(request, to, self.record()?, account, identity);
         self.sock.send_to(host, tag::JOIN, &j.encode()).map(|_| ())
     }
 
@@ -867,7 +877,7 @@ impl Net {
         }
         // 0x588E4F…0x588E67: the full test comes first (`popcount(mask) >= limit − 1`, −2), then the
         // name (0x588E7E, −1), then the slot (0x589440) and the game's callback (−3)
-        let Some(slot) = comm::free_slot(self.mask, self.limit.min(MAX_JOINER_SLOTS + 1)) else {
+        let Some(slot) = comm::free_slot(self.mask, self.limit.min(self.slot_cap + 1)) else {
             return JoinReply { status: JoinStatus::Full, ..echo };
         };
         if j.name == self.my_name && self.my_name != [0; 16] {

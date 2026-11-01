@@ -81,6 +81,11 @@ impl App {
             // 0x5097C2's input dialog: another name, and the join goes again under it
             Some((true, DialogFor::NetName)) => {
                 let typed = self.fe.dialog_input.take().unwrap_or_default();
+                // an internet link: the entry server again, under the new name (0x509905…0x509978)
+                if self.internet_session() && !typed.trim().is_empty() {
+                    self.lobby_persona_retry(typed.trim());
+                    return false;
+                }
                 let host = self.net.session.as_ref().and_then(|n| n.host_addr());
                 if let (Some(host), false) = (host, typed.trim().is_empty()) {
                     self.fe_session_leave();
@@ -96,6 +101,10 @@ impl App {
                 let name: String = typed.chars().take(netplay::GAME_NAME_MAX).collect();
                 if let Err(e) = std::fs::write(netplay::game_name_path(), &name) {
                     tracing::debug!(error = %e, "Comms.GameName not kept");
+                }
+                if self.internet_session() {
+                    self.lobby_create(&name);
+                    return false;
                 }
                 let opened = self.net.lobby.as_ref().map(|l| l.create(&name));
                 if let Some(r) = opened {
@@ -320,8 +329,15 @@ impl App {
             return true;
         }
         let Some(c) = b.controls().into_iter().find(|c| c.index == hit) else { return false };
+        self.fe_bottom_callback(c.callback.as_deref(), event_loop);
+        true
+    }
+
+    /// What a release on a bottom-bar button runs, by its callback (the mouse's [`Self::fe_bottom_click`] and the
+    /// pad's Start / Y / View, D54): sound 5, then the callback.
+    pub(crate) fn fe_bottom_callback(&mut self, callback: Option<&str>, event_loop: &ActiveEventLoop) {
         self.fe_sound(5);
-        match c.callback.as_deref() {
+        match callback {
             // slot 0xBC — `carsetup`'s 0x4F1D00 asks 0x502420 first
             Some("QUIT") => {
                 if !self.fe_carsetup_blocked() {
@@ -338,7 +354,6 @@ impl App {
             Some("OPTIONS") => self.fe_options(),
             other => tracing::info!(callback = ?other, "bottom bar callback not ported"),
         }
-        true
     }
 
     /// `OPTIONS` — `bottombar.lay`'s `ID_OPTIONSBUTTON`, which has no `destination`. The name is
@@ -487,7 +502,7 @@ impl App {
             "ID_CARSETUP" if self.fe_carsetup_blocked() => return,
             // 0x509170 (`[+0x286]` = 1 first) / 0x50A4B0 (once, `[+0x291]`): 0x48E6F0 when the
             // session `[0x628C70]` is linked (`+8`) and not ejected (`+0xBF`)
-            "ID_COMMSCREATESCREEN" | "ID_COMMSJOINSCREEN" => self.fe_session_leave(),
+            "ID_COMMSCREATESCREEN" | "ID_COMMSJOINSCREEN" => self.fe_game_back(),
             // 0x50B4C0: 0x48E9C0 whenever the session object exists
             "ID_PEERTOPEERIP" | "ID_COMMSSERVERSCREEN" => self.fe_session_leave(),
             _ => {}

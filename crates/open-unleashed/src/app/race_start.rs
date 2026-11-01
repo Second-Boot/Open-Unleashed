@@ -654,6 +654,10 @@ impl App {
             // the same single fold the seat build makes of a record (`start_race`'s `fold_list`): the
             // record's `.PARTINDEX` when it is not the car's stock list, else the stock list itself
             let ids: Vec<i16> = rec.parts().into_iter().map(|p| p as i16).collect();
+            // **TEST GLUE** `NFS_TEST_CHEAT_PARTS=<ids,...>` (tooling, LOBBY-AC3): this machine's OWN car is built from these parts while
+            // the record it sent (and every other machine, and the lobby server, saw) says what `rec` says: a client that lies about
+            // its install, for the server's anti-cheat to catch. Not the original's.
+            let ids: Vec<i16> = std::env::var("NFS_TEST_CHEAT_PARTS").ok().map_or(ids, |v| v.split(',').filter_map(|p| p.trim().parse::<i16>().ok()).collect());
             if !ids.is_empty() && ids != car.stock_parts {
                 let owned: Vec<&nfs_formats::career::Part> = ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect();
                 self.specs.apply_parts(&owned, &car.sim_family);

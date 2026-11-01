@@ -53,6 +53,7 @@ pub mod glints;
 mod input;
 mod lists;
 mod movie;
+pub mod pad;
 pub mod loading;
 pub mod nav;
 mod parts;
@@ -545,6 +546,8 @@ pub struct LayoutScreen {
     /// `[this+0x144]` — the handle the pointer is **over**, which slot 8 writes whenever nothing
     /// is held (0x51BD02). The draw paints that one amber and the rest dark red.
     dz_hover: Option<(usize, u32)>,
+    /// the pad's handle on a dead-zone bar: the `.Max` pair (true) or the `.Min` pair (D54, PAD-SLIDERS)
+    dz_pad_max: bool,
     /// `Camera.Current` — which of the four camera slots is on, for `NFS5.CAMERASELECT` (§4.89)
     camera_current: usize,
     /// `Camera.1 … Camera.4` — the view each of the four camera slots holds (0x4E4D40 registers
@@ -1276,7 +1279,7 @@ impl LayoutScreen {
         let mut text: String = bytes.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
         if crate::remaster::enabled() {
             if own {
-                text.push_str(&crate::remaster::generated_rows(crate::remaster::page_of(name).unwrap_or(0)));
+                text = crate::remaster::with_rows(&text, &crate::remaster::generated_rows(crate::remaster::page_of(name).unwrap_or(0)));
             } else if let Some(entry) = crate::remaster::splice_file(name).and_then(|f| crate::remaster::layouts_dir(paths).and_then(|d| std::fs::read_to_string(d.join(f)).ok())) {
                 // the third graphics sub-tab: its button into `GraphicsTabs.lay`, its panel into `graphics.lay`
                 text.push('\n');
@@ -1336,6 +1339,7 @@ impl LayoutScreen {
             deadzone: Vec::new(),
             dz_grab: None,
             dz_hover: None,
+            dz_pad_max: false,
             camera_current: 0,
             camera_list: [0, 1, 2, 3],
             hud_preview: (Vec::new(), 1.0, 1.0),
@@ -3318,6 +3322,21 @@ impl LayoutScreen {
         let e = &self.layout.elements[index];
         let (x, y) = self.position_of(e);
         let (w, h) = e.pair("size")?;
+        let (knob_w, knob_h) = self
+            .shape_parts_at(e, "normal", None)
+            .into_iter()
+            .find_map(|(_, _, file, i, _)| self.shapes.get(&(file, i)).map(|&(_, dw, dh)| (dw, dh)))?;
+        Some(ChronicleSliderGeom { index, x, y, w, h, knob_w, knob_h })
+    }
+
+    /// The geometry of one `NFS5.CarSettingSlider` (element `index`): the scrollbar helper its
+    /// wrapper forwards slots 5 / 7 / 8 / 9 to (0x4D06C0 / 0x4D0710 / 0x4D0730 / 0x4D06E0 → the
+    /// helper's slots 0x14 / 0x1C / 0x20 / 0x24) is the chronicle slider's, so the track is the
+    /// `width` x `height` the `.lay` gives and the knob is the template's knob art.
+    pub fn car_setting_slider_geom(&self, index: usize) -> Option<ChronicleSliderGeom> {
+        let e = self.layout.elements.get(index).filter(|e| e.class == "NFS5.CarSettingSlider")?;
+        let (x, y) = self.position_of(e);
+        let (w, h) = (e.int("width")? as f32, e.int("height")? as f32);
         let (knob_w, knob_h) = self
             .shape_parts_at(e, "normal", None)
             .into_iter()

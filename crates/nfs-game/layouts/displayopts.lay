@@ -1,10 +1,11 @@
-; PORT-DEVIATION D47 (not part of the original): the «дополнительно» / «advanced» panel, the third sub-tab of Options > graphics.
+; PORT-DEVIATION D47 (not part of the original): the «улучшения» / «enhancements» panel, the third sub-tab of Options > graphics.
 ; Port-own layout read by the same engine, embedded in the binary (nfs_game::display_opts), loaded as the panel
 ; ID_DISPLAYPANEL that display_graphics.lay (spliced into graphics.lay at load) names and display_tab.lay's tab button
 ; selects; it is a panel layout like graphicsettings.lay / advgraphics.lay (no screen of its own, the Options oval behind).
 ; Built from widget types the original's display.lay uses. The rows (a caption label + a level combo bound to
 ; PortDisplay.<token>) are NOT in this file: they are generated from the options table (nfs_game::display_opts::REGISTRY) and
-; appended at load. Strings are the port's own table (ids 950000 and up), not FEStrings.loc.
+; inserted right after section 0 at load (ahead of the backgrounds below: the first section takes the click,
+; 0x528C00). Strings are the port's own table (ids 950000 and up), not FEStrings.loc.
 [section.0]
 id=REAL.BLACK_640x480
 name=ID_SCREEN

@@ -57,19 +57,26 @@ impl NetPlay {
                 tracing::info!(%host, addr = %n.local_addr()?, "joining");
                 n
             }
-            // `accountlogin`'s SIGNON (0x5109B0 → 0x48E1A0(net, 1, 0, "porsche-entry.earacing.com")): a connect to the
-            // EA lobby service, which no longer exists — the session is a client that never hears an answer, so the
-            // connect's 16 s deadline ends it in state 4 (830)
-            "signon" => {
-                let sock = CommSocket::bind_on(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))?;
-                with_probe(Net::client(sock, key(), name16(who)))
-            }
             other => anyhow::bail!(
                 "--net wants `host`, `host:PORT` or `join:HOST[:PORT]`, not {other:?}"
             ),
         };
+        let mut n = Self::from_net(net, mode, who, join_target.map(|h| (h, who.to_string(), Instant::now())));
+        // the host's own player is the room's first, id 0: in the original the host's game
+        // joins the room object like any other (0x48BB50 hands out the lowest clear bit of
+        // `room+0xCC0`, and the room is empty)
+        if n.is_host() {
+            let out = n.room.admit(0, &who.as_bytes()[..who.len().min(room::NAME_MAX)]);
+            n.dispatch(out);
+        }
+        Ok(n)
+    }
+
+    /// The session object around a built [`Net`]: `mode` is `host`, `join` or (for the lobby link) anything else.
+    pub(super) fn from_net(net: Net, mode: &str, who: &str, join_wait: Option<(SocketAddr, String, Instant)>) -> Self {
+        let _ = who;
         let id = if net.role == Role::Host { 0 } else { u8::MAX }; // a client's id arrives with its 'a'
-        let mut n = Self {
+        Self {
             net,
             id,
             remotes: HashMap::new(),
@@ -89,7 +96,7 @@ impl NetPlay {
             lockstep_seen: None,
             start_due: false,
             join: if mode == "host" { JoinState::Hosting } else { JoinState::Pending(Instant::now()) },
-            join_wait: join_target.map(|h| (h, who.to_string(), Instant::now())),
+            join_wait,
             hello_wait: Default::default(),
             options: HashMap::new(),
             options_in: Vec::new(),
@@ -103,10 +110,10 @@ impl NetPlay {
             in_race: 0,
             pings: HashMap::new(),
             net148: tick_ms(),
-            reported: HashMap::new(),
+
             launch_index: Vec::new(),
             exch: Default::default(),
-            server: Default::default(),
+            host: Default::default(),
             exchange: false,
             clocked: false,
             timer_anchor: None,
@@ -118,15 +125,8 @@ impl NetPlay {
             sent_time: false,
             tick_override: None,
             voice: Default::default(),
-        };
-        // the host's own player is the room's first, id 0: in the original the host's game
-        // joins the room object like any other (0x48BB50 hands out the lowest clear bit of
-        // `room+0xCC0`, and the room is empty)
-        if n.is_host() {
-            let out = n.room.admit(0, &who.as_bytes()[..who.len().min(room::NAME_MAX)]);
-            n.dispatch(out);
+            inet: None,
         }
-        Ok(n)
     }
 
     /// Deliver what the room object sends — the host's half (0x48C870 on the room's links). Every
@@ -174,6 +174,10 @@ impl NetPlay {
 
     /// One room message for our own player (0x48F0A0's cases).
     pub(super) fn hear(&mut self, m: &[u8]) {
+        // the internet lobby's own messages (`0xB2`, `0xB4`, `0xB5`, `0xB8`, `0xB9`)
+        if self.hear_lobby(m) {
+            return;
+        }
         // 0x48F76C (`0xC1` / `0xC2`): the voice object's receiver 0x493270, when there is one
         if let Some(p) = nfs_net::voice::packets(m) {
             self.voice.receive(&p);
@@ -309,7 +313,7 @@ impl NetPlay {
             // 0x48F46F / 0x48F4FD…0x48F51B: the player's bits leave `+0xE4` and `+0xE5`
             Some(Heard::Left(id)) => {
                 self.pings.remove(&id);
-                self.reported.remove(&id);
+                self.host.reported.remove(&id);
                 if (0..8).contains(&id) {
                     self.in_race &= !(1u8 << id);
                     self.slots.clear(id as usize);
@@ -340,47 +344,27 @@ impl NetPlay {
         if !self.is_host() {
             return;
         }
-        let count = self.room.players.len() as u32;
-        let (rname, dbytes, dwords) = (self.net.name, self.net.desc_bytes, self.net.desc_words);
-        self.dispatch(vec![(To::All, room::description(ROOM_ID, &rname, dbytes, dwords, count))]);
+        let desc = self.room_desc();
+        let d = self.host.describe(&self.room, &desc);
+        self.dispatch(vec![d]);
+    }
+
+    /// The room's `0xB4` inputs: its number and the session's name field and descriptor.
+    pub(super) fn room_desc(&self) -> nfs_net::host::RoomDesc {
+        nfs_net::host::RoomDesc::of(&self.net, ROOM_ID)
     }
 
     /// 0x48BB50 — the room admits a player (the old body of the `PeerJoined` arm).
     fn admit_peer(&mut self, slot: u32, _log: &mut Vec<String>) {
-        // 0x48BB50: the room tells the newcomer who is there, and everyone of it
         let id = slot as i32 + 1;
         let name = self.net.peers.get(slot as usize).and_then(|p| p.as_ref()).map(|p| p.name).unwrap_or_default();
         let name = name.split(|&c| c == 0).next().unwrap_or_default().to_vec();
-        // captured order (REFERENCE-2026-10-02-SRVX, the original host): the description 0xB4 (0x48BBC7), the host's option records,
-        // 0xB2 (0x48BC1B), the 0xB0s, the second description (count + 1), `0xC6 (0xE)`
-        let count = self.room.players.len() as u32;
-        let (rname, dbytes, dwords) = (self.net.name, self.net.desc_bytes, self.net.desc_words);
-        let to_new = |m: Vec<u8>| (To::Player(id), m);
-        self.dispatch(vec![to_new(room::description(ROOM_ID, &rname, dbytes, dwords, count))]);
-        // 0x48BBEE…0x48BBFC: for every player already in the room, 0x48A390 replays that player's own message list (`player+0xC8`) to the
-        // newcomer, host first, before `0xB2` (0x48BC1B). The list is the log `Room::file_options` keeps (0x48A2F0: the `0xBC` messages a
-        // player sent in the lobby group, one per key). The capture (two originals) shows the host's list: the create screen's
-        // options `0x14` (COMMSPOSITIONAL), `0xD`, `0xF`, `0xC`, then the lobby's rows `0x226`, `0x141`, `0x225`, `0x255` (slot 0). Only the
-        // newcomer hears them (To::Player), not every link.
-        let recs: Vec<(To, Vec<u8>)> = self.room.replay_all().into_iter().map(to_new).collect();
-        if !recs.is_empty() {
-            self.dispatch(recs);
-        }
-        let end = rname.iter().position(|&c| c == 0 || c == b'~').unwrap_or(rname.len());
-        let mut out = vec![to_new(room::your_id(id, &rname[..end]))];
-        let mut adm = self.room.admit(id, &name);
-        let c6 = if adm.last().map(|m| m.1.first()) == Some(Some(&0xC6)) { adm.pop() } else { None };
-        out.extend(adm);
-        // 0x48BCE3…0x48BCEE: `room+0xAC` + 1, then 0x490B70 sends the description (0x48BAA0) to every player record of the manager's
-        // list `mgr+0x164` — every connected player, not the newcomer alone (live: the original host's runB / run3,
-        // an earlier joiner gets the newcomer's `0xB0` and then `0xB4` with the new count)
-        out.push((To::All, room::description(ROOM_ID, &rname, dbytes, dwords, count + 1)));
-        out.extend(c6);
+        // the room's protocol side builds the whole admission in the captured order (`nfs_net::host::HostSide::admit`)
+        let desc = self.room_desc();
+        let out = self.host.admit(&self.room, &desc, id, &name);
         self.dispatch(out);
         // 0x491AB4 / 0x491C25: the handler's last store, `+0xBA = 1`, after the `0xC6`
         self.net.peer_in(slot);
-        // 0x48BB66: the newcomer's bit in the exchange room's `+0xCC0` and `+0xCC2`
-        self.server.join(slot as usize + 1);
         // A newcomer hears **no** earlier record: 0x48BB50 / 0x4924D0 send the `0xB0`s and the
         // room description, no state (`network.md` §11.9). What makes every machine know
         // every car is the launch's per-slot resend with race indices (`send_launch`,
@@ -425,8 +409,11 @@ impl NetPlay {
             && last.elapsed() >= Duration::from_secs(1)
         {
             let (h, w) = (*host, who.clone());
-            let _ = self.net.join(h, &join_identity(&w));
             *last = Instant::now();
+            let _ = match &self.inet {
+                Some(i) => self.net.join_account(h, &i.account, &nfs_net::lobby::identity(&w, &game_version())),
+                None => self.net.join(h, &join_identity(&w)),
+            };
         }
         for e in self.net.poll() {
             if let Event::Data { slot: Some(s), bytes, .. } = &e
@@ -443,16 +430,25 @@ impl NetPlay {
                 Event::Joined { slot } => {
                     let join_who = self.join_wait.take().map(|(_, w, _)| w);
                     self.join = JoinState::Joined;
-                    self.id = slot as u8 + 1;
-                    self.room.me = self.id as i32;
+                    // a lobby link has no id until the server's `0xB2` (`lobby.md` §5.3)
+                    if self.inet.is_none() {
+                        self.id = slot as u8 + 1;
+                        self.room.me = self.id as i32;
+                    }
                     log.push(format!("joined at slot {slot}, player id {}", self.id));
                     // the CONMAN's hello, 0x55CED0 via 0x560420 (captured, REFERENCE-2026-10-02-SRVE.md / SRVX): the first frame
                     // of the data layer is `0xFF, 0x00, "Player\0", <identity>\0`; the original host answers it with the
                     // link message `0xFE, 1` and an original joiner waits 5 s for that answer (0x55CED0)
                     if let Some(who) = join_who {
-                        let mut hello = vec![0xFF, 0x00];
-                        hello.extend_from_slice(b"Player\0");
-                        hello.extend_from_slice(&join_identity(&who));
+                        let hello = match &self.inet {
+                            Some(i) => nfs_net::lobby::hello(&i.account, &nfs_net::lobby::identity(&who, &game_version())),
+                            None => {
+                                let mut hello = vec![0xFF, 0x00];
+                                hello.extend_from_slice(b"Player\0");
+                                hello.extend_from_slice(&join_identity(&who));
+                                hello
+                            }
+                        };
                         let _ = self.net.send_game(&hello);
                     }
                 }
@@ -473,12 +469,12 @@ impl NetPlay {
                     self.slots.clear(slot as usize + 1);
                     self.in_race &= !(1u8 << (slot + 1));
                     // 0x48BDA0: a player in the race is reported out (0x48C220), then its bit leaves `+0xCC0`
-                    self.server.out_of_race(slot as usize + 1);
-                    self.server.leave(slot as usize + 1);
+                    self.host.exchange_leave(slot as i32 + 1);
                     log.push(format!("slot {slot} left"));
                     // 0x48BE05: the room tells everyone left that the player has gone
                     let was_in = self.in_room(slot as i32 + 1);
-                    self.dispatch(vec![(To::All, room::player_out(slot as i32 + 1))]);
+                    let gone = self.host.player_out(slot as i32 + 1);
+                    self.dispatch(vec![gone]);
                     if was_in {
                         self.describe_room_to_all();
                     }
@@ -500,20 +496,14 @@ impl NetPlay {
                 Event::Data { slot: Some(s), bytes, .. }
                     if self.is_host() && bytes.first() == Some(&kind::CHAT) =>
                 {
-                    if let Some(r) = ChatRequest::parse(&bytes) {
-                        let out = self.room.route_chat(s as i32 + 1, r.to, &r.text);
-                        self.dispatch(out);
-                    }
+                    let out = self.host.chat(&self.room, s as i32 + 1, &bytes);
+                    self.dispatch(out);
                 }
                 // a player's `0xBC` record: the room's relay 0x48C050 sends it to the players in the
                 // sender's lobby group (`+0xCC2`) and no others — the host's own copy included
                 Event::Data { slot: Some(s), bytes, .. } if self.is_host() && bytes.first() == Some(&kind::OPTIONS) => {
-                    self.room.file_options(s as i32 + 1, &bytes);
-                    let mut out = self.room.relay_options(s as i32 + 1, &bytes);
-                    // 0x48C0A4: the original's list includes the sender, which hears its own record back — an original joiner keeps its
-                    // table (its own `.READY`, which PLAYGAME's 0x50CF0C reads) from that echo alone. Live: without it the original
-                    // joiner pressed READY, the host saw it, but at PLAYGAME the joiner's own `.READY` read 0 and it aborted (0xB7 −2, −1)
-                    out.push((To::Player(s as i32 + 1), bytes.to_vec()));
+                    // (`HostSide::options` includes 0x48C0A4's echo to the sender)
+                    let out = self.host.options(&mut self.room, s as i32 + 1, &bytes);
                     self.dispatch(out);
                 }
                 // the room's `0xB3` / `0xC5` / `0xB7` cases (0x49120C's jump table, 0x4917C0 / 0x49185B /
@@ -533,7 +523,7 @@ impl NetPlay {
                 // message below `0xB0` to the player record's 0x48A2C0 → the room's 0x48C2B0: the
                 // three bytes go into the block of the frame being filled
                 Event::Data { slot: Some(s), bytes, .. } if self.is_host() && bytes.len() >= 3 && bytes[0] < 0xB0 => {
-                    self.server.input(s as usize + 1, [bytes[0], bytes[1], bytes[2]]);
+                    self.host.input(s as i32 + 1, &bytes);
                 }
                 // and a frame from the host reaches a player (0x48F0DC)
                 Event::Data { bytes, .. } if !self.is_host() && bytes.len() >= nfs_net::exchange::FRAME && bytes[0] < 0xB0 => {
@@ -588,11 +578,11 @@ impl NetPlay {
             match e {
                 Event::PeerLeft { slot } => {
                     log.push(format!("slot {slot} timed out"));
-                    self.server.out_of_race(slot as usize + 1);
-                    self.server.leave(slot as usize + 1);
+                    self.host.exchange_leave(slot as i32 + 1);
                     self.remotes
                         .retain(|_, r| Some(r.seat) != self.seats.get(slot as usize).copied());
-                    self.dispatch(vec![(To::All, room::player_out(slot as i32 + 1))]);
+                    let gone = self.host.player_out(slot as i32 + 1);
+                    self.dispatch(vec![gone]);
                 }
                 other => log.push(format!("{other:?}")),
             }
@@ -622,6 +612,7 @@ impl NetPlay {
         if self.is_host() {
             log.extend(self.server_tick());
         }
+        self.poll_internet();
         log
     }
 

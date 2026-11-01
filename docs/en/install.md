@@ -38,6 +38,18 @@ Network races use **UDP port 9442**.
 - **Windows** may show a firewall prompt — allow private networks for LAN / internet play.
 - **Linux:** open UDP 9442 in your firewall if you host.
 
+### Internet games
+
+**multiplayer → internet** (the sign-on screen) connects to an online lobby over the same UDP protocol: type an account and a
+password, press **sign on**, choose a server, then create or join a game there. The lobby's address is set in this order:
+
+1. the environment variable `NFS_LOBBY_ADDRESS=host[:port]`;
+2. a line `address=host[:port]` in the text file `lobby.txt` in the saves folder (see below);
+3. the address built into the game (the port defaults to 9442).
+
+**register** opens the registration page in your browser. The server list shows only servers that answer a ping; on a system
+that does not allow an unprivileged ping, every listed server shows the time of your own connection instead.
+
 ## Saves, settings and the log
 
 | System | Folder |
@@ -47,14 +59,14 @@ Network races use **UDP port 9442**.
 | Linux | `$XDG_DATA_HOME/PorscheUnleashed`, else `~/.local/share/PorscheUnleashed` |
 
 Career saves are written as the original writes them (`SaveData/…sav`). `open-unleashed.log` in the same folder records
-each start — attach it when you report a problem. `display.json` there holds the five display rows of the enhancements tab (frame output, frame rate limit, MSAA, anisotropic filtering, render scale; delete it to get the defaults back; in a safe-mode start those choices are ignored once). `NFS5_SAVE_DIR=<folder>` points the saves elsewhere.
+each start — attach it when you report a problem. `enhancements.json` there holds the choices of Options > graphics > enhancements (delete it to get the defaults back; in a safe-mode start those choices are ignored once). `NFS5_SAVE_DIR=<folder>` points the saves elsewhere.
 
 ## If something goes wrong
 
 - **"original game data not found"** — the `game` folder does not hold `GameData` and `FEData`, or they are one level
   deeper. See [game data](game-data.md).
 - **The game does not start / crashes at start-up** — look at `open-unleashed.log` (above) and report it with your system
-  and GPU. A start that follows a crashed one runs once in a safe mode (a plain GPU device, on Windows Direct3D 12, every enhancement off) and
+  and GPU. A start that follows a crashed one runs once in a safe mode (a plain GPU device, on Windows Direct3D 12) and
   the log says so; if the next start is normal again, nothing is needed. On Windows an Intel integrated GPU uses
   Direct3D 12 by default, and the archive carries `dxcompiler.dll` and `dxil.dll` (the DirectX Shader Compiler) beside
   the exe; `WGPU_BACKEND=vulkan` (or `dx12` / `gl`) picks the graphics API by hand.

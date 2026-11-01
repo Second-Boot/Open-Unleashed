@@ -17,6 +17,11 @@ impl App {
 
     /// Navigate the previewed front-end screen: the buttons carry the name of the screen they lead to.
     pub(crate) fn layout_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
+        // PORT-DEVIATION D54: the arrows, the pad and a pointer-placed Enter run on the virtual pointer
+        // (`pad_menu.rs`); what it leaves is the older Enter on `layout_sel`, which the mouse's release uses
+        if self.pad_menu_key(key, event_loop) {
+            return;
+        }
         let Some(l) = self.fe.layout_preview.as_ref() else {
             return;
         };
@@ -29,14 +34,8 @@ impl App {
         }
         let sel = self.fe.layout_sel.min(controls.len() - 1);
         match key {
-            MenuKey::Up => {
-                self.fe.layout_sel = (sel + controls.len() - 1) % controls.len();
-                self.fe.layout_nav_used = true;
-            }
-            MenuKey::Down => {
-                self.fe.layout_sel = (sel + 1) % controls.len();
-                self.fe.layout_nav_used = true;
-            }
+            // the arrows and the pad's keys never get here: `pad_menu_key` took them (D54)
+            MenuKey::Up | MenuKey::Down | MenuKey::Play | MenuKey::Options | MenuKey::Quit | MenuKey::TabPrev | MenuKey::TabNext => {}
             // A key reaches **no combo** (`controls.md` §4.171.8, CONFIRMED). A key is a type-2
             // event; 0x5289B0 hands it to the capture or the widget under the pointer, whose
             // slot 3 0x525F80 sends type 2 to slot 4, and `FeComboBox`'s (0x5B5C24 + 0x10) and
@@ -146,21 +145,21 @@ impl App {
                     self.bind_indicator_bars();
                     return;
                 }
-                // `carsetup.lay`'s three (0x4F1A30 / 0x4F1A50 / 0x4F1A70) on the garage car:
-                // `SAVESETTINGS` copies the setup over the backup (0x4EF4E0, after 0x4F14B0 has
-                // taken the sliders, which the port writes through as they move), `LOADSETTINGS`
-                // the backup over the setup (0x4EF4C0) and `DEFAULTSETTINGS` puts the
+                // `carsetup.lay`'s three (0x4F1A30 / 0x4F1A50 / 0x4F1A70) on the garage car
+                // (`OwnedCars.Car`, 0x4F18D0): `SAVESETTINGS` commits the sliders (0x4F14B0) and copies the setup over the backup (0x4EF4E0),
+                // `LOADSETTINGS` the backup over the setup (0x4EF4C0) and `DEFAULTSETTINGS` puts the
                 // constructor's defaults back (0x4EF500); the last two re-read the sliders
-                // (0x4F1080)
+                // (0x4F1080). Leaving the screen commits too (its destructor 0x4F1A00 calls
+                // 0x4F14B0), so an edit stays unless LOADSETTINGS took it back — `LOAD` is the cancel.
                 if let Some(cb @ ("SAVESETTINGS" | "LOADSETTINGS" | "DEFAULTSETTINGS")) = c.callback.as_deref()
                     && let Some(cu) = self.career.as_mut()
                 {
                     let sel = cu.car_sel.min(cu.career.garage.len().saturating_sub(1));
                     if let Some(o) = cu.career.garage.get_mut(sel) {
                         match cb {
-                            "SAVESETTINGS" => o.setup_backup = o.setup,
-                            "LOADSETTINGS" => o.setup = o.setup_backup,
-                            _ => o.setup = nfs_game::career::CAR_SETUP_DEFAULT,
+                            "SAVESETTINGS" => o.save_setup(),
+                            "LOADSETTINGS" => o.load_setup(),
+                            _ => o.default_setup(),
                         }
                     }
                     self.bind_indicator_bars();
@@ -554,9 +553,10 @@ impl App {
                 }
                 // `carsetup.lay`'s `TESTDRIVECHECK` (0x4F1A90): unless 0x502420 says no
                 // (`fe_carsetup_blocked`), 0x4F14B0, then `0x4D2100("testdrivecarsetup", 1, 1)` —
-                // pushed over the setup screen. 0x4F14B0 is not read.
+                // pushed over the setup screen. 0x4F14B0 commits the sliders to the car.
                 if c.callback.as_deref() == Some("TESTDRIVECHECK") {
                     if !self.fe_carsetup_blocked() {
+                        self.carsetup_commit();
                         self.fe_open("testdrivecarsetup", 1, true);
                     }
                     return;
@@ -676,7 +676,7 @@ impl App {
         l.in_transition() || room_busy
     }
 
-    fn fe_manager_key(&mut self, code: u8, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn fe_manager_key(&mut self, code: u8, event_loop: &ActiveEventLoop) -> bool {
         let button_enabled = |b: &Option<nfs_game::layout::LayoutScreen>, name: &str| {
             b.as_ref().and_then(|b| b.widgets_named(&[name]).first().map(|(i, _)| !b.widget_disabled(*i))).unwrap_or(false)
         };
@@ -736,6 +736,7 @@ impl App {
     pub(crate) fn fe_apply_combo_drag(&mut self) {
         // `NFS5.CHRONICLESLIDER`'s knob (0x4D0F20) rides the same move events
         self.chronicle_slider_move();
+        self.carsetup_slider_move();
         if let (Some((index, gy, at)), Some((cx, cy))) = (self.fe.combo_drag, self.fe.cursor) {
             let Some(l) = self.fe.layout_preview.as_ref() else { return };
             if !matches!(l.combo_scroll_at(cx, cy), Some((i, 3 | 4)) if i == index) {
@@ -784,8 +785,10 @@ impl App {
         }
         if down {
             self.chronicle_slider_press();
+            self.carsetup_slider_press();
         } else {
             self.fe.chronicle_slider_drag = None;
+            self.fe.carsetup_slider_drag = None;
         }
         // `NFS5.ChroniclePicture` drags its picture about: slot 5 takes hold, slot 8
         // pans, slot 9 lets go (§4.119)

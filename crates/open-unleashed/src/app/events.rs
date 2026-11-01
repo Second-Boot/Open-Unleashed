@@ -95,6 +95,8 @@ impl App {
                 Some(_) => self.pause_confirm = None,
                 None => self.paused = false,
             },
+            // the front end's pad keys (D54) are not the race's
+            MenuKey::Play | MenuKey::Options | MenuKey::Quit | MenuKey::TabPrev | MenuKey::TabNext => {}
         }
     }
 
@@ -615,108 +617,9 @@ impl ApplicationHandler for App {
                     let (fw, x0) = if aspect > design_aspect { (design_aspect / aspect, (1.0 - design_aspect / aspect) * 0.5) } else { (1.0, 0.0) };
                     ((u - x0) / fw * 640.0, v * 480.0)
                 }) };
-                // **`FEControl::onMouseEnter` 0x4C7B90 plays sound 6** through slot 23 (0x4C7A30):
-                // on entering a widget whose state is now `"hover"` (the string compare at
-                // 0x4C7BD9), that was not hovered already (0x4C7BA5) and is not disabled (bit 0x10,
-                // 0x4C7C18). Not carried: 0x4C7C1C's accessor-driven disable (0x4E08E0), which
-                // this port does not model (§4.110).
-                // the move event is 0x4D2850's to drop as well: while it does, only the cursor
-                // sprite follows the device (0x4D32DB); the widgets keep the pointer they had
-                if self.fe_input_swallowed() {
-                    let at = self.fe.cursor;
-                    if let Some(l) = self.fe.layout_preview.as_mut() {
-                        l.set_pointer(at);
-                    }
-                    if let Some(b) = self.fe.layout_bottom.as_mut() {
-                        b.set_pointer(at);
-                    }
-                    return;
-                }
-                if let (Some(l), Some((cx, cy))) = (self.fe.layout_preview.as_mut(), self.fe.cursor) {
-                    l.set_cursor(Some((cx, cy)));
-                }
-                // a dialog's buttons take the pointer too (slot 8, 0x515060)
-                if let (Some((d, _)), Some((cx, cy)), Some(l)) = (self.fe.dialog.as_mut(), self.fe.cursor, self.fe.layout_preview.as_ref().or(self.fe.layout_bottom.as_ref())) {
-                    let th = l.dialog_text_height(&d.text);
-                    let sounds = d.pointer(cx, cy, th);
-                    for s in sounds {
-                        self.fe_sound(s as usize);
-                    }
-                }
-                let now = self.fe.layout_preview.as_ref().and_then(|l| l.hovered());
-                if now != self.fe.last_hover {
-                    self.fe.last_hover = now;
-                    if let (Some(i), Some(l)) = (now, self.fe.layout_preview.as_ref()) {
-                        let controls = l.controls();
-                        // same gate as `fe_sprites`'s `sel`: the keyboard cursor is not the
-                        // original's `selected` flag until Up/Down has actually moved it
-                        let sel = controls
-                            .get(self.fe.layout_sel.min(controls.len().saturating_sub(1)))
-                            .map(|c| c.index)
-                            .filter(|_| self.fe.layout_nav_used);
-                        if l.state_name(i, sel).as_deref() == Some("hover") && !l.widget_disabled(i) {
-                            self.fe_sound(6);
-                        }
-                    }
-                }
-                // Dragging the scrollbar's knob. `FeScrollBar`'s slot 8, 0x4D0F20: with the knob
-                // grabbed (`[this+0x10C] == 3`) and the pointer still on the bar, it sets the
-                // model's position to
-                // `grabPosition + (y - grabY) · (positions - 1) / (trackHeight - knobHeight)`
-                // — the exact inverse of the placement at 0x4D0BBE — and re-places the knob.
-                if let (Some((index, gy, at)), Some((_, cy))) = (self.fe.list_drag, self.fe.cursor) {
-                    let span = self.fe.layout_preview.as_ref().and_then(|l| l.list_scrollbar(index)).map(|b| (b.span, b.positions));
-                    if let Some((span, positions)) = span
-                        && span > 0.0
-                        && positions > 1
-                        && let Some(l) = self.fe.layout_preview.as_mut()
-                    {
-                        let moved = ((cy - gy) * (positions - 1) as f32 / span).round() as i32;
-                        l.set_list_scroll(index, at as i32 + moved);
-                    }
-                }
-                // The open combo's **own** scrollbar knob drag — same arithmetic, `combo_scroll_track`'s
-                // numbers instead of `list_scrollbar`'s (§4.90's bar, not `NFS5.VerticalSlider`'s).
-                // User report 2026-09-30 (b). Shared with the `NFS_FE_CLICKS=drag:…` diagnostic.
-                self.fe_apply_combo_drag();
-                // `NFS5.ColorBox`'s slot 8, 0x4C4830: while the editor is up the widget holds the
-                // capture, so every move reaches it, and it drags the hue, the saturation or the
-                // luminance whenever a button is held (§4.66)
-                if let (Some(l), Some((cx, cy))) = (self.fe.layout_preview.as_mut(), self.fe.cursor) {
-                    l.picker_move(cx, cy);
-                    l.deadzone_drag(cx, cy);
-                }
-                if self.fe.layout_preview.as_ref().is_some_and(|l| l.open_picker().is_some()) {
-                    self.store_picker_wells();
-                    // slot 8 (0x4C4830) reaches the same tail as the press, only while a button
-                    // is held (0x5299C0), and tells the accessor again (0x4C493B)
-                    if self.fe.mouse_down {
-                        self.picker_tell_accessor();
-                    }
-                }
-                // the open drop-down's scrollbar tracks the pointer so its arrows can show their
-                // hovered frame — `[this+0xEC]`, which 0x4DB2F0 writes on every move (§4.101)
-                if let Some((cx, cy)) = self.fe.cursor {
-                    let at = self.fe.layout_preview.as_ref().and_then(|l| l.combo_scroll_at(cx, cy));
-                    let held = self.fe.mouse_down;
-                    if let Some(l) = self.fe.layout_preview.as_mut() {
-                        l.set_combo_scroll(at.map(|(i, r)| (i, r, held)));
-                    }
-                }
-                if let Some((cx, cy)) = self.fe.cursor
-                    && let Some(l) = self.fe.layout_preview.as_mut()
-                {
-                    l.picture_drag_to(cx, cy);
-                }
-                if self.fe.bar_grab.is_some()
-                    && let Some((cx, cy)) = self.fe.cursor
-                    && let Some((_, name, f)) = self.fe.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
-                {
-                    self.set_accessor_fraction(&name, f);
-                    // the bar's draw reads its accessor every frame (0x4CA724); the port's fill is set
-                    // at bind time, so set it again
-                    self.bind_indicator_bars();
-                }
+                // the widgets' side of a pointer move: `fe_pointer_moved` (the pad's virtual pointer runs it too, D54)
+                self.fe.pad_target = None;
+                self.fe_pointer_moved();
             }
             WindowEvent::CursorLeft { .. } => self.fe.cursor = None,
             // `RE/notes/controls.md` §4.40: the pump stamps a `MouseButtonEvent` type **4** on the
@@ -747,23 +650,52 @@ impl ApplicationHandler for App {
                 // timers, so the `b` of 0x4D2970 comes from the keyboard only and no pad button
                 // goes back on a layout screen. (The pad's other keys are the port's own on both.)
                 let text_menu = self.fe.layout_preview.is_none();
+                // PORT-DEVIATION D54 (the layout screens' pad scheme, `pad_menu.rs`): B backs, Y is the bottom
+                // bar's options, Start its race, View the exit question, LB / RB the tabs. The text menu keeps
+                // D10's d-pad, A and B; X is nobody's here
                 let mut keys: Vec<MenuKey> = self
                     .input
                     .pad_menu
                     .iter()
                     .filter_map(|k| {
+                        use nfs_input::MenuNav as N;
                         Some(match k {
-                            nfs_input::MenuNav::Up => MenuKey::Up,
-                            nfs_input::MenuNav::Down => MenuKey::Down,
-                            nfs_input::MenuNav::Left => MenuKey::Left,
-                            nfs_input::MenuNav::Right => MenuKey::Right,
-                            nfs_input::MenuNav::Select => MenuKey::Enter,
-                            nfs_input::MenuNav::Back if text_menu => MenuKey::Back,
-                            // Y and X are the race's dialog keys (PAD-END2), not the menus'
-                            nfs_input::MenuNav::Back | nfs_input::MenuNav::Alt | nfs_input::MenuNav::Aux => return None,
+                            N::Up => MenuKey::Up,
+                            N::Down => MenuKey::Down,
+                            N::Left => MenuKey::Left,
+                            N::Right => MenuKey::Right,
+                            N::Select => MenuKey::Enter,
+                            N::Back => MenuKey::Back,
+                            N::Alt if !text_menu => MenuKey::Options,
+                            N::Start if !text_menu => MenuKey::Play,
+                            N::View if !text_menu => MenuKey::Quit,
+                            N::Prev if !text_menu => MenuKey::TabPrev,
+                            N::Next if !text_menu => MenuKey::TabNext,
+                            N::Alt | N::Aux | N::Start | N::View | N::Prev | N::Next => return None,
                         })
                     })
                     .collect();
+                // PAD-SLIDERS (D54): a held direction / shoulder repeats, for the widgets it adjusts alone
+                let repeats: Vec<MenuKey> = if text_menu {
+                    Vec::new()
+                } else {
+                    self.input
+                        .pad_menu_repeat
+                        .iter()
+                        .filter_map(|k| {
+                            use nfs_input::MenuNav as N;
+                            match k {
+                                N::Up => Some(MenuKey::Up),
+                                N::Down => Some(MenuKey::Down),
+                                N::Left => Some(MenuKey::Left),
+                                N::Right => Some(MenuKey::Right),
+                                N::Prev => Some(MenuKey::TabPrev),
+                                N::Next => Some(MenuKey::TabNext),
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                };
                 self.input.end_tick();
                 // the pad's keys are the port's own; they go the way 0x4D2850 sends keys — and
                 // not while a binding row listens (0x51C4E0): the button is the row's capture
@@ -785,6 +717,13 @@ impl ApplicationHandler for App {
                     if self.fe.menu.is_none() {
                         next_frame(self);
                         return;
+                    }
+                }
+                if !self.fe_input_swallowed() && self.fe.binding_base.is_none() {
+                    for k in repeats {
+                        if self.pad_repeat_ok(k) {
+                            self.menu_key(k, event_loop);
+                        }
                     }
                 }
                 // the dialog's tick (0x512980 and the kind's own), its answer, and the covering
@@ -846,6 +785,8 @@ impl ApplicationHandler for App {
                                 // B: the question's "no" / the menu's "continue" (PAD-END2, D10)
                                 nfs_input::MenuNav::Back => MenuKey::Back,
                                 nfs_input::MenuNav::Alt | nfs_input::MenuNav::Aux => continue,
+                                // the front end's own keys (D54); the pause menu has no use for them
+                                nfs_input::MenuNav::Start | nfs_input::MenuNav::View | nfs_input::MenuNav::Prev | nfs_input::MenuNav::Next => continue,
                             };
                             self.pause_menu_key(key, event_loop);
                             if !self.paused || self.vehicle.is_none() {

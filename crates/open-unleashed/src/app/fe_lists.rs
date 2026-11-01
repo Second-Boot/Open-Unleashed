@@ -158,6 +158,13 @@ impl App {
         Some((c.tables.car(o.car_id)?, o))
     }
 
+    /// The garage car `OwnedCars.Car` stands on (0x4F5A20), for the screens that edit it.
+    pub(crate) fn garage_car_mut(&mut self) -> Option<&mut nfs_game::career::OwnedCar> {
+        let c = self.career.as_mut()?;
+        let sel = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+        c.career.garage.get_mut(sel)
+    }
+
     /// `DealerCar.Car`'s list `[0x691A00]`, filled by 0x4F4000…0x4F4294: every catalogue record the
     /// dealer offers this year (`Career::dealer_lists`), then 0x4F0F50's exchange sort — for each
     /// `i`, every later `j` that 0x4F1D40 puts first swaps with it — on era `+0x1B0`, then class

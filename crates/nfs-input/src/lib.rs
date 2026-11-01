@@ -237,6 +237,56 @@ pub enum MenuNav {
     Alt,
     /// the standard pad's X (`face[3]`): the replay bar's "save" (PAD-END2, D10)
     Aux,
+    /// Start: the front end's bottom bar "race" button (PORT-DEVIATION D54); a race ignores it
+    Start,
+    /// View / Back / Select (SDL's `BACK`): the front end's "exit" question, the Escape path (D54)
+    View,
+    /// the left shoulder: the previous tab of a screen with tab buttons (D54)
+    Prev,
+    /// the right shoulder: the next tab (D54)
+    Next,
+}
+
+/// The hold-repeat of a pad's direction and shoulder keys in the front end (PAD-SLIDERS, PORT-DEVIATION D54): the key held
+/// since `press` repeats after [`MenuHold::DELAY`], then every [`MenuHold::EVERY`]. Only the keys that can *adjust* a
+/// value repeat (the four directions and the shoulders); one key is held at a time (the last pressed).
+#[derive(Debug, Default, Clone)]
+pub struct MenuHold {
+    held: Option<(MenuNav, std::time::Instant)>,
+}
+
+impl MenuHold {
+    /// the wait before the first repeat
+    pub const DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+    /// the interval between repeats
+    pub const EVERY: std::time::Duration = std::time::Duration::from_millis(80);
+
+    /// `key` went down at `now`.
+    pub fn press(&mut self, key: MenuNav, now: std::time::Instant) {
+        self.held = matches!(key, MenuNav::Up | MenuNav::Down | MenuNav::Left | MenuNav::Right | MenuNav::Prev | MenuNav::Next).then_some((key, now + Self::DELAY));
+    }
+
+    /// `key` came up.
+    pub fn release(&mut self, key: MenuNav) {
+        if self.held.is_some_and(|(k, _)| k == key) {
+            self.held = None;
+        }
+    }
+
+    /// The repeats due at `now`: the held key once per interval since the last call, none before the delay.
+    pub fn due(&mut self, now: std::time::Instant) -> Vec<MenuNav> {
+        let mut out = Vec::new();
+        if let Some((k, next)) = self.held.as_mut() {
+            while *next <= now && out.len() < 8 {
+                out.push(*k);
+                *next += Self::EVERY;
+            }
+            if *next <= now {
+                *next = now + Self::EVERY;
+            }
+        }
+        out
+    }
 }
 
 /// Current logical input state, updated from window events and sampled once per tick.
@@ -257,6 +307,9 @@ pub struct InputState {
     pub mouse_delta: (f32, f32),
     /// the front end's pad keys since the last tick ([`MenuNav`]); a race drops them
     pub pad_menu: Vec<MenuNav>,
+    /// the held-key repeats of the same keys ([`MenuHold`]), for the widgets a direction key *adjusts* (PAD-SLIDERS,
+    /// D54): kept apart from `pad_menu` so a held d-pad still moves between targets one step per push
+    pub pad_menu_repeat: Vec<MenuNav>,
 }
 
 /// An action's bit in [`InputState`]'s held / pressed masks.
@@ -477,18 +530,39 @@ impl InputState {
         self.keys_down.clear();
         self.mouse_delta = (0.0, 0.0);
         self.pad_menu.clear();
+        self.pad_menu_repeat.clear();
     }
     /// Call at the end of each tick.
     pub fn end_tick(&mut self) {
         self.pressed = 0;
         self.mouse_delta = (0.0, 0.0);
         self.pad_menu.clear();
+        self.pad_menu_repeat.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAD-SLIDERS: a held direction repeats after the delay, once per interval; a release stops it; a face button never repeats.
+    #[test]
+    fn a_held_direction_repeats_after_the_delay() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut h = MenuHold::default();
+        h.press(MenuNav::Right, t0);
+        assert!(h.due(t0 + Duration::from_millis(399)).is_empty());
+        assert_eq!(h.due(t0 + Duration::from_millis(400)), vec![MenuNav::Right]);
+        assert!(h.due(t0 + Duration::from_millis(450)).is_empty());
+        assert_eq!(h.due(t0 + Duration::from_millis(560)), vec![MenuNav::Right, MenuNav::Right]);
+        h.release(MenuNav::Left);
+        assert_eq!(h.due(t0 + Duration::from_millis(640)), vec![MenuNav::Right]);
+        h.release(MenuNav::Right);
+        assert!(h.due(t0 + Duration::from_secs(5)).is_empty());
+        h.press(MenuNav::Select, t0);
+        assert!(h.due(t0 + Duration::from_secs(5)).is_empty());
+    }
 
     /// FOCUS-INPUT: a focus change forgets the held keys, actions and pending presses.
     #[test]

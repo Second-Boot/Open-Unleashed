@@ -90,12 +90,14 @@ impl NetPlay {
     /// port's records are all two dwords, `(id, value)`). The host's own option table is written by
     /// the caller — the original's launch applies the whole stream locally first (0x4B4DFD).
     pub fn send_options(&mut self, stream: &[(u32, u32)]) {
-        if !self.is_host() {
+        if !self.has_authority() {
             return;
         }
         let recs: Vec<Vec<u32>> = stream.iter().map(|&(id, v)| vec![id, v]).collect();
         for m in nfs_net::options::messages_each(&recs) {
-            self.room.file_options(self.id as i32, &m);
+            if self.is_host() {
+                self.room.file_options(self.id as i32, &m);
+            }
             if let Err(e) = self.net.send_game(&m) {
                 tracing::debug!(error = %e, "option record not sent");
             }
@@ -116,7 +118,7 @@ impl NetPlay {
     /// own starting state (they are set up before any session exists, so nothing is sent for it).
     /// Answers whether a record went out.
     pub fn sync_option(&mut self, id: u32, value: u32) -> bool {
-        if !self.is_host() {
+        if !self.has_authority() {
             return false;
         }
         match self.sent.get(&id) {
@@ -125,8 +127,10 @@ impl NetPlay {
                 self.sent.insert(id, value);
                 // the original's accessor sends on every selection, and the host's own loopback files the record on its player (0x48A2F0) whether or
                 // not anybody is in the room yet — the later newcomer is replayed it (0x48A390). The wire has nobody to tell yet.
-                for m in nfs_net::options::messages_each(&[vec![id, value]]) {
-                    self.room.file_options(self.id as i32, &m);
+                if self.is_host() {
+                    for m in nfs_net::options::messages_each(&[vec![id, value]]) {
+                        self.room.file_options(self.id as i32, &m);
+                    }
                 }
                 return false;
             }
@@ -141,6 +145,8 @@ impl NetPlay {
     pub fn set_descriptor(&mut self, positional: u8, laps: u8, direction: u16, track: u16) {
         self.net.desc_bytes = [0, positional, laps, 0];
         self.net.desc_words = [direction, track];
+        // an internet room's creator tells the server (the room's description is the server's, `lobby.md` §7.2)
+        self.update_description(positional, laps, direction, track);
     }
 
     /// The room's word for "now": `0x48A9A0()` is a bare `jmp [GetTickCount]` (no offset), so the host's word is
@@ -162,60 +168,9 @@ impl NetPlay {
     /// frontend"` (0x492CF0).
     pub(super) fn serve_race_request(&mut self, from: i32, m: &[u8]) {
         let clock = self.room_clock();
-        let out = match m.first().copied() {
-            Some(kind::START) => {
-                tracing::info!(target: "netplay", player = from, "room: Start Race (0xB3 request)");
-                let out = self.room.start_request(from, clock);
-                // 0x48BF10's other half (network.md §11.17): a race the room has just started has fresh
-                // exchange buffers (the ring zeroed, the head and `+0xCC1` cleared, `+0xCC4` clear —
-                // 0x48BF51…0x48BF84), and the player's frame pointer starts at 0
-                if !out.is_empty() {
-                    self.server.started = false;
-                    self.server.running = false;
-                }
-                if let Ok(slot) = usize::try_from(from) {
-                    let _ = self.server.ready(slot, clock);
-                }
-                out
-            }
-            Some(kind::GO) => {
-                let out = self.room.go_request(clock);
-                // 0x48BFB0's other half: the frame and send clocks start at the go
-                if !out.is_empty() {
-                    let _ = self.server.go(clock);
-                }
-                out
-            }
-            Some(kind::RACE_TIME) => {
-                let head = m.get(1..4).map_or(0, |b| nfs_net::msg::sign_extend_24(u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2])));
-                let best = m.get(4..8).map_or(0, |w| i32::from_be_bytes([w[0], w[1], w[2], w[3]]));
-                match head {
-                    -2 => {
-                        tracing::info!(target: "netplay", player = from, "room: Returning to frontend (0xB7)");
-                        // 0x48C220's exchange half: the player is out of the race again; the last one out
-                        // ends the started room
-                        if let Ok(slot) = usize::try_from(from) {
-                            self.server.out_of_race(slot);
-                        }
-                    }
-                    -1 => tracing::info!(target: "netplay", player = from, "room: Leaving game (0xB7)"),
-                    t => tracing::info!(
-                        target: "netplay",
-                        player = from,
-                        "room: Finish {:02}:{:02}.{:02}, Best Lap {:02}:{:02}.{:02}",
-                        t / 0xF00,
-                        (t / 64) % 60,
-                        (t & 63) * 100 / 64,
-                        best / 0xF00,
-                        (best / 64) % 60,
-                        (best & 63) * 100 / 64
-                    ),
-                }
-                self.room.race_time_request(from, head)
-            }
-            _ => return,
-        };
-        self.dispatch(out);
+        if let Some(out) = self.host.race_request(&mut self.room, from, m, clock) {
+            self.dispatch(out);
+        }
     }
 
     /// One request of ours to the room: the host's own room object is a player's link away in the

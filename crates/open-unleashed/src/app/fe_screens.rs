@@ -104,6 +104,14 @@ impl App {
             o.trim.package = ((o.trim.package as i32 + delta).rem_euclid(n_pkg)) as u8;
             return;
         }
+        // the car set-up screen's 17 `FEFloatRangeAccessor`s: the arrow's `step` is added to the
+        // accessor's index and the car takes `index · step + min` (0x4C6CFF, 0x4BC240, 0x4F14B0)
+        if let Some(k) = nfs_game::career::CAR_SETUP_NAMES.iter().position(|n| *n == base) {
+            if let Some(o) = self.garage_car_mut() {
+                o.step_setup(k, delta);
+            }
+            return;
+        }
         if let Some((v, lo, hi)) = self.range_value(base).filter(|_| !base.starts_with("Audio.")) {
             let key = RANGE_ACCESSORS.iter().find(|(n, ..)| *n == base).map(|(_, k, ..)| *k).unwrap_or_default();
             // **one index per press.** An int range is a list of `max − min + 1` entries
@@ -203,6 +211,17 @@ impl App {
             && let Some(n) = self.net.session.as_mut()
         {
             n.step_player(delta);
+            return true;
+        }
+        if matches!(base, "Comms.ServerList" | "Comms.GamesList") && self.internet_session() {
+            let servers = base == "Comms.ServerList";
+            if let Some(n) = self.net.session.as_mut() {
+                let len = if servers { n.server_rows().len() } else { n.game_rows().len() }.max(1);
+                if let Some(i) = n.internet_mut() {
+                    let s = if servers { &mut i.sel_server } else { &mut i.sel_game };
+                    *s = ((*s as i32 + delta).rem_euclid(len as i32)) as usize;
+                }
+            }
             return true;
         }
         if let Some(l) = self.net.lobby.as_mut() {
@@ -411,6 +430,7 @@ impl App {
         if name.eq_ignore_ascii_case("chronicle") {
             self.fe.chronicle_year_idx = None;
             self.fe.chronicle_slider_drag = None;
+            self.fe.carsetup_slider_drag = None;
         }
         // The bar's own construction (0x4D7E70, called at 0x4D39C4) precedes the first layout's
         // (0x4D67D0, both in 0x4D3420's preamble — `RE/notes/layouts.md`'s "The loading steps"),
@@ -456,6 +476,8 @@ impl App {
                 }
                 self.fe.layout_sel = 0;
                 self.fe.layout_nav_used = false;
+                self.fe.pad_target = None;
+                self.fe.pad_serial = self.fe.pad_serial.wrapping_add(1);
                 self.fe.layout_open_combo = None;
                 // a freshly opened screen needs the device list before its first draw, not after
                 let (pads, dz) = (self.fe_pads(), Self::fe_deadzone());
@@ -579,11 +601,14 @@ impl App {
     /// The callback-list object `[fe+0xE0]` deleted (0x4D2570 0x4D2763…0x4D2794, after 0x4D1BD0
     /// sent it out because the bottom layer's screen names another list): the destructors of the
     /// join screen's list (**0x50A260**, [`Self::net_join_screen_gone`]) and of the two victory
-    /// lists (**0x506C30** / **0x51A690**: the back lock is lifted).
+    /// lists (**0x506C30** / **0x51A690**: the back lock is lifted), and of the set-up screen's
+    /// (**0x4F1A00**: the commit 0x4F14B0).
     pub(crate) fn fe_list_gone(&mut self, list: &str) {
         match list {
             "ID_COMMSJOINSCREEN" => self.net_join_screen_gone(),
             "ID_VICTORYSCREEN" | "ID_FDVICTORYSCREEN" => self.fe_back_lock(false),
+            // the set-up screen's destructor 0x4F1A00 commits the sliders (0x4F14B0 at 0x4F1A09)
+            "ID_CARSETUP" => self.carsetup_commit(),
             _ => {}
         }
     }
@@ -626,6 +651,10 @@ impl App {
         // the four screens whose `callbacklist=` is a comms one need a browsing socket
         // a browsing socket is only wanted while looking for a game; once a session is
         // open the lobby screens read from it instead
+        // `serverlist` (0x50B320) re-opens the link to the entry server when a lobby link is there
+        if name.eq_ignore_ascii_case("serverlist") {
+            self.serverlist_arrival();
+        }
         self.net.lobby = match is_network_layout(name) && self.net.session.is_none() {
             true => netplay::Lobby::open(&self.player_name)
                 .map_err(|e| tracing::warn!(error = %e, "cannot open a browsing socket"))
@@ -735,6 +764,8 @@ impl App {
         self.fe.layout_name = Some(n.clone());
         self.fe.layout_sel = 0;
         self.fe.layout_nav_used = false;
+        self.fe.pad_target = None;
+        self.fe.pad_serial = self.fe.pad_serial.wrapping_add(1);
         self.fe.layout_open_combo = None;
         self.fe_bind_screen(&n);
         self.fe_apply_music();

@@ -10,12 +10,14 @@ mod fe_choices;
 mod enhancements;
 mod camfx;
 mod profile;
+mod carsetup;
 mod chronicle;
 mod fe_cars;
 mod fe_rows;
 mod fe_pictures;
 mod audio;
 mod net;
+mod net_inet;
 mod race_end;
 mod opponents;
 mod results;
@@ -47,6 +49,7 @@ mod fe_flow;
 mod fe_screens;
 mod fe_callbacks;
 mod input;
+mod pad_menu;
 mod frame;
 mod events;
 mod scripted;
@@ -945,6 +948,13 @@ pub(crate) struct FrontEnd {
     /// original's idle screens, where no widget is ever `selected` by default. Reset to `false`
     /// wherever `layout_sel` resets to 0 (a fresh screen); set on `MenuKey::Up` / `MenuKey::Down`.
     pub(crate) layout_nav_used: bool,
+    /// where the pad's (or the arrow keys') virtual pointer stands — a target's flattened widget index and its
+    /// row — until the real mouse moves or the screen changes (PORT-DEVIATION D54)
+    pub(crate) pad_target: Option<(usize, usize)>,
+    /// the centre of that target, which tells it from another widget that took its index after a panel opened
+    pub(crate) pad_centre: (f32, f32),
+    /// bumped wherever `layout_sel` resets, so a pad click that opens a screen does not put its old target back
+    pub(crate) pad_serial: u32,
     /// the combo whose list is open, by the flattened index `combo_sliders` uses
     pub(crate) layout_open_combo: Option<usize>,
     /// a list whose scrollbar knob is being dragged: which list, where the grab was, and the
@@ -988,6 +998,9 @@ pub(crate) struct FrontEnd {
     /// A drag of `NFS5.CHRONICLESLIDER`'s knob: the anchor x (`[helper+0x100]`) and the index it
     /// started on (`[helper+0x108]`), 0x4D0900.
     pub(crate) chronicle_slider_drag: Option<(i32, i32)>,
+    /// A drag of a `NFS5.CarSettingSlider`'s knob: the widget's element index, the setting it
+    /// watches, the anchor x and the index the press started on (the same helper, 0x4D0900).
+    pub(crate) carsetup_slider_drag: Option<(usize, usize, i32, i32)>,
     /// `[ColorBox + 0x29C]` — what the colour accessor held when the editor came up (its row,
     /// slot 0x28, 0x4C3CC5), which cancel hands back through slot 11 (0x4C4A0E): a list row, or
     /// the custom colour the car carried.
@@ -1563,4 +1576,10 @@ pub(crate) enum MenuKey {
     Enter,
     /// Backspace / East button: decline the finale, sell the selected car.
     Back,
+    // the pad's front-end keys (PORT-DEVIATION D54): the bottom bar's race / options / exit and the tab strip's neighbours
+    Play,
+    Options,
+    Quit,
+    TabPrev,
+    TabNext,
 }

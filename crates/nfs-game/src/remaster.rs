@@ -456,6 +456,8 @@ const BTN_Y: i32 = 424;
 const BTN_XS: [i32; 4] = [57, 189, 321, 453];
 /// A group header's colour (ARGB), and an inactive row's caption colour.
 const HEADER_COLOR: &str = "0xff7a2a00";
+/// The gap between a caption's right end and the end of the fade bar behind it (master's `display_opts` uses the same).
+const CAPTION_PAD: i32 = 6;
 const INACTIVE_COLOR: &str = "0xff8a8a8a";
 
 // ---- ENHANCEMENT ENH-UPSCALER / ENH-PANEL: the panel's content is built from the CURRENT set ----
@@ -465,7 +467,7 @@ const INACTIVE_COLOR: &str = "0xff8a8a8a";
 /// (MetalFX: mode + scale, FSR: scale + sharpness). E34 / E37 / E39 have no row of their own: [`SETTINGS_OF_E38`].
 /// A group stays on one page when it fits on one (`paginate`).
 pub const GROUPS: &[([&str; 2], &[EnhancementSwitch])] = &[
-    (["image", "Изображение"], &[E1, E35, E2, E3, E38, E4, E5, E6, E22, E33]),
+    (["image", "Изображение"], &[E6, E22, E1, E2, E3, E35, E4, E5, E38, E33]),
     (["light and shadows", "Свет и тени"], &[E7, E9, E43, E25, E14, E32, E16, E15, E24, E23, E20]),
     (["surfaces", "Поверхности"], &[E8, E17, E26, E40, E41, E42]),
     (["atmosphere and effects", "Атмосфера и эффекты"], &[E10, E11, E13, E19, E36, E44, E21, E18, E12]),
@@ -697,13 +699,24 @@ pub fn page_of(name: &str) -> Option<usize> {
     (page < pages()).then_some(page)
 }
 
+/// The panel file's text with a page's generated rows right after its screen section (section 0). `Window::hitTest` 0x528C00
+/// gives the pointer to the **first** section whose box holds it (the draw walks backwards, so the first is also the topmost),
+/// and the file's two background boxes cover the rows: after them the combos took no click. The original's panels put their
+/// backgrounds last for the same reason (`graphicsettings.lay` §36 / §37). A file with no section 1 gets the rows at its end.
+pub fn with_rows(file: &str, rows: &str) -> String {
+    match file.find("[section.1]") {
+        Some(i) => format!("{}{rows}\n{}", &file[..i], &file[i..]),
+        None => format!("{file}{rows}"),
+    }
+}
+
 /// The generated sections for one page of the panel for the current set — see [`generated_rows_in`].
 pub fn generated_rows(page: usize) -> String {
     CUR_PAGE.store(page, Ordering::Relaxed);
     generated_rows_in(&panel_state(), page)
 }
 
-/// The sections appended to `enhancements.lay` for one page of the panel: for each line a caption label and a level combo bound to
+/// The sections inserted into `enhancements.lay` ([`with_rows`]) for one page of the panel: for each line a caption label and a level combo bound to
 /// its accessor (`Enh.<token>`, or a virtual row's), in the geometry `display.lay` uses for its rows (combo width 190, the label
 /// right-aligned 4 px left of it, a fade bar behind the label), one column; a group header is a coloured label alone. An inactive
 /// row (`state=disabled`, the engine's own disabled state: not clickable) has a grey caption and its hover help is the reason. The combo's
@@ -742,8 +755,8 @@ pub fn generated_rows_in(state: &Enhancements, page: usize) -> String {
     }
     for (k, it, info) in &rows {
         let (sid, color, align, x) = match (it, info) {
-            (Item::Header(g), _) => (STR_GROUP + *g as u32, HEADER_COLOR, 2, 189 + dx),
-            (_, Some(i)) => (i.name_id, if i.inactive { INACTIVE_COLOR } else { "0xff000000" }, 2, 189 + dx),
+            (Item::Header(g), _) => (STR_GROUP + *g as u32, HEADER_COLOR, 2, 189 + dx - CAPTION_PAD),
+            (_, Some(i)) => (i.name_id, if i.inactive { INACTIVE_COLOR } else { "0xff000000" }, 2, 189 + dx - CAPTION_PAD),
             _ => continue,
         };
         let _ = write!(
@@ -1098,6 +1111,14 @@ mod tests {
         assert_eq!(paginate(&[], 16), vec![Vec::<Item>::new()]);
         assert_eq!(pages_for(MAX_ROWS * 2 + 6), 3);
         assert_eq!(pages_for(0), 1);
+    }
+
+    #[test]
+    fn the_rows_go_ahead_of_the_backgrounds() {
+        let file = "[section.0]\nid=REAL.BLACK_640x480\n\n[section.1]\nid=NFS5.GOURAUDBOX\n";
+        let t = with_rows(file, "\n[section.900]\nid=NFS5.ComboBoxSlider\n");
+        assert!(t.find("ComboBoxSlider").unwrap() < t.find("GOURAUDBOX").unwrap());
+        assert!(t.starts_with("[section.0]"));
     }
 
     #[test]
