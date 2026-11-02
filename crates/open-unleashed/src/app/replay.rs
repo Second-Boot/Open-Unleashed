@@ -38,7 +38,7 @@ impl App {
     /// port's `--replay` and every race started from the command line) main leaves its loop at
     /// 0x4B6FB5 and the program ends (0x4B6FC0…0x4B6FE5, `return 0`). *(Until 2026-09-27 the port
     /// dropped the stream there and drove on as a live race.)* `true` when the program is ending.
-    pub(crate) fn replay_exit_check(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn replay_exit_check(&mut self, event_loop: &LoopCtl) -> bool {
         use nfs_game::replay::Mode;
         let Some(r) = self.replay.stream.as_ref() else {
             return false;
@@ -69,7 +69,7 @@ impl App {
     /// the replay bar's scripted press and its frame, and the diagnostic `NFS_REPLAY_TYPE`, typed into `HReplaySave`'s
     /// name once the bar's scripted press (or a real one) has just opened it (0x430E10, `replay_save_click` reads it from
     /// the field the same way). `true` when the program is ending: the caller returns.
-    pub(crate) fn race_frame_epilogue(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn race_frame_epilogue(&mut self, event_loop: &LoopCtl) -> bool {
         // 0x415CB3: the played-back stream's end, after the catch-up loop
         if self.replay_exit_check(event_loop) {
             return true;
@@ -180,7 +180,7 @@ impl App {
     /// `"%s.rpl"` over `Replay.List`'s current name, and the start check 0x4D5730 skips the
     /// game-type switch and the car checks for it (0x4D5786). Here: that file read, the stream set
     /// playing, the race set up from its snapshot, and the race started.
-    pub(crate) fn start_replay(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn start_replay(&mut self, event_loop: &LoopCtl) {
         let names = self.replay_names();
         let Some(name) = names.get(self.fe.replay_sel.min(names.len().saturating_sub(1))).cloned() else { return };
         let Some(dir) = self.replay.path.parent().map(|d| d.to_path_buf()) else { return };
@@ -393,7 +393,7 @@ impl App {
     ///
     /// Not carried: the network variant (`+0x198`). *(The tooltips 0x42DD10 and the auto-hide
     /// `+0x124` are ported since 2026-09-27: `Hud::replay_bar`, `App::replay_bar_frame`.)*
-    fn replay_bar_apply_press(&mut self, cx: f32, cy: f32, event_loop: &ActiveEventLoop) -> bool {
+    fn replay_bar_apply_press(&mut self, cx: f32, cy: f32, event_loop: &LoopCtl) -> bool {
         use nfs_game::replay::bar_cell_at;
         if !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)) || self.hud.is_none() {
             return false;
@@ -409,7 +409,7 @@ impl App {
     /// d-pad up the result pages again, d-pad down the restart (a network replay's previous car), X the
     /// save dialog, B quit; Y is the camera already (the bindings' `CameraView`, D44). `true` when the key
     /// pressed a cell.
-    pub(crate) fn pad_replay_bar_key(&mut self, k: nfs_input::MenuNav, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn pad_replay_bar_key(&mut self, k: nfs_input::MenuNav, event_loop: &LoopCtl) -> bool {
         use nfs_input::MenuNav as N;
         // the bar's cells (`BAR` order): 1 rest, 2 paus / next car, 3 quit, 4 speed, 5 Irac, 6 save; the
         // speed cell steps up (`+0x174` 5 → 6 → 7 → 8 → 5), so "down" is three steps and the last answers
@@ -478,7 +478,7 @@ impl App {
 
     /// A press on bar cell `cell` (0x42D880's answer): `presses` > 1 steps the speed cell's counter that
     /// many times and answers the last (a pad's "slower" is three steps of the cycle).
-    fn replay_bar_cell(&mut self, cell: usize, presses: usize, event_loop: &ActiveEventLoop) -> bool {
+    fn replay_bar_cell(&mut self, cell: usize, presses: usize, event_loop: &LoopCtl) -> bool {
         use nfs_game::replay::{bar_event, BarEvent};
         // `+0x198`, built for `FEGAME_TYPE 3` only (0x424F7B): a network race's replay has the network bar
         for _ in 1..presses {
@@ -558,7 +558,7 @@ impl App {
     /// dialogs always do between presses), then the draw's open / close (0x42D22F…0x42D282, at
     /// `[0x606AC8]`), then the HUD frame's pin (0x425CF5…0x425D22: any dialog queued — the pause
     /// menu or its question, a result page, `HReplaySave` or its overwrite question).
-    pub(crate) fn replay_bar_frame(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn replay_bar_frame(&mut self, event_loop: &LoopCtl) {
         // the mailbox is taken and cleared here whatever the guard below finds — 0x435410 runs
         // unconditionally at the pump's head, before any `REPLAY` test
         if let Some((cx, cy)) = self.bar_press.take() {
@@ -676,7 +676,7 @@ impl App {
     /// from the records (0x426B50…0x426C63). The port's race start reloads the track, as its
     /// "race again" does. What the restart does not touch survives it: the records, the track
     /// record already entered, the mission's verdict and the records page.
-    pub(crate) fn start_auto_replay(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn start_auto_replay(&mut self, event_loop: &LoopCtl) {
         self.auto_replay_due = false;
         if !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Recording | nfs_game::replay::Mode::Full)) {
             return;
@@ -687,7 +687,7 @@ impl App {
     /// Race over ends `RaceFrame` (0x415D17) and the session loop restarts the race as its replay: after a tick,
     /// the automatic replay when [`App::simulate`] asked for it. The windowed frame stops its catch-up loop
     /// on `true`, a scripted run's iteration goes on to its own checks.
-    pub(crate) fn start_auto_replay_if_due(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn start_auto_replay_if_due(&mut self, event_loop: &LoopCtl) -> bool {
         if !self.auto_replay_due {
             return false;
         }
@@ -698,7 +698,7 @@ impl App {
     /// The session loop's "play it (again)" arm (0x4B6EF4…0x4B6F18): `REPLAY = 2`, `[0x5E99F4] = 2`,
     /// `[0x657428] = 0`, back to 0x4B6D9F. `pages` is whether the replay's `0x426A80(1)` queues the
     /// result pages — not after the bar's restart, which set `[0x60CA10]` (0x426C1C).
-    pub(crate) fn replay_again(&mut self, event_loop: &ActiveEventLoop, pages: bool) {
+    pub(crate) fn replay_again(&mut self, event_loop: &LoopCtl, pages: bool) {
         let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return };
         if let Some(r) = self.replay.stream.as_mut() {
             r.replay_in_place();
@@ -714,7 +714,7 @@ impl App {
         self.hud_clock_base += self.tick as f64;
         self.tick = 0;
         self.race_pass = true;
-        self.start_race(renderer, window, event_loop);
+        self.start_race(renderer, Some(window), event_loop);
         self.hud_records = hud_records;
         self.mission_result = mission_result;
         self.replay.saved = replay_saved;

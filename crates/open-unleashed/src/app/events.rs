@@ -5,7 +5,7 @@ use crate::*;
 impl App {
     /// The window's events while the start-up movies play: the player reads the keyboard ring for
     /// Esc (0x55FF60) and the mouse's buttons (0x5372A0(6)); nothing else is listening yet.
-    fn intro_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+    fn intro_event(&mut self, event_loop: &LoopCtl, event: WindowEvent) {
         let Some(run) = self.intro.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -56,7 +56,7 @@ impl App {
     /// A key on the pause menu (PORT-DEVIATION D10: the arrows and Enter, and a standard pad's
     /// d-pad / left stick and A, pick and answer its buttons; `HButtonVisual` picks by the cursor
     /// only, 0x41B3BA…0x41B3CE).
-    pub(crate) fn pause_menu_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
+    pub(crate) fn pause_menu_key(&mut self, key: MenuKey, event_loop: &LoopCtl) {
         match key {
             MenuKey::Up | MenuKey::Left => match self.pause_confirm.as_mut() {
                 Some(c) => *c = 0,
@@ -112,7 +112,7 @@ impl App {
     /// PORT-DEVIATION D10 (PAD-END): the original reads only the key-down table here (no pad
     /// button reaches 0x42A3D0), so the pad's A (`MenuNav::Select`) calls this as Space — the
     /// pad could not leave a finished race otherwise.
-    pub(crate) fn race_accept(&mut self, _event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn race_accept(&mut self, _event_loop: &LoopCtl) -> bool {
         if self.vehicle.is_some() && self.net_notice.is_some() && self.net_notice_space {
             self.net_notice = None;
             self.net_notice_space = false;
@@ -137,12 +137,12 @@ impl App {
     ///   mission's summary Y is its "race again" (0x429390);
     /// * a playback with no page up: the replay bar's cells ([`Self::pad_replay_bar_key`]);
     /// * a finished race with no page left: A leaves, as Space does.
-    pub(crate) fn pad_race_accept(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn pad_race_accept(&mut self, event_loop: &LoopCtl) -> bool {
         let keys = std::mem::take(&mut self.input.pad_menu);
         keys.into_iter().any(|k| self.pad_race_key(k, event_loop))
     }
 
-    fn pad_race_key(&mut self, k: nfs_input::MenuNav, event_loop: &ActiveEventLoop) -> bool {
+    fn pad_race_key(&mut self, k: nfs_input::MenuNav, event_loop: &LoopCtl) -> bool {
         use nfs_input::MenuNav as N;
         if self.paused {
             return false;
@@ -176,7 +176,7 @@ impl App {
     /// the pause (bit 8), the pause orbit's steps, the HUD toggles, the sound and the music. Run on
     /// every key event and, for a pad-bound control (PAD-HANG: Start on the pause row never reached
     /// this code, which ran on key events only), once a race frame after `Gamepads::poll`.
-    pub(crate) fn race_interface_keys(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn race_interface_keys(&mut self, event_loop: &LoopCtl) {
         // `I_PAUSE` (P, or a pad's Start under D44's layout; Escape is no in-race key,
         // `nfs_input::default_binding`): pause. The pause action (`0x4138D0(8, 1)`, 0x415170) opens the
         // pause menu (0x461740, 0x426800) only while the HUD's dialog queue is empty —
@@ -263,7 +263,8 @@ impl App {
 }
 
 impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let event_loop = &LoopCtl::real(el);
         // macOS: SDL's pump runs the main run loop and must not run inside winit's handler
         self.gamepads.pump_outside_handler();
         // `self.window` stays `None` for as long as the intro plays (`resume_inner`'s intro branch
@@ -294,7 +295,8 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let event_loop = &LoopCtl::real(el);
         self.net_leaving_step();
         if self.idle_movie_due && self.intro.is_none() {
             self.start_idle_movie();

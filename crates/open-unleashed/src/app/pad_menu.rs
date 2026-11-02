@@ -16,7 +16,7 @@ use nfs_game::layout::pad::{DEADZONE_PAD_STEP, PICKER_LUM_STEP, PICKER_PAD_STEP,
 impl App {
     /// A front-end key the pad scheme takes. `true` when it did; `false` leaves the key to the
     /// layout screen's older handling (a keyboard Enter with no pointer placed, `layout_sel`).
-    pub(crate) fn pad_menu_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn pad_menu_key(&mut self, key: MenuKey, event_loop: &LoopCtl) -> bool {
         if self.fe.layout_preview.is_none() {
             return false;
         }
@@ -179,6 +179,9 @@ impl App {
     fn pad_stand(&mut self, t: &PadTarget) {
         self.fe.pad_target = Some((t.index, t.row));
         self.fe.pad_centre = t.centre();
+        if let Some(l) = self.fe.layout_preview.as_mut() {
+            l.set_pad_mark(true);
+        }
     }
 
     fn pad_find(&self, index: usize, row: usize) -> Option<PadTarget> {
@@ -240,7 +243,7 @@ impl App {
     }
 
     /// A click on a target: aim, press, release — the mouse's own path.
-    fn pad_click(&mut self, t: &PadTarget, event_loop: &ActiveEventLoop) {
+    fn pad_click(&mut self, t: &PadTarget, event_loop: &LoopCtl) {
         let serial = self.fe.pad_serial;
         let name = self.fe.layout_name.clone();
         self.pad_aim(t);
@@ -416,7 +419,7 @@ impl App {
     /// B: the keyboard's `b` — the bottom bar's back where it is enabled; a dialog's "no" and an open
     /// drop-down's closing come first, and a screen whose bottom bar has no back falls to its own
     /// leaving button (one with the `GOBACK` callback, or a destination with a negative `offset`: the overlay's close).
-    fn pad_back(&mut self, event_loop: &ActiveEventLoop) {
+    fn pad_back(&mut self, event_loop: &LoopCtl) {
         // an open drop-down closes unchanged, as a click away from it does (0x4C6E2E: sound 3)
         let open = self.fe.layout_open_combo.or_else(|| self.fe.layout_preview.as_ref().and_then(|l| l.open_combo()));
         if let Some(i) = open {
@@ -453,7 +456,7 @@ impl App {
 
     /// A bottom-bar key (Start, Y): the button by its name, when the bar has it enabled — and, for the
     /// race, when the screen can start one.
-    fn pad_bottom(&mut self, name: &str, event_loop: &ActiveEventLoop) {
+    fn pad_bottom(&mut self, name: &str, event_loop: &LoopCtl) {
         let Some(b) = self.fe.layout_bottom.as_ref() else { return };
         let Some((index, _)) = b.widgets_named(&[name]).first().copied() else { return };
         if b.widget_disabled(index) {
@@ -467,7 +470,7 @@ impl App {
     }
 
     /// LB / RB: the previous / next tab of the strip the pad stands in (else the outermost strip).
-    fn pad_tab(&mut self, step: i32, event_loop: &ActiveEventLoop) {
+    fn pad_tab(&mut self, step: i32, event_loop: &LoopCtl) {
         let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let strips = l.tab_strips();
         let stand = self.fe.layout_preview.as_ref().and_then(|l| self.pad_resolve(&l.pad_targets())).map(|i| l.pad_targets()[i].index);

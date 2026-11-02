@@ -17,6 +17,18 @@ pub(super) struct Offline {
 
 pub(super) static DUMP: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
 
+/// TOOLING ([`no_sound`]): no output opens.
+static NO_SOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// **TOOLING** (`--resim`, the server's re-simulation): [`AudioOutput::new`] answers an error from now on, the game's own path for a machine
+/// with no sound device: no mix (it was ~94 % of a re-simulation's time) and no bank read (~21 MB of live heap). What a network race computes does not
+/// depend on the sound: the draws on the game's stream are made whatever the output (`simulate_audio`; the local car's by `exch_human_order`), the speech's
+/// `busy` is read only by the race-over check 0x417010, which a network race never runs, and the rest of the sound takes the library's generator
+/// [`crate::librand`], the sound modules' own, or the clock-seeded `fe_rng`.
+pub fn no_sound() {
+    NO_SOUND.store(true, Ordering::Relaxed);
+}
+
 /// TEST GLUE: `NFS_AUDIO_DUMP_TICKS=1` (with `NFS_AUDIO_DUMP`) — the dump is the mix at its own rate
 /// `[0x6B48DA]`, 16-bit stereo, `rate / 64` frames per game tick (`RE/notes/REFERENCE-2026-10-24-PA-AUDIOMIX.md`):
 /// the same samples the original's driver pass hands DirectSound (0x58FBC0), on the game's clock.
@@ -153,6 +165,9 @@ impl AudioOutput {
         // mixer runs offline on the calling thread exactly as under `NFS_AUDIO_DUMP`, only nothing is written,
         // so the game's calls into the mixer are the same as with a device.
         let var = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0");
+        if NO_SOUND.load(Ordering::Relaxed) {
+            anyhow::bail!("no sound in a re-simulation");
+        }
         if !var("NFS_SOUND") && (var("NFS_MUTE") || var("NFS_NO_FOCUS")) {
             let (tx, _) = Tx::new(44100, true);
             tracing::info!("audio: muted test run (NFS_MUTE / NFS_NO_FOCUS; NFS_SOUND=1 for the device), no device");

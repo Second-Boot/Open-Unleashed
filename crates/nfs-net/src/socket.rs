@@ -27,6 +27,14 @@ pub struct CommSocket {
     dump: Option<std::cell::RefCell<std::fs::File>>,
 }
 
+/// **TOOLING, not in the original's frame:** a server loop waits on the descriptor as the original's receive thread 0x587340 `select`s on its socket.
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for CommSocket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.sock.as_raw_fd()
+    }
+}
+
 impl CommSocket {
     /// Bind every interface on `port`, as `0x560550` does with `sin_addr = INADDR_ANY`. Port 0 asks
     /// the OS for a free one, which is what the tests use.

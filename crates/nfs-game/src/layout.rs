@@ -498,6 +498,8 @@ pub struct LayoutScreen {
     /// where the pointer is, in design coordinates, when it is over the window at all
     /// (`RE/notes/controls.md` §4.39)
     cursor: Option<(f32, f32)>,
+    /// PORT-DEVIATION D54: the pointer is the pad's virtual one, so a closed combo under it wears a mark
+    pad_mark: bool,
     /// set by [`claim_pointer`](Self::claim_pointer) while a sibling panel holds the window's hit
     /// (EV3): this screen then sees no pointer, though it keeps the one it was handed
     denied: bool,
@@ -1327,6 +1329,7 @@ impl LayoutScreen {
             }),
             denied: false,
             narrow_hit: false,
+            pad_mark: false,
             pointer: None,
             pressed: false,
             capture: None,
@@ -3542,6 +3545,14 @@ impl LayoutScreen {
         }
         self.pointer = None;
         self.place_cursor(at);
+    }
+
+    /// PORT-DEVIATION D54: whether the pointer is the pad's virtual one (`FeState::pad_target`).
+    pub fn set_pad_mark(&mut self, on: bool) {
+        self.pad_mark = on;
+        for g in self.groups.values_mut() {
+            g.set_pad_mark(on);
+        }
     }
 
     /// Move only the cursor sprite: the widgets keep the pointer they last saw. What the front end

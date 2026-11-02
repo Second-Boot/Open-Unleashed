@@ -238,6 +238,7 @@ impl App {
             } else {
                 l.set_cursor(self.fe.cursor);
             }
+            l.set_pad_mark(self.fe.pad_target.is_some());
             if let Some((pads, hud_preview)) = for_screen {
                 l.set_pads(pads, self.fe.pads_sel);
                 l.set_camera_current(cam_cur);

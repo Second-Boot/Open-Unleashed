@@ -159,7 +159,7 @@ pub const REGISTRY: &[Entry] = &[
         token: "E9",
         name: ["sun shadows", "тени от солнца"],
         help: ["cars and roadside objects cast shadows from the sun (cascaded shadow maps); the car's blob shadow stays", "машины и придорожные объекты отбрасывают тени от солнца; пятно под машиной остаётся"],
-        levels: &[["off", "выкл"], ["low (1024, 2 cascades)", "низко (1024, 2 каскада)"], ["high (2048, 3 cascades)", "высоко (2048, 3 каскада)"]],
+        levels: &[["off", "выкл"], ["low (1024, 3 cascades)", "низко (1024, 3 каскада)"], ["high (2048, 4 cascades)", "высоко (2048, 4 каскада)"]],
         default_level: 1,
     },
     Entry {

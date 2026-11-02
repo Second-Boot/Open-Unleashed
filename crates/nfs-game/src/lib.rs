@@ -30,6 +30,7 @@ pub mod police;
 pub mod race;
 pub mod race_order;
 pub mod replay;
+pub mod resim;
 pub mod rng;
 pub mod room;
 pub mod racecar;

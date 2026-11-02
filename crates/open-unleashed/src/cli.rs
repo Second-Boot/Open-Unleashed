@@ -11,12 +11,12 @@
 //! porsche [track] [car] [sim] [--fe[=layout]] [--layout NAME] [--layout-sweep] [--debug-menu]
 //!         [--screenshot out.png] [--autotest SECS [--follow]] [--opponents N] [--laps N]
 //!         [--quick-knockout] [--backwards] [--mirror] [--record run.csv] [--replay FILE]
-//!         [--career ID] [--mission]
+//!         [--career ID] [--mission] [--resim PACKAGE [--resim-out REPORT]]
 //!         [--net host[:PORT] | --net join:HOST[:PORT] [--net-name NAME]] [--net-browse SECS]
 //! ```
 
 /// The flags that take a value: the token after one of them is never a positional argument.
-const FLAGS_WITH_VALUE: [&str; 11] = [
+const FLAGS_WITH_VALUE: [&str; 13] = [
     "--screenshot",
     "--autotest",
     "--opponents",
@@ -28,10 +28,12 @@ const FLAGS_WITH_VALUE: [&str; 11] = [
     "--net",
     "--net-name",
     "--net-browse",
+    "--resim",
+    "--resim-out",
 ];
 
 /// The flags that make a run scripted (no focus taken, see `NO_FOCUS`), by presence alone.
-const SCRIPTED_FLAGS: [&str; 4] = ["--autotest", "--screenshot", "--layout-sweep", "--record"];
+const SCRIPTED_FLAGS: [&str; 5] = ["--autotest", "--screenshot", "--layout-sweep", "--record", "--resim"];
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Cli {
@@ -42,6 +44,10 @@ pub(crate) struct Cli {
     pub options: Vec<String>,
     /// `--replay <file>`: play back a recording the port saved
     pub replay: Option<String>,
+    /// `--resim <package.json>`: re-simulate an input-exchange race from a server's record (`nfs_game::resim`, `RE/notes/lobby.md` section 15)
+    pub resim: Option<String>,
+    /// `--resim-out <report.json>`: where the re-simulation writes its report
+    pub resim_out: Option<String>,
     /// `--career <id>`: start the next event of tournament `<id>` from the saved career
     pub career: Option<i16>,
     /// `--mission`: start the current Factory Driver mission headlessly
@@ -90,6 +96,12 @@ pub(crate) struct Cli {
 }
 
 impl Cli {
+    /// **TOOLING:** `--resim` runs with no window, no GPU device, no audio device and no controller layer (the server's plain Linux
+    /// box has none of them), unless `NFS_RESIM_GPU=1` asks for the windowed scripted run it used to be (the equivalence check of the two).
+    pub(crate) fn headless_resim(&self) -> bool {
+        self.resim.is_some() && std::env::var_os("NFS_RESIM_GPU").is_none_or(|v| v.is_empty() || v == "0")
+    }
+
     /// The process's own arguments, the program name skipped.
     pub(crate) fn from_env() -> Self {
         Self::parse(&std::env::args().skip(1).collect::<Vec<_>>())
@@ -121,6 +133,8 @@ impl Cli {
             positional,
             options,
             replay: value("--replay").cloned(),
+            resim: value("--resim").cloned(),
+            resim_out: value("--resim-out").cloned(),
             career: value("--career").and_then(|v| v.parse().ok()),
             mission: has("--mission"),
             autotest_flag: has("--autotest"),

@@ -28,6 +28,7 @@ mod loading;
 mod simulate;
 mod session;
 mod replay;
+pub(crate) mod resim;
 mod render_scene;
 mod hud_pass;
 mod car_lights;
@@ -291,6 +292,8 @@ pub(crate) struct App {
     /// A network race played back from a file (`replay.md` §18.15): who the humans are and which lane of
     /// the stream is whose. `None` for every other race.
     pub(crate) replay_net: Option<ReplayNetRun>,
+    /// `--resim`: an input-exchange race re-simulated from a server's record (`app/resim.rs`); the lanes of `replay_net` read it
+    pub(crate) resim: Option<resim::ResimRun>,
     /// a network race's replay: which human car the camera follows, an index into the humans by race
     /// index (`[0x606858]`, the bar's previous / next car cells)
     pub(crate) replay_view: usize,

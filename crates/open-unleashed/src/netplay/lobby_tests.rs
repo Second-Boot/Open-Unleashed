@@ -181,3 +181,24 @@ fn the_servers_version_refusal_of_a_join_keeps_the_client_in_the_lobby() {
     b.restore_state();
     assert!(pump(&mut s, &mut [&mut b], |c| c[0].established()));
 }
+
+/// **PORT-DEVIATION D56:** after `0xC6 0xE` the lobby link sends exactly one `0xC7` with the build identity, and the stub (which knows
+/// only the original's messages) ignores it like the original's reference server would (default case 0x491C3C).
+#[test]
+fn the_port_announces_its_build_once_after_the_sign_on() {
+    let mut s = stub();
+    let mut c = client(&s, "racer", "ann");
+    assert!(pump(&mut s, &mut [&mut c], |c| c[0].established()));
+    // a few more rounds: the one message must not repeat
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        s.step();
+        c.poll_lobby();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let builds: Vec<_> = s.heard.iter().filter(|(_, m)| m.first() == Some(&0xC7)).collect();
+    assert_eq!(builds.len(), 1, "{:?}", s.heard.iter().map(|h| h.1.first()).collect::<Vec<_>>());
+    let b = nfs_net::lobby::parse_client_build(&builds[0].1).unwrap();
+    assert_eq!(b.text, crate::brand::build_id());
+    assert!(b.sim() == Some(env!("OU_SIM_VERSION")));
+}

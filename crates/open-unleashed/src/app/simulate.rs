@@ -197,6 +197,19 @@ impl App {
                 }
             }
         }
+        // **TEST GLUE** (not in the original): `NFS_TEST_SPEEDHACK=<m/s>[@<tick>]` (LOBBY-AC4, for the server's anti-cheat runs) holds the
+        // human car's speed at that value or above (its direction kept) from that tick on (default 2500) -- a speed hack: what this
+        // machine then tells the others (and the server records) is impossible for the car it claims. A network race only.
+        if self.net.session.is_some()
+            && let Some((target, from)) = speedhack_glue()
+            && self.tick >= from
+            && let Some(v) = self.vehicle.as_mut()
+        {
+            let s = v.velocity.length();
+            if s > 1.0 && s < target {
+                v.velocity *= target / s;
+            }
+        }
         // 0x417010, the first call of `GameTick`'s odd-tick group (0x4150D5 `test al, 1` → 0x4150D9).
         // What it reads — the finish state and `+0xB14` — only the even tick's progress update
         // changes, so testing it here, before this odd tick's work, is the same test
@@ -3803,8 +3816,8 @@ impl App {
                 wet: self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0,
                 human: true,
             };
-            // (an exchange race produced it above, in registration order)
-            if !self.net.session.as_ref().is_some_and(|n| n.exchanging()) {
+            // (an exchange race, or its `--resim`, produced it above, in registration order)
+            if !self.net.session.as_ref().is_some_and(|n| n.exchanging()) && self.resim.is_none() {
                 self.snd.player_loops.produce_loops(&input, nfs_game::rng::rand16);
             }
             // the queue's one-shots — pushed during the tick's physics, above — take the angle to
@@ -4036,4 +4049,14 @@ fn reset_blockers(police: Option<&nfs_game::police::Police>, traffic: Option<&Tr
         .chain(traffic.into_iter().flat_map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| c.slice)))
         .chain(props.slices().iter().copied())
         .collect()
+}
+
+/// **TEST GLUE** `NFS_TEST_SPEEDHACK=<m/s>[@<tick>]`: the speed to hold and the tick it starts at, read once.
+fn speedhack_glue() -> Option<(f32, u64)> {
+    static G: std::sync::OnceLock<Option<(f32, u64)>> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        let v = std::env::var("NFS_TEST_SPEEDHACK").ok()?;
+        let (speed, tick) = v.split_once('@').map_or((v.as_str(), "2500"), |(a, b)| (a, b));
+        Some((speed.trim().parse().ok()?, tick.trim().parse().ok()?))
+    })
 }

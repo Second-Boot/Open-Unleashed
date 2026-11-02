@@ -3,7 +3,7 @@
 use crate::*;
 
 impl App {
-    pub(crate) fn resume_inner(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn resume_inner(&mut self, event_loop: &LoopCtl) {
         let scripted = NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed);
         let played = self.intro_done.is_some();
         let (window, mut renderer) = match self.intro_done.take() {
@@ -481,7 +481,7 @@ impl App {
             }
             return;
         }
-        self.start_race(renderer, window, event_loop);
+        self.start_race(renderer, Some(window), event_loop);
     }
 
     /// "race again" — command 3 at 0x415721: the race audio is reset (0x4AB360), the simulation is
@@ -499,7 +499,7 @@ impl App {
     /// back to: `NFS_SESSION_FE_KEYS_<k>` (`k` the next race's number, as `NFS_HUD_KEYS_<k>`) runs
     /// its `NFS_FE_KEYS` tokens there — a player's way through the menus, ending in `playgame`
     /// (the bottom bar's button); without it `PLAYGAME` is pressed again for the same game type.
-    pub(crate) fn session_next_from_fe(&mut self, game_type: u8, event_loop: &ActiveEventLoop) {
+    pub(crate) fn session_next_from_fe(&mut self, game_type: u8, event_loop: &LoopCtl) {
         let k = self.scripted_hud.race_no + 1;
         if let Ok(spec) = std::env::var(format!("NFS_SESSION_FE_KEYS_{k}")) {
             for t in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
@@ -511,7 +511,7 @@ impl App {
         self.start_from_layout(event_loop);
     }
 
-    pub(crate) fn session_step(&mut self, event_loop: &ActiveEventLoop, secs: f32) -> bool {
+    pub(crate) fn session_step(&mut self, event_loop: &LoopCtl, secs: f32) -> bool {
         if self.session_races <= 1 {
             return false;
         }
@@ -542,7 +542,7 @@ impl App {
             self.sim_shutdown();
             let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return true };
             self.tick = 0;
-            self.start_race(renderer, window, event_loop);
+            self.start_race(renderer, Some(window), event_loop);
         }
         true
     }

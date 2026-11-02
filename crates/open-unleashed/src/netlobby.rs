@@ -165,14 +165,17 @@ impl App {
         let first = !self.net.lobby_sent;
         let changed = !first && (setsel || car.as_ref().map(|c| (c.0, c.1.clone())) != self.net.lobby_car);
         if first || changed {
+            // the two first ticks are the screens' own (0x509290 the create screen's, 0x50A4F0 the join screen's), not a test of the room:
+            // on a lobby link `has_authority` is still false in a frame between `0xB2` and the room's list
+            let creator = self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("creategame"));
             let mut recs: Vec<Vec<u32>> = Vec::new();
-            if first && !host {
+            if first && !creator {
                 recs.push(slots::ready_record(me as u32, false));
             }
             if let Some((id, name, colour)) = &car {
                 recs.extend(slots::car_records(me as u32, *id, name, *colour));
             }
-            if first && host {
+            if first && creator {
                 recs.push(slots::ready_record(me as u32, true));
             }
             if let Some(n) = self.net.session.as_mut() {
@@ -495,7 +498,7 @@ impl App {
     ///   end, 0x4D2F1A → **0x4A5EA0**, `ShellExecute("open", RegUrl)` (`http://login.earacing.com` when the registry
     ///   has none, as this install's has not). **Platform glue:** `open` on macOS, and not in a scripted
     ///   (`NFS_NO_FOCUS`) run.
-    pub(crate) fn account_callback(&mut self, cb: &str, event_loop: &ActiveEventLoop) {
+    pub(crate) fn account_callback(&mut self, cb: &str, event_loop: &LoopCtl) {
         match cb {
             "CLEARACCOUNTINFO" => {
                 if let Some(l) = self.fe.layout_preview.as_mut() {

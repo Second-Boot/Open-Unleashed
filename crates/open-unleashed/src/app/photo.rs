@@ -450,7 +450,7 @@ impl App {
     /// handler's own order, photo mode's hook first and then the pause menu's keys. Tokens: `pause` (the menu
     /// up, as Esc does), `k`, `f11`, `esc`, `enter`, `up`, `down`, and `lights` (the lights key's command 13 on the
     /// player's lamp byte, `car+0xD87 ^= 3`, 0x49941D, as `simulate` applies it). Logs the state after each. `true` when it ran.
-    pub(crate) fn race_keys_script(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn race_keys_script(&mut self, event_loop: &LoopCtl) -> bool {
         let Some(spec) = nfs_game::config::cfg().nfs_race_keys.as_str().filter(|s| !s.trim().is_empty()) else { return false };
         for tok in spec.split(';').map(str::trim).filter(|t| !t.is_empty()) {
             let code = match tok {

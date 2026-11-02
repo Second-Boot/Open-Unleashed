@@ -31,12 +31,14 @@ mod hud;
 mod hud_str;
 mod hud_cfg;
 mod intro_run;
+mod loopctl;
 mod netlobby;
 mod netplay;
 mod parts_shop;
 mod power;
 use app::*;
 use hud::*;
+use loopctl::LoopCtl;
 
 use anyhow::Result;
 use career_ui::{CareerOpponent, CareerUi};
@@ -80,17 +82,31 @@ fn main() {
 
 fn run() -> Result<()> {
     // PLATFORM GLUE: the start-up crash guard (`guard.rs`): a start after a crashed one asks for a plain GPU device
-    guard::begin();
+    let cli = cli::Cli::from_env();
+    // (a headless re-simulation makes no GPU device: nothing for the guard to protect, and a crash of it must not put the next windowed start in safe mode)
+    let headless = cli.headless_resim();
+    if !headless {
+        guard::begin();
+    } else {
+        // nor any sound: the path of a machine with no sound device (`nfs_audio::mixer::no_sound`)
+        nfs_audio::mixer::no_sound();
+        // and no track pixels: they only reach the GPU upload
+        nfs_assets::track::no_textures();
+    }
     let paths = GamePaths::locate()?;
     tracing::info!(root = %paths.root.display(), "located original game data");
     // the Verok patch's `nfs5.ini` (dll 0x100022B0): `Filtering=0` is the renderer's, before it is made
     nfs_renderer::set_point_filter(!paths.nfs5_ini().filtering);
-    let cli = cli::Cli::from_env();
     // the strings every `Registry::load` reads after `fe.txt` (0x4B6698); PLATFORM GLUE: the port's own `--flags` stay out
     nfs_formats::fetxt::set_command_line(cli.options.clone());
     let positional = &cli.positional;
     // `--replay <file>`: play back a recording the port saved (`RE/notes/replay.md` §14.5 — the
     // original's 118 312-byte .rpl is the registry dump of §16, which `--rpl` writes)
+    // `--resim <package>`: an input-exchange race from a server's record (`nfs_game::resim`); its setup is a network replay's
+    let resim = match cli.resim.as_deref() {
+        Some(p) => Some(app::resim::load(&paths, p, cli.resim_out.as_deref())),
+        None => None,
+    };
     let replay_file = cli
         .replay
         .as_ref()
@@ -104,6 +120,9 @@ fn run() -> Result<()> {
                     None
                 })
         });
+    let replay_file = replay_file.or_else(|| {
+        resim.as_ref().map(|r| nfs_game::replay::ReplayFile { setup: r.setup.clone(), final_tick: r.ticks(), stream: Vec::new() })
+    });
     let career_id = cli.career;
     let mission_flag = cli.mission;
     // (`NFS_FE_PLAYGAME` keeps the front end for a scripted run: the race starts from it)
@@ -380,8 +399,14 @@ fn run() -> Result<()> {
         use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
         builder.with_activation_policy(ActivationPolicy::Accessory).with_activate_ignoring_other_apps(false);
     }
-    let event_loop = builder.build()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // (`--resim` headless: no event loop either - winit needs a display server to open one)
+    let event_loop = if headless {
+        None
+    } else {
+        let event_loop = builder.build()?;
+        event_loop.set_control_flow(ControlFlow::Poll);
+        Some(event_loop)
+    };
     // `--fe` boots into the original front end instead of the text menu, on the quick-race screen
     // or on the layout named after it (`--fe carcompare`)
     let fe_start = cli.fe.clone();
@@ -439,7 +464,8 @@ fn run() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(0);
-    let autotest = cli.autotest;
+    // (a re-simulation runs the frames the record allows: `ticks / 64` seconds of game time, plus a margin)
+    let autotest = cli.autotest.or_else(|| resim.as_ref().map(|r| r.ticks() as f32 / 64.0 + 1.0));
     let follow_road = cli.follow;
     // `--net` without `--opponents` still needs one seat for the other player
     let num_opponents_default = u32::from(cli.net_flag);
@@ -737,6 +763,7 @@ fn run() -> Result<()> {
         skill,
         records,
         replay_file,
+        resim,
         replay_setup,
         track_name,
         car_name,
@@ -796,7 +823,10 @@ fn run() -> Result<()> {
     // every `<Axis>.Min` / `.Max` starts at 0 / 0x80 (0x51E546, 0x51E550), the `.Max` clamped to the
     // range's last index 127 by `SetSelection` 0x4BC240
     app.input.axis_bands = [[0, 127]; 8];
-    event_loop.run_app(&mut app)?;
+    match event_loop {
+        Some(event_loop) => event_loop.run_app(&mut app)?,
+        None => app.run_headless(),
+    }
     Ok(())
 }
 

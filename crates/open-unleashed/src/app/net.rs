@@ -149,7 +149,7 @@ impl App {
     }
 
     /// The press, then the leave it asks for (0x41523A → the session loop's front-end return).
-    pub(crate) fn net_pause_action(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn net_pause_action(&mut self, event_loop: &LoopCtl) {
         if self.net_pause_press() && !self.leave_race_as(false) {
             event_loop.exit();
         }
@@ -311,7 +311,12 @@ impl App {
                 c
             };
             let mut samples: std::collections::HashMap<u32, nfs_net::exchange::Sample> = std::collections::HashMap::new();
-            if let Some(r) = self.replay.stream.as_mut() {
+            if let Some(rs) = self.resim.as_ref() {
+                // `--resim`: the samples the room's frames hold (`nfs_game::resim`), where a replay reads its lanes
+                for &i in &order {
+                    samples.insert(i, rs.feed.sample(i, tick).unwrap_or([0; 4]));
+                }
+            } else if let Some(r) = self.replay.stream.as_mut() {
                 for &i in &order {
                     let p = r.playback_player(i as usize);
                     samples.insert(i, [p.buttons, p.steer as u8, p.throttle, p.brake]);
@@ -616,6 +621,17 @@ impl App {
     /// empty outside one. [`ExchangeIn::humans`] is the same list at an even tick; the audio update
     /// (odd ticks) has no latched samples, only the session.
     pub(crate) fn exch_human_order(&self) -> Vec<HumanCar> {
+        // `--resim` re-runs such a race with no session and no sound: the same order from the record, so that the local car's draw on the
+        // shared stream (`simulate_audio`) is made as in the race it re-runs, not in the producer gated on the sound
+        if self.resim.is_some()
+            && let Some(rn) = self.replay_net.as_ref()
+        {
+            let mut order: Vec<(u32, HumanCar)> = vec![(rn.local_index, HumanCar::Local)];
+            order.extend((0..self.road.opponents.len()).map(|k| (rn.seats.get(k).copied().unwrap_or(u32::MAX), HumanCar::Seat(k))));
+            // (a stable sort: a seat without an index follows the others in seat order)
+            order.sort_by_key(|e| e.0);
+            return order.into_iter().map(|e| e.1).collect();
+        }
         let Some(n) = self.net.session.as_ref().filter(|n| n.exchanging()) else { return Vec::new() };
         let Some(local_index) = n.local_race_index() else { return Vec::new() };
         let mut order: Vec<(u32, HumanCar)> = vec![(local_index, HumanCar::Local)];
@@ -1041,7 +1057,7 @@ impl App {
     ///
     /// `DIAL` has no modem behind it here, and `ENTER` on the server list only moves the cursor,
     /// since what the original's server list connects *to* is the lobby service of §1.
-    pub(crate) fn network_callback(&mut self, cb: &str, _event_loop: &ActiveEventLoop) {
+    pub(crate) fn network_callback(&mut self, cb: &str, _event_loop: &LoopCtl) {
         // the internet lobby (`lobby.md`): the link is the session, the lists its own
         if self.internet_session() {
             match cb {

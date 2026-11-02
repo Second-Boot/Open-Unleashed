@@ -18,6 +18,11 @@ pub mod kind {
     pub const SERVER: u8 = 0xB8;
     /// `0xB9` — a server entry is gone (shares the code of `0xB5`).
     pub const SERVER_GONE: u8 = 0xB9;
+    /// `0xC7` — **PORT-ONLY** (D56): the port's build identity, sent once after `0xC6 0xE` on an internet lobby link. Outside the
+    /// original's tables on both sides (`lobby.md` §14.1): the reference server's switch (0x49127B) takes `type - 0xB1 > 0x14` to its
+    /// default 0x491C3C, the client's (0x48F32F) `type - 0xB0 > 0x16` to 0x48FBD1, and the CONMAN passes anything up to `0xC8` on as a game
+    /// message (0x55CEA0 cut) - so an original ignores it.
+    pub const CLIENT_BUILD: u8 = 0xC7;
     /// `0xBA` — back to the lobby (0x48D97B / 0x48E778: `0x48C870(0xBA, OMIT, OMIT, 0)`, one byte).
     pub const BACK: u8 = 0xBA;
 }
@@ -304,6 +309,68 @@ impl Lists {
     }
 }
 
+/// The revision of the `0xC7` body (the head's 24-bit value).
+pub const CLIENT_BUILD_REVISION: i32 = 1;
+/// The longest build text the port sends (the encoder cuts at [`room::MESSAGE_MAX`] with its 4 head bytes and the NUL).
+pub const CLIENT_BUILD_MAX: usize = room::MESSAGE_MAX - 5;
+
+/// `0xC7 revision24 text\0` - **PORT-ONLY** (D56): who the client is. `text` is `<name> <version> <commit> sim=<hash>`: the
+/// `sim=` word is the physics version ([`ClientBuild::sim`]), the rest is for humans.
+pub fn client_build(text: &str) -> Vec<u8> {
+    let t: Vec<u8> = text.bytes().filter(|&b| (0x20..0x7F).contains(&b)).take(CLIENT_BUILD_MAX).collect();
+    room::encode(kind::CLIENT_BUILD, Some(CLIENT_BUILD_REVISION), None, Some(&t))
+}
+
+/// A `0xC7` read by a server: `Err` for a malformed one (a hygiene flag, never a disconnect).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientBuild {
+    pub revision: i32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientBuildError {
+    NotOne,
+    Short,
+    BadRevision,
+    Empty,
+    NotPrintable,
+    TooLong,
+    NoTerminator,
+}
+
+pub fn parse_client_build(m: &[u8]) -> Result<ClientBuild, ClientBuildError> {
+    if m.first() != Some(&kind::CLIENT_BUILD) {
+        return Err(ClientBuildError::NotOne);
+    }
+    if m.len() < 5 {
+        return Err(ClientBuildError::Short);
+    }
+    let revision = crate::msg::sign_extend_24(u32::from(m[1]) << 16 | u32::from(m[2]) << 8 | u32::from(m[3]));
+    if revision != CLIENT_BUILD_REVISION {
+        return Err(ClientBuildError::BadRevision);
+    }
+    let body = &m[4..];
+    let Some(end) = body.iter().position(|&c| c == 0) else { return Err(ClientBuildError::NoTerminator) };
+    if end == 0 {
+        return Err(ClientBuildError::Empty);
+    }
+    if end > CLIENT_BUILD_MAX {
+        return Err(ClientBuildError::TooLong);
+    }
+    if !body[..end].iter().all(|b| (0x20..0x7F).contains(b)) {
+        return Err(ClientBuildError::NotPrintable);
+    }
+    Ok(ClientBuild { revision, text: body[..end].iter().map(|&b| char::from(b)).collect() })
+}
+
+impl ClientBuild {
+    /// The physics version: the `sim=<hash>` word of the text (`None` when absent or empty).
+    pub fn sim(&self) -> Option<&str> {
+        self.text.split(' ').find_map(|w| w.strip_prefix("sim=")).filter(|f| !f.is_empty())
+    }
+}
+
 /// `OMIT` re-exported for callers that build the lobby's own shapes.
 pub const OMITTED: u32 = OMIT;
 
@@ -388,6 +455,31 @@ mod tests {
         assert_eq!(l.games.len(), 1);
         assert_eq!(l.apply(&room::your_id(1, b"Game")), Changed::Games);
         assert!(l.games.is_empty());
+    }
+
+    #[test]
+    fn the_client_build_message_round_trips_and_malformed_ones_are_named() {
+        let m = client_build("OpenUnleashed 0.1.5 3f2a9c1d4e5b-dirty.00ab12cd sim=0123456789abcdef");
+        assert_eq!(m[..4], [0xC7, 0, 0, 1]);
+        assert_eq!(*m.last().unwrap(), 0);
+        let b = parse_client_build(&m).unwrap();
+        assert_eq!(b.text, "OpenUnleashed 0.1.5 3f2a9c1d4e5b-dirty.00ab12cd sim=0123456789abcdef");
+        assert_eq!(b.sim(), Some("0123456789abcdef"));
+        assert_eq!(ClientBuild { revision: 1, text: "x sim=".into() }.sim(), None);
+        // an overlong text is cut by the sender to the message size
+        let long = client_build(&"x".repeat(500));
+        assert!(long.len() <= room::MESSAGE_MAX);
+        assert!(parse_client_build(&long).is_ok());
+        assert_eq!(parse_client_build(&[0xC7, 0, 0]), Err(ClientBuildError::Short));
+        assert_eq!(parse_client_build(&[0xC7, 0, 0, 9, b'a', 0]), Err(ClientBuildError::BadRevision));
+        assert_eq!(parse_client_build(&[0xC7, 0, 0, 1, 0]), Err(ClientBuildError::Empty));
+        assert_eq!(parse_client_build(&[0xC7, 0, 0, 1, b'a']), Err(ClientBuildError::NoTerminator));
+        assert_eq!(parse_client_build(&[0xC7, 0, 0, 1, 1, 0]), Err(ClientBuildError::NotPrintable));
+        let mut over = vec![0xC7, 0, 0, 1];
+        over.extend(std::iter::repeat_n(b'a', CLIENT_BUILD_MAX + 3));
+        over.push(0);
+        assert_eq!(parse_client_build(&over), Err(ClientBuildError::TooLong));
+        assert_eq!(parse_client_build(&back()), Err(ClientBuildError::NotOne));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::*;
 impl App {
     /// One `NFS_FE_KEYS` token — what the start-up key script does for each of its comma-separated
     /// entries (moved out of `resume_inner` unchanged so `NFS_FE_SEQ_SCRIPT` can run the same).
-    pub(crate) fn fe_scripted_key(&mut self, k: &str, event_loop: &ActiveEventLoop) {
+    pub(crate) fn fe_scripted_key(&mut self, k: &str, event_loop: &LoopCtl) {
         match k {
             // **TEST GLUE** `f12` — the window's F12 (ENHANCEMENT framework: every switch on <-> off), as the key handler runs it
             "f12" => self.enh_toggle_all(),
@@ -295,7 +295,7 @@ impl App {
     }
 
     /// `NFS_FE_SEQ`: run the scripted sequence and write its frames. `true` when it ran.
-    pub(crate) fn fe_sequence(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn fe_sequence(&mut self, event_loop: &LoopCtl) -> bool {
         let Ok(dir) = std::env::var("NFS_FE_SEQ") else { return false };
         let frames: usize = nfs_game::config::cfg().nfs_fe_seq_frames.as_str().and_then(|v| v.parse().ok()).unwrap_or(60);
         let script = nfs_game::config::cfg().nfs_fe_seq_script.as_str().unwrap_or_default();

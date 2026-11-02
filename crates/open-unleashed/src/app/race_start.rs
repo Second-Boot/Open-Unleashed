@@ -69,13 +69,13 @@ impl App {
     /// The tail every launch path ends on: the renderer and the window go to [`App::start_race`] (the clock at 0). The
     /// launch is called from the event loop with both in `self`; without them (a bug elsewhere) it logs and stops
     /// where it used to panic on an `unwrap`.
-    pub(crate) fn hand_over_to_race(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn hand_over_to_race(&mut self, event_loop: &LoopCtl) {
         let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else {
             tracing::error!("race launch without a renderer / window");
             return;
         };
         self.tick = 0;
-        self.start_race(renderer, window, event_loop);
+        self.start_race(renderer, Some(window), event_loop);
     }
 
     /// A test drive, `Game.GameType` 6 / 7 / 8. The car is 0x4EB710's per type — 6 a new
@@ -83,7 +83,7 @@ impl App {
     /// each the record as it stands (0x4EB7A6, 0x4EB85E → 0x4EB727); the race is 0x4FC0B0's for
     /// 6…8 — `Track1.Track`, one lap, forward, **five** traffic cars — with **no** opponents
     /// (0x4ECF00) and no cops.
-    pub(crate) fn start_test_drive(&mut self, game_type: u8, event_loop: &ActiveEventLoop) {
+    pub(crate) fn start_test_drive(&mut self, game_type: u8, event_loop: &LoopCtl) {
         let Some(m) = self.fe.menu.as_ref() else { return };
         // 0x4FC0B0's arms for the two tournament drives (`modes.md` §2): 5 is `prerace.lay`'s
         // `TESTDRIVE` (0x5060D0) on the event `Tournament.RemainingTracks` has selected, and 11 is
@@ -336,7 +336,7 @@ impl App {
     /// Returns whether a race started.
     /// The era finale's launch from `VictoryRoom` (game type 10): the loaned prize car in its
     /// first paint set (0x4EB710), no garage car (`[0x690ADC] = 0`, 0x4EDEAA).
-    fn start_finale_from_layout(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    fn start_finale_from_layout(&mut self, event_loop: &LoopCtl) -> bool {
         // the side state for the launch's save, which `start_finale` makes (0x4D52EA)
         self.sync_save_side_state();
         let Some(cu) = self.career.as_mut() else { return false };
@@ -349,7 +349,7 @@ impl App {
         self.fe_hand_over(game_type::FINALE, event_loop)
     }
 
-    pub(crate) fn start_tournament_from_layout(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn start_tournament_from_layout(&mut self, event_loop: &LoopCtl) -> bool {
         // the side state for the launch's save, which `start_selected_event` makes (0x4D52EA)
         self.sync_save_side_state();
         let Some(cu) = self.career.as_mut() else { return false };
@@ -382,7 +382,7 @@ impl App {
     /// passed** (0x51AEAA) — in `FactoryDriver.Car` (0x4EB710), with 0x4EC040's mission options
     /// (`CareerUi::mission_request`, `load_career_race`). *(Until 2026-10-01 the layout front end
     /// had no type-9 launch: `PLAYGAME` on these screens raced the Quick Race's settings.)*
-    fn start_mission_from_layout(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    fn start_mission_from_layout(&mut self, event_loop: &LoopCtl) -> bool {
         if self.career.is_none() {
             return false;
         }
@@ -404,14 +404,14 @@ impl App {
     /// replay's: the menu kept aside for the way back (`leave_race`, `fe_after_race`), the race's
     /// `FEGAME_TYPE` (`race_game_type`), the layout screen dropped, then [`App::start_race`] on the
     /// window. `false` (nothing started) when the window is not here to take.
-    pub(crate) fn fe_hand_over(&mut self, race_game_type: u8, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn fe_hand_over(&mut self, race_game_type: u8, event_loop: &LoopCtl) -> bool {
         self.fe.menu_template = self.fe.menu.take();
         self.fe.race_game_type = Some(race_game_type);
         self.fe.layout_preview = None;
         self.fe.layout_name = None;
         let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return false };
         self.tick = 0;
-        self.start_race(renderer, window, event_loop);
+        self.start_race(renderer, Some(window), event_loop);
         true
     }
 
@@ -461,7 +461,7 @@ impl App {
     /// to the players first (0x48BF10, `0xB3`), then the launch goes on as any other, with 0x4B4DA0's
     /// network half (`net_launch_sync`) in front of it. **The order is the original's**: `0xB3`, then
     /// the stream (`0xBC`), then the barrier (`0xBD`).
-    pub(crate) fn fe_start_game(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn fe_start_game(&mut self, event_loop: &LoopCtl) {
         // the original's order (`network.md` §11.7): the room's `0xB3` (0x48BF10) first, then each
         // machine's launch - 0x4B4DA0 sends the stream and runs the barrier 0x48D6A0
         if !self.net_playgame() {
@@ -471,7 +471,7 @@ impl App {
         self.start_from_layout(event_loop);
     }
 
-    pub(crate) fn start_from_layout(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn start_from_layout(&mut self, event_loop: &LoopCtl) {
         // `Game.GameType` 10 — `VictoryRoom`'s `PLAYGAME` — is the era finale (0x4D5730's type-10
         // arm to the launch, `CareerUi::start_finale`). *(Until 2026-09-27 the port ran the quick
         // race's single race here, so the finale could not be raced from the layout front end.)*
@@ -717,8 +717,8 @@ impl App {
     pub(crate) fn start_race(
         &mut self,
         mut renderer: Renderer,
-        window: Arc<Window>,
-        event_loop: &ActiveEventLoop,
+        window: Option<Arc<Window>>,
+        event_loop: &LoopCtl,
     ) {
         self.enter_race_mode();
         // the launch dump 0x4B4DA0 (0x4B5179): `[0x657CA0]` = the `Audio.MusicLevel` accessor
@@ -1382,7 +1382,7 @@ impl App {
         self.net_load_barrier(&mut renderer);
         self.race_loading_frame(&mut renderer, 10);
         self.renderer = Some(renderer);
-        self.window = Some(window);
+        self.window = window;
         self.rebuild_scene();
         // the session loop's barriers and the race frame's `0xC5` round (`net_race_go`)
         self.net_race_go();
@@ -1419,7 +1419,7 @@ impl App {
             .unwrap_or_default();
     }
 
-    pub(crate) fn restart_race(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn restart_race(&mut self, event_loop: &LoopCtl) {
         // The pause menu's restart (command 3, 0x415721) resets the race audio through 0x4AB360
         // (a hard stop), never through the resume 0x4AB200 — there is no shared "paused" flag on
         // the original's side to desync. The port tracks pause/resume with `audio_paused`
@@ -1454,7 +1454,7 @@ impl App {
         self.hud_clock_base += self.tick as f64;
         self.tick = 0;
         self.race_pass = true;
-        self.start_race(renderer, window, event_loop);
+        self.start_race(renderer, Some(window), event_loop);
     }
 }
 

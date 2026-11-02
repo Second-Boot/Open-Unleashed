@@ -20,7 +20,7 @@ impl App {
     /// row edits them), so they keep the start-up values (`fe.txt` / the command line) in every
     /// launch. *(2026-10-01: the knockout arm did not write `player_car_id`, so a
     /// Knockout round after a Single Race recorded the Single Race's car id in its replay setup.)*
-    pub(crate) fn text_menu_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
+    pub(crate) fn text_menu_key(&mut self, key: MenuKey, event_loop: &LoopCtl) {
         let Some(m) = self.fe.menu.as_mut() else { return };
         let rows = m.rows();
         match key {

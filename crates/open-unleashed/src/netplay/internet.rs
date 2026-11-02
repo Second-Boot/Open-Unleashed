@@ -101,6 +101,8 @@ pub struct Internet {
     pub sel_game: usize,
     /// when the `'a'` came: the link's own round trip, the stand-in of an echo this host cannot send (D55)
     connected_after: Option<u32>,
+    /// the port-only `0xC7` build message (D56) has gone out on this link
+    build_sent: bool,
     started: Instant,
     echoes_tx: mpsc::Sender<(u32, Echo)>,
     echoes_rx: mpsc::Receiver<(u32, Echo)>,
@@ -120,6 +122,7 @@ impl Internet {
             sel_server: 0,
             sel_game: 0,
             connected_after: None,
+            build_sent: false,
             started: Instant::now(),
             echoes_tx,
             echoes_rx,
@@ -325,6 +328,16 @@ impl NetPlay {
     /// send it the link's own round trip stands in (APPROXIMATION: every row then shows the entry link's time).
     pub(super) fn poll_internet(&mut self) {
         let Some(i) = self.inet.as_mut() else { return };
+        // **PORT-DEVIATION D56:** once, right after the sign-on's `0xC6 0xE`, the port tells the lobby server which build it is
+        // (`0xC7`, outside the original's message tables on both sides, `lobby.md` §14.1). Never on a LAN, direct-IP or game session.
+        if !i.build_sent && self.state_in == Some(nfs_net::room::comm_state::CONNECTED) {
+            i.build_sent = true;
+            let id = crate::brand::build_id();
+            match self.net.send_game(&lobby::client_build(&id)) {
+                Ok(()) => tracing::info!(build = %id, "lobby link: build identity sent (0xC7, port-only)"),
+                Err(e) => tracing::debug!(error = %e, "build identity not sent"),
+            }
+        }
         if i.connected_after.is_none() && self.join == JoinState::Joined {
             i.connected_after = Some((i.started.elapsed().as_millis() as u32).max(1));
         }

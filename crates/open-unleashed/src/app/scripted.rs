@@ -299,7 +299,7 @@ impl App {
 
     /// One scripted left click at design point `(x, y)` (tooling: `NFS_FE_CLICKS`, and the
     /// `click:x,y` token of `NFS_FE_KEYS`, which runs in order with the `keys:` around it).
-    pub(crate) fn fe_scripted_click(&mut self, x: f32, y: f32, event_loop: &ActiveEventLoop) {
+    pub(crate) fn fe_scripted_click(&mut self, x: f32, y: f32, event_loop: &LoopCtl) {
         self.fe.cursor = Some((x, y));
         if let Some(l) = self.fe.layout_preview.as_mut() {
             l.script_cursor(Some((x, y)));
@@ -524,7 +524,7 @@ impl App {
     /// traces), then the race's end as the interactive path files it. Moved out of `start_race` unchanged; the end of
     /// each iteration is [`Self::race_frame_epilogue`], the windowed frame's own. `true` when `start_race` must return
     /// (the run ended the program, left for the front end or started another race), `false` to go on to the screenshot.
-    pub(crate) fn run_scripted_race(&mut self, secs: f32, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn run_scripted_race(&mut self, secs: f32, event_loop: &LoopCtl) -> bool {
         let ticks = (secs * TICKS_PER_SEC_F32) as u32;
         // diagnostic: with `NFS_FX_FRAMES` the scripted run draws a frame every other tick, so the cars' effects
         // (driven by each drawn frame, `nfs_game::car_effects`) run as in a windowed race
@@ -623,6 +623,12 @@ impl App {
                 }
             }
             self.simulate();
+            // `--resim`: the hashes and finishes of the tick; the run ends when every human has finished or the frames are used up
+            if self.resim.is_some() && self.resim_after_tick() {
+                self.resim_report();
+                event_loop.exit();
+                return true;
+            }
             self.start_auto_replay_if_due(event_loop);
             // diagnostic: `NFS_RESULTS_STOP=<n>[:<ticks>]` stops a scripted run `ticks` (96)
             // after the n-th result page of the queue (0-based) was first drawn, its slide-in
@@ -754,7 +760,7 @@ impl App {
     /// **The still of `--screenshot`** (a scripted run's last step): the mirror's texture, the renderer's per-frame
     /// state the scripted loop never sets, the lens-flare warm-up, the offscreen render to `path` and the
     /// `NFS_SHOT_SEQ` extra; then the program ends. Moved out of `start_race` unchanged.
-    pub(crate) fn take_screenshot(&mut self, path: String, event_loop: &ActiveEventLoop) {
+    pub(crate) fn take_screenshot(&mut self, path: String, event_loop: &LoopCtl) {
         // a scripted run seldom redraws, so the mirror may not have a texture yet: render it,
         // and rebuild the scene once more so the HUD carries it
         if self.rear_mirror.is_some() {
@@ -875,7 +881,7 @@ impl App {
     /// the race made again ([`Self::restart_race`]). `true` when it restarted, which leaves the caller's own race
     /// behind. The windowed frame lets go after 64 pause ticks of its clock, a scripted run's loop after 64
     /// iterations.
-    pub(crate) fn end_scripted_pause(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn end_scripted_pause(&mut self, event_loop: &LoopCtl) -> bool {
         self.scripted_hud.pause = false;
         self.paused = false;
         if std::mem::take(&mut self.scripted_hud.restart) {

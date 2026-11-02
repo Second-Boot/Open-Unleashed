@@ -154,6 +154,9 @@ pub struct Renderer {
     edr_ok: bool,
     /// ENH-LITE: the adapter's class, read once at the start
     gpu_class: crate::GpuClass,
+    /// TOOLING (server re-simulation, `Self::headless`): no device, no window, nothing is drawn or recorded. The ids and counts a
+    /// caller reads back (meshes, textures, materials, the surface's size) are handed out exactly as with a device.
+    headless: bool,
 }
 
 impl Renderer {
@@ -179,6 +182,7 @@ impl Renderer {
             spare_scene: None,
             pending_err: None,
             lens_done: Vec::new(),
+            headless: false,
         })
     }
 
@@ -187,10 +191,50 @@ impl Renderer {
         self.edr_ok
     }
 
+    /// **TOOLING (server re-simulation, `open-unleashed --resim`; not the original's):** a renderer with no GPU device, no window and no
+    /// surface, `size` pixels large. Every upload only does the bookkeeping the device-backed renderer mirrors (ids, vertex lengths,
+    /// the materials' textures, the offscreen sizes: the first texture is the 1x1 white one `Core::new` makes), every draw and every
+    /// recorded state change is dropped, and [`Self::render`] succeeds without drawing. What the simulation reads from a renderer is
+    /// only these counts and the size, so a race built on this one plays the same ticks as on a device.
+    pub fn headless(size: (u32, u32)) -> Self {
+        Self {
+            core: None,
+            worker: None,
+            list: CmdList::default(),
+            spare_list: None,
+            spare_scene: None,
+            pending_err: None,
+            lens_done: Vec::new(),
+            size,
+            meshes: Vec::new(),
+            n_textures: 1,
+            white: TextureId(0),
+            material_tex: Vec::new(),
+            offscreen: HashMap::new(),
+            gamma: 1.0,
+            enhancements: crate::Enhancements::ORIGINAL,
+            edr_ok: false,
+            gpu_class: crate::GpuClass::Strong,
+            headless: true,
+        }
+    }
+
+    /// Whether this renderer is the device-less one of [`Self::headless`].
+    pub fn is_headless(&self) -> bool {
+        self.headless
+    }
+
+    /// Record a state change for the next frame (dropped by a headless renderer, which has no frame).
+    fn rec(&mut self, c: Cmd) {
+        if !self.headless {
+            self.list.cmds.push(c);
+        }
+    }
+
     /// Move the encode / submit / present of every frame to a render thread of its own. From here
     /// [`Self::render`] hands the frame over and returns; the pixels drawn for a scene are the same.
     pub fn enable_render_thread(&mut self) {
-        if self.worker.is_some() {
+        if self.worker.is_some() || self.headless {
             return;
         }
         let (tx, jobs) = channel::<Job>();
@@ -243,6 +287,9 @@ impl Renderer {
     /// With the render thread on, this hands the frame over (after the previous one is done) and
     /// returns; a failure of a frame is reported by the next call.
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
+        if self.headless {
+            return Ok(());
+        }
         if self.worker.is_none() {
             let core = self.core.as_mut().expect("core home");
             core.frame_begin();
@@ -270,7 +317,7 @@ impl Renderer {
             return;
         }
         self.size = (width, height);
-        self.list.cmds.push(Cmd::Resize(width, height));
+        self.rec(Cmd::Resize(width, height));
     }
 
     /// The surface's pixel size.
@@ -288,7 +335,7 @@ impl Renderer {
         // `create_buffer_init` rounds the size up to 4 bytes, at least 4
         let vertex_len = (std::mem::size_of_val(mesh.vertices.as_slice()) as u64).next_multiple_of(4).max(4);
         self.meshes.push(MeshMirror { vertex_len, writes: 0 });
-        self.list.cmds.push(Cmd::DynamicMesh(Box::new(mesh.clone())));
+        self.rec(Cmd::DynamicMesh(Box::new(mesh.clone())));
         MeshId(self.meshes.len() as u32 - 1)
     }
 
@@ -298,6 +345,9 @@ impl Renderer {
         }
         let m = &mut self.meshes[id.0 as usize];
         m.writes = m.writes.wrapping_add(1);
+        if self.headless {
+            return;
+        }
         let start = self.list.bytes.len();
         self.list.bytes.extend_from_slice(bytes);
         self.list.cmds.push(Cmd::WriteMesh { mesh: id.0, start, len: bytes.len() });
@@ -331,6 +381,11 @@ impl Renderer {
     }
 
     pub fn upload_mesh(&mut self, mesh: &MeshData) -> MeshId {
+        if self.headless {
+            // `Core::upload_mesh` records the vertex bytes as they are (no rounding, unlike a dynamic mesh)
+            self.meshes.push(MeshMirror { vertex_len: std::mem::size_of_val(mesh.vertices.as_slice()) as u64, writes: 0 });
+            return MeshId(self.meshes.len() as u32 - 1);
+        }
         let core = self.home();
         let id = core.upload_mesh(mesh);
         let vertex_len = core.mesh_vertex_len(id);
@@ -346,9 +401,18 @@ impl Renderer {
         self.upload_texture_mips(tex.width, tex.height, &tex.mips)
     }
 
+    /// The next free texture id (a headless renderer's uploads: one id each, in call order, as `Core` hands them).
+    fn next_texture_id(&mut self) -> TextureId {
+        self.n_textures += 1;
+        TextureId(self.n_textures - 1)
+    }
+
     /// [`Self::upload_texture`] over borrowed levels, so a caller that keeps its pixels does not
     /// clone a whole mip chain just to hand it over.
     pub fn upload_texture_mips(&mut self, width: u32, height: u32, mips: &[Vec<u8>]) -> TextureId {
+        if self.headless {
+            return self.next_texture_id();
+        }
         let core = self.home();
         let id = core.upload_texture_mips(width, height, mips);
         self.n_textures = core.texture_count();
@@ -360,6 +424,9 @@ impl Renderer {
     /// E2 is off the texture is sampled at level 0 only, as the original's. For the cars' pages and
     /// the sprites, never the track's own textures.
     pub fn upload_texture_generated(&mut self, width: u32, height: u32, rgba: &[u8], alpha: MipAlpha) -> TextureId {
+        if self.headless {
+            return self.next_texture_id();
+        }
         let core = self.home();
         let id = core.upload_texture_generated(width, height, rgba, alpha);
         self.n_textures = core.texture_count();
@@ -369,6 +436,9 @@ impl Renderer {
     /// Several textures at once, the ids in the order given (the next free ones, as the same number
     /// of [`Self::upload_texture_mips`] calls would hand them).
     pub fn upload_textures(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
+        if self.headless {
+            return items.iter().map(|_| self.next_texture_id()).collect();
+        }
         let core = self.home();
         let ids = core.upload_textures(items);
         self.n_textures = core.texture_count();
@@ -378,6 +448,9 @@ impl Renderer {
     /// [`Self::upload_textures`] where an item may carry a `MipAlpha`: a single-level texture then
     /// gets a generated chain (ENHANCEMENT E2, the track's single-level textures).
     pub fn upload_textures_gen(&mut self, items: &[(u32, u32, &[Vec<u8>], Option<MipAlpha>)]) -> Vec<TextureId> {
+        if self.headless {
+            return items.iter().map(|_| self.next_texture_id()).collect();
+        }
         let core = self.home();
         let ids = core.upload_textures_gen(items);
         self.n_textures = core.texture_count();
@@ -386,12 +459,16 @@ impl Renderer {
 
     /// ENHANCEMENT E41: whether the device takes BC7 textures ([`Self::upload_textures_bc7`]).
     pub fn supports_bc7(&mut self) -> bool {
-        self.home().supports_bc7()
+        // (a headless renderer has no device: no BC7)
+        !self.headless && self.home().supports_bc7()
     }
 
     /// ENHANCEMENT E41: BC7 textures of the HD pack, uploaded as they are (`(width, height, levels)`, the base level a multiple of 4
     /// each, `levels[0]` first, 16 bytes per 4x4 block); the ids in the order given. Only when [`Self::supports_bc7`].
     pub fn upload_textures_bc7(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
+        if self.headless {
+            return items.iter().map(|_| self.next_texture_id()).collect();
+        }
         let core = self.home();
         let ids = core.upload_textures_bc7(items);
         self.n_textures = core.texture_count();
@@ -403,7 +480,7 @@ impl Renderer {
     /// car's texture pages, which are recomposed when the damage decals change
     /// (`RE/notes/car-model.md` §11).
     pub fn update_texture(&mut self, id: TextureId, tex: &TextureData) {
-        if id.0 >= self.n_textures {
+        if id.0 >= self.n_textures || self.headless {
             return;
         }
         let (mut w, mut h) = (tex.width, tex.height);
@@ -434,7 +511,7 @@ impl Renderer {
 
     pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
         self.material_tex.push(desc.texture.unwrap_or(self.white));
-        self.list.cmds.push(Cmd::CreateMaterial(desc));
+        self.rec(Cmd::CreateMaterial(desc));
         MaterialId(self.material_tex.len() as u32 - 1)
     }
 
@@ -455,27 +532,27 @@ impl Renderer {
             return id;
         }
         self.material_tex.push(texture);
-        self.list.cmds.push(Cmd::DuplicateMaterial { id, texture });
+        self.rec(Cmd::DuplicateMaterial { id, texture });
         MaterialId(self.material_tex.len() as u32 - 1)
     }
 
     /// `night.psh`'s `nght` bitmap, 128 × 128 bytes, for the headlight projector.
     pub fn set_headlight_map(&mut self, map: &[u8]) {
         if map.len() == 128 * 128 {
-            self.list.cmds.push(Cmd::HeadlightMap(map.to_vec()));
+            self.rec(Cmd::HeadlightMap(map.to_vec()));
         }
     }
 
     /// The car shadow projector's texture, `[0x6115CC]+0x18C` (`RE/notes/crp-geometry.md` §8);
     /// `None` for none.
     pub fn set_projector_texture(&mut self, tex: Option<TextureId>) {
-        self.list.cmds.push(Cmd::Projector(tex));
+        self.rec(Cmd::Projector(tex));
     }
 
     /// `HEAD` of `Render/common.fsh`, what `Headlights::LayerUVLight` projects (0x452645 fetches it
     /// by that four-character code); `None` for none.
     pub fn set_headlight_texture(&mut self, tex: Option<TextureId>) {
-        self.list.cmds.push(Cmd::HeadlightTexture(tex));
+        self.rec(Cmd::HeadlightTexture(tex));
     }
 
     /// The view about to be drawn is the rear-view mirror's: `[0x6115CC]+0x190` is set from the
@@ -484,7 +561,7 @@ impl Renderer {
     /// passes (0x445578, 0x445B69).
     /// The same flag keeps out the draws only the main view makes (`DrawItem::main_view_only`).
     pub fn set_mirror_view(&mut self, on: bool) {
-        self.list.cmds.push(Cmd::MirrorView(on));
+        self.rec(Cmd::MirrorView(on));
     }
 
     /// `[0x69DD1D]`, the mip filter's promotion (0x535B40 / 0x535A60, `RE/notes/thrash.md` §4):
@@ -492,13 +569,13 @@ impl Renderer {
     /// 0x44ED10 sets it only at `SPECIALFX` 3 on a card that took `setstate(0x0B, 3)`
     /// (`[0x6197A6]`, taken as accepted); the front end's 0x44F020 clears it.
     pub fn set_trilinear(&mut self, on: bool) {
-        self.list.cmds.push(Cmd::Trilinear(on));
+        self.rec(Cmd::Trilinear(on));
     }
 
     /// Let the window surface be copied from, which the lens flare's frame read-back needs
     /// ([`crate::LensProbe`]); off, the surface is a render attachment alone.
     pub fn set_lens_probe(&mut self, on: bool) {
-        self.list.cmds.push(Cmd::LensProbe(on));
+        self.rec(Cmd::LensProbe(on));
     }
 
     /// The lens-flare read-backs finished since the last call (a frame or two after the frame whose
@@ -513,14 +590,14 @@ impl Renderer {
 
     /// `LayerFalseSort1`/`2`'s per-frame pick (`main.rs`'s `App::fakesort_mode`, [`FakeSortMode`]).
     pub fn set_fakesort_mode(&mut self, mode: FakeSortMode) {
-        self.list.cmds.push(Cmd::FakeSort(mode));
+        self.rec(Cmd::FakeSort(mode));
     }
 
     /// State 0x2E, the display gamma (`Core::set_gamma`); only a change is recorded.
     pub fn set_gamma(&mut self, g: f32) {
         if self.gamma != g {
             self.gamma = g;
-            self.list.cmds.push(Cmd::Gamma(g));
+            self.rec(Cmd::Gamma(g));
         }
     }
 
@@ -532,48 +609,51 @@ impl Renderer {
     /// whether the backend came up, `gpu.rs::temporal_frame`); this call stays the explicit way for another backend.
     #[allow(dead_code)]
     pub fn set_temporal(&mut self, on: bool) {
-        self.list.cmds.push(Cmd::Temporal(on));
+        self.rec(Cmd::Temporal(on));
     }
 
     /// ENHANCEMENT E37: the camera cut at the next frame - the app calls it for what the renderer cannot see in the camera's
     /// numbers: a view change (chase to bumper), photo mode in / out, a replay jump, a new race, a pause. Without a temporal
     /// upscaler on it does nothing.
     pub fn temporal_cut(&mut self) {
-        self.list.cmds.push(Cmd::TemporalCut);
+        self.rec(Cmd::TemporalCut);
     }
 
     /// ENHANCEMENT ENH-LIVETEX (E41): `twin` is `base`'s HD texture. Materials that sample `base` show the twin while E41 is above 0 and `base`
     /// itself otherwise, so the enhancement switch flips the textures without a reload. `None` clears it. Recorded in call order.
     pub fn set_texture_twin(&mut self, base: TextureId, twin: Option<TextureId>) {
-        self.list.cmds.push(Cmd::TextureTwin(base, twin));
+        self.rec(Cmd::TextureTwin(base, twin));
     }
 
     /// ENHANCEMENT ENH-LIVETEX (E42): `twin` is the refined copy of `base`'s mesh; a draw of `base` uses it while E42 is above 0.
     pub fn set_mesh_twin(&mut self, base: MeshId, twin: Option<MeshId>) {
-        self.list.cmds.push(Cmd::MeshTwin(base, twin));
+        self.rec(Cmd::MeshTwin(base, twin));
     }
 
     /// ENHANCEMENT ENH-LIVETEX: give back the video memory of a texture nothing shows any more (a replaced HD twin); the id stays valid
     /// (a 1 x 1 image). Never for a texture a material still samples as its own.
     pub fn release_texture(&mut self, id: TextureId) {
-        self.list.cmds.push(Cmd::ReleaseTexture(id));
+        self.rec(Cmd::ReleaseTexture(id));
     }
 
     /// ENHANCEMENT ENH-LIVELEAK: give back the memory of a mesh nothing draws any more (a replaced refined twin; the caller clears its
     /// twin entry first): a static mesh's arena ranges are used again by a later upload that fits; the id stays valid (an empty mesh).
     pub fn release_mesh(&mut self, id: MeshId) {
-        self.list.cmds.push(Cmd::ReleaseMesh(id));
+        self.rec(Cmd::ReleaseMesh(id));
     }
 
     /// ENHANCEMENT ENH-LIVELEAK: the texture / mesh slots released so far may be taken by later uploads (the end of a live pass, when no
     /// model holds a released id any more).
     pub fn recycle_released(&mut self) {
-        self.list.cmds.push(Cmd::RecycleReleased);
+        self.rec(Cmd::RecycleReleased);
     }
 
     /// ENHANCEMENT ENH-LIVELEAK: the GPU side's resident resources, with everything recorded so far executed (the live-build log, the
     /// leak checks).
     pub fn resource_stats(&mut self) -> crate::gpu::ResourceStats {
+        if self.headless {
+            return Default::default();
+        }
         self.home().resource_stats()
     }
 
@@ -584,7 +664,7 @@ impl Renderer {
     pub fn set_enhancements(&mut self, e: crate::Enhancements) {
         if self.enhancements != e {
             self.enhancements = e;
-            self.list.cmds.push(Cmd::Enhancements(e));
+            self.rec(Cmd::Enhancements(e));
         }
     }
 
@@ -618,7 +698,7 @@ impl Renderer {
                 id
             }
         };
-        self.list.cmds.push(Cmd::Offscreen(Box::new(OffscreenJob { scene: scene.clone_without_sprites(), camera: *camera, width, height, reuse, clear: clear_colour, depth_far, id })));
+        self.rec(Cmd::Offscreen(Box::new(OffscreenJob { scene: scene.clone_without_sprites(), camera: *camera, width, height, reuse, clear: clear_colour, depth_far, id })));
         self.list.barrier = self.list.cmds.len();
         id
     }
@@ -628,23 +708,29 @@ impl Renderer {
     /// like an offscreen pass; the main view uses the map once all six faces have been drawn and
     /// `Scene::refl` is set.
     pub fn render_refl_face(&mut self, scene: &Scene, camera: &Camera, face: u32, size: u32, clear: [f64; 4], depth_far: f32) {
-        self.list.cmds.push(Cmd::ReflFace(Box::new(ReflFaceJob { scene: scene.clone_without_sprites(), camera: *camera, face, size, clear, depth_far })));
+        self.rec(Cmd::ReflFace(Box::new(ReflFaceJob { scene: scene.clone_without_sprites(), camera: *camera, face, size, clear, depth_far })));
         self.list.barrier = self.list.cmds.len();
     }
 
     /// ENHANCEMENT ENH-FE3D: set the environment map from six CPU-made `size x size` RGBA f32 faces (display values, may exceed 1) (`REFL_FACES` order).
     pub fn upload_refl_faces(&mut self, size: u32, faces: Vec<Vec<f32>>) {
-        self.list.cmds.push(Cmd::ReflUpload(size, faces));
+        self.rec(Cmd::ReflUpload(size, faces));
         self.list.barrier = self.list.cmds.len();
     }
 
     pub fn render_to_image(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {
+        if self.headless {
+            anyhow::bail!("a headless renderer draws nothing");
+        }
         self.home().render_to_image(scene, camera, width, height)
     }
 
     /// PORT-DEVIATION D46 (photo mode): a still of the scene (`Core::render_still`) at about `width x height`, the
     /// size it really got and RGBA8 rows.
     pub fn render_still(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<(u32, u32, Vec<u8>)> {
+        if self.headless {
+            anyhow::bail!("a headless renderer draws nothing");
+        }
         self.home().render_still(scene, camera, width, height)
     }
 

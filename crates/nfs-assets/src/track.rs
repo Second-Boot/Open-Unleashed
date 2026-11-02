@@ -390,6 +390,15 @@ pub struct TrackAssets {
     pub sky_bin: Option<nfs_formats::sky::SkyBin>,
 }
 
+/// TOOLING ([`no_textures`]): a track loads without its pixels.
+static NO_TEXTURES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// **TOOLING** (`--resim`, the server's re-simulation): the `.fsh` / `.env` pixels are not read from now on. They reach only the GPU upload, which a
+/// headless renderer drops; the world's materials take a missing texture as they take a name a pack does not hold.
+pub fn no_textures() {
+    NO_TEXTURES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl TrackAssets {
     /// Whether this is a night track: its render methods build a `Headlights::*` layer, which is
     /// what sets the game's night flag (`uses_headlight_layers`). The shipped night tracks are
@@ -505,6 +514,9 @@ impl TrackAssets {
     /// The track's `.fsh` (pack key 0, the one with a mip chain: 0x4877BD, `texture::decode_pack_mipped`)
     /// and `.env` pixels.
     fn decode_textures(lookup: &DirLookup, dir: &std::path::Path, name: &str) -> Result<(Vec<TextureImage>, Vec<TextureImage>), AssetError> {
+        if NO_TEXTURES.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let file = |suffix: &str| -> Result<PathBuf, AssetError> {
             let n = format!("{name}{suffix}");
             lookup.find(&n).ok_or_else(|| AssetError::MissingFile { dir: dir.to_path_buf(), name: n })

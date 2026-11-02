@@ -6,7 +6,7 @@ impl App {
     /// Menu navigation shared by the keyboard and the gamepad.
     /// The keyboard's and the gamepad's menu keys go to the layout screen on show
     /// ([`Self::layout_key`]), else to the developer text menu ([`Self::text_menu_key`]).
-    pub(crate) fn menu_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
+    pub(crate) fn menu_key(&mut self, key: MenuKey, event_loop: &LoopCtl) {
         // `--layout` browse mode: the screens navigate each other through their own `destination` fields
         if self.fe.layout_preview.is_some() {
             self.layout_key(key, event_loop);
@@ -16,7 +16,7 @@ impl App {
     }
 
     /// Navigate the previewed front-end screen: the buttons carry the name of the screen they lead to.
-    pub(crate) fn layout_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
+    pub(crate) fn layout_key(&mut self, key: MenuKey, event_loop: &LoopCtl) {
         // PORT-DEVIATION D54: the arrows, the pad and a pointer-placed Enter run on the virtual pointer
         // (`pad_menu.rs`); what it leaves is the older Enter on `layout_sel`, which the mouse's release uses
         if self.pad_menu_key(key, event_loop) {
@@ -637,7 +637,7 @@ impl App {
     /// A key the screen's widgets did not take: the callback list's slot 4 first (`careerfirst`'s
     /// 0x506170 and the end-of-era show's 0x500770 take 0x1B — the movie circle's tick 0x4CD410
     /// then sees ESC down and opens `tournament`; the show's tick goes back), then 0x4D2970.
-    pub(crate) fn fe_key_code(&mut self, code: u8, event_loop: &ActiveEventLoop) {
+    pub(crate) fn fe_key_code(&mut self, code: u8, event_loop: &LoopCtl) {
         if !self.fe_callback_key(code) {
             self.fe_manager_key(code, event_loop);
         }
@@ -676,7 +676,7 @@ impl App {
         l.in_transition() || room_busy
     }
 
-    pub(crate) fn fe_manager_key(&mut self, code: u8, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn fe_manager_key(&mut self, code: u8, event_loop: &LoopCtl) -> bool {
         let button_enabled = |b: &Option<nfs_game::layout::LayoutScreen>, name: &str| {
             b.as_ref().and_then(|b| b.widgets_named(&[name]).first().map(|(i, _)| !b.widget_disabled(*i))).unwrap_or(false)
         };
@@ -753,7 +753,7 @@ impl App {
 
     /// The front end's left button, press or release — `window_event`'s own arm, and the
     /// `NFS_FE_CLICKS` screenshot diagnostic (tooling: a scripted click through the same path).
-    pub(crate) fn fe_left_button(&mut self, event_loop: &ActiveEventLoop, down: bool) {
+    pub(crate) fn fe_left_button(&mut self, event_loop: &LoopCtl, down: bool) {
         if let Some(l) = self.fe.layout_preview.as_mut() {
             l.set_pressed(down);
         }

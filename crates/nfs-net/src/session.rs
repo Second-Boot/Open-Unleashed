@@ -497,6 +497,11 @@ impl Net {
     /// the records the registrations listed; one that is idle and empty does nothing, so walking all of them is
     /// the same). `+0xBA` ("in") is [`Peer::in_room`]: false until the arrival handler has answered
     /// ([`Net::peer_in`]), and a record that is not in sends nothing.
+    /// Whether a peer's send queue holds a message: [`Self::pump_peers`] sends one per queue per call, so a loop that waits must not wait then.
+    pub fn peers_queued(&self) -> bool {
+        self.peers.iter().flatten().any(|p| !p.queue.is_empty())
+    }
+
     pub fn pump_peers(&mut self) {
         for i in 0..self.peers.len() {
             let Some(p) = self.peers[i].as_mut() else { continue };

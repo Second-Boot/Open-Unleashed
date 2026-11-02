@@ -268,6 +268,13 @@ impl LayoutScreen {
             let (x0, y0, x1, y1) = (x + 1.0, y + 1.0, x + w - 1.0, y + h - 1.0);
             self.gouraud(out, aspect, [[x0, y0], [x1, y0], [x0, y1], [x1, y1]], [l, r, l, r]);
         }
+        // PORT-DEVIATION D54: the original has no hover look on a closed combo (a mouse has its cursor), so
+        // the box the pad stands on takes the buttons' amber over its caption strip, or over the box without one
+        if self.pad_mark && hovered == Some(i) && self.open_combo != Some(i) && !dim && self.attr_num(e, "nolabel") != Some(4.0) {
+            let strip = self.combo_strip(e);
+            let bw = if strip > 0.0 { strip } else { w };
+            out.push(self.quad(aspect, x + 1.0, y + 1.0, bw - 2.0, h - 2.0, tint([0xff, 0xbb, 0, 0xff])));
+        }
         // The same stems the buttons have (§4.24), from the same draw — a combo slider
         // and a colour box share `FeComboBox`'s slot 1, and 0x4C5F18…0x4C5FB2 is its
         // copy of the pair: 0x4D9280 twice, one pixel wide, in 0x4D87E0 of the fade

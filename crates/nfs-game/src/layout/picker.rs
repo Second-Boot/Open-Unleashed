@@ -99,11 +99,26 @@ impl LayoutScreen {
         // rather than the pointer, is `FeListBox`'s "selected row" arm (`[+0x1DD]`, §4.42),
         // which never fires for a `ComboBoxSlider` (`[+0x1DD]==0`) and so never reaches these
         // rows in the original either way. COVERAGE §14.31.
-        let opponent_car_hover = self
-            .attr(e, "accessor")
-            .is_some_and(|a| a.starts_with("OpponentCar.Car"))
-            .then(|| self.pointer.unwrap_or(self.cursor))
-            .flatten();
+        let is_opponent = self.attr(e, "accessor").is_some_and(|a| a.starts_with("OpponentCar.Car"));
+        // **The hovered row, every combo's.** `NFS5.ComboBoxSlider`'s slot 8 (vtable 0x5B5C24) is `FeListBox`'s
+        // mouse move 0x4C6F60 and the colour box's 0x4C4830 ends in it (0x4C4948), and 0x4C674C…0x4C6772 runs for both:
+        // `[+0x1E8]` for the bar, 0x4D87D0 (white) for the text. `ComboBoxSlider.ctr` has no
+        // `highlightcolorhover`, so the bar is the code's default dark red. A heading band is extra height
+        // on the car's row below it (§4.144, `selectable_index`), so the bar lands on that car's row
+        // (0x4F5F2E, 14 tall). The row stays lit on the way to the list's scrollbar (0x4C6F00, §4.154).
+        let hover_row = self.pointer.unwrap_or(self.cursor).and_then(|(cx, cy)| self.combo_row_at(cx, cy)).filter(|(c, _)| *c == i).map(|(_, n)| n);
+        let hover_row = match (hover_row, self.combo_scroll, self.combo_hover.get()) {
+            (Some(n), ..) => {
+                self.combo_hover.set(Some((i, n)));
+                Some(n)
+            }
+            (None, Some((c, _, _)), Some((h, n))) if c == i && h == i => Some(n),
+            _ => {
+                self.combo_hover.set(None);
+                None
+            }
+        };
+        let hover_row = hover_row.and_then(|n| (n..rows.len()).find(|&k| !matches!(rows[k], ListRow::Header(..) | ListRow::GroupHeading(_))));
         let mut acc = 0.0f32;
         let mut ry = py;
         let first = self.scroll.get(&i).copied().unwrap_or(0);
@@ -112,8 +127,10 @@ impl LayoutScreen {
                 break;
             }
             acc += row.height();
-            if opponent_car_hover.is_some_and(|(cx, cy)| self.combo_row_at(cx, cy) == Some((i, n))) {
-                out.push(self.quad(aspect, px, ry, rect_w, row.height(), tint([0xBC, 0x00, 0x00, 0xFF])));
+            // the row's box in a combo is one pixel in on each side (0x4C68B8…0x4C68E5: `w - 2`, `x + 1`)
+            let hovered_row = hover_row == Some(n);
+            if hovered_row {
+                out.push(self.quad(aspect, px + 1.0, ry, rect_w - 2.0, row.height(), tint([0xBC, 0x00, 0x00, 0xFF])));
             }
             // No "selected row" bar and no white text here: that arm of the shared row draw
             // (0x4C677C, §4.42) is gated on `[this+0x1DD]`, which `FeComboBox::FeComboBox`
@@ -121,7 +138,8 @@ impl LayoutScreen {
             // `NFS5.ComboBoxSlider` (0x4C4CA7) and `NFS5.ColorBox` (0x4C38A3) — the only widgets
             // whose open list comes through here (`draw_combo`). A list box's own selected row
             // is `draw_list_box`'s. COVERAGE §14.34 (history: `game-history.md` §34.8).
-            let fg = tint(text_c);
+            // white when hovered, except `FEOpponentCarAccessor`'s five rows: their text is a literal black (0x4F58A0)
+            let fg = if hovered_row && !is_opponent { tint([0xFF, 0xFF, 0xFF, 0xFF]) } else { tint(text_c) };
             match row {
                 ListRow::Text(t) => self.text(out, aspect, f, t, px + 3.0, ry + 2.0, 0.0, 0, fg),
                 // 0x4C688F hands the row draw an inset of 3.0 (§4.171)

@@ -18,7 +18,7 @@ impl App {
 
     /// Act on a dialog's answer (the callers' polls of slots 18/19). Returns whether the front
     /// end is leaving.
-    pub(crate) fn fe_dialog_answer(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn fe_dialog_answer(&mut self, event_loop: &LoopCtl) -> bool {
         match self.fe.dialog_answer.take() {
             // 0x50CC4F: "yes" to 811 is 0x4D56E0(0) — the front end is over
             Some((true, DialogFor::Quit)) => {
@@ -322,7 +322,7 @@ impl App {
     /// **0x4C9470**: unless disabled, sound 5, then the callback (0x50D6D0) and the destination.
     /// `QUIT` raises the exit dialog; `GOBACK` and `PLAYGAME` are the port's own back and race
     /// paths; `OPTIONS` is `fe_options`.
-    pub(crate) fn fe_bottom_click(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn fe_bottom_click(&mut self, event_loop: &LoopCtl) -> bool {
         let Some(b) = self.fe.layout_bottom.as_ref() else { return false };
         let Some(hit) = b.hovered() else { return false };
         if b.widget_disabled(hit) {
@@ -335,7 +335,7 @@ impl App {
 
     /// What a release on a bottom-bar button runs, by its callback (the mouse's [`Self::fe_bottom_click`] and the
     /// pad's Start / Y / View, D54): sound 5, then the callback.
-    pub(crate) fn fe_bottom_callback(&mut self, callback: Option<&str>, event_loop: &ActiveEventLoop) {
+    pub(crate) fn fe_bottom_callback(&mut self, callback: Option<&str>, event_loop: &LoopCtl) {
         self.fe_sound(5);
         match callback {
             // slot 0xBC — `carsetup`'s 0x4F1D00 asks 0x502420 first
@@ -441,7 +441,7 @@ impl App {
     /// freed — the port keeps it loaded too (`fe_push_under` / `fe_pop_under`). The last layer
     /// closing ends the front end; the port has no main loop around
     /// it to go back to, so it leaves the program as its old back did at the bottom of its stack.
-    pub(crate) fn fe_back(&mut self, arg: i32, event_loop: &ActiveEventLoop) {
+    pub(crate) fn fe_back(&mut self, arg: i32, event_loop: &LoopCtl) {
         use nfs_game::layout::nav::Shown;
         let layers = self.fe.nav.layers.len();
         let shown = self.fe.nav.back(arg);
@@ -490,7 +490,7 @@ impl App {
     ///   session) and `ID_PEERTOPEERIP` / `ID_COMMSSERVERSCREEN` 0x50B4C0 (0x48E9C0): the session
     ///   is left (`fe_session_leave`, §4.169.4), then the back;
     /// * the LAN / modem / web lists' 0x506CB0 is `jmp 0x50CBF0`.
-    pub(crate) fn fe_back_callback(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn fe_back_callback(&mut self, event_loop: &LoopCtl) {
         // slot 0xB4 of `[fe+0xE0]` (the `b` key 0x4D2A6B, `GOBACK` 0x50E5A0): the bottom layer's
         // list, so a back pressed on an overlay runs the covered screen's list's
         // override — `settings` over `carsetup` asks 0x502420 first, over a comms screen leaves the

@@ -21,7 +21,7 @@ impl App {
     /// `DealerCar` accessors' reset `SETNAMETHENBACK` makes before loading. Each path ends in
     /// 0x505570 (`fe_tournament_refresh`). The picture is `[0x5D8F2C]` (`App::fe`'s `driver_picture`), which the
     /// eight `NFS5.PLAYERDRIVERPICTURE`s set (0x4CF940) and `CREATEPLAYERENTER` resets to 8.
-    pub(crate) fn player_callback(&mut self, cb: &str, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn player_callback(&mut self, cb: &str, event_loop: &LoopCtl) -> bool {
         use nfs_game::dialog::DialogKind;
         let dir = nfs_game::save::save_dir();
         match cb {

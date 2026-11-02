@@ -371,7 +371,7 @@ impl App {
     /// the quit question; `HYesNoOverlay` 0x437770: 0x1C yes, 0x1D no; `HMissionSummary` 0x429390:
     /// event 3, the restart, only for a failed mission (0x4293BB). The answers do what Enter on the
     /// port's keyboard selection does.
-    pub(crate) fn hud_click(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    pub(crate) fn hud_click(&mut self, event_loop: &LoopCtl) -> bool {
         let Some((dialog, k)) = self.hud_hover else { return false };
         match dialog {
             0 if self.paused && self.pause_confirm.is_none() => {
