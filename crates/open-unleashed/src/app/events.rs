@@ -348,6 +348,10 @@ impl ApplicationHandler for App {
                 self.photo_release_keys();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // PORT-DEVIATION D63: the race panel's keys come first - photo mode's included, which would take them otherwise
+                if self.panel_key_event(&event) {
+                    return;
+                }
                 // PORT-DEVIATION D46: F11 / K enter photo mode (pause menu, replay), and every key is its own while it is up
                 if self.photo_key_event(&event) {
                     return;

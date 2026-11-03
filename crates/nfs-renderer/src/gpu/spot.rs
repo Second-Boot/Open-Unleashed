@@ -242,6 +242,7 @@ impl Core {
                 pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
                 cur_mesh = item.mesh.0;
             }
+            crate::prof::count_draw(u64::from(mesh.index_count / 3));
             pass.draw_indexed(0..mesh.index_count, 0, idx..idx + 1);
         }
     }

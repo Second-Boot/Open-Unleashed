@@ -41,14 +41,14 @@ impl App {
                 // Apple Silicon; or software) gets the light preset, any other the full defaults. Logged once;
                 // nothing is written (the file appears at the first change in the panel), so it is the same
                 // choice every start until the player picks one.
-                if nfs_game::remaster::auto_pending() && self.enh_mode == nfs_game::remaster::Mode::Normal {
-                    let (set, class) = nfs_game::remaster::auto_set(renderer.gpu_class());
+                if nfs_game::enhanced::auto_pending() && self.enh_mode == nfs_game::enhanced::Mode::Normal {
+                    let (set, class) = nfs_game::enhanced::auto_set(renderer.gpu_class());
                     tracing::info!(gpu_class = ?class, enhancements = %set.describe(), "first run: enhancement set chosen by the GPU class (ENH-LITE)");
                     self.enh = set;
                 }
                 renderer.set_enhancements(self.enh);
                 // ENHANCEMENT ENH-UPSCALER: the options panel is generated from this set
-                nfs_game::remaster::set_panel_state(self.enh);
+                nfs_game::enhanced::set_panel_state(self.enh);
                 (window, renderer)
             }
         };
@@ -373,7 +373,7 @@ impl App {
                         if part.trim().eq_ignore_ascii_case("f12") {
                             self.enh_toggle_all();
                         } else if let Some((tok, d)) = part.split_once(':').and_then(|(t, d)| Some((t.trim(), d.trim().parse::<i32>().ok()?))) {
-                            self.enh_step(&format!("{}{tok}", nfs_game::remaster::ACCESSOR_PREFIX), d);
+                            self.enh_step(&format!("{}{tok}", nfs_game::enhanced::ACCESSOR_PREFIX), d);
                         }
                     }
                 }

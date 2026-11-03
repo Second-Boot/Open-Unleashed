@@ -125,7 +125,7 @@ impl App {
             return;
         }
         // ENHANCEMENT framework: an `Enh.<token>` row flips its switch
-        if base.starts_with(nfs_game::remaster::ACCESSOR_PREFIX) && self.enh_step(base, delta) {
+        if base.starts_with(nfs_game::enhanced::ACCESSOR_PREFIX) && self.enh_step(base, delta) {
             return;
         }
         if let Some((cur, options)) = self.choice_index(base) {

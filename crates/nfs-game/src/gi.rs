@@ -1,4 +1,4 @@
-//! ENHANCEMENT E32 baked bounce light ("глобальное освещение"), branch `remaster` — NOT the original.
+//! ENHANCEMENT E32 baked bounce light ("глобальное освещение") — NOT the original.
 //!
 //! The original's track light is baked into the CRP vertex colours (`RE/notes/lighting.md` §5.4: a
 //! track item is texture × vertex colour, nothing else), and nobody knows what EA's tool put there

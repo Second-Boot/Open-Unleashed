@@ -22,6 +22,11 @@ impl App {
         if self.pad_menu_key(key, event_loop) {
             return;
         }
+        self.layout_key_sel(key, event_loop);
+    }
+
+    /// [`Self::layout_key`] on `layout_sel`, past the pointer's and the sliding screen's turn.
+    pub(crate) fn layout_key_sel(&mut self, key: MenuKey, event_loop: &LoopCtl) {
         let Some(l) = self.fe.layout_preview.as_ref() else {
             return;
         };
@@ -1303,7 +1308,7 @@ impl App {
                 self.bind_lists();
                 return;
             }
-            // ENHANCEMENT framework (`nfs_game::remaster`): the buttons of the «Улучшения» panel live in a
+            // ENHANCEMENT framework (`nfs_game::enhanced`): the buttons of the «Улучшения» panel live in a
             // panel, which `controls()` does not list — the release on one runs its port-own callback
             if !down
                 && let Some(cb) = self.fe.layout_preview.as_ref().and_then(|l| l.callback_at(hit)).filter(|cb| cb.starts_with("ENH"))
@@ -1331,7 +1336,7 @@ impl App {
                 .fe
                 .layout_preview
                 .as_ref()
-                .map(|l| l.combo_sliders().into_iter().filter(|c| !(l.widget_disabled_routed(c.index) && c.accessor.as_deref().is_some_and(|a| a.starts_with(nfs_game::remaster::ACCESSOR_PREFIX)))).collect())
+                .map(|l| l.combo_sliders().into_iter().filter(|c| !(l.widget_disabled_routed(c.index) && c.accessor.as_deref().is_some_and(|a| a.starts_with(nfs_game::enhanced::ACCESSOR_PREFIX)))).collect())
                 .unwrap_or_default();
             let strip = !down
                 && was_open != Some(hit)

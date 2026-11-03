@@ -17,6 +17,8 @@ impl App {
         {
             r.enable_render_thread();
         }
+        // PORT-DEVIATION D63: the race panel's frame statistics (nothing while it is closed)
+        self.panel_frame_mark();
         self.sync_save_side_state();
         // ENHANCEMENT ENH-UPSCALER: the options panel's rebuild after a change of the set (before the screens are drawn)
         self.enh_panel_refresh();
@@ -54,11 +56,22 @@ impl App {
         // ENHANCEMENT E29: the camera that is drawn (the shaken one while a shake runs)
         let render_cam = self.render_camera();
         self.temporal_cut_check();
+        // **TEST GLUE** (PORT-DEVIATION D63) `NFS_OFFSCREEN_FRAMES=1`: the frame is drawn into an image of the window's size instead of the
+        // window's surface (a window that nothing shows - a scripted run's, a locked screen's - gives no drawable and the loop would draw nothing),
+        // so a windowed run times real frames; the image is read back, which adds to the frame time
+        let offscreen = nfs_game::config::cfg().nfs_offscreen_frames.is_set();
         if !idle
             && let Some(r) = self.renderer.as_mut()
-            && let Err(e) = r.render(&self.scene, &render_cam)
         {
-            tracing::error!(error = %e, "render failed");
+            let drawn = if offscreen {
+                let (w, h) = r.size();
+                r.render_to_image(&self.scene, &render_cam, w, h).map(|_| ())
+            } else {
+                r.render(&self.scene, &render_cam)
+            };
+            if let Err(e) = drawn {
+                tracing::error!(error = %e, "render failed");
+            }
         }
         // PORT-DEVIATION D46: a photo-mode still asked for this frame, taken from the scene just drawn
         self.photo_after_frame();

@@ -11,7 +11,6 @@ pub mod carparts;
 pub mod config;
 pub mod cheats;
 pub mod dialog;
-pub mod display_opts;
 pub mod end_of_era;
 pub mod fitted_tree;
 /// ENHANCEMENT E32 baked bounce light
@@ -34,7 +33,7 @@ pub mod resim;
 pub mod rng;
 pub mod room;
 pub mod racecar;
-pub mod remaster;
+pub mod enhanced;
 pub mod records;
 pub mod save;
 pub mod scripts;

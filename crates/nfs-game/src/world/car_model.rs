@@ -1481,10 +1481,10 @@ impl CarModel {
         // picks the damage pack below (0x441FFD, 0x442080)
         let light_paint = paint.exterior.iter().copied().max().unwrap_or(0) > 0x50;
         // ENHANCEMENT E41 / ENH-LIVETEX: «новые текстуры» — a race / garage car (not a front-end room, whose pages are written at pixel
-        // positions at run time) with a pack that has the car also gets the pack's pages (x2 or x4 by the level) as HD TWINS next to the
+        // positions at run time) with a pack that has the car also gets the pack's pages as HD TWINS next to the
         // original pages: the originals are uploaded as master does, a material shows the twin while E41 is on. The UVs are normalized, so the
         // bigger page needs nothing else; the damage decals follow it (`scale_damage_patches`). Off: master's call, nothing extra.
-        let hd_pack = if !car.front_end_room { nfs_assets::hdpack::scale_of_level(want.e41).and_then(|scale| nfs_assets::hdpack::HdPack::global(paths, scale)) } else { None };
+        let hd_pack = if !car.front_end_room { nfs_assets::hdpack::scale_of_level(want.e41).and_then(|_| nfs_assets::hdpack::HdPack::global(paths)) } else { None };
         let (pages, hd_pages) = car.build_pages_hd(paths, paint, &style, hd_pack)?;
         let hd_present: Vec<bool> = hd_pages.iter().map(|p| p.is_some()).collect();
         // the original pages as the original's texture cache keeps them (8888 → 4444, `TexturePage::cache_rgba`,

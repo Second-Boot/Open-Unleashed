@@ -1,11 +1,9 @@
-//! ENHANCEMENT E41: the HD texture pack ("новые текстуры").
+//! ENHANCEMENT E41: the HD texture pack («улучшенные текстуры»).
 //!
 //! A pack is a directory of images, one per texture, named by a **key** (below), made from the
-//! original's textures by `asset-extractor hd-export`, upscaled x4 by a model (`tools/hd-textures`) and, for the
-//! x2 level, downscaled from that by `hd-pack x2`. There are two packs, one per level of the switch:
-//! `<hd_textures>/x4/` («x4», level 2) and `<hd_textures>/x2/` («x2», level 1), each with its own `pack.txt`
-//! (`scale=N`). Nothing here is the original's: with E41 at level 0 («оригинальные», `NFS_ENH=off`) no code
-//! of this module runs and no pack file is looked for.
+//! original's textures by `asset-extractor hd-export` and upscaled x4 by a model (`tools/hd-textures`). The game finds it
+//! beside itself ([`HdPack::locate`]): `<hd_textures>/x4/` or a flat `<hd_textures>/` with `pack.txt` (`scale=4`). Without one the
+//! switch's row is grey and cannot change. Nothing here is the original's: with E41 off (`NFS_ENH=off`) no pack file is read.
 //!
 //! ## Keys
 //!
@@ -45,13 +43,27 @@ use std::sync::OnceLock;
 /// Pack scale when `pack.txt` has none.
 pub const DEFAULT_SCALE: u32 = 4;
 
-/// The pack scale of a level of the switch E41: 0 «оригинальные» none, 1 «x2», 2 «x4».
+/// The pack scale of a level of the switch E41: 0 off, none; 1 on, the x4 pack.
 pub fn scale_of_level(level: u8) -> Option<u32> {
-    match level {
-        1 => Some(2),
-        2 => Some(4),
-        _ => None,
+    (level > 0).then_some(DEFAULT_SCALE)
+}
+
+/// Where a pack root may be, in order: `hd_textures` (then `enhanced/hd_textures`, `remaster/hd_textures`) beside the executable, beside a macOS
+/// `.app`, in the game root and in the bundle's Resources.
+fn candidates(exe: Option<&Path>, game_root: &Path) -> Vec<PathBuf> {
+    let exe_dir = exe.and_then(Path::parent);
+    let contents = exe_dir.and_then(Path::parent);
+    let bundle = contents.and_then(Path::parent).filter(|b| b.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")));
+    let mut bases: Vec<PathBuf> = exe_dir.map(Path::to_path_buf).into_iter().collect();
+    bases.extend(bundle.and_then(Path::parent).map(Path::to_path_buf));
+    bases.push(game_root.to_path_buf());
+    bases.extend(bundle.and(contents).map(|c| c.join("Resources")));
+    let mut c = Vec::new();
+    for base in bases {
+        c.push(base.join("hd_textures"));
+        c.extend(ENHANCED_FOLDERS.iter().map(|f| base.join(f).join("hd_textures")));
     }
+    c
 }
 
 type Decoder = fn(&Path) -> Option<(u32, u32, Vec<u8>)>;
@@ -238,52 +250,39 @@ impl HdPack {
         Some(Self { dir: dir.to_path_buf(), scale, listing: Listing::read(dir) })
     }
 
-    /// The pack folder of scale `scale` (2 or 4) inside a pack root `root` (a folder holding `x2/` and / or `x4/`). A root with
-    /// no such sub-folder but a `pack.txt` of that scale is itself the pack (a flat pack, e.g. the upscaler's output dir).
-    pub fn open_in_root(root: &Path, scale: u32) -> Option<Self> {
-        if let Some(p) = Self::open(&root.join(format!("x{scale}"))) {
-            return Some(Self { scale, ..p });
-        }
-        let flat = root.join("pack.txt").is_file().then(|| Self::open(root)).flatten()?;
-        (flat.scale == scale).then_some(flat)
+    /// The pack inside a pack root `root`: its `x4/`, or `root` itself when it has a `pack.txt` of that scale (a flat pack, e.g. the
+    /// upscaler's output dir). A folder with no image is no pack.
+    pub fn open_in_root(root: &Path) -> Option<Self> {
+        let pack = Self::open(&root.join("x4")).map(|p| Self { scale: DEFAULT_SCALE, ..p }).or_else(|| {
+            let flat = root.join("pack.txt").is_file().then(|| Self::open(root)).flatten()?;
+            (flat.scale == DEFAULT_SCALE).then_some(flat)
+        })?;
+        pack.listing.files.iter().any(|f| FORMATS.iter().any(|(ext, _)| f.ends_with(&format!(".{ext}")))).then_some(pack)
     }
 
-    /// Where the pack of `scale` lives: `$NFS_HD_TEX_DIR` (a pack root: it holds `x2/` / `x4/`; alone when set), else
-    /// `enhanced/hd_textures` in the game root (the packaged layout, `packaging/stage_data.sh`), beside the executable / in a macOS
-    /// bundle's Resources, then a development build's repository `enhanced/hd_textures`; `remaster/` (the folder's earlier name)
-    /// is accepted after `enhanced/` at every place.
-    pub fn locate(paths: &GamePaths, scale: u32) -> Option<Self> {
+    /// Where the pack lives: `$NFS_HD_TEX_DIR` (a pack root; alone when set), else [`candidates`], and in a development build the
+    /// repository's `enhanced/hd_textures`.
+    pub fn locate(paths: &GamePaths) -> Option<Self> {
         // an explicit override is the only candidate: a wrong path must not fall back silently
         if let Some(d) = std::env::var_os("NFS_HD_TEX_DIR").filter(|v| !v.is_empty()) {
-            return Self::open_in_root(Path::new(&d), scale);
+            return Self::open_in_root(Path::new(&d));
         }
-        let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
-        let mut c: Vec<PathBuf> = Vec::new();
-        for folder in ENHANCED_FOLDERS {
-            c.push(paths.root.join(folder).join("hd_textures"));
-            if let Some(d) = &exe_dir {
-                c.push(d.join(folder).join("hd_textures"));
-                c.push(d.join("../Resources").join(folder).join("hd_textures"));
-            }
-            c.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(folder).join("hd_textures"));
+        let exe = std::env::current_exe().ok();
+        let mut c = candidates(exe.as_deref(), &paths.root);
+        if cfg!(debug_assertions) {
+            c.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../enhanced/hd_textures"));
         }
-        c.into_iter().find_map(|d| Self::open_in_root(&d, scale))
+        c.into_iter().find_map(|d| Self::open_in_root(&d))
     }
 
-    /// The pack of this run for `scale` (2 or 4), looked for once per scale. `None`: there is no such pack (the original is
-    /// used, one info line).
-    pub fn global(paths: &GamePaths, scale: u32) -> Option<&'static HdPack> {
-        static PACKS: [OnceLock<Option<HdPack>>; 2] = [OnceLock::new(), OnceLock::new()];
-        let slot = match scale {
-            2 => &PACKS[0],
-            4 => &PACKS[1],
-            _ => return None,
-        };
-        slot.get_or_init(|| {
-            let p = Self::locate(paths, scale);
+    /// The pack of this run, looked for once. `None`: there is none (the original is used, one info line).
+    pub fn global(paths: &GamePaths) -> Option<&'static HdPack> {
+        static PACK: OnceLock<Option<HdPack>> = OnceLock::new();
+        PACK.get_or_init(|| {
+            let p = Self::locate(paths);
             match &p {
                 Some(p) => tracing::info!(dir = %p.dir.display(), scale = p.scale, "HD texture pack (ENHANCEMENT E41)"),
-                None => tracing::info!(scale, "no HD texture pack for this level (ENHANCEMENT E41): the original textures"),
+                None => tracing::info!("no HD texture pack beside the game (ENHANCEMENT E41): the original textures"),
             }
             p
         })
@@ -380,6 +379,39 @@ pub fn decode_chain(img: &crate::ktx2::Bc7Image) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pack is looked for beside the executable, beside a macOS `.app`, in the game root; the bundle's Resources only for a bundle.
+    #[test]
+    fn the_pack_is_looked_for_beside_the_game() {
+        let c = candidates(Some(Path::new("/g/Open.app/Contents/MacOS/Open")), Path::new("/data"));
+        for p in ["/g/Open.app/Contents/MacOS/hd_textures", "/g/hd_textures", "/g/enhanced/hd_textures", "/data/hd_textures", "/data/enhanced/hd_textures", "/g/Open.app/Contents/Resources/hd_textures"] {
+            assert!(c.contains(&PathBuf::from(p)), "{p}");
+        }
+        assert_eq!(c[0], PathBuf::from("/g/Open.app/Contents/MacOS/hd_textures"));
+        let c = candidates(Some(Path::new("/g/open-unleashed")), Path::new("/g/game"));
+        assert_eq!(c[0], PathBuf::from("/g/hd_textures"));
+        assert!(c.contains(&PathBuf::from("/g/game/hd_textures")));
+        assert!(!c.iter().any(|p| p.to_string_lossy().contains("Resources")));
+    }
+
+    /// A pack root: `x4/` or a flat x4 pack; an x2 pack and a folder with no image are none.
+    #[test]
+    fn a_pack_root_is_x4_with_images() {
+        let dir = std::env::temp_dir().join(format!("nfs_hdpack_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("x4/track")).unwrap();
+        assert!(HdPack::open_in_root(&dir).is_none(), "an empty x4");
+        std::fs::write(dir.join("x4/track/a.ktx2"), b"x").unwrap();
+        assert_eq!(HdPack::open_in_root(&dir).map(|p| p.scale()), Some(4));
+        let flat = dir.join("flat");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("a.png"), b"x").unwrap();
+        std::fs::write(flat.join("pack.txt"), b"scale=4\n").unwrap();
+        assert!(HdPack::open_in_root(&flat).is_some());
+        std::fs::write(flat.join("pack.txt"), b"scale=2\n").unwrap();
+        assert!(HdPack::open_in_root(&flat).is_none(), "an x2 pack is not read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn keys_are_safe_and_stable() {

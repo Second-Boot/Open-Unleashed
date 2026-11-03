@@ -72,6 +72,8 @@ and `THIRD-PARTY-LICENSES.txt` — never any file of the original game.
 | `NFS_MIC=1` | voice chat from the microphone: in a network session the game sends your voice from the default input device to the other players, as the original did. Off by default (you still hear the others) |
 | `WGPU_BACKEND=vulkan`/`gl`/`dx12`/`metal` | the graphics API (by default Vulkan / Metal / Direct3D 12, OpenGL only without them) |
 | `NFS_GPU_PROFILE=1` | a per-pass GPU timing in the log, every 120 frames (diagnostics; slows the frame down). `NFS_GPU_PROFILE=minimal` asks for a plain GPU device with no optional features |
+| `NFS_RACE_PANEL=<tick>:<action>[,...]` | test glue for the race panel: its actions at game ticks, e.g. `0:open,128:E1:+1,256:close`. Actions: `open`, `close`, `row+`, `row-`, `lvl+`, `lvl-`, `f12`, or `<row token>:<delta>` (a row's token is its key in `enhancements.json`). With `NFS_RACE_KEYS` the tokens `bq`, `lb`, `rb`, `comma`, `period`, `f12` press the panel's keys in a `--screenshot` race |
+| `NFS_OFFSCREEN_FRAMES=1` | test glue: the windowed frame loop draws each frame into an image of the window's size instead of the window (a window nothing shows gives no drawable, and the loop then draws nothing), for timing real frames in a scripted run; the read-back adds to the frame time |
 | `NFS_GUARD=0`/`1` | the start-up crash guard (see [install](install.md)): on by default in a normal release run, `0` turns it off, `1` forces it |
 
 ## `nfs5.ini`
@@ -100,3 +102,5 @@ The port reads the `nfs5.ini` of the Verok patch, from the game data folder (bes
 | `nfs-audio`, `nfs-input`, `nfs-net` | sound, controls and force feedback, the network protocol |
 | `open-unleashed` | the game application |
 | `tools/` | asset viewers and extractors |
+
+The private build with `--with-data` takes the HD pack from the folder `NFS_HD_PACK` names (`<root>/x4`); a public build never has one.

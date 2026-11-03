@@ -127,10 +127,11 @@ impl App {
                     self.combo_strip_release(i);
                 } else if let Some(cb) = k.strip_prefix("cb:") {
                     // `cb:<callback>` — ENTER on the current screen's first control
-                    // with that callback, as `NFS_FE_CALLBACK` does at the start
+                    // with that callback, as `NFS_FE_CALLBACK` does at the start (the screen just opened is still sliding, which would
+                    // drop a player's key: `layout_key_sel`)
                     if let Some(i) = self.fe.layout_preview.as_ref().and_then(|l| l.controls().iter().position(|c| c.callback.as_deref() == Some(cb))) {
                         self.fe.layout_sel = i;
-                        self.layout_key(MenuKey::Enter, event_loop);
+                        self.layout_key_sel(MenuKey::Enter, event_loop);
                     }
                 } else if let Some((x, y)) = k.strip_prefix("click:").and_then(|r| r.split_once(':')).and_then(|(a, b)| Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?))) {
                     // `click:<x>:<y>` — a left click at that design point, in order

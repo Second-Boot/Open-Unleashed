@@ -1,4 +1,4 @@
-//! ENHANCEMENT E35 — SMAA 1x as a post pass over the tone-mapped image (branch `remaster`;
+//! ENHANCEMENT E35 — SMAA 1x as a post pass over the tone-mapped image (
 //! `RE/notes/ENHANCEMENTS.md`). **Not in the original**; render-only (reads the finished 8-bit frame
 //! of the main view, writes it back; nothing reaches the simulation, the network or a replay).
 //!

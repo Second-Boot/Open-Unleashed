@@ -423,14 +423,14 @@ fn run() -> Result<()> {
     }
     // the `NFS_*` switches are read once from here on (`nfs_game::config`, F4): pin the snapshot after the two `set_var`s above
     nfs_game::config::init();
-    // ENHANCEMENT framework (branch `remaster`): the switches — `NFS_ENH` over `enhancements.json`
+    // ENHANCEMENT framework: the switches — `NFS_ENH` over `enhancements.json`
     // over the default — and the mode (`NFS_ENH=off` is the hard original: no front-end additions)
-    let (mut enh, enh_mode) = nfs_game::remaster::load();
+    let (mut enh, enh_mode) = nfs_game::enhanced::load();
     // the previous start died = safe mode (`guard::begin`, run at the top: the plain GPU device); here also every enhancement off,
     // unless an explicit NFS_ENH names a set
     if guard::safe() && std::env::var_os("NFS_ENH").is_none_or(|v| v.is_empty()) {
         enh = nfs_renderer::Enhancements::ORIGINAL;
-        let _ = nfs_game::remaster::auto_pending(); // no GPU-class choice over it
+        let _ = nfs_game::enhanced::auto_pending(); // no GPU-class choice over it
         tracing::warn!("safe mode: every enhancement off for this start");
     } else {
         // (not safe, or NFS_ENH given: the guard's flag no longer decides)
@@ -438,9 +438,13 @@ fn run() -> Result<()> {
             guard::clear_safe();
         }
     }
-    nfs_game::remaster::init(enh_mode);
-    nfs_game::remaster::set_panel_state(enh); // ENHANCEMENT ENH-UPSCALER: the options panel's rows follow the set
-    tracing::info!(enhancements = %enh.describe(), hard_original = (enh_mode == nfs_game::remaster::Mode::HardOriginal), "enhanced game");
+    // ENHANCEMENT E41: the textures' row is available only with a pack beside the game (the original mode looks for no pack file)
+    if enh_mode == nfs_game::enhanced::Mode::Normal {
+        nfs_renderer::set_hd_textures_available(nfs_assets::hdpack::HdPack::global(&paths).is_some());
+    }
+    nfs_game::enhanced::init(enh_mode);
+    nfs_game::enhanced::set_panel_state(enh); // ENHANCEMENT ENH-UPSCALER: the options panel's rows follow the set
+    tracing::info!(enhancements = %enh.describe(), hard_original = (enh_mode == nfs_game::enhanced::Mode::HardOriginal), "enhanced game");
     let fe_start = if layout_sweep { fe_start.or_else(|| Some("QuickRace".to_string())) } else { fe_start };
     // A plain launch is the original's: main 0x4B6A50 plays the intro movies (0x4DD600, unless
     // NOINTROMOVIES) and enters the front end on `"gamesetup"` (0x4B6C52, `FE_ENTRY`), with the
@@ -680,7 +684,7 @@ fn run() -> Result<()> {
         audio_settings.front_end_defaults();
     }
     // `FEStrings.loc` / `hud.loc` in the current language (0x4E04F0, 0x41E170)
-    let fe_strings = if nfs_game::remaster::enabled() { nfs_game::remaster::with_extras(nfs_game::layout::load_strings(&paths)) } else { nfs_game::layout::load_strings(&paths) };
+    let fe_strings = if nfs_game::enhanced::enabled() { nfs_game::enhanced::with_extras(nfs_game::layout::load_strings(&paths)) } else { nfs_game::layout::load_strings(&paths) };
     // `Replay_begin` 0x413CF0 copies the whole saved block back over `0x6573E8` (0x413DCF) and
     // restores only the machine-local options after it, so `SKILL`, `COPS` and `DAMAGE` come from
     // the replay. *(Until the audit of 2026-09-26 `--replay` took all three from the registry.)*

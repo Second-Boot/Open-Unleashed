@@ -1,12 +1,12 @@
-; The enhanced game's «Улучшения» panel (branch `remaster`, not part of the original): the third
+; The enhanced game's «Улучшения» panel (not part of the original): the third
 ; sub-tab of Options > графика. Port-own layout read by the same engine from a second directory
-; (nfs_game::remaster), loaded as the panel `ID_ENHPANEL` that graphics_entry.lay (spliced into
+; (nfs_game::enhanced), loaded as the panel `ID_ENHPANEL` that graphics_entry.lay (spliced into
 ; graphics.lay at load) names and graphicstabs_entry.lay's tab button selects; it is a panel layout
 ; like graphicsettings.lay / advgraphics.lay (no screen of its own, the Options oval behind).
 ; Built from widget types the original's display.lay uses. The rows (a caption label + a level
 ; combo bound to Enh.<token>) and the page button are NOT in this file: they are generated from the
 ; switch registry (nfs_renderer::ENHANCEMENT_REGISTRY) and inserted after section 0 at load (ahead of
-; the backgrounds, which would take their clicks: remaster::with_rows), so adding a registry
+; the backgrounds, which would take their clicks: enhanced::with_rows), so adding a registry
 ; entry adds a row. Strings are the port's own table (ids 900000 and up), not FEStrings.loc.
 [section.0]
 id=REAL.BLACK_640x480

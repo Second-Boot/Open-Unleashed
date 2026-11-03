@@ -60,7 +60,7 @@ const FOCUS_MAX: f32 = 700.0;
 /// ENHANCEMENT E31: the lens a replay gets (f-number), and the distance under which the viewed car is in the cockpit / bumper.
 const REPLAY_F_NUMBER: f32 = 3.5;
 const REPLAY_MIN_DISTANCE: f32 = 2.5;
-/// ENHANCEMENT E7: the ids of the depth-of-field lines (`nfs_game::remaster::PHOTO_DOF_STRINGS`).
+/// ENHANCEMENT E7: the ids of the depth-of-field lines (`nfs_game::enhanced::PHOTO_DOF_STRINGS`).
 const S_DOF_KEYS: usize = 0;
 const S_DOF_PAD: usize = 1;
 const S_DOF: usize = 2;
@@ -322,7 +322,7 @@ impl App {
 
     /// ENHANCEMENT E7: line `k` of the depth-of-field strings.
     fn photo_dof_text(&self, k: usize) -> String {
-        nfs_game::remaster::photo_dof_text(&self.fe.strings, k)
+        nfs_game::enhanced::photo_dof_text(&self.fe.strings, k)
     }
 
     /// Whether the window is the render target a still is sized from.
@@ -465,6 +465,16 @@ impl App {
                     None
                 }
                 "k" => Some(KeyCode::KeyK),
+                // PORT-DEVIATION D63: the race panel's keys, and F12's view
+                "bq" => Some(KeyCode::Backquote),
+                "lb" => Some(KeyCode::BracketLeft),
+                "rb" => Some(KeyCode::BracketRight),
+                "comma" => Some(KeyCode::Comma),
+                "period" => Some(KeyCode::Period),
+                "f12" => {
+                    self.enh_toggle_all();
+                    None
+                }
                 "f11" => Some(KeyCode::F11),
                 "esc" => Some(KeyCode::Escape),
                 "enter" => Some(KeyCode::Enter),
@@ -476,7 +486,9 @@ impl App {
                 }
             };
             if let Some(code) = code {
-                if !self.photo_key_code(code, true, false) && self.paused {
+                if self.panel_key_code(code, true, false) {
+                    // the panel took it
+                } else if !self.photo_key_code(code, true, false) && self.paused {
                     let key = match code {
                         KeyCode::ArrowUp => Some(MenuKey::Up),
                         KeyCode::ArrowDown => Some(MenuKey::Down),

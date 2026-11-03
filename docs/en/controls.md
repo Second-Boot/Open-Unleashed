@@ -100,3 +100,24 @@ Pictures are saved as PNG to `PorscheUnleashed` in the user's Pictures folder: `
 
 Arrows move between rows and change values, **Enter** confirms, **Esc** goes back. The mouse works as in the
 original.
+
+### Race panel
+
+In a race (also in a replay and in photo mode) **`** (the key left of 1) opens a small panel on the left edge of the window: the frame rate and
+frame times with a graph of the last frames (one bar a frame, the newest on the right, marks at 60 and 30 fps, the top at 50 ms: green met 60 fps, orange 30 fps, red neither), the GPU time and the busiest passes, the draw calls and triangles, the render and window size, the graphics card, the game tick and
+its rate (64 a second), the speed, lap, track and car, and below them the rows of the enhancements tab. The race goes on while it is open and
+the driving keys keep working. The panel is closed at the start of every race and is not available in the menus.
+
+| Key | Action |
+|---|---|
+| ` | open / close the panel |
+| [ and ] | the row up / down (the list scrolls) |
+| , and . | the selected row one level down / up; the change takes effect at once and is saved, exactly as in the tab |
+
+The keys are the physical ones, so they work on any keyboard layout. While the panel is open, `[ ] , .` belong to it; closed, only the backquote is
+taken (also if a control of the game is bound to it). A value the card cannot give shows a dash (for instance the GPU time on a card without timestamp
+queries). A row that needs another one (the car light needs the body clear coat) is greyed and starred while the other is off. A press of **F12**
+while the panel is open shows the original's look as everywhere (the panel then shows that look; changing a row ends it).
+
+Every **F12** press, in a race and in the menus, shows for two seconds *enhancements on* or *enhancements off* near the top of the window: what
+the press did. If every row is already at the original's setting there is nothing to compare, and the message says so.

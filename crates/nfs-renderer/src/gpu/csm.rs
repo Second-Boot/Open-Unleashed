@@ -227,6 +227,8 @@ pub(super) struct CsmState {
     /// ENHANCEMENT E9 (SHADOWFIX): the eased cover gate (1 = in the open) and when it was last stepped
     gate: f32,
     gate_at: Option<std::time::Instant>,
+    /// ENHANCEMENT ENH-FE3D: this frame's shadow is a front-end car's (`SunShadow::focus`)
+    focus: bool,
 }
 
 /// What a frame with shadows needs, from [`Core::csm_frame`].
@@ -318,7 +320,7 @@ impl CsmState {
             .collect();
         let dummy = gfx::texture_2d(device, "shadow map placeholder", 1, 1, DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
         let dummy_view = dummy.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
-        Self { pipe_opaque, pipe_cut, light_layout, sampler, uniform, light_bufs, light_bgs, _dummy: dummy, dummy_view, map: None, active: false, gate: 1.0, gate_at: None }
+        Self { pipe_opaque, pipe_cut, light_layout, sampler, uniform, light_bufs, light_bgs, _dummy: dummy, dummy_view, map: None, active: false, gate: 1.0, gate_at: None, focus: false }
     }
 
     /// The view the main shader binds (the placeholder until a map exists).
@@ -366,6 +368,7 @@ impl Core {
     /// (the front end, a night track), or the rear-view mirror's pass. Makes the map when the level's
     /// size changed.
     pub(super) fn csm_frame(&mut self, scene: &Scene, camera: &Camera, aspect: f32) -> Option<CsmFrame> {
+        self.csm.focus = scene.sun_shadow.is_some_and(|s| s.focus.is_some());
         if !self.enhancements.is_on(crate::E9) || self.no_reflections {
             return None;
         }
@@ -438,8 +441,9 @@ impl Core {
         if !car && item.csm & crate::CSM_CAST == 0 {
             return false;
         }
-        // a blended ground decal (the `S_Normal` shadow, depth-biased) is not an object
-        !(mat.alpha_blend && (mat.depth_bias != 0 || item.depth_bias != 0 || item.early && car))
+        // a blended ground decal (the `S_Normal` shadow, depth-biased) is not an object; `early` marks one only in a race: the front end
+        // submits every item early (its materials all blend), its car's body included, and its blob quad is a flat mesh
+        !(mat.alpha_blend && (mat.depth_bias != 0 || item.depth_bias != 0 || item.early && car && !self.csm.focus))
     }
 
     /// What an item does with the shadow map in the main pass, for `ObjectUniform::lit_d.w`: 1 a car
@@ -577,6 +581,7 @@ impl Core {
                     pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
                     cur_mesh = item.mesh.0;
                 }
+                crate::prof::count_draw(u64::from(mesh.index_count / 3));
                 pass.draw_indexed(0..mesh.index_count, 0, idx..idx + 1);
             }
         }

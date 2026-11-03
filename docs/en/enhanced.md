@@ -1,10 +1,10 @@
-# The enhanced version
+# Enhancements
 
 **English** | [Русский](../ru/enhanced.md)
 
-The enhanced version (branch `enhanced`) is the same faithful engine with optional improvements to the picture. Each
-improvement has its own switch; with all of them off the game is the original, frame for frame. Gameplay, physics,
-the AI and the network protocol are never changed, so players of the enhanced and the original version can race each
+The game is the faithful engine with improvements to the picture, on by default. Each improvement has its own switch;
+**F12** shows the original's graphics at once, and with all of them off the game is the original, frame for frame.
+Gameplay, physics, the AI and the network protocol are never changed, so the switches do not stop anyone racing each
 other.
 
 ## Turning things on and off
@@ -32,7 +32,7 @@ The settings are kept in `enhancements.json` in the saves folder.
 ## Photo mode extras
 
 Photo mode itself is part of the game (see [Controls](controls.md#photo-mode)). With **HDR and tone mapping** on, the
-enhanced version adds a depth of field to it, and its pictures go through the same post effects as the screen (glow,
+game adds a depth of field to it, and its pictures go through the same post effects as the screen (glow,
 tone mapping and the rest), rendered at the picture's own size.
 
 | Keyboard | Pad | Action |
@@ -46,8 +46,9 @@ tone mapping and the rest), rendered at the picture's own size.
 
 The HD texture pack is made from the original game's textures, so it is **not distributed**. You can build it from your
 own copy with the pipeline in `tools/hd-textures` (see its README; it runs on your machine with freely licensed upscaling
-models) and put the result into `game/enhanced/hd_textures` (`x2/` and/or `x4/`). Without the pack the textures setting
-uses the original textures.
+models) and put the result beside the game as `hd_textures/x4/`: next to the executable or the `.app`, or in `game/`. The
+game looks for it at start-up. Without the pack the **enhanced textures** row is grey and cannot be changed; with it the row
+turns the pack on and off.
 
 ## Requirements
 

@@ -126,6 +126,10 @@ switches! {
     // TEST GLUE (PORT-DEVIATION D46, photo mode): a scripted still's photo-mode ops and the race-key script (`app/photo.rs`)
     nfs_photo = "NFS_PHOTO",
     nfs_race_keys = "NFS_RACE_KEYS",
+    // TEST GLUE (PORT-DEVIATION D63, the race panel): the panel's actions at game ticks (`app/race_panel.rs`)
+    nfs_race_panel = "NFS_RACE_PANEL",
+    // TEST GLUE (PORT-DEVIATION D63): a windowed run draws each frame into an image instead of the surface (`app/frame.rs`)
+    nfs_offscreen_frames = "NFS_OFFSCREEN_FRAMES",
     // TEST GLUE: a scripted still taken as if that many milliseconds of frames had followed its tick (`app/scripted.rs`)
     nfs_shot_settle = "NFS_SHOT_SETTLE",
     nfs_pa_input = "NFS_PA_INPUT",

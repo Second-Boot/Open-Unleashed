@@ -1,4 +1,4 @@
-//! The enhanced game's switches (branch `remaster`; `RE/notes/REMASTER-PLAN.md`, `ENHANCEMENTS.md`).
+//! The enhanced game's switches (`RE/notes/ENHANCEMENTS.md`, `REMASTER-PLAN.md`).
 //!
 //! **Not the original.** Everything an enhancement does is marked `ENHANCEMENT E<n>` in code and
 //! is gated on one switch of [`Enhancements`]. The set of switches is [`REGISTRY`]; adding an
@@ -492,16 +492,16 @@ pub const REGISTRY: &[Entry] = &[
     },
     // ENHANCEMENT E41: the HD texture packs (registered LAST, after E40). Not a GPU pass: the loaders of the track, the sky and the car pick
     // the pack's images over the original's pixels when the level's pack is on disk; level 0 never looks for a file (master's path exactly).
-    // Levels: 0 original, 1 x2 (the x4 pack downscaled 2:1, a quarter of the memory), 2 x4 (the default; the light preset takes x2).
+    // Levels: 0 off, 1 on (the x4 pack); the row is grey without a pack beside the game (`Cond::NoHdPack`).
     Entry {
         token: "E41",
-        name: ["textures", "текстуры"],
+        name: ["enhanced textures", "улучшенные текстуры"],
         help: [
-            "original: the game's own textures. x2 / x4: the HD pack (every texture enlarged by a neural model, x4; x2 is the same set scaled down to half, for weaker machines: about 4x the original's video memory, x4 about 16x) for the track's surfaces, the horizon mountains and the clouds, and the cars' bodies, wheels and interiors, where the pack has them; the HUD, the menus, the fonts, the lens flares, the particles and anything else that is a picture on the screen keep the originals. Takes effect with the next track or car load (restart the race). Without the pack folder it changes nothing",
-            "оригинальные: родные текстуры игры. x2 / x4: HD-набор (все текстуры увеличены нейросетью в 4 раза; x2 - тот же набор, уменьшенный вдвое, для слабых машин: около 4 размеров оригинала по видеопамяти, x4 около 16) для поверхностей трассы, гор на горизонте и облаков, кузова, колёс и салона машин, где в наборе они есть; индикаторы, меню, шрифты, блики объектива, частицы и всё остальное, что является картинкой на экране, остаются оригинальными. Действует со следующей загрузки трассы или машины (перезапустите заезд). Без папки с набором ничего не меняет",
+            "the HD pack, every texture enlarged x4 by a neural model (about 16x the original's video memory), for the track's surfaces, the horizon mountains and the clouds, and the cars' bodies, wheels and interiors, where the pack has them; the HUD, the menus, the fonts, the lens flares, the particles and everything else keep the original's. The pack is not part of the game: put a folder hd_textures beside it and restart",
+            "HD-набор: все текстуры увеличены нейросетью в 4 раза (около 16 размеров оригинала по видеопамяти) для поверхностей трассы, гор на горизонте и облаков, кузова, колес и салона машин, где в наборе они есть; индикаторы, меню, шрифты, блики объектива, частицы и все остальное остаются оригинальными. Набор не входит в игру: положите папку hd_textures рядом с ней и перезапустите",
         ],
-        levels: &[["original", "оригинальные"], ["x2", "x2"], ["x4", "x4"]],
-        default_level: 2,
+        levels: &[["off", "выкл"], ["on", "вкл"]],
+        default_level: 1,
     },
     // ENHANCEMENT E42: rounder wheels, mirrors, lamps, exhausts, steering wheel (registered LAST, after E41). Not a GPU pass: the car
     // loader builds a render-only refined copy of the round parts after its measurements; level 0 never builds one (master's path).
@@ -661,7 +661,7 @@ switches! {
     E39 = 37,
     /// ENHANCEMENT E40 raindrops on the windscreen of the driver view (registered last, after E39)
     E40 = 38,
-    /// ENHANCEMENT E41 the HD texture pack: 0 original, 1 x2, 2 x4 (registered last, after E40; read by the asset loaders, no GPU pass)
+    /// ENHANCEMENT E41 the HD texture pack: 0 off, 1 on (registered last, after E40; read by the asset loaders, no GPU pass)
     E41 = 39,
     /// ENHANCEMENT E42 rounded details of the cars: 0 off, 1 soft, 2 strong (registered last, after E41; read by the car loader, no GPU pass)
     E42 = 40,
@@ -846,7 +846,6 @@ pub const LITE_PRESET: &[(Switch, u8)] = &[
     (E24, 1), // headlights in tunnels
     (E26, 1), // wet road and rain
     (E32, 2), // baked bounce light, medium as the full defaults (baked once per track: no frame cost)
-    (E41, 1), // textures x2 (2026-10-04: the light preset still gets better textures; ~4x the original's video memory, no frame cost)
     (E42, 1), // rounded details, soft: load-time CPU (~10 ms a car) and a few thousand triangles, no render pass
     (E43, 1), // contact shadow: stands in for the blob (the light preset has no E9), analytic, a few tenths of a ms
     (E44, 1), // lighthouse beam: one analytic full-screen pass on coastal only, a few tenths of a ms there
@@ -867,6 +866,19 @@ pub enum Cond {
     /// a TEMPORAL upscaler is active (FSR 3.1, or MetalFX's temporal mode): the main view is drawn at 1 sample with no
     /// post-process anti-aliasing (E1 MSAA and E35 SMAA are replaced by the upscaler's own temporal filter)
     TemporalUpscaler,
+    /// no HD texture pack was found beside the game ([`set_hd_textures_available`])
+    NoHdPack,
+}
+
+/// Whether this run has an HD texture pack, set once at start-up: E41's row is grey without one.
+static HD_TEXTURES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_hd_textures_available(yes: bool) {
+    HD_TEXTURES.store(yes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn hd_textures_available() -> bool {
+    HD_TEXTURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// One "has no effect while" row, see [`Cond`].
@@ -881,6 +893,7 @@ pub struct Dependency {
 /// E15 spotlights, E24 and E15, E19's fog glow which does not need HDR, E22's levels
 /// 5 / 6 with the frame output (a fallback, not a block), E17 / E8 (only at night, partial)).
 pub const DEPENDS: &[Dependency] = &[
+    Dependency { entry: "E41", cond: Cond::NoHdPack },
     // the float scene (E7) is what the post effects work on: with E7 off `enh_hdr` gives None and every `hdr` / `cur_hdr` gate fails
     Dependency { entry: "E10", cond: Cond::Needs("E7") },
     Dependency { entry: "E11", cond: Cond::Needs("E7") },
@@ -965,6 +978,11 @@ impl Enhancements {
     }
 
     /// Why entry `token` has no effect now, `None` when it acts (or nothing is known to block it). The first unmet row of [`DEPENDS`].
+    /// The level a row shows: its own, but "off" for the textures with no pack (the stored level is kept for when one appears).
+    pub fn shown_level(&self, sw: Switch) -> u8 {
+        if sw == E41 && !hd_textures_available() { 0 } else { self.level(sw) }
+    }
+
     pub fn blocked(&self, token: &str) -> Option<Blocked> {
         let eff = self.effective();
         DEPENDS.iter().enumerate().filter(|(_, d)| d.entry == token).find_map(|(i, d)| {
@@ -972,6 +990,7 @@ impl Enhancements {
                 Cond::Needs(t) => REGISTRY.iter().position(|e| e.token == t).is_some_and(|k| self.levels[k] == 0),
                 Cond::UpscalerOn => eff.level(E34) > 0 || eff.level(E37) > 0,
                 Cond::TemporalUpscaler => self.temporal_upscaler(),
+                Cond::NoHdPack => !hd_textures_available(),
             };
             hit.then(|| Blocked { dep: i, by: if matches!(d.cond, Cond::Needs(_)) { 0 } else { eff.level(E38).min(UP_FSR) } })
         })
@@ -1463,8 +1482,8 @@ mod tests {
         assert_eq!(REGISTRY[E42.0 as usize].default_level, 1); // rounded details: soft
         assert_eq!(REGISTRY[E42.0 as usize].levels.len(), 3);
         assert_eq!(REGISTRY[E41.0 as usize].token, "E41");
-        assert_eq!(REGISTRY[E41.0 as usize].default_level, 2); // textures: x4 (the HD pack, where one is shipped); the light preset takes x2
-        assert_eq!(REGISTRY[E41.0 as usize].levels.len(), 3);
+        assert_eq!(REGISTRY[E41.0 as usize].default_level, 1); // textures: on where a pack is found; off in the light preset
+        assert_eq!(REGISTRY[E41.0 as usize].levels.len(), 2);
         assert_eq!(REGISTRY[E40.0 as usize].token, "E40");
         assert_eq!(REGISTRY[E40.0 as usize].default_level, 1); // raindrops: on, subtle
         assert_eq!(REGISTRY[E38.0 as usize].default_level, 0); // the upscaler is off by default

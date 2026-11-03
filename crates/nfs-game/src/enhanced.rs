@@ -1,9 +1,9 @@
-//! **The enhanced game's own front-end pieces** (branch `remaster`, not the original):
+//! **The enhanced game's own front-end pieces** (not the original):
 //! storage of the switches, the «Улучшения» sub-tab's generated rows and its string table.
 //! `RE/notes/REMASTER-PLAN.md` stage 1, `ENHANCEMENTS.md`.
 //!
 //! Nothing here reads the original's binary: the panel is a port-own layout
-//! (`remaster/layouts/enhancements.lay`) built from widget types the original's layouts use, read
+//! (`enhanced/layouts/enhancements.lay`) built from widget types the original's layouts use, read
 //! by the same layout engine from a second directory ([`layouts_dir`]). It is the **third
 //! sub-tab of Options › графика**: `graphicstabs_entry.lay` (one `NFS5.TABBUTTON`) is spliced into
 //! `GraphicsTabs.lay` and `graphics_entry.lay` (the panel the button names, `ID_ENHPANEL`, and the
@@ -265,8 +265,8 @@ pub fn parse_file(text: &str) -> Enhancements {
                 // detail)
                 EnhancementStored::Level(1) if k == "E8" && version < 5 => EnhancementStored::Level(2),
                 EnhancementStored::Level(2) if k == "E8" && version < 5 => EnhancementStored::Level(1),
-                // ENHANCEMENT E41 (file version 6): the textures' levels are original / x2 / x4 now; the old 1 («новые», the x4 pack) is x4
-                EnhancementStored::Level(1) if k == "E41" && version < 6 => EnhancementStored::Level(2),
+                // ENHANCEMENT E41 (file version 7): the textures are off / on now; every older level above 0 (x2, x4, the first «новые») is on
+                EnhancementStored::Level(l @ 2..) if k == "E41" && version < 7 => EnhancementStored::Level(l.min(1)),
                 s => s,
             }))
         }),
@@ -280,11 +280,11 @@ pub fn parse_file(text: &str) -> Enhancements {
     set
 }
 
-/// The stored form: `{"version": 6, "levels": {"E1": 2, …}}` (3: E34's levels renumbered; 4: the upscaler choice E38, see `parse_file`;
-/// 5: E8's levels are the clear coat's; 6: E41's levels are original / x2 / x4, the old 1 is x4).
+/// The stored form: `{"version": 7, "levels": {"E1": 2, …}}` (3: E34's levels renumbered; 4: the upscaler choice E38, see `parse_file`;
+/// 5: E8's levels are the clear coat's; 6: E41's levels were original / x2 / x4; 7: E41 is off / on).
 pub fn file_text(e: &Enhancements) -> String {
     let levels: serde_json::Map<String, serde_json::Value> = e.pairs_in(ENHANCEMENT_REGISTRY).into_iter().map(|(k, l)| (k.to_string(), l.into())).collect();
-    let v = serde_json::json!({ "version": 6, "levels": levels });
+    let v = serde_json::json!({ "version": 7, "levels": levels });
     serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
 }
 
@@ -386,6 +386,8 @@ pub fn reason_text(dep: &nfs_renderer::EnhancementDependency, by: u8, russian: b
         (C::UpscalerOn, true) => format!("не действует: включен апскейлер ({up}), он сам задает размер"),
         (C::TemporalUpscaler, false) => format!("inactive: a temporal upscaler ({up}) replaces the anti-aliasing"),
         (C::TemporalUpscaler, true) => format!("не действует: временной апскейлер ({up}) заменяет сглаживание"),
+        (C::NoHdPack, false) => "not available: no hd_textures folder".to_string(),
+        (C::NoHdPack, true) => "недоступно: нет папки hd_textures".to_string(),
     }
 }
 
@@ -456,7 +458,7 @@ const BTN_Y: i32 = 424;
 const BTN_XS: [i32; 4] = [57, 189, 321, 453];
 /// A group header's colour (ARGB), and an inactive row's caption colour.
 const HEADER_COLOR: &str = "0xff7a2a00";
-/// The gap between a caption's right end and the end of the fade bar behind it (master's `display_opts` uses the same).
+/// The gap between a caption's right end and the end of the fade bar behind it .
 const CAPTION_PAD: i32 = 6;
 const INACTIVE_COLOR: &str = "0xff8a8a8a";
 
@@ -825,6 +827,20 @@ pub fn splice_file(name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// ENHANCEMENT E41: with no pack found (nothing sets the flag in a test run) the row is disabled, its hint the reason, its level reads off.
+    #[test]
+    fn the_textures_row_is_grey_without_a_pack() {
+        let e = Enhancements::all();
+        let i = nfs_renderer::E41.0 as usize;
+        assert_eq!(e.level(nfs_renderer::E41), 1);
+        assert_eq!(e.shown_level(nfs_renderer::E41), 0);
+        let info = line_info(Item::Entry(i), &e).unwrap();
+        assert!(info.inactive);
+        let b = e.blocked("E41").unwrap();
+        assert_eq!(info.help_id, STR_REASON + b.dep as u32 * 3 + b.by as u32);
+        assert!(reason_text(&nfs_renderer::ENHANCEMENT_DEPENDS[b.dep], b.by, true).contains("hd_textures"));
+    }
+
     #[test]
     fn an_old_file_with_the_photo_switch_still_loads() {
         // 2026-10-27: E30 left the registry and every later index moved; the file names tokens, so the other levels
@@ -870,7 +886,7 @@ mod tests {
         let with = parse_file(r#"{"version": 6, "levels": {"E41": 2, "E45": 3, "E42": 0}}"#);
         let without = parse_file(r#"{"version": 6, "levels": {"E41": 2, "E42": 0}}"#);
         assert_eq!(with, without);
-        assert_eq!(with.level(nfs_renderer::E41), 2);
+        assert_eq!(with.level(nfs_renderer::E41), 1);
         assert_eq!(with.level(nfs_renderer::E42), 0);
     }
 
@@ -936,15 +952,16 @@ mod tests {
         // version 3 is stored as it is (1 = the temporal smoothing-only level)
         assert_eq!(get(r#"{"version":3,"levels":{"E34":1}}"#), if mac { 1 } else { 0 });
         assert_eq!(get(r#"{"version":3,"levels":{"E34":7}}"#), if mac { 7 } else { 0 });
-        // the writer is version 6
-        assert!(file_text(&Enhancements::all()).contains("\"version\": 6"));
-        // ENHANCEMENT E41: a file written before the x2 / x4 levels (version <= 5): 1 («новые») -> x4 (2), 0 stays off, a version-6 file as it is
+        // the writer is version 7
+        assert!(file_text(&Enhancements::all()).contains("\"version\": 7"));
+        // ENHANCEMENT E41: a file written before off / on (version <= 6): any level above 0 is on, 0 stays off
         let e41 = |t: &str| parse_file(t).level(nfs_renderer::E41);
-        assert_eq!(e41(r#"{"version":5,"levels":{"E41":1}}"#), 2);
+        assert_eq!(e41(r#"{"version":5,"levels":{"E41":1}}"#), 1);
         assert_eq!(e41(r#"{"version":5,"levels":{"E41":0}}"#), 0);
         assert_eq!(e41(r#"{"version":6,"levels":{"E41":1}}"#), 1);
-        assert_eq!(e41(r#"{"version":6,"levels":{"E41":2}}"#), 2);
-        assert_eq!(e41(r#"{"version":5,"levels":{"E1":1}}"#), 2); // not named: the default (x4)
+        assert_eq!(e41(r#"{"version":6,"levels":{"E41":2}}"#), 1);
+        assert_eq!(e41(r#"{"version":7,"levels":{"E41":0}}"#), 0);
+        assert_eq!(e41(r#"{"version":5,"levels":{"E1":1}}"#), 1); // not named: the default (on)
         // ENHANCEMENT ENH-COAT: E8's stored levels of a file written before the clear coat (version <= 4): low (1) -> normal (2), high (2) -> new (1);
         // 0 stays off, a version-5 file is read as it is
         let e8 = |text: &str| parse_file(text).level(nfs_renderer::E8);

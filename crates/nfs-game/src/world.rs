@@ -1666,13 +1666,13 @@ pub fn car_specular_maps(r: &mut Renderer, paths: &nfs_assets::GamePaths, front_
     })
 }
 
-/// ENHANCEMENT E41: the HD pack of this run for the level the switch is at (1 = the x2 pack, 2 = the x4 pack; `None`: level 0, or no
-/// pack of that scale on disk, the original is used), the game root taken from the track's own directory (`<root>/GameData/Track`).
+/// ENHANCEMENT E41: the HD pack of this run for the level the switch is at (`None`: off, or no
+/// pack beside the game, the original is used), the game root taken from the track's own directory (`<root>/GameData/Track`).
 /// At level 0 nothing is looked for: no file is touched.
 pub(crate) fn hd_pack_for(r: &Renderer, track: &TrackAssets) -> Option<&'static nfs_assets::hdpack::HdPack> {
-    let scale = nfs_assets::hdpack::scale_of_level(r.enhancements().level(nfs_renderer::E41))?;
+    nfs_assets::hdpack::scale_of_level(r.enhancements().level(nfs_renderer::E41))?;
     let root = track.dir.parent()?.parent()?.to_path_buf();
-    nfs_assets::hdpack::HdPack::global(&nfs_assets::GamePaths { root }, scale)
+    nfs_assets::hdpack::HdPack::global(&nfs_assets::GamePaths { root })
 }
 
 /// ENHANCEMENT E41: one texture of a pack as the uploader takes it.
@@ -2193,7 +2193,7 @@ impl TrackWorld {
         // ENHANCEMENT E32: the bounce light's input (the bake itself waits until the switch is on), on a day
         // track, not in the hard original (`NFS_ENH=off`): every world article drawn through `track_lods`
         // but the animated ones (their matrix moves)
-        let gi = (crate::remaster::enabled() && !track.is_night()).then(|| {
+        let gi = (crate::enhanced::enabled() && !track.is_night()).then(|| {
             let t = std::time::Instant::now();
             let animated: std::collections::HashSet<usize> = anim_articles.iter().map(|a| a.article).collect();
             let skip = |a: &nfs_assets::track::ArticleMeshes| breakable_articles.contains(&a.index) || smackable_articles.contains(&a.index) || a.animation.is_some() || animated.contains(&a.index);

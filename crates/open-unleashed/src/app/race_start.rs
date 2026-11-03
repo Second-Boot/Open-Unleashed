@@ -721,6 +721,8 @@ impl App {
         event_loop: &LoopCtl,
     ) {
         self.enter_race_mode();
+        // PORT-DEVIATION D63: the race panel starts closed
+        self.panel_close();
         // the launch dump 0x4B4DA0 (0x4B5179): `[0x657CA0]` = the `Audio.MusicLevel` accessor
         self.snd.registry_music_level = self.snd.audio_settings.music_level;
         // `Replay_startRace` 0x413EA0 + `0x414EB0`: rewind the stream and seed the shared RNG from

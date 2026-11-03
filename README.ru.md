@@ -28,14 +28,14 @@ macOS (Apple Silicon и Intel), Windows и Linux — без Wine, эмулято
 | Куда положить данные игры | [docs/ru/game-data.md](docs/ru/game-data.md) | [docs/en/game-data.md](docs/en/game-data.md) |
 | Управление | [docs/ru/controls.md](docs/ru/controls.md) | [docs/en/controls.md](docs/en/controls.md) |
 | Сборка из исходников, параметры | [docs/ru/building.md](docs/ru/building.md) | [docs/en/building.md](docs/en/building.md) |
-| Улучшенная версия | [docs/ru/enhanced.md](docs/ru/enhanced.md) | [docs/en/enhanced.md](docs/en/enhanced.md) |
+| Улучшения | [docs/ru/enhanced.md](docs/ru/enhanced.md) | [docs/en/enhanced.md](docs/en/enhanced.md) |
 
-## Улучшенная версия
+## Улучшения
 
-Эта ветка (`enhanced`) добавляет поверх точного порта необязательные улучшения графики: свет, тени, отражения,
-сглаживание, апскейлинг (AMD FidelityFX FSR 3), HD-текстуры, сделанные из вашей копии игры, и другое. У каждого улучшения
-свой переключатель на экране «Улучшения» в игре; если выключить все, игра становится оригиналом. Игровой процесс, физика
-и сетевой протокол не меняются. Подробнее: [docs/ru/enhanced.md](docs/ru/enhanced.md).
+Поверх точного порта в игре есть улучшения графики, по умолчанию включённые: свет, тени, отражения, сглаживание,
+апскейлинг (AMD FidelityFX FSR 3), HD-текстуры, сделанные из вашей копии игры, и другое. У каждого улучшения свой
+переключатель на экране «Улучшения» в игре, а **F12** сразу показывает графику оригинала. Игровой процесс, физика и
+сетевой протокол не меняются. Подробнее: [docs/ru/enhanced.md](docs/ru/enhanced.md).
 
 ## Быстрый старт
 
@@ -59,7 +59,7 @@ GNU General Public License v3.0 или новее ([LICENSE](LICENSE)). Стор
 Неофициальному патчу 1.0.6 от Verok: его исправления оригинального exe этот движок воспроизводит там, где они
 меняют поведение игры.
 
-Улучшенная версия: AMD FidelityFX Super Resolution 3 через [wgpu-ffx](https://github.com/cwfitzgerald/wgpu-ffx)
+Улучшения: AMD FidelityFX Super Resolution 3 через [wgpu-ffx](https://github.com/cwfitzgerald/wgpu-ffx)
 (MIT, лежит в `third_party/`); DirectX Shader Compiler (сборки для Windows, лицензии в `licenses/dxc`); модели
 апскейла для `tools/hd-textures`: 4x-PBRify (CC0) и 4xTextures_GTAV_rgt-s, автор **Philip Hofmann** (CC-BY-4.0).
 

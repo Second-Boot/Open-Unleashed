@@ -74,8 +74,10 @@ pub fn typed_char(ch: char) -> Option<char> {
     }
     let b = match ch as u32 {
         c @ 0x0410..=0x044F => (c - 0x0410 + 0xC0) as u8,
-        0x0401 => 0xA8,
-        0x0451 => 0xB8,
+        // PORT-DEVIATION D26: no shipped font has «ё»: its 1251 bytes draw as the Latin `¨` / `¸` in some fonts (a dot, a comma) and as nothing in the
+        // others, so the letter goes to the fonts as «е»
+        0x0401 => 0xC5,
+        0x0451 => 0xE5,
         _ => return None,
     };
     Some(cp1252(b))
@@ -189,6 +191,16 @@ fn csv_rows(text: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No shipped font has «ё» (D26): it reaches them as «е», in both cases, and nothing else of the alphabet moves.
+    #[test]
+    fn yo_reaches_the_fonts_as_ye() {
+        assert_eq!(typed_char('ё'), typed_char('е'));
+        assert_eq!(typed_char('Ё'), typed_char('Е'));
+        assert_eq!(typed_char('е'), Some(cp1252(0xE5)));
+        assert_eq!(typed_char('Е'), Some(cp1252(0xC5)));
+        assert_eq!(typed_char('я'), Some(cp1252(0xFF)));
+    }
 
     /// An id both tables give reads the front end's row; a HUD-only id still reads.
     #[test]

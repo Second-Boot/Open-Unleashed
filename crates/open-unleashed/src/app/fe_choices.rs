@@ -562,7 +562,7 @@ impl App {
 
     pub(crate) fn choice_index(&self, name: &str) -> Option<(usize, &'static [u32])> {
         // ENHANCEMENT framework: the «Улучшения» screen's own accessors (`Enh.<token>`)
-        if name.starts_with(nfs_game::remaster::ACCESSOR_PREFIX) {
+        if name.starts_with(nfs_game::enhanced::ACCESSOR_PREFIX) {
             return self.enh_choice(name);
         }
         let (_, key, options) = CHOICE_ACCESSORS.iter().find(|(n, _, _)| *n == name)?;

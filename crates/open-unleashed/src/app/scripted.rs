@@ -623,6 +623,8 @@ impl App {
                 }
             }
             self.simulate();
+            // **TEST GLUE** (PORT-DEVIATION D63) `NFS_RACE_PANEL`: the panel's actions at their ticks
+            self.panel_script_step();
             // `--resim`: the hashes and finishes of the tick; the run ends when every human has finished or the frames are used up
             if self.resim.is_some() && self.resim_after_tick() {
                 self.resim_report();
@@ -921,7 +923,7 @@ impl App {
                     self.enh_toggle_all();
                     true
                 } else {
-                    self.enh_step(&format!("{}{tok}", nfs_game::remaster::ACCESSOR_PREFIX), d)
+                    self.enh_step(&format!("{}{tok}", nfs_game::enhanced::ACCESSOR_PREFIX), d)
                 };
                 if !stepped {
                     continue;

@@ -109,18 +109,11 @@ mod sim_version_tests {
         assert_eq!(parse_sim_version("version = x\nsource_hash = \"a\""), None);
     }
 
-    /// **MASTER-ONLY CHECK.** The simulation set's sources must match `sim_version.toml`; see the header of that file. The enhanced branch
-    /// edits sim-set files for rendering (its physics is proven identical by the race goldens), so there the check cannot hold: it skips
-    /// itself when a file that exists only on the enhanced branch (`nfs-renderer/src/enhancements.rs`) is present. That needs no edit on
-    /// the enhanced branch, so it cannot be forgotten, and it cannot be present on master.
+    /// The simulation set's sources must match `sim_version.toml`; see the header of that file.
     ///
     /// **TEST GLUE** (tooling): `NFS_UPDATE_SIM_VERSION=1` rewrites the hash in `sim_version.toml`; `=bump` also increments the number.
     #[test]
     fn sim_version_file_matches_the_simulation_sources() {
-        if std::path::Path::new("../nfs-renderer/src/enhancements.rs").exists() {
-            eprintln!("enhanced branch: the physics version is inherited from master, check skipped");
-            return;
-        }
         let have = sim_source_hash();
         let file = read_sim_version();
         if file.source_hash == have {

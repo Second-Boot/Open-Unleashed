@@ -249,8 +249,8 @@ impl App {
 pub(crate) const HIDDEN_FPS: f64 = 30.0;
 
 /// The shortest frame time the host holds the redraw loop to: the slower of `NFS_FPS_CAP` (D4) and,
-/// while the window is hidden, [`HIDDEN_FPS`]; `None` = no cap. (On the enhanced branch
-/// `user_cap` is `fps_cap`: `NFS_FPS_CAP`, else ENHANCEMENT E22's menu cap.)
+/// while the window is hidden, [`HIDDEN_FPS`]; `None` = no cap. (`user_cap` is
+/// `fps_cap`: `NFS_FPS_CAP`, else ENHANCEMENT E22's menu cap.)
 pub(crate) fn frame_floor(user_cap: Option<f64>, hidden: bool) -> Option<Duration> {
     let rate = match (user_cap, hidden) {
         (Some(c), true) => Some(c.min(HIDDEN_FPS)),

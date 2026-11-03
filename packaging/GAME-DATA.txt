@@ -14,7 +14,7 @@ installed game's folder.
 
 HD textures (optional): the HD texture pack is made from the original textures, so it is not distributed.
 Make it yourself from your own copy with tools/hd-textures (see its README) and put the result into
-game/enhanced/hd_textures (x2/ and/or x4/).
+hd_textures/x4/ beside the game.
 
 --------------------------------------------------------------------------------
 
@@ -34,4 +34,4 @@ NFS5_GAME_PATH папку установленной игры.
 
 HD-текстуры (по желанию): пакет HD-текстур делается из оригинальных текстур, поэтому не распространяется.
 Соберите его сами из своей копии инструментом tools/hd-textures (см. его README) и положите результат в
-game/enhanced/hd_textures (x2/ и/или x4/).
+hd_textures/x4/ рядом с игрой.

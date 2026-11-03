@@ -53,9 +53,9 @@ pub(crate) struct AppInit<'a> {
     pub(crate) music_lengths: Vec<u32>,
     pub(crate) audio_settings: nfs_audio::music::Settings,
     pub(crate) sound_set: String,
-    // ENHANCEMENT framework (branch `remaster`): the switches and the mode `run` read at start-up
+    // ENHANCEMENT framework: the switches and the mode `run` read at start-up
     pub(crate) enh: nfs_renderer::Enhancements,
-    pub(crate) enh_mode: nfs_game::remaster::Mode,
+    pub(crate) enh_mode: nfs_game::enhanced::Mode,
 }
 
 impl App {
@@ -572,6 +572,7 @@ impl App {
             wall_hits: 0,
             resets: 0,
             hud: None,
+            panel: Default::default(),
             // **A launch with no front end (`fe = 0`) never runs 0x4EB710** (called from 0x4ECF00, the front
             // end's launch): the ten dial options (`SPEEDOSTYLEKMH` … `SPEEDOTOTALUNITS`, 0x657DF4…0x657E1C)
             // keep their cleared values, so HSpeedometer 0x42E710 / HTach 0x42F3A0 build style 0 faces

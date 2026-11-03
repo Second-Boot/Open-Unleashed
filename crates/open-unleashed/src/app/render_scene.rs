@@ -810,6 +810,8 @@ impl App {
     }
 
     pub(crate) fn rebuild_scene(&mut self) {
+        // **TEST GLUE** (PORT-DEVIATION D63) `NFS_RACE_PANEL`
+        self.panel_script_step();
         // PORT-DEVIATION D46: the camera slot's camera and slice as its own last pass left them (see `photo.rs`)
         self.photo_frame_begin();
         let (lw, lh) = self.hud_logical();
@@ -940,6 +942,8 @@ impl App {
                 self.scene.sprites = self.fe.race_loading.as_ref().map(|l| l.sprites(lw as f32, lh as f32)).unwrap_or_default();
                 self.renderer = Some(r);
             }
+            // PORT-DEVIATION D63: the F12 message, over every screen of the front end (the panel is a race's)
+            self.panel_overlay();
             return;
         }
         let (hud_sprites_from, mut hud_hover) = self.hud_pass();
@@ -1071,6 +1075,8 @@ impl App {
         }
         // PORT-DEVIATION D46: photo mode's hint, and the pointer to it on the pause menu / in a replay
         self.photo_hint();
+        // PORT-DEVIATION D63: the race panel and the F12 message, after the hint (a photo-mode still cuts the sprites off there)
+        self.panel_overlay();
         // `+0x100` for the next release, and sound 9 when the pointer crosses into a button
         // (0x41B3BA…0x41B3C6)
         let hover = hud_hover.flatten();

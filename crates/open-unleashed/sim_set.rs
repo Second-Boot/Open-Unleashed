@@ -22,7 +22,7 @@ pub const NOT_SIM: &[&str] = &[
     "app/audio.rs", "app/car_lights.rs", "app/chronicle.rs", "app/debug_menu.rs", "app/effects.rs", "app/events.rs",
     "app/fe_callbacks.rs", "app/fe_cars.rs", "app/fe_choices.rs", "app/fe_colour.rs", "app/fe_flow.rs", "app/fe_lists.rs", "app/fe_pictures.rs",
     "app/fe_room.rs", "app/fe_rows.rs", "app/fe_screens.rs", "app/fe_seq.rs", "app/force_feedback.rs", "app/frame.rs", "app/hud_pass.rs",
-    "app/idle.rs", "app/lens_flare.rs", "app/menu.rs", "app/mirror.rs", "app/pa_trace.rs", "app/pad_menu.rs", "app/photo.rs", "app/reflections.rs", "app/cover.rs",
+    "app/idle.rs", "app/lens_flare.rs", "app/menu.rs", "app/mirror.rs", "app/pa_trace.rs", "app/pad_menu.rs", "app/photo.rs", "app/race_panel.rs", "app/reflections.rs", "app/cover.rs",
     "app/render_scene.rs",
     // the enhanced game's render / front-end modules (their switches never reach the simulation)
     "app/camfx.rs", "app/cover.rs", "app/drops.rs", "app/enhancements.rs", "app/fe_enh.rs", "app/haze.rs", "app/rain.rs",

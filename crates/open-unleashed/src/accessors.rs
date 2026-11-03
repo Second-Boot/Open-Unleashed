@@ -773,7 +773,7 @@ impl App {
             "FF.TotalVolume" | "FF.RoadVolume" | "FF.EngineVolume" | "FF.CollisionVolume"
             | "FF.RoadGripVolume" | "Graphics.GammaCorrection" => self.range_value(base)?.0.to_string(),
             // a multiple-choice setting: the text is the `FEStrings` entry its chosen index names
-            _ if CHOICE_ACCESSORS.iter().any(|(n, _, _)| *n == base) || base.starts_with(nfs_game::remaster::ACCESSOR_PREFIX) => {
+            _ if CHOICE_ACCESSORS.iter().any(|(n, _, _)| *n == base) || base.starts_with(nfs_game::enhanced::ACCESSOR_PREFIX) => {
                 let (i, options) = self.choice_index(base)?;
                 self.fe.strings.get(options[i])?.to_string()
             }

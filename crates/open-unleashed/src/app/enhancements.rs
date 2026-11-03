@@ -1,10 +1,10 @@
-//! The enhanced game's switches in the application (branch `remaster`, not the original):
+//! The enhanced game's switches in the application (not the original):
 //! pushing them to the renderer, the «Улучшения» sub-tab's accessors and its «как в оригинале» /
-//! «по умолчанию» / page buttons, and the debug A/B key. `nfs_game::remaster` is the storage,
+//! «по умолчанию» / page buttons, and the debug A/B key. `nfs_game::enhanced` is the storage,
 //! `nfs_renderer::Enhancements` the set. `RE/notes/ENHANCEMENTS.md`.
 
 use crate::*;
-use nfs_game::remaster::{self, Mode};
+use nfs_game::enhanced::{self, Mode};
 use nfs_renderer::{ENHANCEMENT_REGISTRY, EnhancementSwitch, Enhancements};
 
 impl App {
@@ -30,29 +30,29 @@ impl App {
 
     /// The registry index of an `Enh.<token>` accessor.
     fn enh_index(name: &str) -> Option<usize> {
-        let tok = name.strip_prefix(remaster::ACCESSOR_PREFIX)?;
+        let tok = name.strip_prefix(enhanced::ACCESSOR_PREFIX)?;
         ENHANCEMENT_REGISTRY.iter().position(|e| e.token == tok)
     }
 
     /// An `Enh.*` accessor's combo state: the level is the row index (0 = off), the rows are the
-    /// entry's level captions (`remaster::level_ids`).
+    /// entry's level captions (`enhanced::level_ids`).
     pub(crate) fn enh_choice(&self, name: &str) -> Option<(usize, &'static [u32])> {
         // ENHANCEMENT ENH-UPSCALER: the settings rows that edit a part of E34's / E37's stored level
-        if let Some(v) = remaster::VRow::from_accessor(name) {
-            let ids = remaster::vrow_ids(v);
+        if let Some(v) = enhanced::VRow::from_accessor(name) {
+            let ids = enhanced::vrow_ids(v);
             return Some(match v {
-                remaster::VRow::MfxMode => (matches!(nfs_renderer::mfx_mode(self.enh.level(nfs_renderer::E34)), nfs_renderer::MfxMode::Simple) as usize, ids),
+                enhanced::VRow::MfxMode => (matches!(nfs_renderer::mfx_mode(self.enh.level(nfs_renderer::E34)), nfs_renderer::MfxMode::Simple) as usize, ids),
                 // the simple mode has no 1:1: its list is the same captions from the second
-                remaster::VRow::MfxScale => {
+                enhanced::VRow::MfxScale => {
                     let l = self.enh.level(nfs_renderer::E34);
                     let simple = matches!(nfs_renderer::mfx_mode(l), nfs_renderer::MfxMode::Simple);
                     (nfs_renderer::mfx_scale_index(l), if simple { &ids[1..] } else { ids })
                 }
-                remaster::VRow::FsrScale => (nfs_renderer::fsr_scale_index(self.enh.level(nfs_renderer::E37)), ids),
+                enhanced::VRow::FsrScale => (nfs_renderer::fsr_scale_index(self.enh.level(nfs_renderer::E37)), ids),
             });
         }
         let i = Self::enh_index(name)?;
-        let ids = remaster::level_ids(i);
+        let ids = enhanced::level_ids(i);
         // ENHANCEMENT ENH-UPSCALER: the upscaler row lists the backends this platform has
         if i == nfs_renderer::E38.0 as usize {
             return Some((nfs_renderer::upscaler_choices().iter().position(|&c| c == self.enh.level(nfs_renderer::E38)).unwrap_or(0), ids));
@@ -61,7 +61,7 @@ impl App {
         if i == nfs_renderer::E33.0 as usize {
             return Some(if self.enh_edr_available() { ((self.enh.level(nfs_renderer::E33) as usize).min(1), &ids[..2]) } else { (0, &ids[2..3]) });
         }
-        Some((self.enh.level(EnhancementSwitch(i as u8)) as usize, ids))
+        Some((self.enh.shown_level(EnhancementSwitch(i as u8)) as usize, ids))
     }
 
     /// ENHANCEMENT E33: the display does extended-range output.
@@ -73,20 +73,20 @@ impl App {
     /// like every combo.
     pub(crate) fn enh_step(&mut self, name: &str, delta: i32) -> bool {
         // ENHANCEMENT ENH-UPSCALER: a settings row edits its part of the stored level
-        if let Some(v) = remaster::VRow::from_accessor(name) {
+        if let Some(v) = enhanced::VRow::from_accessor(name) {
             let mut e = self.enh;
             let (e34, e37) = (e.level(nfs_renderer::E34), e.level(nfs_renderer::E37));
             let mode = nfs_renderer::mfx_mode(e34);
             match v {
-                remaster::VRow::MfxMode => {
+                enhanced::VRow::MfxMode => {
                     let to = if (matches!(mode, nfs_renderer::MfxMode::Simple) as i32 + delta).rem_euclid(2) == 1 { nfs_renderer::MfxMode::Simple } else { nfs_renderer::MfxMode::Temporal };
                     e.set_level(nfs_renderer::E34, nfs_renderer::mfx_switch_mode(e34, to));
                 }
-                remaster::VRow::MfxScale => {
+                enhanced::VRow::MfxScale => {
                     let n = nfs_renderer::mfx_scale_count(mode) as i32;
                     e.set_level(nfs_renderer::E34, nfs_renderer::mfx_level(mode, (nfs_renderer::mfx_scale_index(e34) as i32 + delta).rem_euclid(n) as usize));
                 }
-                remaster::VRow::FsrScale => e.set_level(nfs_renderer::E37, (nfs_renderer::fsr_scale_index(e37) as i32 + delta).rem_euclid(4) as u8 + 1),
+                enhanced::VRow::FsrScale => e.set_level(nfs_renderer::E37, (nfs_renderer::fsr_scale_index(e37) as i32 + delta).rem_euclid(4) as u8 + 1),
             }
             self.enh_apply(e);
             return true;
@@ -140,7 +140,7 @@ impl App {
     }
 
     /// Show a set; `save` stores it (a player's choice) or not (the A/B view).
-    fn enh_set(&mut self, e: Enhancements, save: bool) {
+    pub(crate) fn enh_set(&mut self, e: Enhancements, save: bool) {
         if e == self.enh {
             return;
         }
@@ -149,14 +149,14 @@ impl App {
         self.enh_live_dirty = true;
         // ENHANCEMENT ENH-UPSCALER: the panel is generated from the set (settings rows of the chosen upscaler, inactive rows); when
         // its lines changed it is rebuilt at the start of the next frame (`enh_panel_refresh`), not inside the click that did it
-        if remaster::set_panel_state(e) {
+        if enhanced::set_panel_state(e) {
             self.enh_panel_dirty = true;
         }
         if let Some(r) = self.renderer.as_mut() {
             r.set_enhancements(e);
         }
         if save {
-            remaster::save(&e);
+            enhanced::save(&e);
             crate::guard::clear_safe();
         }
         tracing::info!(enhancements = %e.describe(), saved = save, "enhancements changed");
@@ -220,13 +220,13 @@ impl App {
     /// appeared / went, a row became inactive or active again): the current page is loaded again, clamped to the pages that exist now
     /// (paging keeps working: the page button's callback follows the same page names). Nothing when the panel is not on screen.
     pub(crate) fn enh_panel_refresh(&mut self) {
-        if !std::mem::take(&mut self.enh_panel_dirty) || !remaster::enabled() {
+        if !std::mem::take(&mut self.enh_panel_dirty) || !enhanced::enabled() {
             return;
         }
-        let file = remaster::page_name(remaster::current_page());
+        let file = enhanced::page_name(enhanced::current_page());
         // a combo's list that was open belongs to the old widgets
         let rebuilt = match (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
-            (Some(l), Some(r)) => l.swap_panel(r, &self.paths, remaster::PANEL, &file),
+            (Some(l), Some(r)) => l.swap_panel(r, &self.paths, enhanced::PANEL, &file),
             _ => false,
         };
         if rebuilt {
@@ -251,14 +251,16 @@ impl App {
         nfs_renderer::fov_bonus_deg(self.enh.level(nfs_renderer::E4))
     }
 
-    /// The debug A/B key: the player's set <-> every switch off (`remaster::ab_toggle`). A view only: it never
+    /// The debug A/B key: the player's set <-> every switch off (`enhanced::ab_toggle`). A view only: it never
     /// writes `enhancements.json`, so the player's levels survive any number of presses (ENH-SAVE).
     pub(crate) fn enh_toggle_all(&mut self) {
         if self.enh_mode == Mode::HardOriginal {
             return;
         }
-        let (show, stash) = remaster::ab_toggle(self.enh, self.enh_stash);
+        let (show, stash) = enhanced::ab_toggle(self.enh, self.enh_stash);
         self.enh_stash = stash;
+        // PORT-DEVIATION D63: the message says what the press left on the screen
+        self.panel_toast(show.any_on(), false);
         self.enh_set(show, false);
     }
 
@@ -266,16 +268,16 @@ impl App {
     /// «по умолчанию», «как в оригинале», or the page button `ENHPAGE<n>` (1-based), which makes the
     /// panel's content page `n` (`LayoutScreen::swap_panel`).
     pub(crate) fn enh_panel_callback(&mut self, cb: &str) {
-        if cb == remaster::CB_ORIGINAL {
+        if cb == enhanced::CB_ORIGINAL {
             self.enh_all_original();
-        } else if cb == remaster::CB_DEFAULTS {
+        } else if cb == enhanced::CB_DEFAULTS {
             self.enh_all_defaults();
-        } else if cb == remaster::CB_LITE {
+        } else if cb == enhanced::CB_LITE {
             self.enh_all_lite();
-        } else if let Some(page) = cb.strip_prefix(remaster::CB_PAGE).and_then(|n| n.parse::<usize>().ok()) {
-            let file = remaster::page_name(page.saturating_sub(1));
+        } else if let Some(page) = cb.strip_prefix(enhanced::CB_PAGE).and_then(|n| n.parse::<usize>().ok()) {
+            let file = enhanced::page_name(page.saturating_sub(1));
             if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
-                l.swap_panel(r, &self.paths, remaster::PANEL, &file);
+                l.swap_panel(r, &self.paths, enhanced::PANEL, &file);
             }
             self.bind_screen_widgets();
         }

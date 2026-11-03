@@ -69,7 +69,7 @@ Time (277 textures of alps + 993 + sky, default settings): 1.5 s/texture, 7300 t
 
 ## After the upscale (ENH-HDTEX2)
 
-The x4 PNG pack is turned into what the game ships by `hd-pack` (`tools/hd-pack`, Rust): `hd-pack x2` makes the x2 pack from it
-(2:1 Lanczos-3, no second neural run), `hd-pack bc7` packs either into KTX2 / BC7 (`enhanced/hd_textures/x4`, `x2`).
+The x4 PNG pack is turned into what the game ships by `hd-pack` (`tools/hd-pack`, Rust): `hd-pack bc7` packs it into KTX2 / BC7
+(`hd_textures/x4` beside the game).
 The sky textures: `asset-extractor hd-export <dir> --all --only sky,sky_detail`, manifest
 columns file / tile / class / text with class `sky_detail` (PBRify) or `sky` (bicubic).

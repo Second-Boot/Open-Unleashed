@@ -194,6 +194,7 @@ impl Core {
                 st.ib = mesh.ib_serial;
             }
             let first_index = (mesh.index_offset / 4) as u32;
+            crate::prof::count_draw(u64::from(mesh.index_count / 3) * u64::from(r.count));
             pass.draw_indexed(first_index..first_index + mesh.index_count, (mesh.vertex_offset / VERTEX_STRIDE) as i32, r.first..r.first + r.count);
             return;
         }
@@ -202,6 +203,7 @@ impl Core {
             pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
             st.mesh = r.mesh;
         }
+        crate::prof::count_draw(u64::from(mesh.index_count / 3) * u64::from(r.count));
         pass.draw_indexed(0..mesh.index_count, 0, r.first..r.first + r.count);
     }
 
@@ -276,6 +278,7 @@ impl Core {
                     pass.set_bind_group(0, bg, &[]);
                     bound_tex = tex;
                 }
+                crate::prof::count_draw(((end - first) * 2) as u64);
                 pass.draw((first * 6) as u32..(end * 6) as u32, 0..1);
             };
             for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {

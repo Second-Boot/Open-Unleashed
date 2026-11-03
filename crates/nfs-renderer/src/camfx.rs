@@ -1,5 +1,5 @@
 //! ENHANCEMENTS E27 motion blur, E28 lens dirt, E29 camera shake — the camera effects of the
-//! enhanced game (branch `remaster`; `RE/notes/ENHANCEMENTS.md`). **None of them is in the original**
+//! enhanced game (`RE/notes/ENHANCEMENTS.md`). **None of them is in the original**
 //! and all three are render-only: they read the finished image (and, for the blur, the depth the
 //! frame drew) and write another image; nothing reaches the simulation, the camera the game uses,
 //! the network or a replay.
