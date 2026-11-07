@@ -177,8 +177,8 @@ impl App {
     /// every key event and, for a pad-bound control (PAD-HANG: Start on the pause row never reached
     /// this code, which ran on key events only), once a race frame after `Gamepads::poll`.
     pub(crate) fn race_interface_keys(&mut self, event_loop: &LoopCtl) {
-        // `I_PAUSE` (P, or a pad's Start under D44's layout; Escape is no in-race key,
-        // `nfs_input::default_binding`): pause. The pause action (`0x4138D0(8, 1)`, 0x415170) opens the
+        // `I_PAUSE` (P, or a pad's Start under D44's layout; Escape too, PORT-DEVIATION D10 ESC-PAUSE —
+        // the original reads no Escape in a race, `nfs_input::default_binding`): pause. The pause action (`0x4138D0(8, 1)`, 0x415170) opens the
         // pause menu (0x461740, 0x426800) only while the HUD's dialog queue is empty —
         // 0x41518C tests it with 0x426A60 first — and with a dialog up it goes to
         // 0x4151ED, which acts only in a network game (`[0x6573E8] == 3` → 0x41523A, the

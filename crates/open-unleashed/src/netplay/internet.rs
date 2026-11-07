@@ -41,6 +41,12 @@ pub fn lobby_address() -> String {
     address_from(std::fs::read_to_string(lobby_settings_path()).ok().as_deref())
 }
 
+/// Whether a real lobby address is set (the environment variable or `lobby.txt`), not the built-in placeholder. PORT-DEVIATION D55
+/// item 5: while it is the placeholder the protocol screen's «интернет» button is hidden (`App::bind_internet_button`).
+pub fn lobby_configured() -> bool {
+    lobby_address() != LOBBY_DEFAULT_ADDRESS
+}
+
 /// The environment variable that overrides everything else (D55).
 pub const LOBBY_ADDRESS_ENV: &str = "NFS_LOBBY_ADDRESS";
 

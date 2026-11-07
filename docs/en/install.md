@@ -40,6 +40,8 @@ Network races use **UDP port 9442**.
 
 ### Internet games
 
+There is no public lobby server yet, so the **internet** button is hidden until an address is set (1 or 2 below).
+
 **multiplayer → internet** (the sign-on screen) connects to an online lobby over the same UDP protocol: type an account and a
 password, press **sign on**, choose a server, then create or join a game there. The lobby's address is set in this order:
 

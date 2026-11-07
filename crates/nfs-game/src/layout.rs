@@ -3189,6 +3189,20 @@ impl LayoutScreen {
         (e.class == "NFS5.CAMERAPICTURE").then(|| self.attr_num(e, "picturenum").unwrap_or(0.0) as i32)
     }
 
+    /// PORT-DEVIATION D64 (pad button icons): the design rectangle `(x, y, w, h)` of the named widget's hit
+    /// box — a bar button's icon and caption — when it is on show and enabled (not hidden, not disabled),
+    /// else `None`. Where the pad's icon goes beside it.
+    pub fn live_widget_rect(&self, name: &str) -> Option<(f32, f32, f32, f32)> {
+        let (i, _) = *self.widgets_named(&[name]).first()?;
+        let e = self.layout.elements.get(i)?;
+        if self.state_is_hidden(e) || self.hidden_flags.contains(&i) || self.widget_disabled(i) {
+            return None;
+        }
+        let (x, y) = self.position_of(e);
+        let (w, h) = self.box_hit(e);
+        (w >= 1.0 && h >= 1.0).then_some((x, y, w, h))
+    }
+
     /// The flattened indices of the widgets whose `.lay` `name` is one of `names`, with the
     /// position of the name that matched — what 0x50D9A0's `FeScreen::findWidget` does.
     pub fn widgets_named(&self, names: &[&str]) -> Vec<(usize, usize)> {

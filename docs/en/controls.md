@@ -30,6 +30,8 @@ In the colour editor the d-pad moves the picked point over the wheel (Left / Rig
 
 The arrow keys work the same way. Typing a name still needs the keyboard.
 
+While a standard pad is connected, small icons of its buttons appear beside the actions it can trigger: the bottom bar's Back (B), Race (Start), Options (Y) and exit (View), the pause menu and its question, the result pages and the replay-save dialog. The icon set follows the pad: letters A B X Y for Xbox pads and the like, the shapes cross / circle / triangle / square for PlayStation pads, the letters of the labels SDL reports for Nintendo pads. The icons show the pad that sent the latest input and vanish when the last pad is unplugged; the keys themselves are unchanged.
+
 On a standard pad the race's dialogs and the replay bar have their own keys, which act only while a dialog or the bar
 is up (never while driving): d-pad / left stick picks, A answers, B goes back.
 
@@ -71,7 +73,7 @@ is up (never while driving): d-pad / left stick picks, A answers, B goes back.
 | F8 | HUD transparency |
 | 1 / 2 | cycle the HUD / the map |
 | F9 / F10 | music / sound effects |
-| P | pause; in the pause menu the arrows pick and Enter answers (continue, race again, quit, photo mode) |
+| P, Esc | pause; in the pause menu the arrows pick and Enter answers (continue, race again, quit, photo mode) |
 | F1 | hide / show the pause menu or a result page, to look at the scene behind it |
 
 At the end of a race **Space** closes the result pages one by one and leaves the last one.

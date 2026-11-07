@@ -810,6 +810,8 @@ impl App {
     }
 
     pub(crate) fn rebuild_scene(&mut self) {
+        // PORT-DEVIATION D64: the pad button icons for the pad connected now (before any screen draws them)
+        self.pad_icons_refresh();
         // **TEST GLUE** (PORT-DEVIATION D63) `NFS_RACE_PANEL`
         self.panel_script_step();
         // PORT-DEVIATION D46: the camera slot's camera and slice as its own last pass left them (see `photo.rs`)
@@ -1084,7 +1086,7 @@ impl App {
             self.fe_sound(9);
         }
         self.hud_hover = hover;
-        let (view, slot_near) = self.camera_pass(car_pos, car_rot, rear_view, false);
+        let (view, slot_near) = self.camera_pass(car_pos, car_rot, rear_view, false, alpha);
         // PORT-DEVIATION D46: the free camera draws instead of the slot's (which is kept for the next pass)
         self.photo_apply();
         // draw distance from `<track>_{forward,backwards}.key` for the camera's slice, scaled by the
@@ -1439,7 +1441,7 @@ impl App {
     /// The camera slot's per-frame work (`RE/notes/camera*.md`): the view's update(s) since the last
     /// game tick, the car-relative eye, the mirror's eye, the beacon and the headlight frames.
     /// Returns the view id and the slot's near plane.
-    fn camera_pass(&mut self, car_pos: Vec3, car_rot: Quat, rear_view: bool, audio: bool) -> (u16, f32) {
+    fn camera_pass(&mut self, car_pos: Vec3, car_rot: Quat, rear_view: bool, audio: bool, alpha: f32) -> (u16, f32) {
         // every view is slot 0's half-angle, 37.5° by default, across (`camera::fov_y`); only a
         // trackside camera element brings its own (`+0x9C` when `+0x98` is set)
         // the TV modes take the view the last trackside camera set (`TvSlot::view`): the sweep
@@ -1596,10 +1598,17 @@ impl App {
         let frame_steps = steps;
         let n_upd = (frame_steps + anim_done).max(1);
         let (frame_car_pos, frame_car_rot) = (car_pos, car_rot);
+        // PORT-DEVIATION D8 (camera followers, `CamFollow`): the views whose offset from the car is a state stepped
+        // per tick (chase / heli, the roll-over of those, BlimpCam) take the tick's own pose in the frame's last
+        // update too, not the interpolated one, so the state is a function of the tick sequence alone; the eye is
+        // drawn at `lerp(offset before, offset after, alpha)` from the interpolated car below the loop. The
+        // other views (rigid on the car, aimed at it, the world's cameras) keep the frame's pose in that update.
+        let follower_view = matches!(view, 0x02..=0x07 | 0x0D) && !rear_view;
+        let mut followed = false;
         for upd in anim_done..n_upd {
             let last_upd = upd + 1 == n_upd;
             let steps = frame_steps.min(1);
-            let hist = if !last_upd {
+            let hist = if !last_upd || (follower_view && frame_steps > 0) {
                 // the ticks are consecutive: the entry is at its offset from the oldest
                 let want = cam_tick0 + 1 + u64::from(upd);
                 let first = self.cam_hist.front().map_or(want, |h| h.tick);
@@ -1607,7 +1616,11 @@ impl App {
             } else {
                 None
             };
-            let (car_pos, car_rot) = hist.map_or((frame_car_pos, frame_car_rot), |h| (h.pos, h.rot));
+            // a frame between two ticks: the follower's latest tick pose
+            let held = (last_upd && follower_view && frame_steps == 0).then(|| self.cam_follow.filter(|f| f.view == view).map(|f| f.pose)).flatten();
+            let (car_pos, car_rot) = hist.map(|h| (h.pos, h.rot)).or(held).unwrap_or((frame_car_pos, frame_car_rot));
+            // the follower's offset from the car this update leaves (exact state, not eye - car)
+            let mut follow_off: Option<Vec3> = None;
             let fwd = car_rot * Vec3::Z;
             aimed = aimed0;
             // what the update reads of its tick's car: the frame's own for the last
@@ -1658,6 +1671,7 @@ impl App {
                     cur += (a - cur) * 0.02;
                 }
                 self.chase_offset = Some((cur, view));
+                follow_off = Some(cur);
                 self.camera.position = car_pos + cur;
                 self.camera.target = car_pos + Vec3::Y * 4.0 * if (0x02..=0x04).contains(&view) { 0.325 } else { 0.4 };
                 aimed = true;
@@ -1818,6 +1832,7 @@ impl App {
                         }
                     }
                     self.chase_offset = Some((cur, view));
+                    follow_off = Some(cur);
                     self.camera.position = car_pos + cur;
                     self.camera.target = car_pos + aim_lift;
                     self.camera.up = Vec3::Y;
@@ -1838,6 +1853,7 @@ impl App {
                 for _ in 0..steps {
                     d += (target - d) * 0.1;
                 }
+                follow_off = Some(d);
                 self.camera.position = car_pos + d;
                 self.camera.target = car_pos;
                 self.camera.up = Vec3::Y;
@@ -2072,9 +2088,29 @@ impl App {
                     }
                 }
             }
+            // PORT-DEVIATION D8: the follower's offsets of the previous and of this tick (reset on a view switch, a
+            // SetSlotView re-entry, the look-back's rigid branch and anything that is not a follower)
+            if let (Some(off), true) = (follow_off, follower_view) {
+                let fresh = view_entered && upd == anim_done;
+                self.cam_follow = Some(CamFollow::update(self.cam_follow, view, off, (car_pos, car_rot), steps > 0, fresh));
+                followed = last_upd;
+            } else {
+                self.cam_follow = None;
+            }
             if !last_upd {
                 self.slot_eye = Some(self.camera.position);
             }
+        }
+        // PORT-DEVIATION D8: the eye the follower updates built is the tick's (`car_tick + offset`, also the slot's
+        // eye `+0x24` for the next tick's ceiling tests); the frame draws it at the interpolated car plus the
+        // offset blended by `alpha`, the aim point at the interpolated car. At `alpha` 1 (and in the audio slot's
+        // pass, which reads the tick's own eye) nothing moves.
+        let mut eye_shift = Vec3::ZERO;
+        if followed && !audio && let Some(f) = self.cam_follow {
+            let want = frame_car_pos + f.draw_offset(alpha);
+            eye_shift = want - self.camera.position;
+            self.camera.position = want;
+            self.camera.target += frame_car_pos - f.pose.0;
         }
         // diagnostic (`RUST_LOG=camslot=debug`): the slot's eye `+0x24` after this frame's updates
         tracing::debug!(target: "camslot", tick = self.tick, view, updates = frame_steps, eye = ?self.camera.position, at = ?self.camera.target, up = ?self.camera.up, car = ?car_pos, "camera slot");
@@ -2115,6 +2151,7 @@ impl App {
             self.orbit.yaw = self.orbit.yaw.wrapping_add(self.orbit.step);
             let turn = Quat::from_rotation_y(self.orbit.yaw as f32 / 1024.0 * std::f32::consts::TAU);
             let eye = car_pos + turn * base;
+            eye_shift = Vec3::ZERO;
             if aimed {
                 self.camera.target = car_pos + turn * (self.camera.target - car_pos);
             } else {
@@ -2126,7 +2163,7 @@ impl App {
         }
         // the slot keeps its own eye `+0x24`; the pushes and the clamp below act on the copy the build
         // hands out (0x4651BF…0x4651DB)
-        self.slot_eye = Some(self.camera.position);
+        self.slot_eye = Some(self.camera.position - eye_shift);
         // **The build's pushes** (0x4651E4…0x465233), for views whose slot flags carry 0x10 — the
         // table's 0x08: views 2…0x0A, 0x10 and 0x11 (`race-logic.md` §11): the prop push 0x4649E0,
         // then the wall push 0x464500
@@ -2283,6 +2320,7 @@ impl App {
             anim_cam_counter: self.anim_cam_counter,
             chase_offset: self.chase_offset,
             chase_settle: self.chase_settle,
+            cam_follow: self.cam_follow,
             slot_view: self.slot_view,
             slot_seen: self.slot_seen,
             look_yaw: self.look_yaw,
@@ -2306,6 +2344,7 @@ impl App {
         swap(&mut self.anim_cam_counter, &mut s.anim_cam_counter);
         swap(&mut self.chase_offset, &mut s.chase_offset);
         swap(&mut self.chase_settle, &mut s.chase_settle);
+        swap(&mut self.cam_follow, &mut s.cam_follow);
         swap(&mut self.slot_view, &mut s.slot_view);
         swap(&mut self.slot_seen, &mut s.slot_seen);
         swap(&mut self.look_yaw, &mut s.look_yaw);
@@ -2347,7 +2386,7 @@ impl App {
         self.swap_cam_slot(&mut slot);
         // `camera_pass` counts the ticks done: the update of this tick is the one that brings the count to `tick + 1`
         self.tick += 1;
-        self.camera_pass(h.pos, h.rot, rear_view, true);
+        self.camera_pass(h.pos, h.rot, rear_view, true, 1.0);
         self.tick -= 1;
         let out = (self.camera.position, self.camera.target);
         self.swap_cam_slot(&mut slot);

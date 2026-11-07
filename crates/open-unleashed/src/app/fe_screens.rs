@@ -708,6 +708,7 @@ impl App {
         self.bind_player_buttons();
         self.bind_parts_buttons();
         self.bind_mergedlist_panel();
+        self.bind_internet_button();
         self.bind_showcase_pictures();
         self.bind_track_maps();
         self.bind_player_pictures();

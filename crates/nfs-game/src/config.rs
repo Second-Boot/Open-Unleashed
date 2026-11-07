@@ -78,6 +78,8 @@ switches! {
     // TEST GLUE: the rumble backend's by-hand check (`Gamepads::rumble_test_tick`), set to anything
     nfs_ff_test = "NFS_FF_TEST",
     nfs_fe_hints = "NFS_FE_HINTS",
+    // TEST GLUE (PORT-DEVIATION D64): `xbox` / `ps` / `nintendo` shows the pad button icons as if such a pad were connected
+    nfs_pad_kind = "NFS_PAD_KIND",
     nfs_fe_redraw_always = "NFS_FE_REDRAW_ALWAYS",
     nfs_detail = "NFS_DETAIL",
     nfs_fe_seq_frames = "NFS_FE_SEQ_FRAMES",

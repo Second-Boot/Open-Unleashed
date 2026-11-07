@@ -50,6 +50,7 @@ mod fe_flow;
 mod fe_screens;
 mod fe_callbacks;
 mod input;
+mod pad_icons;
 mod pad_menu;
 mod frame;
 mod events;
@@ -464,6 +465,10 @@ pub(crate) struct App {
     pub(crate) camera: Camera,
     pub(crate) input: InputState,
     pub(crate) gamepads: Gamepads,
+    /// PORT-DEVIATION D64: the pad button icons' atlas (uploaded on the first frame a pad is connected) and the kind
+    /// of the pad they are drawn for now (`None` = no standard pad: nothing is drawn)
+    pub(crate) pad_icons: Option<crate::pad_glyphs::PadIcons>,
+    pub(crate) pad_atlas: Option<nfs_renderer::TextureId>,
     /// The force-feedback state (`0x5E94xx`, `RE/notes/force-feedback.md`), made at a race's start
     /// (`ff_arm`); output only.
     pub(crate) ff: Option<nfs_physics::force_feedback::ForceFeedback>,
@@ -664,6 +669,9 @@ pub(crate) struct App {
     /// was built for, and the `+0xC1` settle count SetSlotView starts at 0x32 (0x465848).
     pub(crate) chase_offset: Option<(Vec3, u16)>,
     pub(crate) chase_settle: u8,
+    /// PORT-DEVIATION D8 (camera followers): the follower views' offset from the car as of the previous and the
+    /// latest game tick, and the latest tick's pose; the draw interpolates between them ([`CamFollow`]).
+    pub(crate) cam_follow: Option<CamFollow>,
     /// The view slot 0 was on at the last camera pass: a change is a SetSlotView, whose seed 0x465CF0 of the
     /// offset `+0x08` (`chase_offset`) the pass applies. `None` until the first pass (the race's init).
     pub(crate) slot_view: Option<u16>,

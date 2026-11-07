@@ -741,6 +741,10 @@ impl App {
                 let over = h.billboard_h.get() >= BILLBOARD.3 && Hud::over_button(Hud::mission_button(), self.fe.cursor);
                 *hud_hover = Some(over.then_some((2, 0)));
                 h.mission_summary_sprites(&mut table, hud_aspect, &bb, MissionSummary { narrator, name: &name, lines: &lines, race_again: &fe(hud_str::PAUSE_BUTTON_2), typed: Some(self.pages.frames as usize), button: (over, over && self.fe.mouse_down) });
+                // PORT-DEVIATION D64: Y is "race again" on a failed mission's summary (D10, PAD-END2)
+                if self.mission_result.is_some_and(|(passed, _)| !passed) && h.billboard_h.get() >= BILLBOARD.3 {
+                    h.pad_glyphs_beside(&mut table, hud_aspect, Hud::mission_button(), &[crate::pad_glyphs::Glyph::Face(2)]);
+                }
             } else if let Some((place, t)) = race_congrats {
                 h.congrats_sprites(&mut table, hud_aspect, place, t, false);
             } else if let ResultPage::TournamentPlace(rank) = page {

@@ -69,6 +69,7 @@ and `THIRD-PARTY-LICENSES.txt` — never any file of the original game.
 | `NFS_PHOTO_DIR=<folder>` | where photo mode saves its pictures (default `Pictures/PorscheUnleashed`) |
 | `NFS_FPS_CAP=<n>` | at most `n` frames a second (frame pacing only); wins over the frame rate limit row of the enhancements tab (Options > graphics) |
 | `NFS_LOBBY_ADDRESS=host[:port]` | the internet lobby's address (overrides `lobby.txt` `address=` in the saves folder and the built-in default; see [install](install.md)) |
+| `NFS_PAD_KIND=xbox`/`ps`/`nintendo` | test glue: shows the pad button icons (bottom bar, pause menu, result pages, replay-save dialog) as if a pad of that kind were connected, so stills need no hardware |
 | `NFS_MIC=1` | voice chat from the microphone: in a network session the game sends your voice from the default input device to the other players, as the original did. Off by default (you still hear the others) |
 | `WGPU_BACKEND=vulkan`/`gl`/`dx12`/`metal` | the graphics API (by default Vulkan / Metal / Direct3D 12, OpenGL only without them) |
 | `NFS_GPU_PROFILE=1` | a per-pass GPU timing in the log, every 120 frames (diagnostics; slows the frame down). `NFS_GPU_PROFILE=minimal` asks for a plain GPU device with no optional features |

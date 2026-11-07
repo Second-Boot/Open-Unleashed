@@ -690,7 +690,7 @@ impl App {
     }
 
     /// `Race_finalize(2)` 0x416AC0 over the live race: the ranking table and every racer's record.
-    fn finalize_race(&self) -> (Vec<usize>, Vec<nfs_game::race::RacerResult>) {
+    pub(crate) fn finalize_race(&self) -> (Vec<usize>, Vec<nfs_game::race::RacerResult>) {
         use nfs_game::race::{FinalizeIn, STATE_FINISHED, STATE_OUT, STATE_RACING};
         // **The order is the ranking table 0x608B38** (`race::ranking`): progress `car+0xAF8`
         // descending, ties by the earlier `car+0xB14`, whatever the car's state — `Race_finalize`

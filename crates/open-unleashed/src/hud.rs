@@ -70,6 +70,8 @@ pub(crate) struct Hud {
     /// The height the billboard currently has while it opens (`HBillBoard +0xE8`, see
     /// [`Hud::billboard`]); set by the caller before a post-race page is drawn
     pub(crate) billboard_h: std::cell::Cell<f32>,
+    /// PORT-DEVIATION D64: the pad button icons to draw beside the dialogs' actions (`None` = no standard pad), set each frame
+    pub(crate) pad_icons: std::cell::Cell<Option<crate::pad_glyphs::PadIcons>>,
     /// `[0x606AC8]` now and at the billboard's creation, for its strips' moving split
     pub(crate) billboard_clock: std::cell::Cell<(u64, u64)>,
     /// `DISPLAYCOLORS` (0x4204F0, `Display.DispCols`): 0xCCFAB400 orange, 0xCCFF0606 red, 0xCC1EE605

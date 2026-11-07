@@ -145,6 +145,7 @@ impl Hud {
             strip_shade,
             button_ramps,
             billboard_h: std::cell::Cell::new(BILLBOARD.3),
+            pad_icons: std::cell::Cell::new(None),
             billboard_clock: std::cell::Cell::new((0, 0)),
             display: std::cell::Cell::new(Hud::display_colour(0)),
             dial_ring,

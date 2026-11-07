@@ -1,6 +1,12 @@
 //! The HUD's result pages, dialogs, buttons and tables.
 
 use crate::*;
+use crate::pad_glyphs::Glyph;
+
+/// PORT-DEVIATION D64: the pad icons' side beside the HUD's dialogs, in the 640 x 480 reference rows.
+const PAD_ICON: f32 = 24.0;
+/// ... and in the dialogs' 22-row strips.
+const HINT_ICON: f32 = 20.0;
 
 impl Hud {
     /// `HTable` (ctor 0x42E8B0, draw 0x42EA50) inside the billboard box: the column widths it is
@@ -354,6 +360,11 @@ impl Hud {
             if let Some(sp) = space {
                 let sw = self.text_width(sp, th);
                 self.text(out, aspect, sp, (x + w - 10.0 - sw, by), th, white);
+                // PORT-DEVIATION D64: A closes the page as Space does (D10)
+                if let Some(icons) = self.pad_icons.get() {
+                    let (pos, size) = Self::place(aspect, x + w - 10.0 - sw - 4.0 - HINT_ICON, by + (EXT_MAIN - HINT_ICON) * 0.5, HINT_ICON, HINT_ICON);
+                    out.push(icons.sprite(Glyph::Face(0), pos, size));
+                }
             }
         }
         true
@@ -458,6 +469,19 @@ impl Hud {
         self.text(out, aspect, label, (x + (bw - tw) / 2.0, (y + (bh - EXT_MAIN) / 2.0).trunc()), FONT_MAIN, argb(text));
     }
 
+    /// PORT-DEVIATION D64 (pad button icons): the pad's keys beside a dialog button (`x`, `y` its top-left in the
+    /// 640 x 480 reference), to its right past the button's drop shadow, in the order given. Nothing with no
+    /// standard pad connected.
+    pub(crate) fn pad_glyphs_beside(&self, out: &mut Vec<Sprite>, aspect: f32, (x, y): (f32, f32), glyphs: &[crate::pad_glyphs::Glyph]) {
+        let Some(icons) = self.pad_icons.get() else { return };
+        let (bw, bh) = HUD_BUTTON;
+        for (n, g) in glyphs.iter().enumerate() {
+            let gx = x + bw + 8.0 + n as f32 * (PAD_ICON + 3.0);
+            let (pos, size) = Self::place(aspect, gx, y + (bh - PAD_ICON) * 0.5, PAD_ICON, PAD_ICON);
+            out.push(icons.sprite(*g, pos, size));
+        }
+    }
+
     /// `HPauseMenu` (0x42A440): the billboard titled FE 18128 with three buttons — 18108 continue,
     /// 18109 race again, 18110 quit — at `x = W/2 − 71` and `y = ftol(H/2 − 1.5·step) + k·step`
     /// with `step = 19 · 1.6` (0x42A482…0x42A587, each `ftol`'d from the previous one).
@@ -467,6 +491,14 @@ impl Hud {
         }
         for (k, (l, (bx, by))) in labels.iter().zip(Self::pause_buttons()).enumerate() {
             self.button_sprites(out, aspect, (bx, by), l, k == sel, pressed);
+            // PORT-DEVIATION D64: A answers the picked button, B is "continue" (D10)
+            let keys: &[Glyph] = match (k == sel, k == 0) {
+                (true, true) => &[Glyph::Face(0), Glyph::Face(1)],
+                (true, false) => &[Glyph::Face(0)],
+                (false, true) => &[Glyph::Face(1)],
+                (false, false) => &[],
+            };
+            self.pad_glyphs_beside(out, aspect, (bx, by), keys);
         }
     }
 
@@ -526,6 +558,8 @@ impl Hud {
         }
         for (k, (l, by)) in buttons.iter().zip([b0, b1]).enumerate() {
             self.button_sprites(out, aspect, (x, by), l, hover == Some(k), pressed);
+            // PORT-DEVIATION D64: A saves, B closes (D10)
+            self.pad_glyphs_beside(out, aspect, (x, by), &[Glyph::Face(k)]);
         }
         self.text(out, aspect, label, (x, label_y), FONT_MAIN, [0.0, 0.0, 0.0, 0xC0 as f32 / 255.0]);
     }
@@ -586,6 +620,14 @@ impl Hud {
         }
         for (k, (b, (bx, by))) in buttons.iter().zip(Self::yes_no_buttons()).enumerate() {
             self.button_sprites(out, aspect, (bx, by), b, k == sel, pressed);
+            // PORT-DEVIATION D64: A answers the picked button, B is "no" (D10)
+            let keys: &[Glyph] = match (k == sel, k == 1) {
+                (true, true) => &[Glyph::Face(0), Glyph::Face(1)],
+                (true, false) => &[Glyph::Face(0)],
+                (false, true) => &[Glyph::Face(1)],
+                (false, false) => &[],
+            };
+            self.pad_glyphs_beside(out, aspect, (bx, by), keys);
         }
     }
 

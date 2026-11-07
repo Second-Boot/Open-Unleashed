@@ -194,6 +194,7 @@ impl App {
         self.camera_mode = forced.unwrap_or(0);
         self.anim_cam = if forced.is_some() { AnimCamSlot::Off } else { AnimCamSlot::Start };
         self.chase_offset = None;
+        self.cam_follow = None;
         self.slot_view = None;
         self.chase_settle = 0;
         self.look_yaw = None;
@@ -220,6 +221,7 @@ pub(crate) struct CamSlotState {
     pub(crate) anim_cam_counter: u32,
     pub(crate) chase_offset: Option<(Vec3, u16)>,
     pub(crate) chase_settle: u8,
+    pub(crate) cam_follow: Option<CamFollow>,
     pub(crate) slot_view: Option<u16>,
     pub(crate) slot_seen: (u32, u32),
     pub(crate) look_yaw: Option<(i16, u16, bool)>,
@@ -266,6 +268,40 @@ pub(crate) struct Orbit {
 /// level `to`, and a new ramp of 0x3E8 ms starts. The value is `from + (to − from)·t` while
 /// `t = elapsed / duration` is at most 1 (`test ah, 0x41`), else `to` (and the duration is cleared).
 /// The clock is `GetTickCount` (0x53BFD0) — here the port's lamp clock in ms.
+/// PORT-DEVIATION D8 (the camera followers): the follower views (chase / heli 0x461E80 / 0x4623D0, the roll-over
+/// 0x461590, BlimpCam) keep an offset `eye - car` that moves once per game tick. The offset is stepped strictly
+/// on the tick poses (a pure function of the tick sequence, whatever the frame rate), the draw puts the eye at
+/// `lerp(prev, cur, alpha)` from the interpolated car, like every other thing D8 blends. At `alpha` 1 that is the
+/// original's eye (the tick's pose + this tick's offset).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CamFollow {
+    /// the view the offsets belong to
+    pub(crate) view: u16,
+    /// the offset as of the tick before the latest
+    pub(crate) prev: Vec3,
+    /// the offset as of the latest tick
+    pub(crate) cur: Vec3,
+    /// the car's pose at the latest tick (what the update read)
+    pub(crate) pose: (Vec3, Quat),
+}
+
+impl CamFollow {
+    /// The state after one update that has just produced the offset `off` against the tick pose `pose`.
+    /// `ticked`: the update advanced the follower by a game tick (not a frame between ticks); `fresh`: the
+    /// follower jumped (a view switch, a snap, the first update) — nothing to glide from, so `prev` = `off`.
+    pub(crate) fn update(old: Option<Self>, view: u16, off: Vec3, pose: (Vec3, Quat), ticked: bool, fresh: bool) -> Self {
+        match old {
+            Some(o) if o.view == view && !fresh => Self { view, prev: if ticked { o.cur } else { o.prev }, cur: off, pose: if ticked { pose } else { o.pose } },
+            _ => Self { view, prev: off, cur: off, pose },
+        }
+    }
+
+    /// The offset to draw at the fraction `alpha` of a tick (exactly `cur` at 1).
+    pub(crate) fn draw_offset(&self, alpha: f32) -> Vec3 {
+        if alpha >= 1.0 { self.cur } else { self.prev.lerp(self.cur, alpha.max(0.0)) }
+    }
+}
+
 /// What the camera slot's per-tick update reads of one game tick (0x463C30 on `Sc64`): the
 /// viewed car's pose at the end of that tick (`car+0x330` with the body lift, the matrix), the
 /// car's local velocity (the follow rate, the pull-back), its half length, and the race slice
@@ -359,5 +395,72 @@ mod look_tests {
         assert_eq!(t(true, false, false, true), -45);
         assert_eq!(t(false, false, true, true), 90);
         assert_eq!(t(false, false, false, true), 0);
+    }
+}
+
+/// PORT-DEVIATION D8 (camera followers): the follower state is a function of the tick sequence alone, and the
+/// draw at `alpha` 1 is the tick's own offset.
+#[cfg(test)]
+mod follow_tests {
+    use super::CamFollow;
+    use glam::{Quat, Vec3};
+
+    /// a toy follower the way the chase update steps it: `cur += (target - cur) * k` once per tick, the target
+    /// turning with the car
+    fn drive(frames_per_tick: &[u32]) -> (Option<CamFollow>, Vec<Vec3>) {
+        let mut cur = Vec3::new(0.0, 2.0, -6.0);
+        let mut f: Option<CamFollow> = None;
+        let mut draws = Vec::new();
+        for (tick, &frames) in frames_per_tick.iter().enumerate() {
+            let yaw = 0.01 * tick as f32;
+            let pose = (Vec3::new(tick as f32 * 0.5, 0.0, 0.0), Quat::from_rotation_y(yaw));
+            let target = pose.1 * Vec3::new(0.0, 2.0, -6.0);
+            cur += (target - cur) * 0.1;
+            // the frame that holds the tick, then the frames between it and the next
+            for fr in 0..frames {
+                f = Some(CamFollow::update(f, 3, cur, pose, fr == 0, false));
+                draws.push(f.unwrap().draw_offset(fr as f32 / frames as f32));
+            }
+        }
+        (f, draws)
+    }
+
+    #[test]
+    fn follower_state_does_not_depend_on_the_frame_rate() {
+        let n = 200;
+        let one = drive(&vec![1; n]);
+        let two = drive(&vec![2; n]);
+        let three = drive(&vec![3; n]);
+        let mixed = drive(&(0..n).map(|i| [1, 2, 1, 3, 2][i % 5]).collect::<Vec<_>>());
+        assert_eq!(one.0, two.0);
+        assert_eq!(one.0, three.0);
+        assert_eq!(one.0, mixed.0);
+    }
+
+    #[test]
+    fn alpha_one_is_the_ticks_own_offset_and_alpha_zero_the_previous() {
+        let (f, _) = drive(&vec![2; 50]);
+        let f = f.unwrap();
+        assert_eq!(f.draw_offset(1.0), f.cur);
+        assert_eq!(f.draw_offset(0.0), f.prev);
+        assert_ne!(f.prev, f.cur);
+        let mid = f.draw_offset(0.5);
+        assert!((mid - (f.prev + f.cur) * 0.5).length() < 1e-6);
+    }
+
+    #[test]
+    fn a_fresh_follower_or_a_view_switch_does_not_glide() {
+        let pose = (Vec3::ZERO, Quat::IDENTITY);
+        let a = CamFollow::update(None, 3, Vec3::X, pose, true, false);
+        assert_eq!((a.prev, a.cur), (Vec3::X, Vec3::X));
+        let b = CamFollow::update(Some(a), 3, Vec3::Y, pose, true, false);
+        assert_eq!((b.prev, b.cur), (Vec3::X, Vec3::Y));
+        let c = CamFollow::update(Some(b), 4, Vec3::Z, pose, true, false);
+        assert_eq!((c.prev, c.cur), (Vec3::Z, Vec3::Z));
+        let d = CamFollow::update(Some(b), 3, Vec3::Z, pose, true, true);
+        assert_eq!((d.prev, d.cur), (Vec3::Z, Vec3::Z));
+        // a frame between ticks keeps the pair
+        let e = CamFollow::update(Some(b), 3, Vec3::Y, pose, false, false);
+        assert_eq!((e.prev, e.cur), (b.prev, b.cur));
     }
 }

@@ -1194,6 +1194,8 @@ impl App {
                 if let Some((d, _)) = &self.fe.dialog {
                     v.extend(l.dialog_sprites(d, aspect, &self.fe.strings, self.fe.mouse_down));
                 }
+                // PORT-DEVIATION D64: the pad's keys beside the bottom bar's buttons while a standard pad is connected
+                v.extend(self.fe_pad_glyphs(aspect));
                 // the port's own key-hint line, a diagnostic the original has no counterpart
                 // to: drawn only under `NFS_FE_HINTS` (decided 2026-09-27 — until
                 // then it was always on, and the credits roll drew over it in the oval)

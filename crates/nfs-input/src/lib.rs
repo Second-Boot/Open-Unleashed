@@ -353,6 +353,16 @@ impl InputState {
                 }
             }
         }
+        // PORT-DEVIATION D10 (ESC-PAUSE): Escape is a second pause key beside P, unless a row is
+        // bound to Escape itself. The original reads no Escape in a race (no binding names
+        // `SC_ESC`, nothing reads `[0x5DE029]`), so the key was free.
+        if code == KeyCode::Escape && !self.key_bound(code) {
+            match state {
+                ElementState::Pressed => self.hold(Action::Pause),
+                ElementState::Released => self.unhold(Action::Pause),
+            }
+            return;
+        }
         let Some(action) = default_binding(code) else { return };
         if let Some(b) = binding_id(action).and_then(|i| self.bindings.get(i)) {
             // PORT-DEVIATION D44 (PAD-HANG): a row bound to a pad control still answers its
@@ -942,6 +952,31 @@ mod tests {
             assert_eq!((b.kind, b.index), (3, scancode(k).unwrap() as u32), "{a:?}");
         }
         assert_eq!(default_binding(KeyCode::Escape), None);
+    }
+
+    /// ESC-PAUSE (D10): Escape presses the pause beside P, also when the pause row is on a pad,
+    /// and not when a row is bound to Escape.
+    #[test]
+    fn escape_is_a_second_pause_key() {
+        let mut st = InputState::default();
+        st.key_changed(KeyCode::Escape, ElementState::Pressed);
+        assert!(st.take_pressed(Action::Pause));
+        st.key_changed(KeyCode::Escape, ElementState::Released);
+        assert!(!st.held(Action::Pause));
+        st.key_changed(KeyCode::KeyP, ElementState::Pressed);
+        assert!(st.take_pressed(Action::Pause), "P still pauses");
+        st.key_changed(KeyCode::KeyP, ElementState::Released);
+
+        let mut pad = modern_pad_state(&gamepad::PadSnapshot::default());
+        pad.key_changed(KeyCode::Escape, ElementState::Pressed);
+        assert!(pad.take_pressed(Action::Pause), "pause row on Start: Escape still pauses");
+
+        let mut bound = InputState::default();
+        let horn = binding_id(Action::Horn).unwrap();
+        bound.bindings.by_id.insert(horn, bindings::Binding { kind: 3, index: u32::from(scancode(KeyCode::Escape).unwrap()), ..Default::default() });
+        bound.key_changed(KeyCode::Escape, ElementState::Pressed);
+        assert!(!bound.take_pressed(Action::Pause), "a row bound to Escape keeps it");
+        assert!(bound.take_pressed(Action::Horn));
     }
 
     /// D44 item 9: the keyboard's factory rows are recognised as untouched; the pad's layout, or a

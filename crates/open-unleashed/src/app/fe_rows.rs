@@ -527,6 +527,23 @@ impl App {
     /// — so `owned` below is 0x4F4DF0's own `cur < n` directly, not the id-match this used to
     /// stand in with; the two can differ when the player owns a car of the same model as the
     /// catalogue row they currently have picked.)*
+    /// PORT-DEVIATION D55 item 5: the protocol screen's `ID_COMMSINTERNET` («интернет», `SETMODENET` → `accountlogin`) is hidden
+    /// while the lobby address is the built-in placeholder (no service yet), through the original's own hide 0x50D910; a real address
+    /// in `lobby.txt` or `NFS_LOBBY_ADDRESS` shows it.
+    pub(crate) fn bind_internet_button(&mut self) {
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
+        let want = l.widgets_named(&["ID_COMMSINTERNET"]);
+        if want.is_empty() {
+            return;
+        }
+        let hide = !crate::netplay::lobby_configured();
+        if let Some(l) = self.fe.layout_preview.as_mut() {
+            for (index, _) in want {
+                l.set_hidden_flag(index, hide);
+            }
+        }
+    }
+
     pub(crate) fn bind_mergedlist_panel(&mut self) {
         self.sync_merged_zero();
         let Some(l) = self.fe.layout_preview.as_ref() else { return };

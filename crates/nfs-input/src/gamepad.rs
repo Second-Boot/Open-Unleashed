@@ -90,6 +90,8 @@ pub struct Gamepads {
     ff_hotplug: bool,
     /// set by [`Gamepads::poll`] when any device was connected; taken by [`Gamepads::take_pad_hotplug`]
     pad_hotplug: bool,
+    /// the standard pad that sent the latest button or stick input (SDL instance id), for [`Gamepads::pad_kind`]
+    last_pad: Option<SDL_JoystickID>,
 }
 
 /// The last SDL error, for the log.
@@ -109,6 +111,8 @@ struct Device {
     pad: *mut SDL_Gamepad,
     /// SDL's gamepad buttons for the port's `South`, `East`, `North`, `West` ([`face_buttons`])
     face: [SDL_GamepadButton; 4],
+    /// the pad's kind for the menu icons (PORT-DEVIATION D64), [`PadKind::Xbox`] for a raw device
+    kind: PadKind,
     /// the force-feedback device of a non-pad joystick SDL can drive ([`crate::ff::HapticWheel`])
     haptic: Option<crate::ff::HapticWheel>,
     name: String,
@@ -197,6 +201,7 @@ impl Devices {
             } else {
                 face_buttons([SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH].map(|b| SDL_GetGamepadButtonLabel(pad, b)))
             };
+            let kind = if pad.is_null() { PadKind::Xbox } else { pad_kind_of(SDL_GetGamepadType(pad), SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_SOUTH)) };
             let name = {
                 let p = SDL_GetJoystickName(joy);
                 if p.is_null() { String::new() } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
@@ -227,13 +232,17 @@ impl Devices {
                 wheel = ty == SDL_JOYSTICK_TYPE_WHEEL,
                 "joystick connected"
             );
-            self.list.push(Device { id, joy, pad, face, haptic, name });
+            self.list.push(Device { id, joy, pad, face, kind, haptic, name });
         }
     }
 
     /// The record index (`records` order) of the standard pad with SDL instance id `which`.
     fn pad_index(&self, which: SDL_JoystickID) -> Option<usize> {
         self.list.iter().position(|x| x.id == which && !x.pad.is_null())
+    }
+
+    fn pad_index_of(&self, which: SDL_JoystickID) -> Option<usize> {
+        self.pad_index(which)
     }
 
     /// The name of the first open device that can rumble.
@@ -418,13 +427,13 @@ impl Gamepads {
                 None
             }
         };
-        Self { devices, stick_latch: [false; 2], menu_hold: Default::default(), rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
+        Self { devices, stick_latch: [false; 2], menu_hold: Default::default(), rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false, last_pad: None }
     }
 
     /// TOOLING (the server's headless re-simulation): no device layer at all, as on a machine where SDL's joystick support is
     /// unavailable ([`Self::new`] after a failure) - nothing is opened, no thread started.
     pub fn none() -> Self {
-        Self { devices: None, stick_latch: [false; 2], menu_hold: Default::default(), rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
+        Self { devices: None, last_pad: None, stick_latch: [false; 2], menu_hold: Default::default(), rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
     }
 
     /// PLATFORM GLUE (macOS): move SDL's event pump out of winit's handler into a run-loop observer
@@ -449,6 +458,17 @@ impl Gamepads {
     /// gives untouched keyboard rows the pad's layout).
     pub fn take_pad_hotplug(&mut self) -> bool {
         std::mem::take(&mut self.pad_hotplug)
+    }
+
+    /// PORT-DEVIATION D64 (pad button icons): the kind of the standard pad the menus should show icons
+    /// for — the one that sent the latest input, else the first connected standard pad; `None` with no
+    /// standard pad (raw devices — wheels, sticks — get no icons).
+    pub fn pad_kind(&self) -> Option<PadKind> {
+        let d = self.devices.as_ref()?;
+        self.last_pad
+            .and_then(|id| d.pad_index_of(id))
+            .or_else(|| d.list.iter().position(|x| !x.pad.is_null()))
+            .map(|i| d.list[i].kind)
     }
 
     /// Whether a pad that can rumble is connected (`SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN`).
@@ -610,10 +630,16 @@ impl Gamepads {
                     tracing::info!(name = d.list[i].name.as_str(), "joystick disconnected");
                     d.list.remove(i);
                 }
+                if self.last_pad == Some(which) {
+                    self.last_pad = None;
+                }
             } else if ty == SDL_EVENT_GAMEPAD_BUTTON_DOWN {
                 // the front end's pad keys (D10): a standard pad's d-pad, A and B, and the left
                 // stick past 0.6 of its travel (latched, one key per push)
                 let b = unsafe { ev.gbutton };
+                if d.pad_index(b.which).is_some() {
+                    self.last_pad = Some(b.which);
+                }
                 if let Some(i) = d.pad_index(b.which)
                     && let Some(k) = menu_button(SDL_GamepadButton(i32::from(b.button)), &d.list[i].face)
                 {
@@ -642,6 +668,9 @@ impl Gamepads {
                 };
                 let v = unit(a.value);
                 let now = v.abs() > MENU_STICK;
+                if now {
+                    self.last_pad = Some(a.which);
+                }
                 if now && !self.stick_latch[i] {
                     let k = if v < 0.0 { neg } else { pos };
                     input.pad_menu.push(k);
@@ -723,6 +752,51 @@ impl Gamepads {
             left_thumb: p.button(Button::LeftThumb),
             start: p.button(Button::Start),
         })
+    }
+}
+
+/// PORT-DEVIATION D64: which icon set a pad's menu icons take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PadKind {
+    /// letters A B X Y; Start, View, LB, RB (Xbox pads, and the standard pads SDL has no brand for)
+    #[default]
+    Xbox,
+    /// cross, circle, square, triangle; Options, Share, L1, R1 (PS3 / PS4 / PS5)
+    PlayStation,
+    /// letters by the labels SDL reports; + and − , L, R (Switch Pro, Joy-Cons, GameCube)
+    Nintendo,
+}
+
+impl PadKind {
+    /// The kind named by `NFS_PAD_KIND` (TEST GLUE): `xbox`, `ps`, `nintendo`.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "xbox" => Some(Self::Xbox),
+            "ps" | "playstation" => Some(Self::PlayStation),
+            "nintendo" | "switch" => Some(Self::Nintendo),
+            _ => None,
+        }
+    }
+}
+
+/// PORT-DEVIATION D64: a pad's icon set from SDL's gamepad type, with the label of the south button as
+/// the second opinion for a pad SDL has no type for (cross / circle labels = PlayStation).
+pub fn pad_kind_of(ty: SDL_GamepadType, south: SDL_GamepadButtonLabel) -> PadKind {
+    if ty == SDL_GAMEPAD_TYPE_PS3 || ty == SDL_GAMEPAD_TYPE_PS4 || ty == SDL_GAMEPAD_TYPE_PS5 {
+        PadKind::PlayStation
+    } else if ty == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO
+        || ty == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT
+        || ty == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT
+        || ty == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR
+        || ty == SDL_GAMEPAD_TYPE_GAMECUBE
+    {
+        PadKind::Nintendo
+    } else if ty == SDL_GAMEPAD_TYPE_XBOX360 || ty == SDL_GAMEPAD_TYPE_XBOXONE {
+        PadKind::Xbox
+    } else if south == SDL_GAMEPAD_BUTTON_LABEL_CROSS {
+        PadKind::PlayStation
+    } else {
+        PadKind::Xbox
     }
 }
 
@@ -1117,6 +1191,26 @@ mod tests {
         let bands = [[0, 0x80]; 8];
         assert!(axis_read(&b, &[cur], &bands) > 0x80);
         assert_eq!(axis_read(&b, &[base], &bands), 0);
+    }
+
+    /// PORT-DEVIATION D64: the icon set follows SDL's gamepad type; an untyped pad is told by its south label.
+    #[test]
+    fn the_pad_kind_follows_sdl_type() {
+        use SDL_GamepadButtonLabel as L;
+        let k = |t, l| pad_kind_of(t, l);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_XBOXONE, L::A), PadKind::Xbox);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_XBOX360, L::A), PadKind::Xbox);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_PS4, L::CROSS), PadKind::PlayStation);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_PS5, L::CROSS), PadKind::PlayStation);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_PS3, L::UNKNOWN), PadKind::PlayStation);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO, L::B), PadKind::Nintendo);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR, L::B), PadKind::Nintendo);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_STANDARD, L::A), PadKind::Xbox);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_UNKNOWN, L::UNKNOWN), PadKind::Xbox);
+        assert_eq!(k(SDL_GAMEPAD_TYPE_STANDARD, L::CROSS), PadKind::PlayStation);
+        assert_eq!(PadKind::from_name("PS"), Some(PadKind::PlayStation));
+        assert_eq!(PadKind::from_name("nintendo"), Some(PadKind::Nintendo));
+        assert_eq!(PadKind::from_name("x"), None);
     }
 
     /// PAD-MODERN (D44): a standard pad's record has the six axes, LT on `lZ` and RT on `lRz`

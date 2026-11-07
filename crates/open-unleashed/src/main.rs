@@ -34,6 +34,7 @@ mod intro_run;
 mod loopctl;
 mod netlobby;
 mod netplay;
+mod pad_glyphs;
 mod parts_shop;
 mod power;
 use app::*;

@@ -464,6 +464,27 @@ impl App {
                     self.pause_confirm = None;
                     None
                 }
+                // TEST GLUE (PORT-DEVIATION D64): the replay-save dialog and its overwrite question up, for stills
+                "replaysave" | "replayover" => {
+                    self.replay_save.up = true;
+                    self.replay_save.overwrite = tok == "replayover";
+                    self.replay_save.opened = Some(Instant::now());
+                    None
+                }
+                // TEST GLUE (PORT-DEVIATION D64): the result pages up now, a failed mission's summary on a `--mission` run
+                "results" => {
+                    let (order, racers) = self.finalize_race();
+                    let mission = self.mission_outcome();
+                    self.results = Some(RaceResults { racers, order, clean: [true; 8], mission, opened: 0, congrats: true });
+                    self.mission_result = Some((false, None));
+                    self.pages.open_tick = Some(0);
+                    self.pages.seen = Some(0);
+                    // a drawn frame opens the billboard and types the text a step each: stand-ins for them
+                    for _ in 0..60 {
+                        self.rebuild_scene();
+                    }
+                    None
+                }
                 "k" => Some(KeyCode::KeyK),
                 // PORT-DEVIATION D63: the race panel's keys, and F12's view
                 "bq" => Some(KeyCode::Backquote),

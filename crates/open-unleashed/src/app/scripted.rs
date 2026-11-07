@@ -536,6 +536,14 @@ impl App {
         // headless run lets one machine's tick run far ahead of the other's
         let exchange_run = self.net.session.as_ref().is_some_and(|n| n.clocked());
         let pace = (nfs_game::config::cfg().nfs_net_pace.is_set() && self.net.session.is_some() && !exchange_run).then(Instant::now);
+        // **TEST GLUE** (not in the original) `NFS_CAM_LOG=<file.csv>[:<fps>]` (negative fps: irregular pacing): after each tick the frames a windowed run at `fps`
+        // (default 120) would draw before the next one (`rebuild_scene` at that frame's fraction of the tick), each logged with the
+        // camera and the drawn car — for measuring the chase camera's jitter against the car (PORT-DEVIATION D8, camera followers)
+        let cam_log = std::env::var("NFS_CAM_LOG").ok().map(|v| {
+            let (path, fps) = v.rsplit_once(':').and_then(|(p, f)| Some((p.to_string(), f.parse::<f64>().ok()?))).unwrap_or((v.clone(), 120.0));
+            (std::io::BufWriter::new(std::fs::File::create(path).expect("NFS_CAM_LOG")), fps, 0u64, 0.0f64)
+        });
+        let mut cam_log = cam_log;
         for t in 0..ticks {
             self.net_race_notice();
             // **TEST GLUE** `NFS_NET_LOCKSTEP=<D>`: the remote cars' blocks arrive at fixed receiver ticks (`NetPlay::lockstep_wait`)
@@ -623,6 +631,27 @@ impl App {
                 }
             }
             self.simulate();
+            if let Some((w, fps, frame, ft)) = cam_log.as_mut() {
+                use std::io::Write;
+                // the frames with time T (s) in [n / 64, (n + 1) / 64), n = the ticks done
+                let n = self.tick as f64;
+                // (a negative `fps` is an irregular pacing around `|fps|`: each interval 0.6…1.4 of the mean, a fixed sequence)
+                while *ft * 64.0 < n + 1.0 {
+                    let tt = *ft * 64.0;
+                    if tt >= n {
+                        let alpha = (tt - n) as f32;
+                        self.test_alpha = Some(alpha);
+                        self.rebuild_scene();
+                        let (cp, _) = Self::blend_pose(self.render_prev.as_ref(), self.car_pos, self.car_rot, alpha);
+                        let (e, g) = (self.camera.position, self.camera.target);
+                        let _ = writeln!(w, "{frame},{},{alpha},{},{},{},{},{},{},{},{},{}", self.tick, e.x, e.y, e.z, g.x, g.y, g.z, cp.x, cp.y, cp.z);
+                    }
+                    *frame += 1;
+                    let k = if *fps < 0.0 { 0.6 + 0.8 * ((*frame * 2654435761 % 1000) as f64 / 1000.0) } else { 1.0 };
+                    *ft += k / fps.abs();
+                }
+                self.test_alpha = None;
+            }
             // **TEST GLUE** (PORT-DEVIATION D63) `NFS_RACE_PANEL`: the panel's actions at their ticks
             self.panel_script_step();
             // `--resim`: the hashes and finishes of the tick; the run ends when every human has finished or the frames are used up
