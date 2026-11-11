@@ -103,12 +103,17 @@ struct Spots {
 struct Lamps {
     // xyz the lamp, w its radius
     pos: array<vec4<f32>, 32>,
-    // rgb the colour, the brightness folded in
+    // rgb the colour, the brightness folded in; w (ENHANCEMENT E47) the lamp's shadow slot + 1, 0 = no shadow
     col: array<vec4<f32>, 32>,
-    // x the count, z the gain
+    // x the count, z the gain, w (ENHANCEMENT E47) one shadow texel in map coordinates
     params: vec4<f32>,
+    // ENHANCEMENT E47: per shadow slot the lamp's frustum, and x the world size of a texel at 1 m, y near, z far, w the strength
+    smat: array<mat4x4<f32>, 4>,
+    sinfo: array<vec4<f32>, 4>,
 };
 @group(0) @binding(20) var<uniform> lamps: Lamps;
+// ENHANCEMENT E47: the lamps' car shadow maps (`gpu/lamps.rs`), one layer per slot
+@group(0) @binding(25) var t_lamp_shadow: texture_depth_2d_array;
 
 // ENHANCEMENT E43: the near cars' contact shadow (`gpu/contact.rs`). `params.x` is the car count, 0 = off (the shading is then the
 // original's); `params.y` the strength (weaker where E9's sun shadow is drawn).
@@ -133,10 +138,14 @@ fn contact_sdf(q: vec2<f32>, h: vec2<f32>) -> f32 {
     return length(max(p, vec2<f32>(0.0))) + min(max(p.x, p.y), 0.0) - rc;
 }
 
-// ENHANCEMENT E43: how much of the light the cars' contact shadows leave at a road point (1 = all). Per car, in its own frame: the
-// body is a rounded box hovering half a tyre radius over the road (the road under it and beside it is occluded: a short exponential
-// plus a wider tail, both lengthening with the clearance, which a jump or a ramp makes large), and each tyre adds a patch and a halo
-// where the rubber meets the road. Only faces that look up in the car's frame take it.
+// ENHANCEMENT E43: how much of the light the cars' contact shadows leave at a road point (1 = all): the ambient occlusion of the
+// car's underside. Per car, in its own frame: the body's underside is a rounded rectangle (the box's footprint) hovering `h` over the
+// road (the clearance + `params.z`, `gpu/contact.rs` SOFTEN); the share of a cosine-weighted sky it hides from a point at signed distance `s` inside its edge (negative outside) is the
+// half-plane's, `0.5 + (asin t + t sqrt(1 - t^2)) / pi`, `t = s / sqrt(s^2 + h^2)` (1 deep under the car, 0.5 at the outline, 0.09
+// at `h` outside, 0.02 at `2 h`): the shadow stays inside the footprint and is soft over about the clearance. The body's sides add a
+// faint short skirt (`params.w` at the outline, SKIRT); each tyre a tight crease where the rubber meets the road. A bigger clearance (a jump, a ramp) widens and thins
+// it. Only faces that look up in the car's frame take it. (CONTACT-LAMPS: replaces a 0.7 / 0.3 exponential pair reaching ~1 m beyond
+// the outline at full strength, which read as a separate thick dark patch at night between the street lamps.)
 fn contact_keep(world: vec3<f32>, n: vec3<f32>) -> f32 {
     var keep = 1.0;
     let cnt = i32(contacts.params.x);
@@ -145,7 +154,7 @@ fn contact_keep(world: vec3<f32>, n: vec3<f32>) -> f32 {
         let axs = contacts.ax[i];
         let ays = contacts.ay[i];
         let d = world - c.xyz;
-        let reach = c.w + axs.w + 3.5;
+        let reach = c.w + axs.w + 1.5;
         if dot(d, d) > reach * reach {
             continue;
         }
@@ -158,10 +167,12 @@ fn contact_keep(world: vec3<f32>, n: vec3<f32>) -> f32 {
         // the clearance under the body's underside, and how a bigger one thins the shadow out (a jump)
         let gap = max(0.5 * r - q.y, 0.03);
         let kg = 1.0 / (1.0 + (gap / 0.6) * (gap / 0.6));
-        let out_d = max(contact_sdf(q.xz, vec2<f32>(c.w, axs.w)), 0.0);
-        let lscale = 0.16 + 0.7 * gap;
-        let body = 0.7 * exp(-out_d / lscale) + 0.3 * exp(-out_d / (3.0 * lscale));
-        // the tyres: a tight patch and a wide halo; a tyre in the air (the road far below the car's plane) has neither
+        let sd = contact_sdf(q.xz, vec2<f32>(c.w, axs.w));
+        let h = gap + contacts.params.z;
+        let t = -sd / sqrt(sd * sd + h * h);
+        let under = 0.5 + (asin(t) + t * sqrt(max(1.0 - t * t, 0.0))) * 0.31830988;
+        let body = 1.0 - (1.0 - under) * (1.0 - contacts.params.w * exp(-max(sd, 0.0) / 0.35));
+        // the tyres: a tight patch with a short halo; a tyre in the air (the road far below the car's plane) has neither
         let gw = max(-q.y, 0.0) / 0.3;
         let kw = 1.0 / (1.0 + gw * gw);
         var wh = 0.0;
@@ -171,7 +182,7 @@ fn contact_keep(world: vec3<f32>, n: vec3<f32>) -> f32 {
             let e1 = (q.xz - w.zw) / vec2<f32>(0.55 * r, 0.95 * r);
             let a0 = dot(e0, e0);
             let a1 = dot(e1, e1);
-            wh = max(wh, max(0.5 * exp(-a0 * 1.6) + 0.5 * exp(-a0 * 7.0), 0.5 * exp(-a1 * 1.6) + 0.5 * exp(-a1 * 7.0)));
+            wh = max(wh, max(0.4 * exp(-a0 * 3.0) + 0.6 * exp(-a0 * 9.0), 0.4 * exp(-a1 * 3.0) + 0.6 * exp(-a1 * 9.0)));
         }
         let occ = 1.0 - (1.0 - body * kg) * (1.0 - wh * kw);
         keep = keep * (1.0 - contacts.params.y * facing * occ);
@@ -606,8 +617,6 @@ fn csm_tap(c: i32, world: vec3<f32>, n: vec3<f32>, ndl: f32) -> f32 {
     return sum / 9.0;
 }
 
-// the cascade by the point's view depth, blended into the next over the last eighth of its range, the
-// last one fading out toward its end
 // ENHANCEMENT E9 (ENH-TUNPOOL): how covered a world point is, 0..1: inside a covered road slice's box (a tunnel's or a gallery's
 // interior, from the track's own overhead flags, `CoverBox`), whatever the camera is doing. The sun does not reach there and the
 // baked colour has its own light in it (the lamps' pools), so the sun's shadow must not darken it a second time.
@@ -637,12 +646,27 @@ fn cover_at(world: vec3<f32>) -> f32 {
     return w;
 }
 
-fn csm_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+// ENHANCEMENT E9 (SHADOW-REAL): how much of the sun's light the shadow is drawn for at a world point: the cover gate (1 in
+// the open; with the covered boxes known it shuts only while the camera is deep inside a covered run), times the point's own openness (0 inside a covered
+// road slice's box: a tunnel ends at its mouth in space, not when the camera leaves it)
+fn csm_share(world: vec3<f32>) -> f32 {
+    var share = csm.orig.w;
+    if csm.cover_n.x > 0.5 {
+        share = share * (1.0 - cover_at(world));
+    }
+    return share;
+}
+
+// ENHANCEMENT E9 (SHADOW-REAL): the sun's shadow at a point in its two parts: x the cascades' visibility (0 shadowed .. 1 lit),
+// y the share of the sun's light it is drawn for (`csm_share`, faded out toward the last cascade's end). The cascade is chosen by
+// the point's view depth, blended into the next over the last eighth of its range. A covered point reads no map at all.
+fn csm_split(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
     let count = i32(csm.dir.w);
     let vd = -(globals.view * vec4<f32>(world, 1.0)).z;
     let last = csm.info[count - 1].z;
-    if vd >= last {
-        return 1.0;
+    let share = csm_share(world);
+    if vd >= last || share <= 0.0 {
+        return vec2<f32>(1.0, 0.0);
     }
     let ndl = dot(n, -csm.dir.xyz);
     var c = 0;
@@ -660,11 +684,13 @@ fn csm_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
         }
     }
     let f = clamp((vd - csm.params.y) / max(last - csm.params.y, 0.001), 0.0, 1.0);
-    var vis = mix(mix(v, 1.0, f), 1.0, 1.0 - csm.orig.w);
-    if csm.cover_n.x > 0.5 {
-        vis = mix(vis, 1.0, cover_at(world));
-    }
-    return vis;
+    return vec2<f32>(v, share * (1.0 - f));
+}
+
+// how much of the sun reaches `world` (0 shadowed .. 1 lit; 1 under cover, beyond the cascades and with the gate shut)
+fn csm_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+    let t = csm_split(world, n);
+    return 1.0 - t.y * (1.0 - t.x);
 }
 
 // ENHANCEMENT E15: how much of the player's lamp pair reaches `world` (0 shadowed .. 1 lit): the shadow
@@ -730,9 +756,56 @@ fn lamp_light(world: vec3<f32>, n: vec3<f32>, floor_: f32) -> vec3<f32> {
         let cone = smoothstep(0.1, 0.55, l.y);
         let r = 1.0 - dist / radius;
         let fall = r * r * (3.0 - 2.0 * r);
-        sum += lamps.col[i].rgb * (cone * fall * mix(floor_, 1.0, clamp(dot(n, l), 0.0, 1.0)));
+        var w = cone * fall * mix(floor_, 1.0, clamp(dot(n, l), 0.0, 1.0));
+        // ENHANCEMENT E47: a lamp with a shadow slot is shadowed by the cars (only its own term)
+        if lamps.col[i].w > 0.5 && w > 0.0 {
+            w = w * lamp_visibility(i32(lamps.col[i].w) - 1, lamps.pos[i].xyz, world, n);
+        }
+        sum += lamps.col[i].rgb * w;
     }
     return sum * lamps.params.z;
+}
+
+// ENHANCEMENT E47: how much of lamp slot `k`'s light (the lamp at `lamp`) reaches `world` (0 shadowed .. 1 lit), mixed toward 1 by the
+// slot's strength: the slot's perspective map, the point pushed along its normal by about a texel, the depth held a few
+// centimetres (in metres, turned into the stored depth's units) below the stored one, E15's 3 x 3 grid with its four-tap early-out,
+// the frustum's border fading to lit. Outside the frustum nothing is shadowed (it holds every caster's cone).
+fn lamp_visibility(k: i32, lamp: vec3<f32>, world: vec3<f32>, n: vec3<f32>) -> f32 {
+    let info = lamps.sinfo[k];
+    let dist = length(world - lamp);
+    let texel = info.x * dist;
+    let ndl = clamp(dot(n, (lamp - world) / max(dist, 0.001)), 0.0, 1.0);
+    let p = lamps.smat[k] * vec4<f32>(world + n * (texel * (1.0 + 2.0 * (1.0 - ndl))), 1.0);
+    let near = info.y;
+    let far = info.z;
+    if p.w <= near {
+        return 1.0;
+    }
+    let ndc = p.xyz / p.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0 {
+        return 1.0;
+    }
+    let bias = (0.04 + 1.5 * texel) * far * near / ((far - near) * p.w * p.w);
+    let depth = ndc.z - bias;
+    let st = lamps.params.w;
+    var sum = 0.0;
+    for (var t = 0; t < 4; t++) {
+        sum += textureSampleCompareLevel(t_lamp_shadow, s_shadow, uv + vec2<f32>(f32(t & 1) * 2.0 - 1.0, f32(t >> 1) * 2.0 - 1.0) * st, k, depth);
+    }
+    if sum > 0.001 && sum < 3.999 {
+        sum += textureSampleCompareLevel(t_lamp_shadow, s_shadow, uv, k, depth);
+        sum += textureSampleCompareLevel(t_lamp_shadow, s_shadow, uv + vec2<f32>(-st, 0.0), k, depth);
+        sum += textureSampleCompareLevel(t_lamp_shadow, s_shadow, uv + vec2<f32>(st, 0.0), k, depth);
+        sum += textureSampleCompareLevel(t_lamp_shadow, s_shadow, uv + vec2<f32>(0.0, -st), k, depth);
+        sum += textureSampleCompareLevel(t_lamp_shadow, s_shadow, uv + vec2<f32>(0.0, st), k, depth);
+        sum = sum / 9.0;
+    } else {
+        sum = sum * 0.25;
+    }
+    let edge = max(abs(ndc.x), abs(ndc.y));
+    let vis = mix(sum, 1.0, smoothstep(0.85, 1.0, edge));
+    return mix(1.0, vis, info.w);
 }
 
 fn spot_light(world: vec3<f32>, n: vec3<f32>, floor_: f32) -> vec3<f32> {
@@ -1212,6 +1285,12 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         }
         //@enh-only-end
     }
+    // ENHANCEMENT E43: the near cars' contact shadow on the track (`sky_on.w` 1: a receiver), the sky's occlusion `ao` (1 = none)
+    let contact_rx = contacts.params.x > 0.5 && object.sky_on.w > 0.5;
+    var ao = 1.0;
+    if contact_rx {
+        ao = contact_keep(in.world, n);
+    }
     // ENHANCEMENT E9: the track has no direct term of its own (baked vertex light x texture), so a shadow
     // scales its colour by `1 - s (1 - visibility)`, `s` the strength x how much the face looks at the sun
     // x how bright the baked colour is (a baked shadow is not darkened twice)
@@ -1228,14 +1307,29 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         if csm.params.z > 1.0 {
             bright = mix(0.6, 1.0, bright);
         }
-        let s = csm.params.x * facing * bright;
-        if s > 0.0 {
-            light = light * (1.0 - s * (1.0 - csm_visibility(in.world, n)));
+        let a0 = csm.params.x * facing;
+        let s = a0 * bright;
+        if s > 0.0 || ao < 1.0 {
+            // ENHANCEMENT E9 (SHADOW-REAL): x the cascades' visibility, y the share of the sun the shadow is drawn for here (0 under
+            // a covered box, beyond the cascades)
+            let t = csm_split(in.world, n);
+            light = light * (1.0 - s * t.y * (1.0 - t.x));
+            // ENHANCEMENT E43 (SHADOW-REAL): the contact shadow is the sky's occlusion, so it takes only the sky's (ambient) share of
+            // the light, `1 - a`, and the sun's (direct) share `a` keeps the sun's visibility: of the light left at this point the
+            // occlusion leaves `((1 - a) ao + a v) / ((1 - a) + a v)`. In the sun's light (v 1) it is a faint crease at the tyres and
+            // sills; inside the car's own sun shadow (v 0) it is whole and deepens it under the body: one shadow, the car grounded.
+            // `a` is E9's strength x facing x the share drawn here, without the "baked dark" gate (the map knows where the car
+            // blocks the sun even where the bake is dim). Under cover, at night, beyond the cascades (a 0) it is the whole occlusion,
+            // as before. Not under E25's overcast light (`params.z` > 1): its soft shadow is itself a sky occlusion (the product).
+            if ao < 1.0 && csm.params.z <= 1.0 {
+                let a = a0 * t.y;
+                let sky = 1.0 - a;
+                ao = (sky * ao + a * t.x) / max(sky + a * t.x, 0.0001);
+            }
         }
     }
-    // ENHANCEMENT E43: the near cars' contact shadow on the track (`sky_on.w` 1: a receiver; the same product as E9's receiving above)
-    if contacts.params.x > 0.5 && object.sky_on.w > 0.5 {
-        light = light * contact_keep(in.world, n);
+    if contact_rx {
+        light = light * ao;
     }
     var base = tex * in.color;
     // `CarExtEnv`'s pass 1 (option mask 2): its `Rs` block is `{1, 2, 0, 1, 0, −1}` — gouraud,
@@ -1347,8 +1441,9 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             var blob = sh.a;
             // (not under E25's overcast light, `params.z` > 0: its car shadow is too faint to stand in for the blob)
             // (the garage's `FESH` blob, `extra.x` > 0: ENH-GARAGE fades it below, once the focus shadow has a contact core)
+            // ENHANCEMENT E9 (SHADOW-REAL): by the point's own cover (`csm_share`), not by where the camera is
             if csm.dir.w > 0.5 && csm.extra.x <= 0.0 && csm.params.z <= 0.0 {
-                blob = blob * (1.0 - csm.orig.w);
+                blob = blob * (1.0 - csm_share(in.world));
             }
             // ENHANCEMENT ENH-GARAGE: the garage's `FESH` blob gives way to the focus shadow (`extra.w`, its core carries the contact)
             if csm.dir.w > 0.5 && csm.extra.x > 0.0 {
@@ -1381,10 +1476,12 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         let vd = -(globals.view * vec4<f32>(in.world, 1.0)).z;
         let last = csm.info[i32(csm.dir.w) - 1].z;
         let f = clamp((vd - csm.params.y) / max(last - csm.params.y, 0.001), 0.0, 1.0);
+        // ENHANCEMENT E9 (SHADOW-REAL): the gate by the decal's own cover (`csm_share`)
+        let g = csm_share(in.world);
         if layered {
-            lit = lit * (1.0 - csm.orig.w * (1.0 - f));
+            lit = lit * (1.0 - g * (1.0 - f));
         }
-        alpha = alpha * (1.0 - csm.orig.w * (1.0 - f));
+        alpha = alpha * (1.0 - g * (1.0 - f));
     }
     //@enh-only-end
     // ENHANCEMENT E8 / ENH-COAT: the car paint's clear coat (a physically based one, Filament / Unreal style) and the glass.

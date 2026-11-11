@@ -31,6 +31,38 @@ mod metalfx;
 #[cfg(target_os = "macos")]
 mod metalfx_temporal;
 
+/// ENHANCEMENT UPSCALE-SOFT: the extra (negative) LOD bias of a TEMPORAL upscaler's main view, on top of the resolution term of
+/// [`mip_bias`]. The jittered frames that the temporal filter accumulates cover each window pixel with several sub-pixel samples, so
+/// textures may be sampled finer than one internal pixel (FSR 2 / 3's integration guide: log2(render / display) - 1.0; Apple's
+/// MetalFX guidance: the resolution term alone). See `RE/notes/ENHANCEMENTS.md` (UPSCALE-SOFT) for the stills it was chosen on.
+pub(crate) const TEMPORAL_MIP_EXTRA: f32 = -0.5;
+
+/// TEST GLUE `NFS_UPSCALE_MIP_EXTRA=<f>`: [`TEMPORAL_MIP_EXTRA`] replaced (for A/B stills; read once).
+fn temporal_mip_extra() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NFS_UPSCALE_MIP_EXTRA").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(TEMPORAL_MIP_EXTRA))
+}
+
+/// TEST GLUE `NFS_UPSCALE_MIP=0`: no upscaler LOD bias at all (the frame before UPSCALE-SOFT, for A/B stills; read once).
+fn mip_bias_off() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NFS_UPSCALE_MIP").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// ENHANCEMENT UPSCALE-SOFT: the texture LOD bias added to every material's own while the main view is drawn at `render_w` for a
+/// window `display_w` wide by an upscaler (`temporal`: FSR 3.1 / MetalFX temporal; else MetalFX's spatial scaler). The resolution
+/// term `log2(render / display)` picks the mip for the window's pixel, not for the smaller internal one (without it the scene is
+/// textured as if the window were that small, and the upscaler cannot bring the detail back: the softness seen at 67 / 59 / 50 %);
+/// FSR 1's guide gives the same values for a spatial scaler (-0.58 at 67 %, -1.0 at 50 %). A temporal one adds
+/// [`TEMPORAL_MIP_EXTRA`], at 1:1 too. Never used at level 0 or without an upscaler (nothing is added then).
+pub(crate) fn mip_bias(render_w: u32, display_w: u32, temporal: bool) -> f32 {
+    if mip_bias_off() {
+        return 0.0;
+    }
+    let ratio = (render_w.max(1) as f32 / display_w.max(1) as f32).min(1.0);
+    ratio.log2() + if temporal { temporal_mip_extra() } else { 0.0 }
+}
+
 /// The upscaler behind a level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpscalerKind {
@@ -67,7 +99,7 @@ pub trait Upscaler: Send {
     }
     /// ENHANCEMENT E37: drop the history at the next frame (a camera cut the renderer cannot see)
     fn reset_history(&mut self) {}
-    /// ENHANCEMENT ENH-UPSCALER: the post-upscale sharpening strength (`None` = off); only FSR has one (RCAS), the default does nothing
+    /// ENHANCEMENT ENH-UPSCALER: the post-upscale sharpening strength (`None` = off); only FSR has one inside (RCAS), the default does nothing (MetalFX is sharpened by `sharpen.rs` instead)
     fn set_sharpness(&mut self, _strength: Option<f32>) {}
 }
 

@@ -588,8 +588,17 @@ impl App {
         used: &mut [usize; 7],
         material: nfs_renderer::MaterialId,
         ((n, depth_bias), verts): ((usize, i32), &[nfs_renderer::Vertex]),
+        cover: &[nfs_renderer::CoverBox],
     ) {
         let Some(r) = renderer else { return };
+        // ENHANCEMENT E9 (SHADOW-REAL): how covered the patch stands (its vertices' mean), so it gives way to the sun's shadow by its own
+        // place (render only; 0 without covered boxes)
+        let cover = if cover.is_empty() || verts.is_empty() {
+            0.0
+        } else {
+            let c = verts.iter().fold(Vec3::ZERO, |a, v| a + Vec3::from(v.position)) / verts.len() as f32;
+            nfs_renderer::cover_weight(cover, c)
+        };
         let pool = &mut pools[n];
         if pool.len() <= used[n] {
             let mut m = nfs_renderer::MeshData::default();
@@ -631,6 +640,7 @@ impl App {
             depth_bias,
             // ENHANCEMENT E9: fades where the sun's shadow map draws the car's own shadow (inert without E9)
             csm: nfs_renderer::CSM_CAR_BLOB,
+            cover,
             ..nfs_renderer::DrawItem::new(mesh, material, Mat4::IDENTITY)
         });
     }

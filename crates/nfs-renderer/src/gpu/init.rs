@@ -90,6 +90,7 @@ impl Core {
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(spot_state.view()) },
                 wgpu::BindGroupEntry { binding: 11, resource: spot_state.uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 20, resource: lamp_state.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(lamp_state.view()) },
                 wgpu::BindGroupEntry { binding: 24, resource: contact_state.uniform.as_entire_binding() },
             ],
         });
@@ -202,6 +203,8 @@ impl Core {
             upscale_active: false,
             upscale_images: None,
             upscale_present: None,
+            sharpen: None,
+            cur_lod_shift: 0.0,
             smaa: None,
             post: Default::default(),
             sprite_sampler,
@@ -469,6 +472,8 @@ impl Core {
                 spot_entries[1],
                 // ENHANCEMENT E23: the street lamps
                 lamps::layout_entry(),
+                // ENHANCEMENT E47: the lamps' car shadow maps
+                lamps::shadow_layout_entry(),
                 // ENHANCEMENT E43: the cars' contact shadow
                 contact::layout_entry(),
             ],
@@ -501,7 +506,7 @@ impl Core {
         let sky_layout = gfx::bgl(device, "sky map", &[gfx::bgl_tex(0, wgpu::TextureSampleType::Float { filterable: true }, false)]);
         let csm_state = csm::CsmState::new(device, &object_layout, &material_layout);
         let spot_state = spot::SpotState::new(device, &csm_state.light_layout);
-        let lamp_state = lamps::LampState::new(device);
+        let lamp_state = lamps::LampState::new(device, &csm_state.light_layout);
         let contact_state = contact::ContactState::new(device);
         let pipeline_layout = gfx::pipeline_layout(device, "mesh pipeline layout", &[&globals_layout, &object_layout, &material_layout, &sky_layout]);
         let pipelines = build_mesh_pipelines(device, &shader, &pipeline_layout, format, 1, false);

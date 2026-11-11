@@ -260,7 +260,7 @@ impl App {
                     && let Some(mat) = shadow_material
                     && let Some(q) = self.shadow_quad(p + (c.position - c.draw_origin()), r, c.half_extents, &mut shadow_verts)
                 {
-                    Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
+                    Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()), &self.scene.cover);
                 }
                 // the model at `car+0x330 − M[1]·car+0x3AC` (0x43A410), LOD 1's box
                 let key = (p - fx_eye).length_squared().round_ties_even() as u32;
@@ -335,7 +335,7 @@ impl App {
                     && let Some(mat) = shadow_material
                     && let Some(q) = self.shadow_quad(p + (c.position - c.draw_origin()), r, c.half_extents, &mut shadow_verts)
                 {
-                    Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
+                    Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()), &self.scene.cover);
                 }
                 // the model at `car+0x330 − M[1]·car+0x3AC` (0x43A410), LOD 5's box like a racer's
                 let key = (p - fx_eye).length_squared().round_ties_even() as u32;
@@ -399,7 +399,7 @@ impl App {
                 && !(followed_here && own_view <= 1)
                 && let Some(q) = self.shadow_quad(p + (o.vehicle.position - o.vehicle.draw_origin()), r, o.vehicle.half_extents, &mut shadow_verts)
             {
-                Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
+                Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()), &self.scene.cover);
             }
             let key = (p - fx_eye).length_squared().round_ties_even() as u32;
             let m = Mat4::from_rotation_translation(r, p);
@@ -477,7 +477,7 @@ impl App {
             && !own_skipped
             && let Some(q) = self.shadow_quad(local_pos, local_rot, v.half_extents, &mut shadow_verts)
         {
-            Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
+            Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()), &self.scene.cover);
         }
         // R3DCar slot 14, 0x43A490, run by the car's draw 0x443490 inside its model transform: in
         // the driver view the `Wndo` corners go to the windscreen drops (0x459200 → 0x457E60).
@@ -888,14 +888,21 @@ impl App {
         self.scene.ao = self.vehicle.is_some();
         // ENHANCEMENT E21: the eye adaptation is for the race's main view
         self.scene.eye = self.vehicle.is_some();
+        // ENHANCEMENT E9 (ENH-TUNPOOL): the covered stretches, so the sun's shadow does not darken a tunnel's baked light by the camera's place
+        self.scene.cover = if self.vehicle.is_some() && !self.track.is_night() && self.enh.is_on(nfs_renderer::E9) { self.cover_boxes() } else { Default::default() };
         // ENHANCEMENT E9 (SHADOWFIX): under cover (the enclosure test the car's light uses, 0x473330 flags & 0xC000) the sun
         // does not reach: the camera or the player's car in a tunnel / gallery fades the shadows out
-        let lit = self.world.as_ref().is_none_or(|w| w.overhead_flags(self.camera.position) & 0xC000 == 0 && self.vehicle.as_ref().is_none_or(|v| w.overhead_flags(v.position) & 0xC000 == 0));
+        // SHADOW-REAL: that was only the fallback of a track without covered boxes; with them the shadow is decided per surface
+        // (`cover_at`: it ends at the tunnel's mouth in space, the sun shadow no longer comes in late on a tunnel exit), and the
+        // gate only switches the pass off while the camera is deep inside a covered run (`cover_open_view`)
+        let lit = if self.scene.cover.is_empty() {
+            self.world.as_ref().is_none_or(|w| w.overhead_flags(self.camera.position) & 0xC000 == 0 && self.vehicle.as_ref().is_none_or(|v| w.overhead_flags(v.position) & 0xC000 == 0))
+        } else {
+            super::cover::cover_open_view(&self.scene.cover, self.camera.position)
+        };
         self.scene.sun_shadow = (self.vehicle.is_some() && !self.track.is_night())
             .then(|| self.world.as_ref().filter(|w| w.sun_direction.x.abs() + w.sun_direction.z.abs() > 1e-3).map(|w| nfs_renderer::SunShadow { direction: w.sun_direction, lit, focus: None }))
             .flatten();
-        // ENHANCEMENT E9 (ENH-TUNPOOL): the covered stretches, so the sun's shadow does not darken a tunnel's baked light by the camera's place
-        self.scene.cover = if self.vehicle.is_some() && !self.track.is_night() && self.enh.is_on(nfs_renderer::E9) { self.cover_boxes() } else { Default::default() };
         // ENHANCEMENT E25: a day track with no sun disc (the sun overhead, the cars' light straight down: autobahn,
         // canyon, foothills, forest) gets the overcast shadows with that same light
         self.scene.overcast_shadow = (self.vehicle.is_some() && !self.track.is_night() && self.scene.sun_shadow.is_none())

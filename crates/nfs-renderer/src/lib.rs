@@ -42,6 +42,7 @@ mod prof;
 mod haze;
 mod lbeam;
 mod shafts;
+mod sharpen;
 pub use prof::{LiveStats, live_set, live_stats, timestamps_supported};
 mod smaa;
 mod soft;
@@ -56,7 +57,7 @@ pub use drops::Drops;
 pub use haze::{HAZE_LAMPS, Haze, HazeLamp};
 pub use lbeam::{LBeam, LBeams, MAX_LBEAMS};
 pub use shafts::Shafts;
-pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E20, E21, E23, E24, E25, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
+pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E20, E21, E23, E24, E25, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
 pub use front::Renderer;
 pub use mipgen::MipAlpha;
 /// ENHANCEMENT E41: the E2 mip chain generator (levels 1.. of a base image), for the HD textures' own chains
@@ -345,6 +346,10 @@ pub struct DrawItem {
     /// found exactly instead of by the (mesh, material, order) pairing of `temporal.rs`. 0 = none (the pairing).
     /// Never read by the original's path: only the temporal pass looks at it. See [`assign_motion_ids`].
     pub motion_id: u32,
+    /// ENHANCEMENT E9 (SHADOW-REAL): a car's `SHAD` patch ([`CSM_CAR_BLOB`]): how covered the car stands, 0..1 ([`cover_weight`] of
+    /// `Scene::cover` at the patch): the patch gives way to the sun's shadow by its own place, not by the camera's. 0 elsewhere. Read
+    /// only by the renderer while E9 draws shadows.
+    pub cover: f32,
 }
 
 /// ENHANCEMENT E37: give every item of one object (a car's parts) a [`DrawItem::motion_id`]: a hash of `group` (the
@@ -433,7 +438,7 @@ pub const CSM_SKID: u8 = 64;
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false, mirrored: false, csm: 0, soft: 0.0, hdr_boost: 1.0, water: false, particle: 0, wet: 0.0, shadow_only: false, motion_id: 0 }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false, mirrored: false, csm: 0, soft: 0.0, hdr_boost: 1.0, water: false, particle: 0, wet: 0.0, shadow_only: false, motion_id: 0, cover: 0.0 }
     }
 }
 
@@ -503,6 +508,21 @@ mod tests {
         // `mesh`/`material` carry no data of their own here — only `depth_bias` distinguishes
         // one item from another once the key is stripped off
         DrawItem { depth_bias: n as i32, ..DrawItem::new(MeshId::default(), MaterialId::default(), Mat4::IDENTITY) }
+    }
+
+    /// ENHANCEMENT E9 (SHADOW-REAL): the CPU cover weight is the shader's `cover_at`: whole inside a run, ramping at its end face,
+    /// nothing beside, above the ceiling or below the road.
+    #[test]
+    fn cover_weight_follows_the_box_and_its_ramp() {
+        let b = CoverBox { centre: Vec3::ZERO, forward: Vec3::Z, lateral: Vec3::X, up: Vec3::Y, half_len: 6.0, half_nom: 3.0, half_wid: 8.0, ceil: 6.5, w_back: 2.0, w_front: 0.0 };
+        let boxes = [b];
+        assert_eq!(cover_weight(&boxes, Vec3::new(0.0, 1.0, -3.0)), 1.0);
+        assert!((cover_weight(&boxes, Vec3::new(0.0, 1.0, 1.5)) - 0.5).abs() < 1e-5);
+        assert_eq!(cover_weight(&boxes, Vec3::new(0.0, 1.0, 3.0)), 0.0);
+        assert_eq!(cover_weight(&boxes, Vec3::new(9.0, 1.0, -3.0)), 0.0);
+        assert_eq!(cover_weight(&boxes, Vec3::new(0.0, 7.0, -3.0)), 0.0);
+        assert_eq!(cover_weight(&boxes, Vec3::new(0.0, -2.5, -3.0)), 0.0);
+        assert_eq!(cover_weight(&[], Vec3::ZERO), 0.0);
     }
 
     #[test]
@@ -791,6 +811,35 @@ pub struct CoverBox {
     pub w_front: f32,
 }
 
+impl CoverBox {
+    /// How covered `p` is by this box, 0..1 (0 outside it): the shader's `cover_at` for one box.
+    pub fn weight(&self, p: Vec3) -> f32 {
+        let r = p - self.centre;
+        let l = r.dot(self.forward);
+        if l.abs() > self.half_len || r.dot(self.lateral).abs() > self.half_wid {
+            return 0.0;
+        }
+        let h = r.dot(self.up);
+        if !(-2.0..=self.ceil).contains(&h) {
+            return 0.0;
+        }
+        (self.w_back + (self.w_front - self.w_back) * ((l + self.half_nom) / (2.0 * self.half_nom))).clamp(0.0, 1.0)
+    }
+}
+
+/// ENHANCEMENT E9 (SHADOW-REAL): how covered `p` is by the track's covered boxes, 0..1 (the highest of the boxes'; the shader's
+/// `cover_at`, over every box rather than the nearest 64).
+pub fn cover_weight(boxes: &[CoverBox], p: Vec3) -> f32 {
+    let mut w = 0.0f32;
+    for b in boxes {
+        w = w.max(b.weight(p));
+        if w >= 1.0 {
+            break;
+        }
+    }
+    w
+}
+
 /// ENHANCEMENT E26: what the wet road reflects and the lights it shows streaks of.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RainEnv {
@@ -941,9 +990,10 @@ pub struct SunShadow {
     /// The direction the light travels (from the sun to the ground) — the one the cars' `R3DLightLayer`
     /// is given (`-SkyBin::sun_position`, 0x43AC8D), so the shadows agree with the car shading.
     pub direction: Vec3,
-    /// ENHANCEMENT E9 (SHADOWFIX): false while the camera or the player's car is under cover (a tunnel, a gallery:
-    /// the car's light is the straight-down one there); the renderer fades the shadows out over half a second and
-    /// back in, so a stretch boundary never switches them.
+    /// ENHANCEMENT E9 (SHADOWFIX): false = the frame-wide cover gate shuts (the renderer fades the shadows out over half a
+    /// second and back in). SHADOW-REAL: the race keeps it true whenever `Scene::cover` holds the track's covered boxes, so the
+    /// shadow ends at a tunnel's mouth per surface (the shader's `cover_at`); the gate is the fallback of a track without them
+    /// (false while the camera or the player's car is under cover).
     pub lit: bool,
     /// ENHANCEMENT ENH-FE3D: the front end's 3-D views fit ONE cascade to a sphere (centre, radius) round the car
     /// instead of the race's view-depth cascades, and soften the edge (a jittered disc of that many texels); `None` =

@@ -363,7 +363,17 @@ impl Core {
             // ENHANCEMENT ENH-TEMPORAL: the jitter, the vector / mask targets, the temporal pipeline set
             self.cur_temporal = if temporal { Some(self.temporal_begin(camera, aspect, scene.mirror, (iw, ih), width)) } else { None };
             self.cur_hdr = hdr;
+            // ENHANCEMENT UPSCALE-SOFT: an upscaler's view (FSR 3.1 / MetalFX temporal, MetalFX spatial) samples its textures for the
+            // window's pixel (`upscale::mip_bias`); E3's plain scale and the debug TAA keep the materials' own bias
+            self.cur_lod_shift = if fsr_on {
+                crate::upscale::mip_bias(iw, width, true)
+            } else if self.upscale_active && self.upscaler.is_some() {
+                crate::upscale::mip_bias(iw, width, false)
+            } else {
+                0.0
+            };
             self.encode_frame(scene, scene.clear_color, false, camera, &rt_view, &rt_tex, true, &depth3, aspect, VIEW_FAR, ms.as_ref());
+            self.cur_lod_shift = 0.0;
             self.cur_hdr = None;
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scale blit") });
             let mut sprites = std::mem::take(&mut self.frame_scratch.sprites);
@@ -412,7 +422,7 @@ impl Core {
                 let RtImage { tex: out_tex, view: out_view, bg: out_bg, .. } = self.fsr_out.as_ref().expect("fsr output");
                 match (self.temporal_inputs.as_ref(), self.fsr.as_mut()) {
                     (Some(inp), Some(up)) => {
-                        // ENHANCEMENT ENH-UPSCALER: FSR's RCAS strength follows E39 (the other backends have none)
+                        // ENHANCEMENT ENH-UPSCALER: FSR's RCAS strength follows E39 (MetalFX: the RCAS pass below, UPSCALE-SOFT)
                         up.set_sharpness(crate::enhancements::fsr_sharpness(self.enhancements.level(crate::E39)));
                         match up.encode_temporal(&self.device, &self.queue, inp, out_tex) {
                             Some(cb) => {
@@ -426,6 +436,15 @@ impl Core {
                         }
                     }
                     _ => self.temporal_dead(),
+                }
+                // ENHANCEMENT E39 (UPSCALE-SOFT): MetalFX's temporal scaler has no sharpening of its own: RCAS over its float output
+                // (window size, before the post chain), at E39's strength. FSR's RCAS is inside the backend
+                let mfx = self.fsr_kind.is_some_and(|k| k != crate::upscale::UpscalerKind::Fsr3);
+                if let (true, Some(_), Some(strength)) = (mfx, fsr_cb.as_ref(), crate::enhancements::fsr_sharpness(self.enhancements.level(crate::E39))) {
+                    let format = self.fsr.as_ref().expect("temporal backend").output_format();
+                    let sh = self.sharpen.get_or_insert_with(|| crate::sharpen::Sharpen::new(&self.device, &self.sprite_layout));
+                    let src = &self.fsr_out.as_ref().expect("temporal output").bg;
+                    chain.out = Some(sh.run_float(&self.device, &mut encoder, &self.sprite_layout, &self.sprite_sampler, src, (width, height), format, strength));
                 }
             }
             // ENHANCEMENTS E27 / the depth of field (photo mode, E31) / E40 / E10 / E21: the post chain over the scene (`chain`), at the chain's size
@@ -463,19 +482,29 @@ impl Core {
                 let first = std::mem::replace(&mut encoder, self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("upscale present") }));
                 cbs.push(first.finish());
                 let scaled = up.encode(&self.device, &imgs.input, &imgs.output);
-                let present_bg = match scaled {
+                let (present_bg, scaled_ok) = match scaled {
                     Some(cb) => {
                         cbs.push(cb);
-                        &imgs.output_bg
+                        (&imgs.output_bg, true)
                     }
                     None => {
                         // the scaler failed: this frame's image is stretched bilinearly (E3's way)
                         tracing::warn!("upscaler (ENHANCEMENT E34) failed to encode, blitting bilinearly");
-                        &imgs.input_bg
+                        (&imgs.input_bg, false)
                     }
                 };
-                let present = self.upscale_present.get_or_insert_with(|| ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, None, false, None, false));
-                present.draw(&mut encoder, &dest, None, Some(present_bg), None);
+                // ENHANCEMENT E39 (UPSCALE-SOFT): the spatial scaler's output is sharpened by RCAS on its way to the window image
+                // (it takes the place of the present blit, a 1:1 copy); off (E39 = 0) or a failed scale = the plain blit
+                match crate::enhancements::fsr_sharpness(self.enhancements.level(crate::E39)).filter(|_| scaled_ok) {
+                    Some(strength) => {
+                        let sh = self.sharpen.get_or_insert_with(|| crate::sharpen::Sharpen::new(&self.device, &self.sprite_layout));
+                        sh.run(&self.device, &mut encoder, present_bg, &dest, self.config.format, false, strength);
+                    }
+                    None => {
+                        let present = self.upscale_present.get_or_insert_with(|| ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, None, false, None, false));
+                        present.draw(&mut encoder, &dest, None, Some(present_bg), None);
+                    }
+                }
             } else if smaa {
                 // ENHANCEMENT E35: the tone map writes the window-sized image SMAA reads; SMAA writes the destination
                 let sm = self.smaa.get_or_insert_with(|| crate::smaa::Smaa::new(&self.device, &self.queue, self.config.format));

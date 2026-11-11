@@ -1077,21 +1077,8 @@ impl MaterialCache<'_> {
         // thrash.md` §6d.3): ≈ `b · 2^-15 · Z² / near` of view depth, 0.05 mm a unit at 0.5 m in
         // the driver view (near 0.15), 0.5 m at 50 m. (history: `game-history.md` §10.5)
         let depth_bias = if env.rs_bias { m.and_then(|m| m.rs).map_or(0, |rs| rs[4]) } else { 0 };
-        // ENHANCEMENT E8: the material class of the dynamic body reflection, read from the file's own
-        // data — the render method and the reflection strength the original keeps for its sphere-map
-        // pass (`mt+284`: 0.5 on the paint, 1.0 on the glass, 0 on `CarExtEnv` pieces that never
-        // reflect, such as the bumper insert of page 3): `CarExtEnv` / `CarExtEnvNS` with a strength
-        // = paint (class 1), `CarWindow` = glass (class 2); the tyres and wheel faces (`CarWheel`),
-        // the interior (`CarInt`, incl. its glass page), the decals and trim (`CarExt`) stay as they are
-        // (`RE/notes/ENHANCEMENTS.md` E8 table)
-        let mut reflect = match m {
-            Some(m) if m.reflection > 0.0 => match m.render_method.as_str() {
-                "CarExtEnv" | "CarExtEnvNS" => nfs_renderer::Reflect { class: nfs_renderer::Reflect::PAINT, strength: m.reflection, interior: false },
-                "CarWindow" => nfs_renderer::Reflect { class: nfs_renderer::Reflect::GLASS, strength: m.reflection, interior: false },
-                _ => nfs_renderer::Reflect::NONE,
-            },
-            _ => nfs_renderer::Reflect::NONE,
-        };
+        // ENHANCEMENT E8: the material class of the dynamic body reflection ([`e8_reflect`])
+        let mut reflect = m.map_or(nfs_renderer::Reflect::NONE, |m| e8_reflect(&m.render_method, m.reflection, m.rs));
         // ENHANCEMENT E16: the cabin keeps the original's scalar ambient (the probe looks at the outside)
         reflect.interior = m.is_some_and(|m| matches!(m.render_method.as_str(), "CarInt" | "CarIntShd"));
         let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: spec, env_mix: 1.0, env_variant: variant, sky_map: reflective, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias, false_sort: false, reflect });
@@ -1113,6 +1100,53 @@ impl MaterialCache<'_> {
         }
         mat_ids.insert(id, mid);
         mid
+    }
+}
+
+/// ENHANCEMENT E8: a car material's class for the dynamic body reflection, read from the file's own data — the render
+/// method, the reflection strength the original keeps for its sphere-map pass (`mt+284`: 0.5 on the paint, 1.0 on the
+/// glass, 0 on `CarExtEnv` pieces that never reflect, such as the bumper insert of page 3) and the `Rs` block. `CarExtEnv` /
+/// `CarExtEnvNS` with a strength = paint (class 1), `CarWindow` = glass (class 2); the tyres and wheel faces (`CarWheel`),
+/// the interior (`CarInt`, incl. its glass page) and the trim (`CarExt` at bias 0) stay as they are
+/// (`RE/notes/ENHANCEMENTS.md` E8 table).
+///
+/// The decals: a `CarExt` **decal** — a material whose own `Rs` block pulls it toward the eye (Thrash 0x18, `rs[4]`
+/// −10 / −3, `thrash.md` §6d.3: the door handles, badges and small marks; 108 materials over the shipped cars) — is a
+/// sprite drawn over the body panel under it, at the panel's depth and normal, its alpha-0 texels showing the panel. The
+/// paint under it takes the clear coat, so the decal takes it too (class 1): without it the coat stopped at the sprite's
+/// rectangle and a body-coloured handle sat in an uncoated, darker and more saturated patch of the original's paint. The
+/// coat's ENH-GRILLE rule (`shader.wgsl`) still leaves the decal's near-black texels (rubber, openings) bare.
+pub(crate) fn e8_reflect(method: &str, reflection: f32, rs: Option<[i32; 6]>) -> nfs_renderer::Reflect {
+    use nfs_renderer::Reflect;
+    match method {
+        "CarExtEnv" | "CarExtEnvNS" if reflection > 0.0 => Reflect { class: Reflect::PAINT, strength: reflection, interior: false },
+        "CarWindow" if reflection > 0.0 => Reflect { class: Reflect::GLASS, strength: reflection, interior: false },
+        "CarExt" if rs.is_some_and(|rs| rs[4] < 0) => Reflect { class: Reflect::PAINT, strength: reflection, interior: false },
+        _ => Reflect::NONE,
+    }
+}
+
+#[cfg(test)]
+mod e8_tests {
+    use super::e8_reflect;
+    use nfs_renderer::Reflect;
+
+    /// ENHANCEMENT E8: the classes by the file's data — a `CarExt` decal (negative `Rs` bias: the 993's
+    /// door handle is `CarExt` bias −10) is coated like the paint under it; `CarExt` trim at bias 0, a `CarExtEnv` piece of
+    /// strength 0, the wheels and the cabin are not.
+    #[test]
+    fn decals_take_the_paints_coat() {
+        let rs = |b: i32| Some([1, 2, 0, 1, b, -1]);
+        assert_eq!(e8_reflect("CarExtEnv", 0.5, rs(0)).class, Reflect::PAINT);
+        assert_eq!(e8_reflect("CarExtEnvNS", 1.0, rs(-3)).class, Reflect::PAINT);
+        assert_eq!(e8_reflect("CarWindow", 1.0, rs(0)).class, Reflect::GLASS);
+        assert_eq!(e8_reflect("CarExt", 0.0, rs(-10)).class, Reflect::PAINT);
+        assert_eq!(e8_reflect("CarExt", 0.0, rs(-3)).class, Reflect::PAINT);
+        assert_eq!(e8_reflect("CarExt", 0.0, rs(0)), Reflect::NONE);
+        assert_eq!(e8_reflect("CarExt", 0.0, None), Reflect::NONE);
+        assert_eq!(e8_reflect("CarExtEnv", 0.0, rs(-3)), Reflect::NONE);
+        assert_eq!(e8_reflect("CarWheel", 0.0, rs(0)), Reflect::NONE);
+        assert_eq!(e8_reflect("CarInt", 0.0, rs(-3)), Reflect::NONE);
     }
 }
 

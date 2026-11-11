@@ -131,6 +131,7 @@ mod tests {
             ("bloom".into(), crate::bloom::source()),
             ("coat prefilter".into(), crate::coat::source()),
             ("smaa".into(), crate::smaa::source()),
+            ("sharpen".into(), crate::sharpen::source()),
             ("soft depth".into(), crate::soft::source()),
             ("temporal pass".into(), crate::temporal::pass_source()),
             ("gamma".into(), crate::gpu::gamma_source()),

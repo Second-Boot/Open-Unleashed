@@ -462,19 +462,20 @@ pub const REGISTRY: &[Entry] = &[
         token: "E38",
         name: ["upscaler", "апскейлер"],
         help: [
-            "off, MetalFX (macOS) or AMD FSR 3.1: the 3D scene is drawn smaller and enlarged to the window, which saves GPU work; the settings of the chosen upscaler follow below. While one is on, 'render scale' has no effect. On a Mac FSR works but is slower than MetalFX (and than no upscaler) — MetalFX is the Mac's own",
-            "выкл, MetalFX (macOS) или AMD FSR 3.1: 3D-сцена рисуется меньше и растягивается до размера окна, это экономит работу видеокарты; ниже идут настройки выбранного апскейлера. Пока он включен, «масштаб рендера» не действует. На Mac FSR работает, но медленнее MetalFX (и медленнее, чем без апскейлера) — родной для Mac вариант MetalFX",
+            "off, MetalFX (macOS) or AMD FSR 3.1: the 3D scene is drawn smaller and enlarged to the window, which saves GPU work; the settings of the chosen upscaler follow below. While one is on, 'render scale' has no effect. The temporal modes (FSR 3.1, MetalFX 'temporal') work on the HDR image: they need 'HDR and tone mapping', without it they do nothing (MetalFX 'simple' works either way). On a Mac FSR works but is slower than MetalFX (and than no upscaler) — MetalFX is the Mac's own",
+            "выкл, MetalFX (macOS) или AMD FSR 3.1: 3D-сцена рисуется меньше и растягивается до размера окна, это экономит работу видеокарты; ниже идут настройки выбранного апскейлера. Пока он включен, «масштаб рендера» не действует. Временные режимы (FSR 3.1, «временной» MetalFX) работают с HDR-изображением: им нужен «HDR и тонемап», без него они ничего не делают («простой» MetalFX работает в любом случае). На Mac FSR работает, но медленнее MetalFX (и медленнее, чем без апскейлера) — родной для Mac вариант MetalFX",
         ],
         levels: &[["off", "выкл"], ["MetalFX", "MetalFX"], ["FSR 3.1", "FSR 3.1"]],
         default_level: 0,
     },
-    // ENHANCEMENT ENH-UPSCALER: FSR's RCAS sharpening (the MetalFX scaler has none); a row of the FSR choice. 0.3 is what E37 had as a constant.
+    // ENHANCEMENT ENH-UPSCALER: the upscaler's RCAS sharpening; a row of the FSR choice and (UPSCALE-SOFT) of the MetalFX one too:
+    // FSR's own RCAS, for MetalFX (which has none) the port's RCAS pass (`sharpen.rs`). 0.3 is what E37 had as a constant.
     Entry {
         token: "E39",
-        name: ["FSR sharpness", "резкость FSR"],
+        name: ["sharpness", "резкость"],
         help: [
-            "FSR 3.1's contrast-adaptive sharpening (RCAS) after the upscale: it counters the temporal filter's softness; too much rings on thin lines and foliage. off, or the strength 0.2 / 0.3 / 0.5 / 0.8",
-            "контрастно-адаптивная резкость FSR 3.1 (RCAS) после апскейла: убирает мягкость временного фильтра; слишком сильная даёт ореолы на тонких линиях и листве. Выкл или сила 0.2 / 0.3 / 0.5 / 0.8",
+            "contrast-adaptive sharpening (AMD's RCAS) after the upscale: it counters the softness of the upscaler's filter (FSR 3.1's own pass; for MetalFX, which has none, the same method as a pass of its own); too much rings on thin lines and foliage. off, or the strength 0.2 / 0.3 / 0.5 / 0.8",
+            "контрастно-адаптивная резкость (RCAS от AMD) после апскейла: убирает мягкость фильтра апскейлера (у FSR 3.1 его собственный проход; для MetalFX, у которого своей нет, тот же метод отдельным проходом); слишком сильная даёт ореолы на тонких линиях и листве. Выкл или сила 0.2 / 0.3 / 0.5 / 0.8",
         ],
         levels: &[["off", "выкл"], ["0.2", "0.2"], ["0.3", "0.3"], ["0.5", "0.5"], ["0.8", "0.8"]],
         default_level: 2,
@@ -536,6 +537,19 @@ pub const REGISTRY: &[Entry] = &[
         help: [
             "the lighthouse's beam on the coast track is drawn as soft light in the air instead of the original's flat translucent box with its straight edges and flat end: a Gaussian cone round the beam's own axis that turns with the lamp, bright near the lantern and fading smoothly with the distance, a little stronger at dusk and when it points at you, hidden behind hills and cars. The lantern itself and its glare are untouched. Needs the HDR scene (E7); without it the original's box is drawn. Only the picture changes",
             "луч маяка на трассе у моря рисуется мягким светом в воздухе вместо плоской полупрозрачной коробки оригинала с прямыми краями и плоским торцом: гауссов конус вокруг собственной оси луча, которая вращается вместе с лампой, яркий у фонаря и плавно слабеющий с расстоянием, чуть сильнее в сумерках и когда направлен на вас, скрывается за холмами и машинами. Сам фонарь и его блик не меняются. Нужен HDR-режим (E7); без него рисуется коробка оригинала. Меняется только картинка",
+        ],
+        levels: ON_OFF,
+        default_level: 1,
+    },
+    // ENHANCEMENT E47: the cars' shadows from the street / tunnel lamps of E23 (registered LAST, after E44; the tokens E45 / E46 belonged to
+    // removed trials). One small perspective depth map per lamp near the camera that has a car in its light, the cars as the only casters;
+    // the map only attenuates that lamp's own added light. Needs E23 (its lamps).
+    Entry {
+        token: "E47",
+        name: ["lamp shadows", "тени от фонарей"],
+        help: [
+            "the street lamps (E23) on night tracks and the tunnel lamps on every track cast the cars' shadows: under the four lamps nearest the camera that have a car in their light, a car darkens the lamp's pool on the road, the walls and the other cars on the side away from the lamp. Only the lamp's own added light is shadowed (night stays as dark as before, the original's baked light is untouched); the scenery casts nothing. Needs the street lamps (E23). Only the picture changes",
+            "уличные фонари (E23) на ночных трассах и лампы тоннелей на любой трассе отбрасывают тени машин: под четырьмя ближайшими к камере фонарями, в свете которых есть машина, машина затеняет световое пятно фонаря на дороге, стенах и других машинах со стороны, противоположной фонарю. Затеняется только добавленный свет самого фонаря (ночь остаётся такой же тёмной, запечённый свет оригинала не меняется); окружение тени не отбрасывает. Нужны уличные фонари (E23). Меняется только картинка",
         ],
         levels: ON_OFF,
         default_level: 1,
@@ -657,7 +671,7 @@ switches! {
     E37 = 35,
     /// ENHANCEMENT ENH-UPSCALER: the upscaler choice (0 off, 1 MetalFX, 2 FSR 3.1; registered after E37, on every platform, level 1 is macOS only)
     E38 = 36,
-    /// ENHANCEMENT ENH-UPSCALER: FSR's RCAS sharpness (0 off, then 0.2 / 0.3 / 0.5 / 0.8; used only while E38 = FSR)
+    /// ENHANCEMENT ENH-UPSCALER: the upscaler's RCAS sharpness (0 off, then 0.2 / 0.3 / 0.5 / 0.8; FSR's own, MetalFX's through `sharpen.rs`)
     E39 = 37,
     /// ENHANCEMENT E40 raindrops on the windscreen of the driver view (registered last, after E39)
     E40 = 38,
@@ -669,6 +683,8 @@ switches! {
     E43 = 41,
     /// ENHANCEMENT E44 the lighthouse beam as soft volumetric light: 0 off, 1 on (registered last, after E43; needs E7)
     E44 = 42,
+    /// ENHANCEMENT E47 the cars' shadows from the street / tunnel lamps (E23): 0 off, 1 on (registered last, after E44; needs E23)
+    E47 = 43,
 }
 
 /// ENHANCEMENT E34: its levels 1..=this are the temporal ones (MetalFX temporal scaler); the levels above are the spatial ('simple') ones
@@ -866,6 +882,9 @@ pub enum Cond {
     /// a TEMPORAL upscaler is active (FSR 3.1, or MetalFX's temporal mode): the main view is drawn at 1 sample with no
     /// post-process anti-aliasing (E1 MSAA and E35 SMAA are replaced by the upscaler's own temporal filter)
     TemporalUpscaler,
+    /// UPSCALE-SOFT: the chosen upscaler is a TEMPORAL one (FSR 3.1, MetalFX's temporal mode) and E7 is off: the temporal backends take
+    /// the float scene (`temporal_frame` / `enh_fsr` need `hdr`), so nothing is upscaled (MetalFX's spatial mode works without E7)
+    TemporalNeedsHdr,
     /// no HD texture pack was found beside the game ([`set_hd_textures_available`])
     NoHdPack,
 }
@@ -913,11 +932,17 @@ pub const DEPENDS: &[Dependency] = &[
     Dependency { entry: "E16", cond: Cond::Needs("E8") },
     // the overcast shadows are a second light of E9's cascades
     Dependency { entry: "E25", cond: Cond::Needs("E9") },
+    // the lamp shadows shadow E23's lamps: without them there is no lamp light to shadow
+    Dependency { entry: "E47", cond: Cond::Needs("E23") },
     // an upscaler draws the scene at its own internal size: E3's scale is not used; a temporal one also draws at 1 sample with
     // no SMAA pass (the spatial MetalFX mode keeps both)
     Dependency { entry: "E3", cond: Cond::UpscalerOn },
     Dependency { entry: "E1", cond: Cond::TemporalUpscaler },
     Dependency { entry: "E35", cond: Cond::TemporalUpscaler },
+    // UPSCALE-SOFT: a temporal upscaler runs only on the float scene: with E7 off the choice and its sharpness do nothing (the
+    // spatial MetalFX mode is not blocked; the mode / scale rows stay editable, so the player can pick it)
+    Dependency { entry: "E38", cond: Cond::TemporalNeedsHdr },
+    Dependency { entry: "E39", cond: Cond::TemporalNeedsHdr },
 ];
 
 /// Why a row is inactive: the [`DEPENDS`] row, and for the upscaler conditions which backend (the E38 level, to name it).
@@ -956,7 +981,7 @@ impl Enhancements {
     }
 
     /// The old files / `NFS_ENH` lists have no E38: a set with E34 > 0 (macOS) means MetalFX, else with E37 > 0 means FSR 3.1 (both: the
-    /// platform's own, MetalFX on macOS). FSR's sharpness (E39), new, then takes its default (E37 always had 0.3) unless `e39_named`.
+    /// platform's own, MetalFX on macOS). The sharpness (E39), new, then takes its default (E37 always had 0.3; UPSCALE-SOFT: MetalFX's too) unless `e39_named`.
     pub fn infer_upscaler(&mut self, e39_named: bool) {
         let up = if self.level(E34) > 0 && cfg!(target_os = "macos") {
             UP_METALFX
@@ -966,15 +991,26 @@ impl Enhancements {
             return;
         };
         self.set_level(E38, up);
-        if up == UP_FSR && !e39_named && self.level(E39) == 0 {
+        if !e39_named && self.level(E39) == 0 {
             self.set_level(E39, REGISTRY[E39.0 as usize].default_level);
         }
     }
 
-    /// Whether a TEMPORAL upscaler is active (the effective set: FSR 3.1, or MetalFX's temporal mode).
+    /// Whether a TEMPORAL upscaler is active (the effective set: FSR 3.1, or MetalFX's temporal mode, and E7 on: UPSCALE-SOFT, the
+    /// renderer's `temporal_frame` / `enh_fsr` need the float scene).
     pub fn temporal_upscaler(&self) -> bool {
+        self.temporal_chosen() && self.level(E7) > 0
+    }
+
+    /// A TEMPORAL upscaler is chosen (FSR 3.1, or MetalFX's temporal mode), whether or not E7 lets it run.
+    fn temporal_chosen(&self) -> bool {
         let e = self.effective();
         e.level(E37) > 0 || (1..=E34_TEMPORAL_LEVELS).contains(&e.level(E34))
+    }
+
+    /// Whether an upscaler sets the internal size this frame: MetalFX's spatial mode (no E7 needed) or a running temporal one.
+    pub fn upscaler_running(&self) -> bool {
+        self.effective().level(E34) > E34_TEMPORAL_LEVELS || self.temporal_upscaler()
     }
 
     /// Why entry `token` has no effect now, `None` when it acts (or nothing is known to block it). The first unmet row of [`DEPENDS`].
@@ -988,8 +1024,10 @@ impl Enhancements {
         DEPENDS.iter().enumerate().filter(|(_, d)| d.entry == token).find_map(|(i, d)| {
             let hit = match d.cond {
                 Cond::Needs(t) => REGISTRY.iter().position(|e| e.token == t).is_some_and(|k| self.levels[k] == 0),
-                Cond::UpscalerOn => eff.level(E34) > 0 || eff.level(E37) > 0,
+                // UPSCALE-SOFT: a temporal one with E7 off does not run, so it blocks nothing
+                Cond::UpscalerOn => self.upscaler_running(),
                 Cond::TemporalUpscaler => self.temporal_upscaler(),
+                Cond::TemporalNeedsHdr => self.temporal_chosen() && self.level(E7) == 0,
                 Cond::NoHdPack => !hd_textures_available(),
             };
             hit.then(|| Blocked { dep: i, by: if matches!(d.cond, Cond::Needs(_)) { 0 } else { eff.level(E38).min(UP_FSR) } })
@@ -1470,8 +1508,11 @@ mod tests {
         assert_eq!((E34.0, E37.0, E38.0, E39.0), (33, 35, 36, 37));
         assert_eq!(REGISTRY[E38.0 as usize].token, "E38");
         assert_eq!(REGISTRY[E39.0 as usize].token, "E39");
-        assert_eq!(E44.0 as usize, REGISTRY.len() - 1); // ENHANCEMENT E44 is the last entry
-        assert_eq!((E39.0, E40.0, E41.0, E42.0, E43.0, E44.0), (37, 38, 39, 40, 41, 42));
+        assert_eq!(E47.0 as usize, REGISTRY.len() - 1); // ENHANCEMENT E47 is the last entry
+        assert_eq!((E39.0, E40.0, E41.0, E42.0, E43.0, E44.0, E47.0), (37, 38, 39, 40, 41, 42, 43));
+        assert_eq!(REGISTRY[E47.0 as usize].token, "E47");
+        assert_eq!(REGISTRY[E47.0 as usize].default_level, 1); // lamp shadows: on
+        assert_eq!(REGISTRY[E47.0 as usize].levels.len(), 2);
         assert_eq!(REGISTRY[E44.0 as usize].token, "E44");
         assert_eq!(REGISTRY[E44.0 as usize].default_level, 1); // lighthouse beam: on
         assert_eq!(REGISTRY[E44.0 as usize].levels.len(), 2);
@@ -1519,6 +1560,11 @@ mod tests {
         // an explicit E38 wins over the inference, and E39 named stays as named
         let c = Enhancements::parse_override("E37=3,E38=0,E39=0", &mut u).unwrap();
         assert_eq!((c.level(E38), c.effective().level(E37), c.level(E39)), (UP_OFF, 0, 0));
+        // UPSCALE-SOFT: `E34=n` alone takes the sharpness default too (MetalFX is sharpened since)
+        let ms = Enhancements::parse_override("E34=2", &mut u).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!((ms.level(E38), ms.level(E39)), (UP_METALFX, 2));
+        }
         let m = Enhancements::parse_override("E38=1", &mut u).unwrap();
         assert_eq!(m.effective().level(E34), if cfg!(target_os = "macos") { 2 } else { 0 });
         // defaults: no upscaler
@@ -1657,6 +1703,24 @@ mod tests {
             assert!(u.blocked("E1").is_none() && u.blocked("E35").is_none());
             u.set_level(E34, 3); // temporal
             assert!(u.blocked("E1").is_some() && u.blocked("E35").is_some());
+        }
+        // UPSCALE-SOFT: a temporal backend with E7 off runs nothing: the choice and its sharpness are inactive, and it blocks
+        // neither MSAA / SMAA nor the render scale; the spatial MetalFX mode works without E7
+        let mut h = Enhancements::all();
+        h.set_level(E38, UP_FSR);
+        h.set_level(E7, 0);
+        assert_eq!(h.blocked("E38").map(|b| DEPENDS[b.dep].cond), Some(Cond::TemporalNeedsHdr));
+        assert!(h.blocked("E39").is_some() && !h.temporal_upscaler() && !h.upscaler_running());
+        assert!(h.blocked("E1").is_none() && h.blocked("E35").is_none() && h.blocked("E3").is_none());
+        h.set_level(E7, 1);
+        assert!(h.blocked("E38").is_none() && h.blocked("E39").is_none() && h.blocked("E1").is_some() && h.blocked("E3").is_some());
+        if cfg!(target_os = "macos") {
+            h.set_level(E38, UP_METALFX);
+            h.set_level(E34, 6); // simple
+            h.set_level(E7, 0);
+            assert!(h.blocked("E38").is_none() && h.blocked("E39").is_none() && h.blocked("E3").is_some() && h.blocked("E1").is_none());
+            h.set_level(E34, 2); // temporal
+            assert!(h.blocked("E38").is_some() && h.blocked("E3").is_none());
         }
     }
 }

@@ -22,7 +22,7 @@ The settings are kept in `enhancements.json` in the saves folder.
 |---|---|
 | Image quality | MSAA and SMAA anti-aliasing, anisotropic filtering, render scale, upscaling (AMD FSR 3.1, MetalFX on macOS), field of view, draw distance, frame output and frame-rate limit |
 | Light | HDR and tone mapping, glow, a bright sun, eye adaptation, global illumination, corner shading (AO), light from the surroundings on the cars |
-| Shadows | sun shadows, soft shadows when overcast, contact shadows under the cars, headlights and street lamps that light the road, headlights in tunnels |
+| Shadows | sun shadows, soft shadows when overcast, contact shadows under the cars, headlights and street lamps that light the road, the cars' shadows from the street and tunnel lamps, headlights in tunnels |
 | Atmosphere | fog and sky, haze and headlight beams, light shafts, lightning that lights the scene, the lighthouse beam, water, wet road and rain, raindrops on the windscreen |
 | Cars | clear coat on the body, rounded wheels and details |
 | Camera | motion blur, depth of field in replays, lens dirt, camera shake |

@@ -369,7 +369,7 @@ impl Core {
             let of = fill::ObjectFrame {
                 camera,
                 depth_far: f.depth_far,
-                csm: lights.csm.as_ref().map(|c| fill::CsmFill { car_patch_keep: c.car_patch_keep(), decal_fades: c.decal_fades() }),
+                csm: lights.csm.as_ref().map(|c| fill::CsmFill { car_patch_gate: c.car_patch_gate(), decal_fades: c.decal_fades() }),
                 soft_split: f.soft_split,
                 spots: lights.spot.is_some() || lights.lamps_on,
                 contact_on: lights.contact_on,
@@ -377,6 +377,7 @@ impl Core {
                 roles,
                 motion_index: &self.motion.index,
                 vp_j: glam::DMat4::from_cols_array(&f.vp_j.to_cols_array().map(f64::from)),
+                lod_shift: self.cur_lod_shift,
             };
             let (csm, spot, contact) = (|it: &crate::DrawItem| self.csm_receive(it), |it: &crate::DrawItem| self.spot_receive(it), |it: &crate::DrawItem| self.contact_receive(it));
             let rx = fill::Receivers { csm: &csm, spot: &spot, contact: &contact };
@@ -596,9 +597,10 @@ impl Core {
         self.csm_pass(&mut encoder, scene, n, camera, lights.csm.as_ref());
         // ENHANCEMENT E15: the player's lamp pair's shadow map
         self.spot_pass(&mut encoder, scene, n, lights.spot.as_ref());
-        self.lamp_pass(&mut encoder, scene);
-        // ENHANCEMENT E43: the cars' contact shadow (the share E9's sun shadow carries: it weakens where that is drawn)
-        self.contact_pass(&mut encoder, scene, lights.csm.as_ref().map_or(0.0, |c| c.sun_share()));
+        // ENHANCEMENT E23 / E47: the street lamps and their car shadow maps
+        self.lamp_pass(&mut encoder, scene, n, camera);
+        // ENHANCEMENT E43: the cars' contact shadow (SHADOW-REAL: its share against E9's sun shadow is split per pixel in the shader)
+        self.contact_pass(&mut encoder, scene);
 
         let n_sprites = self.upload_sprites(&mut encoder, scene, with_sprites, aspect, &mut scratch.sprites);
 

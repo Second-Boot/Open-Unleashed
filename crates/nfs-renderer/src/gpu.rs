@@ -477,6 +477,11 @@ pub(crate) struct Core {
     /// ENHANCEMENT E34: the scaler's input / output images and the plain blit that lays its output over the window image
     upscale_images: Option<crate::upscale::UpscaleImages>,
     upscale_present: Option<ScaleBlit>,
+    /// ENHANCEMENT E39 (UPSCALE-SOFT): the sharpening after the MetalFX scalers (built at first use)
+    sharpen: Option<crate::sharpen::Sharpen>,
+    /// ENHANCEMENT UPSCALE-SOFT: the texture LOD bias added to every material's own while an upscaler's main view is encoded
+    /// (`upscale::mip_bias`); 0 otherwise, and then the object uniforms are master's bytes
+    cur_lod_shift: f32,
     /// ENHANCEMENT E35: SMAA 1x over the tone-mapped image, made at first use
     smaa: Option<crate::smaa::Smaa>,
     /// ENHANCEMENTS E10 / E21 / E27 / the depth of field (photo mode, E31) / E40 / E28: the post chain's passes (each built at its first use)

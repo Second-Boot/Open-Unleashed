@@ -99,8 +99,12 @@ pub(super) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
 /// The shadow frustum's matrix for a lamp pair at `origin` shining along `dir` (unit): x, y the
 /// light's axes over `tan(fov / 2)`, `w` the distance along the axis, `z / w` 0 at `near`, 1 at `far`.
 pub(super) fn shadow_matrix(origin: Vec3, dir: Vec3, near: f32, far: f32) -> Mat4 {
+    shadow_matrix_tan(origin, dir, near, far, (FOV_DEG.to_radians() * 0.5).tan())
+}
+
+/// [`shadow_matrix`] with the frustum's `tan(half angle)` given (ENHANCEMENT E47's lamp maps fit theirs per frame).
+pub(super) fn shadow_matrix_tan(origin: Vec3, dir: Vec3, near: f32, far: f32, t: f32) -> Mat4 {
     let (ax, ay) = csm::light_axes(dir);
-    let t = (FOV_DEG.to_radians() * 0.5).tan();
     let a = far / (far - near);
     let b = -far * near / (far - near);
     let (ox, oy, od) = (ax.dot(origin) / t, ay.dot(origin) / t, dir.dot(origin));
@@ -221,9 +225,15 @@ impl Core {
             multiview_mask: None,
         });
         pass.set_bind_group(0, &self.spot.light_bg, &[]);
+        self.draw_shadow_casters(&mut pass, scene, &casters);
+    }
+
+    /// Draw `casters` (indices into `scene.items`) into a depth-only shadow pass whose light group (0) is set: E9's opaque /
+    /// cut-out pipelines, the object buffer as group 1 (shared by E15's headlight map and ENHANCEMENT E47's lamp maps).
+    pub(super) fn draw_shadow_casters(&self, pass: &mut wgpu::RenderPass<'_>, scene: &Scene, casters: &[u32]) {
         pass.set_bind_group(1, &self.object_bg, &[]);
         let (mut cur_pipe, mut cur_mat, mut cur_mesh) = (u8::MAX, u32::MAX, u32::MAX);
-        for &idx in &casters {
+        for &idx in casters {
             let item = &scene.items[idx as usize];
             let mat = &self.materials[item.material.0 as usize];
             let cut = mat.alpha_blend || mat.device_states || item.alpha_test;

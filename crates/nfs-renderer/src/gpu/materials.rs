@@ -125,6 +125,7 @@ impl Core {
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(self.spot.view()) },
                 wgpu::BindGroupEntry { binding: 11, resource: self.spot.uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 20, resource: self.lamp.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(self.lamp.view()) },
                 wgpu::BindGroupEntry { binding: 24, resource: self.contact.uniform.as_entire_binding() },
             ],
         })

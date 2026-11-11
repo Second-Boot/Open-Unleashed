@@ -161,10 +161,12 @@ impl GpuMaterial {
     }
 }
 
-/// ENHANCEMENT E9: what an item's uniform takes from this frame's cascades (`CsmFrame::car_patch_keep` / `decal_fades`).
+/// ENHANCEMENT E9: what an item's uniform takes from this frame's cascades (`CsmFrame::car_patch_gate` / `decal_fades`).
 #[derive(Clone, Copy)]
 pub(super) struct CsmFill {
-    pub car_patch_keep: f32,
+    /// how much of a car's `SHAD` patch the sun's shadow takes in the open (the cover gate; 0 = the patch stays whole); SHADOW-REAL:
+    /// scaled by the patch's own openness, `1 - DrawItem::cover`
+    pub car_patch_gate: f32,
     pub decal_fades: bool,
 }
 
@@ -188,6 +190,8 @@ pub(super) struct ObjectFrame<'a> {
     pub motion_index: &'a [u32],
     /// the frame's clip transform ([`ObjectUniform::mvp`], PORT-DEVIATION D37): `globals.view_proj`, in `f64`
     pub vp_j: glam::DMat4,
+    /// ENHANCEMENT UPSCALE-SOFT: added to the materials' LOD bias in an upscaler's main view (`upscale::mip_bias`); 0 = master's
+    pub lod_shift: f32,
 }
 
 /// The per-item receivers the fill asks only when their effect is on this frame (`Core::csm_receive`, `spot_receive`,
@@ -200,11 +204,12 @@ pub(super) struct Receivers<'a> {
 
 /// Item `i`'s [`ObjectUniform`]; `sky_tex`: the item's sky-map pass has its section map (`sky_tex_of`).
 pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Option<MatFill>, sky_tex: bool, rx: &Receivers) -> ObjectUniform {
-    let ObjectFrame { camera, depth_far, csm: csm_frame, soft_split, spots, contact_on, env, roles, motion_index, vp_j } = *f;
+    let ObjectFrame { camera, depth_far, csm: csm_frame, soft_split, spots, contact_on, env, roles, motion_index, vp_j, lod_shift } = *f;
     let (water_env, rain_env, p_fx, hdr_boost) = (env.water, env.rain, env.p_fx, env.hdr_boost);
     let mat = mat.as_ref();
     let env_mix = mat.map_or(0.0, |m| m.env_mix);
-    let lod_bias = mat.map_or(0.0, |m| m.lod_bias);
+    // ENHANCEMENT UPSCALE-SOFT: plus the upscaler's shift (none = the material's own value, bit for bit)
+    let lod_bias = mat.map_or(0.0, |m| if lod_shift == 0.0 { m.lod_bias } else { m.lod_bias + lod_shift });
     // the alpha test: the material's race states, or the draw's own Thrash 0x24 ← 10
     let alpha_test = mat.is_some_and(|m| m.device_states) || item.alpha_test;
     // `.w` below: 0 no test, else the reference + ½ — a texel alpha under it (≤ the
@@ -228,9 +233,9 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
         // .y flags an item the headlight projector lights
         env_mix: [env_mix, item.headlit as u32 as f32, item.uv_offset[0], item.uv_offset[1]],
-        // ENHANCEMENT E9: the car's `SHAD` patch gives way to the sun's shadow of the car (cover gate)
+        // ENHANCEMENT E9: the car's `SHAD` patch gives way to the sun's shadow of the car (cover gate; SHADOW-REAL: by the car's own cover)
         light: [item.light[0], item.light[1], item.light[2], match &csm_frame {
-            Some(f) if item.csm & crate::CSM_CAR_BLOB != 0 => item.alpha * f.car_patch_keep,
+            Some(f) if item.csm & crate::CSM_CAR_BLOB != 0 => item.alpha * (1.0 - f.car_patch_gate * (1.0 - item.cover.clamp(0.0, 1.0))),
             _ => item.alpha,
         }],
         lit_a: item.layer_light.map_or([0.0; 4], |l| [l.ambient[0], l.ambient[1], l.ambient[2], 1.0]),
@@ -418,7 +423,7 @@ mod tests {
             items.push(it);
         }
         for depth_far in [700.0, 65000.0] {
-            let of = ObjectFrame { camera: &cam, depth_far, csm: None, soft_split: false, spots: false, contact_on: false, env, roles: &[], motion_index: &[], vp_j: glam::DMat4::from_cols_array(&cam.view_projection_mirrored(16.0 / 10.0, false).to_cols_array().map(f64::from)) };
+            let of = ObjectFrame { camera: &cam, depth_far, csm: None, soft_split: false, spots: false, contact_on: false, env, roles: &[], motion_index: &[], vp_j: glam::DMat4::from_cols_array(&cam.view_projection_mirrored(16.0 / 10.0, false).to_cols_array().map(f64::from)), lod_shift: 0.0 };
             for (i, item) in items.iter().enumerate() {
                 for mat in mats {
                     for sky_tex in [false, true] {

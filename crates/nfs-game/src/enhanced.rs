@@ -18,7 +18,7 @@
 use nfs_assets::paths::GamePaths;
 use nfs_formats::locale::{Strings, typed_char};
 use nfs_renderer::{ENHANCEMENT_REGISTRY, EnhancementStored, EnhancementSwitch, Enhancements, MAX_ENHANCEMENT_LEVELS};
-use nfs_renderer::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E20, E21, E22, E23, E24, E25, E26, E27, E28, E29, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44};
+use nfs_renderer::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E20, E21, E22, E23, E24, E25, E26, E27, E28, E29, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::PathBuf;
@@ -386,6 +386,9 @@ pub fn reason_text(dep: &nfs_renderer::EnhancementDependency, by: u8, russian: b
         (C::UpscalerOn, true) => format!("не действует: включен апскейлер ({up}), он сам задает размер"),
         (C::TemporalUpscaler, false) => format!("inactive: a temporal upscaler ({up}) replaces the anti-aliasing"),
         (C::TemporalUpscaler, true) => format!("не действует: временной апскейлер ({up}) заменяет сглаживание"),
+        // UPSCALE-SOFT: a temporal backend chosen with E7 off
+        (C::TemporalNeedsHdr, false) => format!("inactive: the temporal {up} works on the HDR image: needs '{}' (or MetalFX 'simple')", name("E7")),
+        (C::TemporalNeedsHdr, true) => format!("не действует: временному {up} нужно HDR-изображение: нужен «{}» (или «простой» MetalFX)", name("E7")),
         (C::NoHdPack, false) => "not available: no hd_textures folder".to_string(),
         (C::NoHdPack, true) => "недоступно: нет папки hd_textures".to_string(),
     }
@@ -466,11 +469,11 @@ const INACTIVE_COLOR: &str = "0xff8a8a8a";
 
 /// The panel's groups in display order: `[English, Russian]` header, then the registry switches in row order. The display order is
 /// independent of the registry's (the Switch indices never move). After E38 the panel inserts the settings rows of the chosen upscaler
-/// (MetalFX: mode + scale, FSR: scale + sharpness). E34 / E37 / E39 have no row of their own: [`SETTINGS_OF_E38`].
+/// (MetalFX: mode + scale + sharpness, FSR: scale + sharpness). E34 / E37 / E39 have no row of their own: [`SETTINGS_OF_E38`].
 /// A group stays on one page when it fits on one (`paginate`).
 pub const GROUPS: &[([&str; 2], &[EnhancementSwitch])] = &[
     (["image", "Изображение"], &[E6, E22, E1, E2, E3, E35, E4, E5, E38, E33]),
-    (["light and shadows", "Свет и тени"], &[E7, E9, E43, E25, E14, E32, E16, E15, E24, E23, E20]),
+    (["light and shadows", "Свет и тени"], &[E7, E9, E43, E25, E14, E32, E16, E15, E24, E23, E47, E20]),
     (["surfaces", "Поверхности"], &[E8, E17, E26, E40, E41, E42]),
     (["atmosphere and effects", "Атмосфера и эффекты"], &[E10, E11, E13, E19, E36, E44, E21, E18, E12]),
     (["camera", "Камера"], &[E27, E28, E29, E31]),
@@ -585,7 +588,8 @@ pub fn group_items(state: &Enhancements) -> Vec<Vec<Item>> {
                 v.push(Item::Entry(i));
                 if i == nfs_renderer::E38.0 as usize {
                     match state.level(nfs_renderer::E38) {
-                        nfs_renderer::UP_METALFX if cfg!(target_os = "macos") => v.extend([Item::Virtual(VRow::MfxMode), Item::Virtual(VRow::MfxScale)]),
+                        // UPSCALE-SOFT: the sharpness row is MetalFX's too (the port's RCAS pass after its scalers)
+                        nfs_renderer::UP_METALFX if cfg!(target_os = "macos") => v.extend([Item::Virtual(VRow::MfxMode), Item::Virtual(VRow::MfxScale), Item::Entry(nfs_renderer::E39.0 as usize)]),
                         nfs_renderer::UP_FSR => v.extend([Item::Virtual(VRow::FsrScale), Item::Entry(nfs_renderer::E39.0 as usize)]),
                         _ => {}
                     }
@@ -1088,8 +1092,8 @@ mod tests {
         assert_eq!((at(&fsr, Item::Virtual(VRow::FsrScale)), at(&fsr, e39)), (at(&fsr, up) + 1, at(&fsr, up) + 2));
         if cfg!(target_os = "macos") {
             let mfx = rows(nfs_renderer::UP_METALFX);
-            assert!(has(&mfx, Item::Virtual(VRow::MfxMode)) && has(&mfx, Item::Virtual(VRow::MfxScale)) && !has(&mfx, Item::Virtual(VRow::FsrScale)) && !has(&mfx, e39));
-            assert_eq!(at(&mfx, Item::Virtual(VRow::MfxScale)), at(&mfx, up) + 2);
+            assert!(has(&mfx, Item::Virtual(VRow::MfxMode)) && has(&mfx, Item::Virtual(VRow::MfxScale)) && !has(&mfx, Item::Virtual(VRow::FsrScale)) && has(&mfx, e39));
+            assert_eq!((at(&mfx, Item::Virtual(VRow::MfxScale)), at(&mfx, e39)), (at(&mfx, up) + 2, at(&mfx, up) + 3));
         } else {
             // no MetalFX off macOS: a stored choice 1 shows no settings
             assert!(!has(&rows(nfs_renderer::UP_METALFX), Item::Virtual(VRow::MfxMode)));

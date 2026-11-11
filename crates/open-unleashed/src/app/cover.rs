@@ -21,6 +21,18 @@ const MAX_HOLE: usize = 2;
 /// Margin over the ceiling the overhead query found (m).
 const CEIL_MARGIN: f32 = 0.5;
 
+/// ENHANCEMENT E9 (SHADOW-REAL): how near a covered run's mouth the camera must be for the sun's shadow pass to run while the camera
+/// is under cover (m). Deeper inside, everything in view is covered (no sun-shadow darkening there) except the exterior far down the
+/// tube, so the pass is skipped (its cost, about 1.5 ms on an M1 Pro, is not spent on nothing); it eases back in (the gate's 0.5 s)
+/// while the mouth is still this far away, where the open ground through it is a few pixels. APPROXIMATION: judged by eye.
+const OPEN_VIEW: f32 = 160.0;
+
+/// ENHANCEMENT E9 (SHADOW-REAL): whether the sun's shadow can show from `eye`: the eye is not wholly covered, or a covered run's end (a
+/// box whose weights ramp, the first / last metres of a run) is within [`OPEN_VIEW`].
+pub(crate) fn cover_open_view(boxes: &[CoverBox], eye: Vec3) -> bool {
+    nfs_renderer::cover_weight(boxes, eye) < 1.0 || boxes.iter().any(|b| b.w_back.min(b.w_front) < 1.0 && b.centre.distance_squared(eye) < OPEN_VIEW * OPEN_VIEW)
+}
+
 impl App {
     /// The track's covered boxes, built once per race (empty until the world and the slices exist).
     pub(crate) fn cover_boxes(&mut self) -> Arc<Vec<CoverBox>> {

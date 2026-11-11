@@ -45,7 +45,9 @@ const MAX_CASTER_RADIUS: f32 = 60.0;
 /// ENHANCEMENT ENH-SHPOP: where the last cascade starts to fade out, as a share of its end (was 0.85: a 33 m ramp at 220 m)
 const FADE_START: f32 = 0.6;
 
-/// ENHANCEMENT E9 (SHADOWFIX): how fast the cover gate eases toward its target, per second (fully in or out in 0.5 s).
+/// ENHANCEMENT E9 (SHADOWFIX): how fast the cover gate eases toward its target, per second (fully in or out in 0.5 s). SHADOW-REAL:
+/// only a fallback now: the race holds the gate open while it hands the covered boxes (`SunShadow::lit`), and the shader decides
+/// per surface (`cover_at`), so a tunnel exit has no wall-clock ramp.
 const GATE_RATE: f32 = 2.0;
 /// ENHANCEMENT ENH-FE3D: how far toward the sun a caster may stand and still shade the front-end car's one cascade (m,
 /// [`fit_focus`]'s `ext`), beyond its focus sphere.
@@ -251,15 +253,10 @@ impl CsmFrame {
         self.focus.is_none() && !self.overcast
     }
 
-    /// ENHANCEMENT E9: how much of the car's `SHAD` patch is left (1 − the cover gate; 1 in the front end's focus and under
-    /// E25's overcast light, whose car shadow is too faint to stand in for it)
-    pub(super) fn car_patch_keep(&self) -> f32 {
-        if self.focus.is_some() || self.overcast { 1.0 } else { 1.0 - self.gate }
-    }
-
-    /// ENHANCEMENT E43: how much of the car's shadow this frame's sun shadow carries (the cover gate; 0 under E25's overcast light
-    /// and in the front end's focus): the contact shadow weakens by this much where the sun shadow is drawn.
-    pub(super) fn sun_share(&self) -> f32 {
+    /// ENHANCEMENT E9: how much of the car's `SHAD` patch the sun's shadow takes in the open (the cover gate; 0 in the front end's
+    /// focus and under E25's overcast light, whose car shadow is too faint to stand in for it). SHADOW-REAL: the fill scales it by
+    /// the patch's own openness (`DrawItem::cover`), so a car in a tunnel keeps its patch whatever the camera does.
+    pub(super) fn car_patch_gate(&self) -> f32 {
         if self.focus.is_some() || self.overcast { 0.0 } else { self.gate }
     }
 }
