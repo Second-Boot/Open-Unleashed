@@ -8,15 +8,15 @@
 //! underside). The track has no lighting model (baked vertex colour), so as in E15 the term is a
 //! multiply-add on the texture with a floor under `n.l`. One small uniform.
 //!
-//! ENHANCEMENT E47: the cars' shadows from these lamps. Of the frame's lamps (nearest to the camera first, the order the porsche
-//! side hands them in) the first [`SHADOW_SLOTS`] that have a car in their light get a perspective depth map each, one layer of a
+//! ENHANCEMENT E47: the cars' shadows from these lamps. Of the frame's lamps that have a car in their light the
+//! [`SHADOW_SLOTS`] whose light on the cars matters most ([`lamp_score`], LAMP-TUNE) get a perspective depth map each, one layer of a
 //! [`SHADOW_SIZE`]^2 `Depth32Float` array: the frustum looks from the lamp at the car parts in its reach and is just wide enough
 //! for their bounding spheres (a caster's shadow lies inside the caster's own cone as seen from the lamp, and the cars are the
 //! only casters, so nothing outside the cone can be shadowed), its far plane at the lamp's radius. Drawn with E9's two depth-only
 //! pipelines and `shadow.wgsl` like E15's map. The shader multiplies only that lamp's own term by the visibility (`lamp_visibility`:
 //! normal offset, a metre-based bias, 3 x 3 hardware PCF with a four-tap early-out), so the baked night, the other lamps and E9 /
-//! E43 stay as they are. A slot's strength fades with the lamp's distance between 75 % of the first lamp left out (the one after
-//! the last slot) and that lamp, so a lamp taking or losing a slot does not pop; a lamp with no car in its reach costs nothing.
+//! E43 stay as they are. A slot's strength fades in from the score of the first lamp left out (the one after the last slot) to 1.5
+//! times it ([`slot_strength`]), so a lamp taking or losing a slot does not pop; a lamp with no car in its reach costs nothing.
 
 use super::*;
 use bytemuck::Zeroable;
@@ -159,10 +159,38 @@ pub(super) fn fit_frustum(lamp: Vec3, radius: f32, cs: impl Iterator<Item = Cast
     Some(LampFrustum { dir, tan_half: half.tan(), near, far: radius + 1.0 })
 }
 
-/// ENHANCEMENT E47: a slot's strength by its lamp's distance `d` from the camera and the first left-out lamp's `cut` (fades over
-/// the last quarter before it, the same rule as the lamps' own selection).
-pub(super) fn slot_strength(d: f32, cut: f32) -> f32 {
-    let f = 1.0 - ((d - 0.75 * cut) / (0.25 * cut).max(1e-3)).clamp(0.0, 1.0);
+/// ENHANCEMENT E47 (LAMP-TUNE): how much a lamp's shadow matters this frame: the largest, over the car parts in its reach, of its
+/// light at the part (the shader's falloff `smoothstep(1 - d / radius)` and downward cone, `d` from the lamp to the part's sphere,
+/// times the colour's brightness) weighted by the part's nearness to the camera (`1 / (1 + (d_eye / 40 m)^2)`: a car far ahead
+/// under a lamp counts less than the one under the camera). 0 = no car in its light. Smooth in the cars' and the camera's
+/// positions, so the ranking and [`slot_strength`] change without steps. APPROXIMATION (the 40 m).
+pub(super) fn lamp_score(lamp: Vec3, radius: f32, color: [f32; 3], eye: Vec3, casters: &[Caster]) -> f32 {
+    let bright = color[0].max(color[1]).max(color[2]);
+    let mut best: f32 = 0.0;
+    for c in casters.iter().filter(|c| in_reach(lamp, radius, c)) {
+        let v = c.centre - lamp;
+        let d = (v.length() - c.radius).max(0.0);
+        let r = (1.0 - d / radius).clamp(0.0, 1.0);
+        let fall = r * r * (3.0 - 2.0 * r);
+        // the cone toward the part's lowest point (the lamp lights what is below it)
+        let low = c.centre - Vec3::Y * c.radius - lamp;
+        let t = ((-low.y / low.length().max(1e-3) - 0.1) / 0.45).clamp(0.0, 1.0);
+        let cone = t * t * (3.0 - 2.0 * t);
+        let e = c.centre.distance(eye) / 40.0;
+        best = best.max(bright * fall * cone.max(0.05) / (1.0 + e * e));
+    }
+    best
+}
+
+/// ENHANCEMENT E47 (LAMP-TUNE): a slot's strength by its lamp's [`lamp_score`] and the first left-out lamp's `cut` (0 = none left
+/// out): full from 1.5 x the cut, 0 at the cut, so a lamp taking or losing the last slot fades instead of popping. (Was by the
+/// lamp's distance from the camera, which did not follow the cars: a lamp entering the set as a car drove into its light could
+/// push another out at full strength.)
+pub(super) fn slot_strength(score: f32, cut: f32) -> f32 {
+    if cut <= 0.0 {
+        return 1.0;
+    }
+    let f = ((score - cut) / (0.5 * cut)).clamp(0.0, 1.0);
     f * f * (3.0 - 2.0 * f)
 }
 
@@ -210,39 +238,47 @@ impl Core {
             u.pos[i] = [s.pos.x, s.pos.y, s.pos.z, s.radius];
             u.col[i] = [s.color[0], s.color[1], s.color[2], 0.0];
         }
-        u.params = [l.n as f32, 0.0, l.gain, 0.0];
-        // ENHANCEMENT E47: the lamps with a car in their light, nearest to the camera first
-        let mut slots: Vec<(usize, LampFrustum, Vec<u32>)> = Vec::new();
-        if self.enhancements.is_on(crate::E47) {
+        u.params = [(l.n as usize).min(crate::MAX_LAMPS) as f32, 0.0, l.gain, 0.0];
+        // ENHANCEMENT E47: the lamps with a car in their light, the ones whose light on the cars matters most first (LAMP-TUNE: was
+        // nearest to the camera first, so the three heads of one post or lamps lighting nothing near the camera took the slots)
+        let mut slots: Vec<(usize, LampFrustum, Vec<u32>, f32)> = Vec::new();
+        // ENHANCEMENT E49: the environment faces take the lamps' light without their shadow maps (a pass per lamp per face)
+        if self.enhancements.is_on(crate::E47) && !self.refl_building {
             let casters = self.lamp_casters(scene, n);
-            let mut cut = f32::MAX;
+            let mut cut = 0.0;
             if !casters.is_empty() {
-                for (i, s) in l.lamps.iter().take(l.n as usize).enumerate() {
-                    if s.color == [0.0; 3] || s.radius <= 0.0 {
-                        continue;
-                    }
-                    let near = || casters.iter().copied().filter(|c| in_reach(s.pos, s.radius, c));
-                    if near().next().is_none() {
-                        continue;
-                    }
+                let mut ranked: Vec<(usize, f32)> = l
+                    .lamps
+                    .iter()
+                    .take(l.n as usize)
+                    .enumerate()
+                    .filter(|(_, s)| s.color != [0.0; 3] && s.radius > 0.0)
+                    .map(|(i, s)| (i, lamp_score(s.pos, s.radius, s.color, camera.position, &casters)))
+                    .filter(|(_, sc)| *sc > 0.0)
+                    .collect();
+                // by score, ties by the lamps' order (stable)
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for &(i, score) in &ranked {
+                    let s = &l.lamps[i];
                     if slots.len() == SHADOW_SLOTS {
-                        cut = s.pos.distance(camera.position);
+                        cut = score;
                         break;
                     }
+                    let near = || casters.iter().copied().filter(|c| in_reach(s.pos, s.radius, c));
                     if let Some(f) = fit_frustum(s.pos, s.radius, near()) {
-                        slots.push((i, f, near().map(|c| c.idx).collect()));
+                        slots.push((i, f, near().map(|c| c.idx).collect(), score));
                     }
                 }
             }
-            for (k, (i, f, _)) in slots.iter().enumerate() {
+            for (k, (i, f, _, score)) in slots.iter().enumerate() {
                 let p = l.lamps[*i].pos;
                 let m = spot::shadow_matrix_tan(p, f.dir, f.near, f.far, f.tan_half);
                 u.smat[k] = m.to_cols_array_2d();
-                u.sinfo[k] = [2.0 * f.tan_half / SHADOW_SIZE as f32, f.near, f.far, slot_strength(p.distance(camera.position), cut)];
+                u.sinfo[k] = [2.0 * f.tan_half / SHADOW_SIZE as f32, f.near, f.far, slot_strength(*score, cut)];
                 u.col[*i][3] = (k + 1) as f32;
             }
             u.params[3] = 1.0 / SHADOW_SIZE as f32;
-            tracing::debug!(slots = slots.len(), casters = casters.len(), cut, "lamp shadows (ENHANCEMENT E47)");
+            tracing::debug!(slots = ?slots.iter().map(|(i, _, _, sc)| (l.lamps[*i].pos.x.round() as i32, l.lamps[*i].pos.z.round() as i32, (sc * 1000.0).round() as i32, (slot_strength(*sc, cut) * 1000.0).round() as i32)).collect::<Vec<_>>(), casters = casters.len(), cut, "lamp shadows (ENHANCEMENT E47)");
         }
         self.lamp.active = true;
         self.belt.write_buffer(encoder, &self.lamp.uniform, 0, size).copy_from_slice(bytemuck::bytes_of(&u));
@@ -270,7 +306,7 @@ impl Core {
         }
         let lsize = wgpu::BufferSize::new(64).expect("light size");
         let used = slots.len();
-        for (k, (_, _, list)) in slots.into_iter().enumerate() {
+        for (k, (_, _, list, _)) in slots.into_iter().enumerate() {
             self.belt.write_buffer(encoder, &self.lamp.light_bufs[k], 0, lsize).copy_from_slice(bytemuck::bytes_of(&u.smat[k]));
             self.lamp.casters[k] = list;
         }
@@ -331,9 +367,17 @@ mod tests {
         assert!(!in_reach(lamp, 25.0, &car(40.0, 0.0)));
         // a car on a deck above the lamp
         assert!(!in_reach(lamp, 25.0, &Caster { idx: 0, centre: Vec3::new(3.0, 16.0, 0.0), radius: 2.4 }));
-        assert_eq!(slot_strength(10.0, f32::MAX), 1.0);
-        assert_eq!(slot_strength(40.0, 40.0), 0.0);
-        assert_eq!(slot_strength(20.0, 40.0), 1.0);
-        assert!((slot_strength(35.0, 40.0) - 0.5).abs() < 1e-6);
+        assert_eq!(slot_strength(0.3, 0.0), 1.0);
+        assert_eq!(slot_strength(0.4, 0.4), 0.0);
+        assert_eq!(slot_strength(0.7, 0.4), 1.0);
+        assert!((slot_strength(0.5, 0.4) - 0.5).abs() < 1e-6);
+        // the score follows the light at the car: brighter under the lamp, 0 out of its reach, less for a car far from the eye
+        let eye = Vec3::new(0.0, 2.0, -6.0);
+        let under = lamp_score(lamp, 25.0, [1.0; 3], eye, &[car(2.0, 0.0)]);
+        let edge = lamp_score(lamp, 25.0, [1.0; 3], eye, &[car(20.0, 0.0)]);
+        assert!(under > edge && edge > 0.0, "{under} {edge}");
+        assert_eq!(lamp_score(lamp, 25.0, [1.0; 3], eye, &[car(40.0, 0.0)]), 0.0);
+        let far_eye = Vec3::new(0.0, 2.0, -120.0);
+        assert!(lamp_score(lamp, 25.0, [1.0; 3], far_eye, &[car(2.0, 0.0)]) < under);
     }
 }

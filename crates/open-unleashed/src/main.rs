@@ -375,6 +375,8 @@ fn run() -> Result<()> {
     NO_FOCUS.store(scripted, std::sync::atomic::Ordering::Relaxed);
     // diagnostic: `NFS_PLAY_INTRO=1` keeps the start-up movies for a scripted run (see `PLAY_INTRO`)
     PLAY_INTRO.store(std::env::var_os("NFS_PLAY_INTRO").is_some(), std::sync::atomic::Ordering::Relaxed);
+    // TEST GLUE `--perf-bench <frames>` (see `PERF_BENCH`)
+    PERF_BENCH.store(cli.perf_bench.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     // Tooling only, not a game rule: a scripted capture (`--screenshot`, or any other scripted
     // run, which is always `NFS_NO_FOCUS=1` too — the flag `scripted` is set from above) must not
     // let wherever the operator's real mouse happens to rest change a hover state — the golden

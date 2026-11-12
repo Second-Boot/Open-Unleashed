@@ -30,8 +30,15 @@ pub(crate) struct FeEnh {
     pub shadow: Option<SunShadow>,
 }
 
-/// The key light's travel direction in the front end's frame (x right, y up, z away from the camera): from above and a
-/// little behind the car's far side, so its soft shadow falls toward the viewer and shows under and in front of the car.
+/// The key light's travel direction in the room's own frame at its rest turn (x right, y up, z away from the camera):
+/// from above and a little behind the car's far side, so at rest its soft shadow falls toward the viewer.
+///
+/// The light belongs to the room, not to the camera: the garage, the factory and the victory room turn their own models
+/// with the car (`Room::models_turn` `None`, 0x4EA0E3), and a light fixed to the camera circled the turning room once a
+/// turn — the shadow stayed on the viewer's side while the car and the lift turned over it, so it slid round the car
+/// (behind the nose, then beside the door, then behind the tail). It turns with the room's models now
+/// ([`App::fe_enh_prepare`]'s `room_turn`): the shadow turns rigidly with the car and the floor, as the original's
+/// `FESH` blob it stands in for does.
 const KEY_LIGHT: Vec3 = Vec3::new(0.2, -1.0, -0.5);
 
 /// Sphere round the room's car the shadow map covers (m): a car is ~4.5 m long.
@@ -74,8 +81,9 @@ impl App {
     }
 
     /// The frame's enhancements for the room's scene (and the offscreen views): the environment map made / refreshed,
-    /// the weights returned. `car` is where the room's own car stands, `None` with no room car.
-    pub(crate) fn fe_enh_prepare(&mut self, car: Option<Vec3>, ambient: f32, sun: Vec3) -> FeEnh {
+    /// the weights returned. `car` is where the room's own car stands, `None` with no room car; `room_turn` is the turn the
+    /// room's own models are drawn with this frame (the key light turns with them; identity where they stand still).
+    pub(crate) fn fe_enh_prepare(&mut self, car: Option<Vec3>, room_turn: Quat, ambient: f32, sun: Vec3) -> FeEnh {
         let mut out = FeEnh::default();
         if self.vehicle.is_some() || self.renderer.is_none() {
             self.fe.enh_refl = 0.0;
@@ -85,7 +93,7 @@ impl App {
         if self.fe_enh_on(nfs_renderer::E9)
             && let Some(p) = car
         {
-            out.shadow = Some(SunShadow { direction: KEY_LIGHT.normalize(), lit: true, focus: Some(ShadowFocus { centre: p + Vec3::Y * 0.5, radius: SHADOW_RADIUS, blur: SHADOW_BLUR, strength: SHADOW_STRENGTH, core: SHADOW_CORE, soft: SHADOW_SOFT, blob_fade: BLOB_FADE }) });
+            out.shadow = Some(SunShadow { direction: (room_turn * KEY_LIGHT).normalize(), lit: true, focus: Some(ShadowFocus { centre: p + Vec3::Y * 0.5, radius: SHADOW_RADIUS, blur: SHADOW_BLUR, strength: SHADOW_STRENGTH, core: SHADOW_CORE, soft: SHADOW_SOFT, blob_fade: BLOB_FADE }) });
         }
         if self.fe_enh_on(nfs_renderer::E8) {
             let rooms = !self.fe.enh_room.is_empty() && car.is_some();

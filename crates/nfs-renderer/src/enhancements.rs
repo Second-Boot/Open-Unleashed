@@ -554,6 +554,59 @@ pub const REGISTRY: &[Entry] = &[
         levels: ON_OFF,
         default_level: 1,
     },
+    // ENHANCEMENT E48: the chase / heli cameras' slope lift held steady while the car stands across the road (registered LAST, after
+    // E47). Camera state only: the lift's sample direction keeps its last side while the car's heading is near the slice's
+    // perpendicular, where the wrong-way counter flips on every rock (race-logic §11.2, CAM-JIT2). Off = the original's camera exactly.
+    Entry {
+        token: "E48",
+        name: ["steady chase camera on slopes", "плавная камера на склонах"],
+        help: [
+            "in the far chase and helicopter views the original lifts the camera by the road's slope, sampled ahead of or behind the car by whether it faces the wrong way; a car standing across a steep road flips that every time it rocks, and the camera swings up and down by most of a metre. With this on the slope is sampled on the same side until the car clearly turns along or against the road, so a car stuck across a slope keeps a still camera; while driving nothing changes. Off is the original's camera. Only the picture changes",
+            "в дальних видах сзади и с вертолёта оригинал поднимает камеру по уклону дороги, измеренному впереди или позади машины в зависимости от того, едет ли она навстречу; машина, стоящая поперёк крутой дороги, переключает это при каждом покачивании, и камера качается вверх-вниз почти на метр. Со включённым улучшением уклон берётся с той же стороны, пока машина явно не развернётся вдоль дороги или против неё, так что у застрявшей поперёк склона машины камера стоит спокойно; в движении ничего не меняется. Выключено — камера оригинала. Меняется только картинка",
+        ],
+        levels: ON_OFF,
+        default_level: 1,
+    },
+    // ENHANCEMENT E49: reflections of nearby objects (registered after E48). E8's environment faces take the lamps' light (E23 / E15)
+    // and the lamp flares, the player's own paint a second set of faces with the near cars, and in a tunnel the faces are read
+    // through its covered box (a parallax-corrected lookup); NEAR-REFL2: on the player's car the original's sphere-map overlay (the
+    // painted sky) shows the faces where they see geometry, not sky. Needs E8 (its cube). Off = E8's faces and paint exactly.
+    Entry {
+        token: "E49",
+        name: ["reflections of nearby objects", "отражения ближних объектов"],
+        help: [
+            "the reflections in the cars' paint and glass (E8) show what is really near the car: the street and tunnel lamps and the headlights light the surroundings in the reflection and the lamps glint in it, the other cars within about 50 m appear in your own car's paint and glass (the other cars keep a reflection without cars, so none reflects itself), and inside a tunnel the walls, the ceiling and the lamp rows sit where they are and slide over the car as it drives (the reflection is laid onto the tunnel's box instead of an infinitely far surrounding). On your own car the original's painted sky in the paint and glass gives way to the real surroundings wherever something covers the sky: in a tunnel or under a rock it shows the ceiling, the rock and the lamps and moves with the car, in the open it stays the original's sky. The paint's colour and the strength of the reflection do not change. Needs the reflections (E8). Only the picture changes",
+            "отражения в краске и стёклах машин (E8) показывают то, что действительно рядом с машиной: уличные и тоннельные фонари и фары освещают окружение в отражении, а лампы в нём блестят, другие машины в пределах примерно 50 м видны в краске и стёклах вашей машины (у остальных машин отражение без машин, так что ни одна не отражает саму себя), а в тоннеле стены, потолок и ряды ламп стоят на своих местах и скользят по машине при движении (отражение ложится на коробку тоннеля, а не на бесконечно далёкое окружение). На вашей машине нарисованное небо оригинала в краске и стёклах уступает настоящему окружению везде, где небо чем-то закрыто: в тоннеле или под скалой в нём видны потолок, скала и лампы, и оно движется вместе с машиной, а на открытой дороге остаётся небо оригинала. Цвет краски и сила отражения не меняются. Нужны отражения (E8). Меняется только картинка",
+        ],
+        levels: ON_OFF,
+        default_level: 1,
+    },
+    // ENHANCEMENT E50: moonlight on the night tracks (registered after E49). A faint cold directional light through E9's cascades (the
+    // way E25's overcast light is a second light of them): soft shadows of the cars and the roadside objects on the baked night
+    // colour, a weak cold direct term on the cars. Needs E9.
+    Entry {
+        token: "E50",
+        name: ["moonlight", "лунный свет"],
+        help: [
+            "on the night tracks (Industrial, Monaco) a faint cold moonlight: the cars, trees, posts and buildings cast soft moon shadows on the road and the cars take a weak cold light from the moon's side. The night stays as dark as before (the original's baked night light already holds the moon's glow; under the street lamps the moon shadow gives way to the lamp light). On Industrial the light comes from the sky's own moon, on Monaco (no moon in its sky) from a chosen direction. Needs the sun shadows (E9). Only the picture changes",
+            "на ночных трассах (Индастриал, Монако) слабый холодный лунный свет: машины, деревья, столбы и дома отбрасывают мягкие лунные тени на дорогу, а машины получают слабый холодный свет со стороны луны. Ночь остаётся такой же тёмной (запечённый ночной свет оригинала уже содержит свечение луны; под фонарями лунная тень уступает свету фонаря). На Индастриале свет идёт от луны на небе трассы, в Монако (на его небе луны нет) - с выбранной стороны. Нужны тени от солнца (E9). Меняется только картинка",
+        ],
+        levels: &[["off", "выкл"], ["weak", "слабо"], ["normal", "средне"]],
+        default_level: 2,
+    },
+    // ENHANCEMENT E51: the cars' own sun shadow on dimly baked roads (registered after E50). E9's track receiver leaves a shadow out
+    // where the baked colour is already dark (a baked shadow must not be darkened twice); a car's shadow is never baked into the
+    // road, so a second, cars-only map of the near cascades lets the cars' shadows past that gate. Needs E9.
+    Entry {
+        token: "E51",
+        name: ["car shadow on dark roads", "тень машины на тёмной дороге"],
+        help: [
+            "the cars' sun shadow is drawn in full on roads whose baked colour is already dim (the coast at dusk, a hill's shade): the sun shadows (E9) leave the darkening out there so that a shadow baked into the road is not darkened twice, which also took the car's own shadow away; a car's shadow is never baked, so it now passes (the shadows of trees, rocks and buildings keep the rule). Needs the sun shadows (E9). Only the picture changes",
+            "солнечная тень машин рисуется полностью и на дороге, чей запечённый цвет уже тёмный (побережье в сумерках, тень холма): тени от солнца (E9) там не затемняют, чтобы не затемнить второй раз тень, запечённую в дорогу, и вместе с ней пропадала тень самой машины; тень машины никогда не запечена, поэтому теперь она рисуется (тени деревьев, скал и домов по-прежнему следуют правилу). Нужны тени от солнца (E9). Меняется только картинка",
+        ],
+        levels: ON_OFF,
+        default_level: 1,
+    },
 ];
 
 /// The [`Switch`] constants. `E7 = 6` declares `pub const E7: Switch = Switch(6)` and checks AT COMPILE TIME that `REGISTRY[6]` is
@@ -685,6 +738,14 @@ switches! {
     E44 = 42,
     /// ENHANCEMENT E47 the cars' shadows from the street / tunnel lamps (E23): 0 off, 1 on (registered last, after E44; needs E23)
     E47 = 43,
+    /// ENHANCEMENT E48 the chase / heli cameras' steady slope lift: 0 off (the original), 1 on (registered last, after E47)
+    E48 = 44,
+    /// ENHANCEMENT E49 reflections of nearby objects: 0 off, 1 on (registered after E48; needs E8)
+    E49 = 45,
+    /// ENHANCEMENT E50 moonlight on the night tracks: 0 off, 1 weak, 2 normal (registered after E49; needs E9)
+    E50 = 46,
+    /// ENHANCEMENT E51 the cars' own sun shadow on dimly baked roads: 0 off, 1 on (registered after E50; needs E9)
+    E51 = 47,
 }
 
 /// ENHANCEMENT E34: its levels 1..=this are the temporal ones (MetalFX temporal scaler); the levels above are the spatial ('simple') ones
@@ -934,6 +995,11 @@ pub const DEPENDS: &[Dependency] = &[
     Dependency { entry: "E25", cond: Cond::Needs("E9") },
     // the lamp shadows shadow E23's lamps: without them there is no lamp light to shadow
     Dependency { entry: "E47", cond: Cond::Needs("E23") },
+    // the moonlight is a third light of E9's cascades, and the cars' dim-road shadow a cars-only map of them
+    Dependency { entry: "E50", cond: Cond::Needs("E9") },
+    Dependency { entry: "E51", cond: Cond::Needs("E9") },
+    // the reflections of nearby objects are drawn into E8's cube and read by its clear coat
+    Dependency { entry: "E49", cond: Cond::Needs("E8") },
     // an upscaler draws the scene at its own internal size: E3's scale is not used; a temporal one also draws at 1 sample with
     // no SMAA pass (the spatial MetalFX mode keeps both)
     Dependency { entry: "E3", cond: Cond::UpscalerOn },
@@ -1508,8 +1574,29 @@ mod tests {
         assert_eq!((E34.0, E37.0, E38.0, E39.0), (33, 35, 36, 37));
         assert_eq!(REGISTRY[E38.0 as usize].token, "E38");
         assert_eq!(REGISTRY[E39.0 as usize].token, "E39");
-        assert_eq!(E47.0 as usize, REGISTRY.len() - 1); // ENHANCEMENT E47 is the last entry
+        assert_eq!(E51.0 as usize, REGISTRY.len() - 1); // ENHANCEMENT E51 is the last entry
         assert_eq!((E39.0, E40.0, E41.0, E42.0, E43.0, E44.0, E47.0), (37, 38, 39, 40, 41, 42, 43));
+        // ENHANCEMENT E48: the steady slope lift of the chase cameras, index 44, on by default, off / on
+        assert_eq!(E48.0, 44);
+        assert_eq!(REGISTRY[E48.0 as usize].token, "E48");
+        assert_eq!(REGISTRY[E48.0 as usize].default_level, 1);
+        assert_eq!(REGISTRY[E48.0 as usize].levels.len(), 2);
+        assert_eq!((E50.0, E51.0), (46, 47));
+        // ENHANCEMENT E49: reflections of nearby objects, index 45, on by default; needs E8 (its cube)
+        assert_eq!(E49.0, 45);
+        assert_eq!(REGISTRY[E49.0 as usize].token, "E49");
+        assert_eq!(REGISTRY[E49.0 as usize].default_level, 1);
+        assert_eq!(REGISTRY[E49.0 as usize].levels.len(), 2);
+        let mut no_e8 = Enhancements::all();
+        no_e8.set_level(E8, 0);
+        assert_eq!(no_e8.resolved().level(E49), 0);
+        assert!(no_e8.blocked("E49").is_some());
+        assert_eq!(REGISTRY[E50.0 as usize].token, "E50");
+        assert_eq!(REGISTRY[E50.0 as usize].default_level, 2); // moonlight: normal
+        assert_eq!(REGISTRY[E50.0 as usize].levels.len(), 3);
+        assert_eq!(REGISTRY[E51.0 as usize].token, "E51");
+        assert_eq!(REGISTRY[E51.0 as usize].default_level, 1); // the cars' shadow on dim roads: on
+        assert_eq!(REGISTRY[E51.0 as usize].levels.len(), 2);
         assert_eq!(REGISTRY[E47.0 as usize].token, "E47");
         assert_eq!(REGISTRY[E47.0 as usize].default_level, 1); // lamp shadows: on
         assert_eq!(REGISTRY[E47.0 as usize].levels.len(), 2);
@@ -1690,6 +1777,14 @@ mod tests {
         s.set_level(E9, 0);
         s.set_level(E8, 0);
         assert!(s.blocked("E25").is_some() && s.blocked("E16").is_some());
+        // ENHANCEMENT E50 / E51: the moonlight and the cars' dim-road shadow are lights / maps of E9's cascades
+        assert!(s.blocked("E50").is_some() && s.blocked("E51").is_some());
+        assert_eq!(DEPENDS[s.blocked("E50").unwrap().dep].cond, Cond::Needs("E9"));
+        s.set_level(E9, 1);
+        assert!(s.blocked("E50").is_none() && s.blocked("E51").is_none());
+        let mut r = Enhancements::all();
+        r.set_level(E9, 0);
+        assert_eq!((r.resolved().level(E50), r.resolved().level(E51)), (0, 0));
         // an upscaler: render scale is overridden by any; MSAA / SMAA only by a temporal one
         let mut u = Enhancements::all();
         assert!(u.blocked("E3").is_none() && u.blocked("E1").is_none());

@@ -69,7 +69,7 @@ impl GammaPass {
             pass.draw(0..3, 0..1);
         }
         crate::prof::resolve(&mut enc);
-        queue.submit(Some(enc.finish()));
+        crate::prof::submit(device, queue, Some(crate::prof::finish(enc)));
     }
 }
 

@@ -920,6 +920,8 @@ impl App {
         self.replay.saved = false;
         self.replay.loop_count = 0;
         nfs_game::rng::seed(self.traffic_seed);
+        // PERF (not in the original): the race's mesh pipeline sets are built on the renderer's own thread while the track loads
+        renderer.prewarm_pipelines();
         // 0x4A4A70(0) as the front end hands over (main 0x4B6CCA)
         self.race_loading_frame(&mut renderer, 0);
         // 0x427A60, the race load 0x4B67B0's first call (before its steps 1 and 2): `pic16.fsh` from

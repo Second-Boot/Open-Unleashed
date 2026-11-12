@@ -121,8 +121,8 @@ mod tests {
     /// Every WGSL source the renderer can build, after composition, for every variant the passes use.
     fn every_source() -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = vec![
-            ("mesh shader".into(), crate::classes::mesh_shader_source(true)),
-            ("mesh shader (all off)".into(), crate::classes::mesh_shader_source(false)),
+            ("mesh shader".into(), crate::classes::mesh_shader_source(crate::classes::feat::ALL)),
+            ("mesh shader (all off)".into(), crate::classes::mesh_shader_source(0)),
             ("sprite".into(), include_str!("sprite.wgsl").into()),
             ("shadow".into(), include_str!("gpu/shadow.wgsl").into()),
             ("probe".into(), include_str!("probe.wgsl").into()),
@@ -135,6 +135,7 @@ mod tests {
             ("soft depth".into(), crate::soft::source()),
             ("temporal pass".into(), crate::temporal::pass_source()),
             ("gamma".into(), crate::gpu::gamma_source()),
+            ("near mask".into(), crate::gpu::near_mask_source()),
         ];
         for ms in [false, true] {
             v.push((format!("motion blur ms={ms}"), crate::camfx::blur_source(ms)));
@@ -159,6 +160,20 @@ mod tests {
         }
         #[cfg(target_os = "macos")]
         v.push(("edr present".into(), crate::edr::present_source()));
+        // PERF-B: the mesh shader with each part alone and with every part but one, and the light preset's and the mirror's sets
+        use crate::classes::feat;
+        for (name, bit) in feat::NAMES {
+            v.push((format!("mesh shader {name} only"), crate::classes::mesh_shader_source(bit)));
+            v.push((format!("mesh shader without {name}"), crate::classes::mesh_shader_source(feat::ALL & !bit)));
+        }
+        let lite = crate::classes::mesh_features(&crate::Enhancements::lite());
+        v.push(("mesh shader (light preset)".into(), crate::classes::mesh_shader_source(lite)));
+        v.push(("mesh shader (light preset, mirror)".into(), crate::classes::mesh_shader_source(lite & !feat::NOT_IN_MIRROR)));
+        v.push(("mesh shader (light preset, plain items)".into(), crate::classes::mesh_shader_source(lite & !feat::PER_ITEM)));
+        v.push(("mesh shader (light preset, surfaces)".into(), crate::classes::mesh_shader_source(lite & !feat::EFFECT)));
+        v.push(("mesh shader (light preset, effects)".into(), crate::classes::mesh_shader_source(lite & !feat::SURFACE)));
+        v.push(("mesh shader (plain items)".into(), crate::classes::mesh_shader_source(feat::ALL & !feat::PER_ITEM)));
+        v.push(("mesh shader (mirror)".into(), crate::classes::mesh_shader_source(feat::ALL & !feat::NOT_IN_MIRROR)));
         v
     }
 

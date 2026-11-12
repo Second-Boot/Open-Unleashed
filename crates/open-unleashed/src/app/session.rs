@@ -47,6 +47,11 @@ impl App {
                     self.enh = set;
                 }
                 renderer.set_enhancements(self.enh);
+                // PERF (PERF-D): a scripted run's frames (a still, an autotest) wait for the pipeline sets their lights want; a live
+                // frame draws a stand-in with the same picture until they are built
+                if self.screenshot.is_some() || self.scripted {
+                    renderer.set_exact_pipelines(true);
+                }
                 // ENHANCEMENT ENH-UPSCALER: the options panel is generated from this set
                 nfs_game::enhanced::set_panel_state(self.enh);
                 (window, renderer)

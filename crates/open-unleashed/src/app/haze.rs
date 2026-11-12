@@ -41,8 +41,13 @@ impl App {
         let lum = 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
         let dark = (1.25 - 1.5 * lum).clamp(0.1, 1.0);
         let night = self.track.is_night();
-        let mut haze = Haze { fog, wet, cover, dark, ..Haze::default() };
+        let mut haze = Haze { fog, wet, cover, dark, day: !night, ..Haze::default() };
         let (beam, lamp) = haze.air(self.enh.level(nfs_renderer::E36));
+        // TEST GLUE: `NFS_HAZE_LOG=1` logs the air per frame (for stills)
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("NFS_HAZE_LOG").is_some()) {
+            eprintln!("haze tick {} fog {fog:.5} wet {wet:.3} cover {cover:.3} dark {dark:.3} night {night} -> beam {beam:.5} lamp {lamp:.5}", self.tick);
+        }
         if beam <= 1e-5 && lamp <= 1e-5 {
             return;
         }
@@ -51,7 +56,7 @@ impl App {
             let mut near: Vec<(f32, Vec3, [f32; 3], f32)> = self
                 .street_lamp_sites()
                 .iter()
-                .filter(|s| (s.tunnel && cover > 0.01) || night)
+                .filter(|s| (s.air && cover > 0.01) || night)
                 .filter(|s| s.pos.distance(eye) < LAMP_REACH && cone.is_none_or(|c| c.sees(s.pos, LAMP_RADIUS)))
                 .map(|s| (s.pos.distance(eye), s.pos, s.color, s.height))
                 .collect();
@@ -59,7 +64,7 @@ impl App {
             for (d, pos, color, height) in near.into_iter().take(HAZE_LAMPS) {
                 // the far ones fade out toward the reach; a tunnel lamp on a day track also with the covered value
                 let fade = 1.0 - ((d - 0.7 * LAMP_REACH) / (0.3 * LAMP_REACH)).clamp(0.0, 1.0);
-                let k = fade * fade * (3.0 - 2.0 * fade) * if night { 1.0 } else { cover };
+                let k = fade * fade * (3.0 - 2.0 * fade) * if night { 1.0 } else { cover * super::street_lamps::DAY_TUNNEL_GAIN };
                 haze.lamps[haze.n as usize] = HazeLamp { pos, color: color.map(|c| c * k), radius: (1.2 * height + 6.0).clamp(9.0, LAMP_RADIUS) };
                 haze.n += 1;
             }

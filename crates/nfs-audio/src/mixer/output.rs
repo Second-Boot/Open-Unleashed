@@ -206,6 +206,12 @@ impl AudioOutput {
         Err(last.expect("an attempt was made").into())
     }
 
+    /// Whether a sound device plays this mix. `false` for the offline mixer of a muted run (`NFS_MUTE`, a scripted
+    /// run) or a dump: its voices' positions do not advance with the wall clock, so nothing may wait on them.
+    pub fn has_device(&self) -> bool {
+        self._stream.is_some()
+    }
+
     /// TEST GLUE (`NFS_AUDIO_DUMP_TICKS=1`): one game tick of the offline mix, `rate / 64` frames at
     /// the mix rate appended to the dump — called once per `GameTick`; nothing otherwise.
     pub fn offline_game_tick(&self) {

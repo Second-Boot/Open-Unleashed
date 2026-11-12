@@ -4,18 +4,23 @@
 use super::*;
 
 /// ENHANCEMENT E7: set in a pipeline-set key for the float set (the key's low bits are the sample count).
-pub(super) const HDR_KEY: u32 = 1 << 8;
+pub(super) const HDR_KEY: u64 = 1 << 8;
 
 /// ENHANCEMENT ENH-TEMPORAL: the key bit of the temporal pipeline set (the main view's, with the vector and mask targets)
-const TEMPORAL_KEY: u32 = 1 << 9;
-/// The sets built from the full mesh shader (any switch on); key 1 etc. without it are the all-off shader's, which lacks the
-/// inert blocks of ENH-DBLSH / E26 (`classes::mesh_shader_source`)
-const FULL_KEY: u32 = 1 << 10;
+const TEMPORAL_KEY: u64 = 1 << 9;
+/// PERF (PERF-B): the mesh shader's parts (`classes::feat`) sit in a key from this bit up; key 1 etc. without any are the
+/// original's shader's (`classes::mesh_shader_source(0)`)
+const FEATS_SHIFT: u32 = 16;
 
 /// The mesh pipelines (54: blend group × cull × depth, see `Core::new`'s notes; with `samples > 1`
 /// six more, the alpha-to-coverage opaque group 9 — ENHANCEMENT E1; then the two layered groups, 12 — master's 9 / 10)
 /// for a target of `samples`.
 pub(super) fn build_mesh_pipelines(device: &wgpu::Device, shader: &wgpu::ShaderModule, pipeline_layout: &wgpu::PipelineLayout, format: wgpu::TextureFormat, samples: u32, temporal: bool) -> Vec<wgpu::RenderPipeline> {
+    build_mesh_pipelines_on(device, shader, pipeline_layout, format, samples, temporal, std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8))
+}
+
+/// [`build_mesh_pipelines`] on `workers` threads.
+fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, pipeline_layout: &wgpu::PipelineLayout, format: wgpu::TextureFormat, samples: u32, temporal: bool, workers: usize) -> Vec<wgpu::RenderPipeline> {
     // Thrash state 0x38's pairs (`dx7z.dll` 0x600046BB): 1 `SRCALPHA`/`ONE` (the general arm;
     // two device kinds take `ONE`/`ONE`), 2 `ZERO`/`INVSRCALPHA`, 3 `DESTCOLOR`/`ZERO`
     let pair_state = |pair: u8| {
@@ -143,7 +148,7 @@ pub(super) fn build_mesh_pipelines(device: &wgpu::Device, shader: &wgpu::ShaderM
             specs.push((true, 0, CULLS[i / 2], i % 2 == 0, zwrite, false, true));
         }
     }
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
+    let workers = workers.max(1);
     let pipelines: Vec<wgpu::RenderPipeline> = std::thread::scope(|sc| {
         let make_pipeline = &make_pipeline;
         let handles: Vec<_> = specs
@@ -155,26 +160,394 @@ pub(super) fn build_mesh_pipelines(device: &wgpu::Device, shader: &wgpu::ShaderM
     pipelines
 }
 
-impl Core {
-    /// ENHANCEMENT E1: make `pipelines` the set built for `samples` (built once, kept).
-    pub(super) fn ensure_pipelines(&mut self, samples: u32, hdr: bool, temporal: bool) {
-        let full = self.enhancements.any_on();
-        let key = samples | if full { FULL_KEY } else { 0 } | if hdr { HDR_KEY } else { 0 } | if temporal { TEMPORAL_KEY } else { 0 };
-        if self.pipeline_samples == key {
+
+/// PERF (PERF-D): how far from a family's current light state the prewarm reaches (the number of light groups — cascades, spots,
+/// lamps, contact — whose state differs): the states one light away. Every state (16 per family, four variants each) was
+/// measured on the Mac: ~100 sets, +230 MB resident and a minute and a half of four cores, for states a race mostly never
+/// meets; a farther state is built when met (its stand-in draws meanwhile), so this is only how often a stand-in draws.
+const PREWARM_DEPTH: u32 = 1;
+
+/// PERF (PERF-D): the light parts a frame can leave out (`shut` of `ensure_pipelines`), as the groups that go together.
+/// (ENHANCEMENT E50 / E51: the moon's part and the cars-only layers' part are groups of their own: by day the first is off, at night the second)
+const LIGHT_GROUPS: [u32; 6] = [
+    crate::classes::feat::CSM,
+    crate::classes::feat::SPOT,
+    crate::classes::feat::LAMPS | crate::classes::feat::LSHAD,
+    crate::classes::feat::CONTACT,
+    crate::classes::feat::MOON,
+    crate::classes::feat::CARSH,
+];
+
+/// PERF (PERF-D): a mesh pipeline set's build parameters (the key's low bits, the parts above them).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SetSpec {
+    feats: u32,
+    samples: u32,
+    hdr: bool,
+    temporal: bool,
+}
+
+impl SetSpec {
+    fn key(self) -> u64 {
+        u64::from(self.samples) | (u64::from(self.feats) << FEATS_SHIFT) | if self.hdr { HDR_KEY } else { 0 } | if self.temporal { TEMPORAL_KEY } else { 0 }
+    }
+}
+
+/// The low bits of a set's key (sample count, float, temporal): its family without the parts.
+const BASE_MASK: u64 = (1 << FEATS_SHIFT) - 1;
+
+/// PERF (PERF-D): the parts of item variant `v` of the parts `feats` (`fill::item_variant`: bit 0 the surface parts, bit 1 the
+/// effect parts).
+fn variant_feats(feats: u32, v: usize) -> u32 {
+    use crate::classes::feat;
+    feats & !(if v & 1 == 0 { feat::SURFACE } else { 0 }) & !(if v & 2 == 0 { feat::EFFECT } else { 0 })
+}
+
+/// PERF (PERF-D): the built set of the family of `want` with every part of `want`, none outside `fam` and the fewest others,
+/// among `keys` (`None`: there is none).
+fn superset_of(keys: impl Iterator<Item = u64>, want: SetSpec, fam: u32) -> Option<u64> {
+    let base = want.key() & BASE_MASK;
+    keys.filter(|&k| {
+        let f = (k >> FEATS_SHIFT) as u32;
+        k & BASE_MASK == base && f & want.feats == want.feats && f & !fam == 0
+    })
+    .min_by_key(|&k| ((k >> FEATS_SHIFT) as u32).count_ones())
+}
+
+/// PERF (PERF-D): one set for the builder thread.
+struct SetJob {
+    spec: SetSpec,
+    device: wgpu::Device,
+    module: Option<wgpu::ShaderModule>,
+    layout: wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    /// a frame wants it (built on more worker threads than a prewarmed one)
+    need: bool,
+}
+
+/// PERF (PERF-D): a set the builder thread made.
+pub(super) struct BuiltSet {
+    spec: SetSpec,
+    module: wgpu::ShaderModule,
+    set: Vec<wgpu::RenderPipeline>,
+    ms: f32,
+}
+
+#[derive(Default)]
+struct BuilderQueue {
+    jobs: std::collections::VecDeque<SetJob>,
+    closed: bool,
+}
+
+type Shared = std::sync::Arc<(std::sync::Mutex<BuilderQueue>, std::sync::Condvar)>;
+
+/// PERF (PERF-D): the mesh pipeline sets built off the frame. One thread takes the jobs in queue order (a set a frame wants goes
+/// to the front, a prewarmed one to the back) and builds each on a few worker threads (`create_render_pipeline` is thread-safe:
+/// `wgpu::Device` is `Send + Sync`); the sets come back over a channel and are taken in at the next frame.
+pub(super) struct SetBuilder {
+    shared: Shared,
+    tx: std::sync::mpsc::Sender<BuiltSet>,
+    rx: std::sync::mpsc::Receiver<BuiltSet>,
+    /// the keys queued or being built
+    queued: std::collections::HashSet<u64>,
+    /// false: the thread could not be started (every set is then built in the frame)
+    running: Option<bool>,
+}
+
+impl Default for SetBuilder {
+    fn default() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self { shared: Default::default(), tx, rx, queued: Default::default(), running: None }
+    }
+}
+
+impl Drop for SetBuilder {
+    fn drop(&mut self) {
+        // the thread ends after the set it is building (not joined: the device it holds stays alive until then)
+        if let Ok(mut q) = self.shared.0.lock() {
+            q.closed = true;
+            q.jobs.clear();
+        }
+        self.shared.1.notify_all();
+    }
+}
+
+fn builder_thread(shared: Shared, tx: std::sync::mpsc::Sender<BuiltSet>) {
+    // a wanted set on half the cores (at most four), a prewarmed one on a quarter: the frame keeps the rest
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let (need_workers, warm_workers) = ((cores / 2).clamp(1, 4), (cores / 4).clamp(1, 2));
+    loop {
+        let job = {
+            let (lock, cv) = &*shared;
+            let Ok(mut q) = lock.lock() else { return };
+            loop {
+                if q.closed {
+                    return;
+                }
+                if let Some(j) = q.jobs.pop_front() {
+                    break j;
+                }
+                match cv.wait(q) {
+                    Ok(g) => q = g,
+                    Err(_) => return,
+                }
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let s = job.spec;
+        let module = job.module.unwrap_or_else(|| crate::gfx::wgsl_module(&job.device, "mesh shader (parts)", &crate::classes::mesh_shader_source(s.feats)));
+        let set = build_mesh_pipelines_on(&job.device, &module, &job.layout, job.format, s.samples, s.temporal, if job.need { need_workers } else { warm_workers });
+        if tx.send(BuiltSet { spec: s, module, set, ms: t0.elapsed().as_secs_f32() * 1000.0 }).is_err() {
             return;
         }
-        if full && self.mesh_shader_full.is_none() {
-            self.mesh_shader_full = Some(crate::gfx::wgsl_module(&self.device, "mesh shader (full)", &crate::classes::mesh_shader_source(true)));
+    }
+}
+
+impl SetBuilder {
+    fn running(&mut self) -> bool {
+        *self.running.get_or_insert_with(|| {
+            let (shared, tx) = (self.shared.clone(), self.tx.clone());
+            match std::thread::Builder::new().name("pipeline sets".into()).spawn(move || builder_thread(shared, tx)) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "pipeline set thread not started: the sets are built in the frame");
+                    false
+                }
+            }
+        })
+    }
+
+    fn push(&mut self, job: SetJob, front: bool) {
+        self.queued.insert(job.spec.key());
+        let (lock, cv) = &*self.shared;
+        if let Ok(mut q) = lock.lock() {
+            if front {
+                q.jobs.push_front(job);
+            } else {
+                q.jobs.push_back(job);
+            }
         }
-        let shader = if full { self.mesh_shader_full.as_ref().expect("full mesh shader") } else { &self.mesh_shader };
-        let set = match self.pipeline_sets.remove(&key) {
-            Some(set) => set,
-            // ENHANCEMENT ENH-TEMPORAL: the float set again with the vector / mask targets and the object layout that has the matrices
-            None if temporal => build_mesh_pipelines(&self.device, shader, &self.temporal_gpu.as_ref().expect("temporal gpu").pipeline_layout, HDR_FORMAT, 1, true),
-            None => build_mesh_pipelines(&self.device, shader, &self.mesh_layout, if hdr { HDR_FORMAT } else { self.config.format }, samples, false),
-        };
-        let old = std::mem::replace(&mut self.pipelines, set);
-        self.pipeline_sets.insert(self.pipeline_samples, old);
-        self.pipeline_samples = key;
+        cv.notify_one();
+    }
+
+    /// Move a queued set to the front of the queue (nothing when it is being built already).
+    fn promote(&mut self, key: u64) {
+        let Ok(mut q) = self.shared.0.lock() else { return };
+        if let Some(i) = q.jobs.iter().position(|j| j.spec.key() == key)
+            && let Some(mut j) = q.jobs.remove(i)
+        {
+            j.need = true;
+            q.jobs.push_front(j);
+        }
+    }
+}
+
+impl Core {
+    /// ENHANCEMENT E1: make `pipelines` the set built for `samples` (built once, kept).
+    /// PERF (PERF-B): `shut` = the parts whose light this frame has none of (`classes::feat`; their uniforms are cleared), left out.
+    ///
+    /// PERF (PERF-D): a set not built yet does not hold the frame. The frame draws with a built set of the same family that has
+    /// every part of the wanted one and more (the fewest more), while the wanted set is built on the builder thread; the first
+    /// frame after it is done takes it. The picture is the wanted set's: the parts beyond it are ones this frame's uniforms
+    /// switch off — a shut light's uniform is zeroed (`csm.dir.w`, `spots.params.x`, `lamps.params.x`, `contacts.params.x` 0:
+    /// `csm_pass`, `spot_pass`, `lamp_pass`, `contact_pass`; LSHAD runs inside the lamps' loop only), a per-item part tests the
+    /// item's own uniform (`fill::item_variant` is those tests) — which is how the one uber shader drew every frame before
+    /// PERF-B. The family's whole set (every part its switches can run: the superset of all its sets) is the one set a frame
+    /// waits for, the first time the family (sample count, float / temporal target, the mirror's cut, the switches) is drawn:
+    /// built in the frame, or waited for when the race load's prewarm (`prewarm_pipelines`) has it queued.
+    pub(super) fn ensure_pipelines(&mut self, samples: u32, hdr: bool, temporal: bool, shut: u32) {
+        self.take_built_sets();
+        // PERF (PERF-B): the shader has only the parts the switches can run, less those the mirror's pass never runs (its own set)
+        let mut fam = crate::classes::mesh_features(&self.enhancements);
+        if self.no_reflections {
+            fam &= !crate::classes::feat::NOT_IN_MIRROR;
+        }
+        let spec = |feats: u32| SetSpec { feats, samples, hdr, temporal };
+        let full = spec(fam);
+        if !self.pipeline_sets.contains_key(&full.key()) {
+            self.wait_or_build(full);
+            self.prewarm_family(full, shut, PREWARM_DEPTH);
+        }
+        // PERF (PERF-B): the per-item parts (`classes::feat::SURFACE`: a reflection class; `classes::feat::EFFECT`: a particle /
+        // soft / HDR boost role) only in the sets of the items that can take them (`fill::item_variant`): variant `v` has the
+        // surface parts with bit 0, the effect parts with bit 1. A variant whose set is an earlier one's draws with that set.
+        let feats = fam & !shut;
+        let mut chosen = [0u64; 4];
+        for (v, c) in chosen.iter_mut().enumerate() {
+            let want = spec(variant_feats(feats, v));
+            if self.exact_sets && !self.pipeline_sets.contains_key(&want.key()) {
+                self.queue_set(want, true);
+                self.wait_or_build(want);
+            }
+            *c = if self.pipeline_sets.contains_key(&want.key()) {
+                want.key()
+            } else {
+                self.queue_set(want, true);
+                superset_of(self.pipeline_sets.keys().copied(), want, fam).unwrap_or(full.key())
+            };
+        }
+        if chosen == self.pipeline_cur {
+            return;
+        }
+        let mut var_set = [0u8; 4];
+        for v in 0..4 {
+            var_set[v] = (0..v).find(|&u| chosen[u] == chosen[v]).map_or(v as u8, |u| var_set[u]);
+        }
+        self.pipelines = self.pipeline_sets[&chosen[0]].clone();
+        for v in 1..4 {
+            self.pipeline_vars[v - 1] = if var_set[v] as usize == v { self.pipeline_sets[&chosen[v]].clone() } else { Vec::new() };
+        }
+        self.var_set = var_set;
+        self.pipeline_cur = chosen;
+    }
+
+    /// PERF (PERF-D): take in the sets the builder thread has finished.
+    fn take_built_sets(&mut self) {
+        while let Ok(b) = self.set_builder.rx.try_recv() {
+            self.keep_built(b);
+        }
+    }
+
+    fn keep_built(&mut self, b: BuiltSet) {
+        let key = b.spec.key();
+        self.set_builder.queued.remove(&key);
+        if b.spec.feats != 0 {
+            self.mesh_shaders.entry(b.spec.feats).or_insert(b.module);
+        }
+        tracing::info!(samples = b.spec.samples, hdr = b.spec.hdr, temporal = b.spec.temporal, parts = format_args!("{:#06x}", b.spec.feats), ms = b.ms, "mesh pipeline set built (builder thread)");
+        self.pipeline_sets.entry(key).or_insert(b.set);
+    }
+
+    /// PERF (PERF-D): the set `spec` now: waited for when it is queued (moved to the front), else built in the frame.
+    fn wait_or_build(&mut self, spec: SetSpec) {
+        let key = spec.key();
+        if self.pipeline_sets.contains_key(&key) {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        if self.set_builder.queued.contains(&key) {
+            self.set_builder.promote(key);
+            while !self.pipeline_sets.contains_key(&key) {
+                match self.set_builder.rx.recv() {
+                    Ok(b) => self.keep_built(b),
+                    Err(_) => break,
+                }
+            }
+            if self.pipeline_sets.contains_key(&key) {
+                tracing::info!(parts = format_args!("{:#06x}", spec.feats), ms = t0.elapsed().as_secs_f32() * 1000.0, "mesh pipeline set waited for");
+                return;
+            }
+        }
+        if spec.feats != 0 && !self.mesh_shaders.contains_key(&spec.feats) {
+            let module = crate::gfx::wgsl_module(&self.device, "mesh shader (parts)", &crate::classes::mesh_shader_source(spec.feats));
+            self.mesh_shaders.insert(spec.feats, module);
+        }
+        let shader = if spec.feats != 0 { &self.mesh_shaders[&spec.feats] } else { &self.mesh_shader };
+        let (layout, format) = self.set_target(spec);
+        let set = build_mesh_pipelines(&self.device, shader, &layout, format, spec.samples, spec.temporal);
+        tracing::info!(samples = spec.samples, hdr = spec.hdr, temporal = spec.temporal, parts = format_args!("{:#06x}", spec.feats), ms = t0.elapsed().as_secs_f32() * 1000.0, "mesh pipeline set built (in the frame)");
+        self.pipeline_sets.insert(key, set);
+    }
+
+    /// The layout and colour format of a set: the temporal set's object layout has the matrices and its vector / mask targets
+    /// (ENHANCEMENT ENH-TEMPORAL), the float set the scene's float format (ENHANCEMENT E7).
+    fn set_target(&self, spec: SetSpec) -> (wgpu::PipelineLayout, wgpu::TextureFormat) {
+        if spec.temporal {
+            (self.temporal_gpu.as_ref().expect("temporal gpu").pipeline_layout.clone(), HDR_FORMAT)
+        } else {
+            (self.mesh_layout.clone(), if spec.hdr { HDR_FORMAT } else { self.config.format })
+        }
+    }
+
+    /// PERF (PERF-D): queue the set `spec` on the builder thread unless it is built or queued (`need`: a frame wants it — to the
+    /// front of the queue; else a prewarm — to the back).
+    fn queue_set(&mut self, spec: SetSpec, need: bool) {
+        let key = spec.key();
+        if self.pipeline_sets.contains_key(&key) || (spec.temporal && self.temporal_gpu.is_none()) {
+            return;
+        }
+        if self.set_builder.queued.contains(&key) {
+            if need {
+                self.set_builder.promote(key);
+            }
+            return;
+        }
+        if !self.set_builder.running() {
+            // no thread: a wanted set is built now (the frame draws its stand-in until the next), a prewarm is dropped
+            if need {
+                self.wait_or_build(spec);
+            }
+            return;
+        }
+        let (layout, format) = self.set_target(spec);
+        let module = if spec.feats == 0 { Some(self.mesh_shader.clone()) } else { self.mesh_shaders.get(&spec.feats).cloned() };
+        self.set_builder.push(SetJob { spec, device: self.device.clone(), module, layout, format, need }, need);
+    }
+
+    /// PERF (PERF-D): queue (at the back) the sets of the family whose whole set is `full` for the light states at most `depth`
+    /// light groups away from `shut`, nearest first, each with its four item variants.
+    fn prewarm_family(&mut self, full: SetSpec, shut: u32, depth: u32) {
+        let groups: Vec<u32> = LIGHT_GROUPS.iter().copied().filter(|g| full.feats & g != 0).collect();
+        let now = groups.iter().enumerate().fold(0u32, |m, (i, g)| if shut & g != 0 { m | 1 << i } else { m });
+        let mut states: Vec<u32> = (0..1u32 << groups.len()).filter(|s| (s ^ now).count_ones() <= depth).collect();
+        states.sort_by_key(|s| (s ^ now).count_ones());
+        for s in states {
+            let off = groups.iter().enumerate().fold(0, |m, (i, g)| if s & 1 << i != 0 { m | g } else { m });
+            for v in 0..4 {
+                self.queue_set(SetSpec { feats: variant_feats(full.feats & !off, v), ..full }, false);
+            }
+        }
+    }
+
+    /// PERF (PERF-D): at a race's load, queue the whole sets of the families the race will draw — the main view, the rear-view
+    /// mirror and the environment faces, as their passes will pick them (`encode_with_gamma_inner`, `render_offscreen`,
+    /// `refl.rs`) — then the sets of their light states ([`Self::prewarm_family`], from a start in the open by day: every light
+    /// on but the street lamps), so the builder thread makes them while the track loads. A family guessed wrong costs only its
+    /// build: a frame still waits for what it needs.
+    pub(super) fn prewarm_pipelines(&mut self) {
+        let fam = crate::classes::mesh_features(&self.enhancements);
+        if fam == 0 {
+            return;
+        }
+        let hdr = self.enhancements.is_on(crate::E7) && self.hdr_ok;
+        let temporal = hdr && self.temporal_gpu.is_some() && (self.temporal.is_some() || self.temporal_flag || self.temporal_want().is_some());
+        let mirror_hdr = hdr && crate::tonemap_mode(self.enhancements.level(crate::E7)) != 0;
+        let mut fams = vec![
+            SetSpec { feats: fam, samples: if temporal { 1 } else { self.enh_samples(hdr) }, hdr, temporal },
+            SetSpec { feats: fam & !crate::classes::feat::NOT_IN_MIRROR, samples: self.enh_samples(mirror_hdr), hdr: mirror_hdr, temporal: false },
+        ];
+        if self.enhancements.is_on(crate::E8) {
+            fams.push(SetSpec { feats: fam, samples: 1, hdr, temporal: false });
+        }
+        for f in &fams {
+            self.queue_set(*f, false);
+        }
+        // (the main view meets the most light states; the others are prewarmed in their start state only)
+        // (ENHANCEMENT E50: and no moon)
+        let start = crate::classes::feat::LAMPS | crate::classes::feat::LSHAD | crate::classes::feat::MOON;
+        for (i, f) in fams.into_iter().enumerate() {
+            self.prewarm_family(f, start, if i == 0 { PREWARM_DEPTH } else { 0 });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classes::feat;
+
+    /// PERF-D: the stand-in has every wanted part, none outside the family, the fewest others; the family's whole set qualifies.
+    #[test]
+    fn the_stand_in_is_the_smallest_superset() {
+        let fam = feat::CSM | feat::SPOT | feat::COAT | feat::PFX;
+        let s = |feats| SetSpec { feats, samples: 4, hdr: true, temporal: false };
+        let other_family = SetSpec { feats: feat::COAT, samples: 1, hdr: true, temporal: false };
+        let keys = [s(fam).key(), s(feat::CSM | feat::COAT | feat::PFX).key(), s(feat::COAT | feat::FLASH).key(), other_family.key()];
+        assert_eq!(superset_of(keys.iter().copied(), s(feat::COAT), fam), Some(s(feat::CSM | feat::COAT | feat::PFX).key()));
+        assert_eq!(superset_of(keys.iter().copied(), s(feat::SPOT), fam), Some(s(fam).key()));
+        assert_eq!(superset_of(keys[2..].iter().copied(), s(feat::COAT), fam), None);
+        // variant 0 has no per-item part, variant 3 all of them
+        assert_eq!(variant_feats(fam, 0), feat::CSM | feat::SPOT);
+        assert_eq!(variant_feats(fam, 3), fam);
     }
 }

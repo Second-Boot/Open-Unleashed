@@ -133,6 +133,8 @@ impl Core {
                 // < 10000` unsigned)
                 FakeSortMode::PerItem => !item.fakesort_near,
             };
+            // PERF (PERF-B): an item that can take a per-item part draws with a set that has it (`ensure_pipelines`)
+            let var = (self.var_set[self.item_var.get(idx as usize).copied().unwrap_or(3) as usize & 3] as usize) << SET_SHIFT;
             let material = item.material.0 * 2;
             if mat.false_sort && mat.alpha_blend && !fakesort_single {
                 // two pipelines in turn on one item: never merged, and the run before it
@@ -140,14 +142,14 @@ impl Core {
                 if let Some(r) = run.take() {
                     self.draw_run(pass, st, &r);
                 }
-                let mut r = Run { first: idx, count: 1, pipeline: plain * 6 + sub, material, sky, mesh: self.shown_mesh(item.mesh.0) };
+                let mut r = Run { first: idx, count: 1, pipeline: (plain * 6 + sub) | var, material, sky, mesh: self.shown_mesh(item.mesh.0) };
                 self.draw_run(pass, st, &r);
-                r.pipeline = group * 6 + sub;
+                r.pipeline = (group * 6 + sub) | var;
                 self.draw_run(pass, st, &r);
                 continue;
             }
             let material = if mat.false_sort && mat.alpha_blend && mat.bind_group_point.is_some() { material | 1 } else { material };
-            let next = Run { first: idx, count: 1, pipeline: group * 6 + sub, material, sky, mesh: self.shown_mesh(item.mesh.0) };
+            let next = Run { first: idx, count: 1, pipeline: (group * 6 + sub) | var, material, sky, mesh: self.shown_mesh(item.mesh.0) };
             match &mut run {
                 Some(r) if r.first + r.count == idx && r.pipeline == next.pipeline && r.material == next.material && r.sky == next.sky && r.mesh == next.mesh => r.count += 1,
                 _ => {
@@ -166,7 +168,11 @@ impl Core {
     /// of `r.count` consecutive objects (`first_instance` = the first object's index).
     pub(super) fn draw_run(&self, pass: &mut wgpu::RenderPass<'_>, st: &mut DrawState, r: &Run) {
         if st.pipeline != r.pipeline {
-            pass.set_pipeline(&self.pipelines[r.pipeline]);
+            let set = match r.pipeline >> SET_SHIFT {
+                0 => &self.pipelines,
+                k => &self.pipeline_vars[k - 1],
+            };
+            pass.set_pipeline(&set[r.pipeline & ((1 << SET_SHIFT) - 1)]);
             st.pipeline = r.pipeline;
         }
         let m = &self.materials[(r.material >> 1) as usize];
@@ -349,6 +355,7 @@ impl Core {
             soft_split: f.soft_split,
             env: f.env,
             temporal: f.tcur.as_ref().map(|t| (t.jitter_ndc, t.size)),
+            near: f.near,
         });
         let size = wgpu::BufferSize::new(std::mem::size_of::<GlobalsUniform>() as u64).expect("globals size");
         self.belt.write_buffer(encoder, &self.globals_buf, 0, size).copy_from_slice(bytemuck::bytes_of(&globals));
@@ -358,6 +365,7 @@ impl Core {
     /// refilled); `roles`: the items' roles of a temporal pass (empty otherwise).
     fn write_objects(&mut self, encoder: &mut wgpu::CommandEncoder, f: &FrameIn, camera: &Camera, lights: &Lights, roles: &[f32], objects: &mut Vec<ObjectUniform>) {
         let n = f.n;
+        self.item_var.clear();
         if n == 0 {
             return;
         }
@@ -378,6 +386,7 @@ impl Core {
                 motion_index: &self.motion.index,
                 vp_j: glam::DMat4::from_cols_array(&f.vp_j.to_cols_array().map(f64::from)),
                 lod_shift: self.cur_lod_shift,
+                near_own: f.near.is_some_and(|n| n.own),
             };
             let (csm, spot, contact) = (|it: &crate::DrawItem| self.csm_receive(it), |it: &crate::DrawItem| self.spot_receive(it), |it: &crate::DrawItem| self.contact_receive(it));
             let rx = fill::Receivers { csm: &csm, spot: &spot, contact: &contact };
@@ -387,12 +396,15 @@ impl Core {
             }));
         }
         self.belt.write_buffer(encoder, &self.object_buf, 0, size).copy_from_slice(bytemuck::cast_slice(objects));
+        // PERF (PERF-B): which items draw with the set that has the per-item parts
+        self.item_var.extend(objects.iter().map(fill::item_variant));
     }
 
     /// Which passes over the finished scene this frame has (E13 shafts, E36 haze, E44 lighthouse beam) and so which images
     /// the main pass keeps for them (its depth, its samples), and whether the depth is kept to the end of the frame (E27 /
     /// the depth of field (photo mode, E31) / E40 / ENH-TEMPORAL). `overlay`: the frame has an overlay stage (the lens flare).
-    fn post_flags(&self, f: &FrameIn, camera: &Camera, overlay: bool) -> PostFlags {
+    /// `spot_lit`: E15 lights spots this frame (its uniform's count is above 0; without them `spot_pass` zeroes it).
+    fn post_flags(&self, f: &FrameIn, camera: &Camera, overlay: bool, spot_lit: bool) -> PostFlags {
         let (scene, with_sprites, depth_far, vp_j) = (f.scene, f.with_sprites, f.depth_far, f.vp_j);
         // ENHANCEMENT E13: light shafts of the main race view in the float image (E7 on, a sun point
         // in the scene): the depth is kept for the pass that reads it
@@ -405,7 +417,11 @@ impl Core {
         // air in the scene: the pass is not run on a clear dry open road); the depth is kept for it like for the shafts
         let haze = scene.haze.filter(|_| self.enhancements.is_on(crate::E36) && self.cur_hdr.is_some() && !with_sprites && depth_far == VIEW_FAR && !self.no_reflections).and_then(|h| {
             let (beam, lamp) = h.air(self.enhancements.level(crate::E36));
-            (beam > 1e-5 || lamp > 1e-5).then(|| {
+            // PERF (picture identical): the march adds light only from E15's lit spots (`n_spots = spots.params.x`, the beams' term
+            // is skipped without them) and from the tunnel lamps (`n_lamps = haze.n`, the glow's loop runs over them); with neither
+            // every half-size texel is (0, 0, 0, distance), the composite adds exactly 0 (One + One blend) and the pass is not
+            // run - nor the depth it would keep, its second depth conversion or the multisampled colour it would store
+            ((beam > 1e-5 || lamp > 1e-5) && ((beam > 0.0 && spot_lit) || (lamp > 0.0 && h.n > 0))).then(|| {
                 // ENHANCEMENT ENH-TEMPORAL: the haze rebuilds positions from the depth the jittered pass drew
                 let inv_vp = vp_j.inverse();
                 let fwd = (camera.target - camera.position).normalize_or_zero();
@@ -432,7 +448,7 @@ impl Core {
                 && self.cur_hdr.is_some()
                 && !with_sprites
                 && depth_far == VIEW_FAR);
-        PostFlags { shafts, haze, lbeam, post_depth, shafts_ms, keep_depth }
+        PostFlags { shafts, haze, lbeam, post_depth, shafts_ms, keep_depth, blended_depth: true }
     }
 
     /// One pass of the 3-D stages over the frame's targets (the lens reference, the main pass, the split pass's blended
@@ -494,10 +510,13 @@ impl Core {
         // blended stage of a split pass, E12 / E14); the blended foliage writes depth too, so the shafts (E13: the sky mask) and the haze
         // (E36) read ONE fresh conversion of the FULL depth into the same image (E12's particles and E14 are done with it), as the lighthouse
         // beam reads the full depth (ENH-LBEAM2). No second pass: both effects share it; nothing runs without them.
-        if soft_view.is_some() && (post.shafts.is_some() || post.haze.is_some()) {
+        // PERF (picture identical): when no item of the blended half writes depth (`post.blended_depth`), the depth after it is
+        // the opaque one, already in the image: no conversion
+        if soft_view.is_some() && post.blended_depth && (post.shafts.is_some() || post.haze.is_some()) {
             let mut soft = self.soft.take().unwrap_or_else(|| crate::soft::SoftDepth::new(&self.device));
             soft_view = Some(soft.convert(&self.device, encoder, tg.depth(), tg.ms.is_some(), tg.target.width(), tg.target.height()));
             self.soft = Some(soft);
+            crate::prof::mark(encoder, "depth conversion 2 (E13/E36)");
         }
         // ENHANCEMENT E13: the light shafts, added into the finished float scene (before the lens
         // flare's test and elements, the sprites and the tone map)
@@ -505,6 +524,7 @@ impl Core {
             let mut pass = self.shafts.take().unwrap_or_else(|| crate::shafts::ShaftsPass::new(&self.device, HDR_FORMAT));
             pass.draw(&self.queue, encoder, &sh, [camera.near, camera.far], &over_scene(tg, overlay, soft_view.as_ref()));
             self.shafts = Some(pass);
+            crate::prof::mark(encoder, "E13 shafts");
         }
         // ENHANCEMENT E44: the lighthouse beam, over the finished scene before the shafts / haze (they add to it) and the lens flare.
         // ENHANCEMENT ENH-LBEAM2: it reads the FULL depth (opaque + alpha-tested + the blended foliage's own depth writes, i.e. the
@@ -514,12 +534,14 @@ impl Core {
             let mut pass = self.lbeam.take().unwrap_or_else(|| crate::lbeam::LBeamPass::new(&self.device, HDR_FORMAT));
             pass.draw(&self.queue, encoder, &bf, &over_scene(tg, overlay, None));
             self.lbeam = Some(pass);
+            crate::prof::mark(encoder, "E44 lighthouse beam");
         }
         // ENHANCEMENT E36: the haze, after the shafts and before the lens flare, the sprites and the tone map
         if let Some(hf) = post.haze {
             let mut pass = self.haze.take().unwrap_or_else(|| crate::haze::HazePass::new(&self.device, HDR_FORMAT));
             pass.draw(&self.queue, encoder, &hf, &over_scene(tg, overlay, soft_view.as_ref()), &self.spot.uniform, self.spot.view());
             self.haze = Some(pass);
+            crate::prof::mark(encoder, "E36 haze");
         }
     }
 
@@ -537,7 +559,6 @@ impl Core {
             self.refl_prefilter();
         }
         let tcur = self.cur_temporal.clone();
-        self.ensure_pipelines(ms.map_or(1, |m| m.samples), self.cur_hdr.is_some(), tcur.is_some());
         // the items' stage and, for the temporal pass, their role (sky: the camera's rotation moves it; 1 a translucent effect)
         let mut scratch = std::mem::take(&mut self.frame_scratch);
         scratch.sky_flags.clear();
@@ -563,6 +584,14 @@ impl Core {
         let split = soft_split || ao_level > 0;
         self.seal_arena();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        // ENHANCEMENT E49: an environment face's near-cars pass first keeps the face without them (`refl.rs`)
+        if let (Some(layer), Some(c)) = (self.refl_pre_copy.take(), self.refl.as_ref()) {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &c.face, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &c.array, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: c.size, height: c.size, depth_or_array_layers: 1 },
+            );
+        }
         self.flush_texture_writes(&mut encoder);
         self.flush_mesh_writes(&mut encoder);
         // ENHANCEMENT ENH-TEMPORAL: the matrices into their buffer (the object pass's second binding)
@@ -580,6 +609,19 @@ impl Core {
             // ENHANCEMENT E43: this frame's contact shadows
             contact_on: self.contact_on(scene),
         };
+        // PERF (PERF-B): the parts whose light is off this frame (their uniform is cleared: the code would run for nothing)
+        let shut = {
+            use crate::classes::feat;
+            (if lights.csm.is_none() { feat::CSM } else { 0 }) | (if lights.spot.is_none() { feat::SPOT } else { 0 }) | (if lights.lamps_on { 0 } else { feat::LAMPS | feat::LSHAD }) | (if lights.contact_on { 0 } else { feat::CONTACT })
+                // ENHANCEMENT E50 / E51: the moon's part only in a moon frame, the cars-only layers' only in a frame that has them
+                | (if lights.csm.as_ref().is_some_and(|c| c.is_moon()) { 0 } else { feat::MOON })
+                | (if lights.csm.as_ref().is_some_and(|c| c.has_car_layers()) { 0 } else { feat::CARSH })
+        };
+        // PERF (PERF-D): a frame without a 3-D item (a loading screen, a 2-D front-end screen) draws no mesh: it needs no set (its
+        // family, the 8-bit one of a sprite-only scene, was built in such a frame for nothing)
+        if n > 0 {
+            self.ensure_pipelines(ms.map_or(1, |m| m.samples), self.cur_hdr.is_some(), tcur.is_some(), shut);
+        }
         let vp = camera.view_projection_mirrored(aspect, scene.mirror);
         // ENHANCEMENT ENH-TEMPORAL: the main view's clip transform carries the sub-pixel jitter (`vp` stays the un-jittered one:
         // the vectors, the shadow fits, the lens flare's position); the passes that rebuild a position from the depth
@@ -589,18 +631,25 @@ impl Core {
         // ENHANCEMENT E17 / E26 / E18 / E11: the water's sky / sun and the wet road's sky and lamps (only with their switch on), the
         // particles' HDR / sun lighting and the HDR boost (on the float scene only)
         let env = fill::FrameEnv::new(scene, &self.enhancements, self.cur_hdr);
-        let f = FrameIn { scene, with_sprites, depth_far, n, tcur, vp_j, soft_split, env };
+        let near = self.near_frame(scene);
+        let f = FrameIn { scene, with_sprites, depth_far, n, tcur, vp_j, soft_split, env, near };
         self.write_globals(&mut encoder, &f, camera);
         self.write_objects(&mut encoder, &f, camera, &lights, &scratch.roles, &mut scratch.objects);
+        // TEST GLUE (`--perf-bench`): the stage marks of the frame (nothing is recorded without the bench)
+        crate::prof::mark(&mut encoder, "uploads");
 
         // ENHANCEMENT E9: the shadow cascades, before the passes that read them
         self.csm_pass(&mut encoder, scene, n, camera, lights.csm.as_ref());
+        crate::prof::mark(&mut encoder, "E9 sun shadow");
         // ENHANCEMENT E15: the player's lamp pair's shadow map
         self.spot_pass(&mut encoder, scene, n, lights.spot.as_ref());
+        crate::prof::mark(&mut encoder, "E15 lamp-pair shadow");
         // ENHANCEMENT E23 / E47: the street lamps and their car shadow maps
         self.lamp_pass(&mut encoder, scene, n, camera);
+        crate::prof::mark(&mut encoder, "E23/E47 street lamps");
         // ENHANCEMENT E43: the cars' contact shadow (SHADOW-REAL: its share against E9's sun shadow is split per pixel in the shader)
         self.contact_pass(&mut encoder, scene);
+        crate::prof::mark(&mut encoder, "E43 contact shadow");
 
         let n_sprites = self.upload_sprites(&mut encoder, scene, with_sprites, aspect, &mut scratch.sprites);
 
@@ -608,7 +657,7 @@ impl Core {
         let clear = wgpu::Color { r: c[0], g: c[1], b: c[2], a: c[3] };
         let probe = scene.lens_probe.filter(|_| can_copy);
         let overlay = !buckets[3].is_empty();
-        let post = self.post_flags(&f, camera, overlay);
+        let post = self.post_flags(&f, camera, overlay, lights.spot.is_some());
         let (post_depth, shafts_ms, keep_depth) = (post.post_depth, post.shafts_ms, post.keep_depth);
         let tg = FrameTargets { view, target, depth_view, ms };
         let tcur = f.tcur.as_ref();
@@ -621,6 +670,7 @@ impl Core {
             // ENHANCEMENT E1: multisampled, resolved into `view` (the probe reads the resolved image)
             self.stage_pass(&mut encoder, scene, &tg, tcur, &object_bg, StagePass { label: "lens reference pass", prof: "lens reference", clear: Some(clear), resolve: true, keep_samples: false, store_extra: false, store_depth: false, globals: &self.globals_bg, buckets: &buckets[..1] });
             self.lens_copy(&mut encoder, target, p, true);
+            crate::prof::mark(&mut encoder, "lens reference");
         }
         // ENHANCEMENT E1: multisampled, resolved into `view`; the samples are kept only
         // for the overlay pass that draws over them
@@ -634,21 +684,25 @@ impl Core {
             StagePass {
                 label: "main pass",
                 prof: "main pass",
-                clear: Some(clear),
+                // ENHANCEMENT E49: the near cars of an environment face are drawn over the face (its colour and depth loaded)
+                clear: if self.refl_near_pass == Some(NearPass::Over) { None } else { Some(clear) },
                 resolve: !split && !shafts_ms,
                 keep_samples: overlay || split || shafts_ms,
                 store_extra: true,
-                store_depth: overlay || split || post_depth || keep_depth,
+                // ENHANCEMENT E49: ... and the face keeps its depth for them (and, NEAR-REFL2, both keep it for the geometry mask)
+                store_depth: overlay || split || post_depth || keep_depth || self.refl_near_pass.is_some(),
                 globals: &self.globals_bg,
                 buckets: &buckets[..if split { 2 } else { 3 }],
             },
         );
+        crate::prof::mark(&mut encoder, "main pass");
         // ENHANCEMENT E12: the opaque part's depth into a readable image, then the blended stage in a
         // second pass over the same colour and depth (loaded), the soft sprites reading that image;
         // the draw order, blend states and depth tests of the stage are the original's
         let mut soft_view = None;
         if split {
             let sv = self.soft_and_ao(&mut encoder, &tg, camera, aspect, ao_level);
+            crate::prof::mark(&mut encoder, "E12/E14 soft depth + AO");
             soft_view = Some(sv.clone());
             let soft_bg = if soft_split { self.make_globals_bg(Some(&sv)) } else { self.make_globals_bg(None) };
             self.stage_pass(
@@ -664,29 +718,38 @@ impl Core {
                     resolve: !shafts_ms,
                     keep_samples: overlay || shafts_ms,
                     store_extra: true,
-                    store_depth: overlay || post_depth || keep_depth,
+                    store_depth: overlay || post_depth || keep_depth || self.refl_near_pass.is_some(),
                     globals: &soft_bg,
                     buckets: &buckets[2..3],
                 },
             );
+            crate::prof::mark(&mut encoder, "main pass blended (split)");
         }
+        // the split pass's blended half writes depth: one of its items has a blended material with depth writes (`device_states`,
+        // the only blended pipelines that write it, `pipelines.rs`)
+        let post = PostFlags { blended_depth: split && buckets[2].iter().any(|&i| self.materials[scene.items[i as usize].material.0 as usize].device_states), ..post };
         self.scene_depth_passes(&mut encoder, post, &tg, camera, overlay, soft_view);
         // The lens flare's test (0x460525): the block of the finished 3-D pass, before the flare's
         // own elements are laid over it
         if let Some(p) = probe.filter(|p| p.test) {
             self.lens_copy(&mut encoder, target, p, false);
+            crate::prof::mark(&mut encoder, "lens test");
         }
         // the lens flare's elements (0x460460 → 0x451710): flat on the screen over the finished
         // frame, under no depth test
         if overlay {
             self.stage_pass(&mut encoder, scene, &tg, tcur, &object_bg, StagePass { label: "overlay pass", prof: "overlay", clear: None, resolve: true, keep_samples: false, store_extra: true, store_depth: keep_depth, globals: &self.globals_bg, buckets: &buckets[3..] });
+            crate::prof::mark(&mut encoder, "overlay");
         }
         self.sprite_pass(&mut encoder, scene, n_sprites, view, depth_view);
+        if n_sprites > 0 {
+            crate::prof::mark(&mut encoder, "sprites");
+        }
         self.buckets = buckets;
         self.frame_scratch = scratch;
         self.belt.finish();
         crate::prof::resolve(&mut encoder);
-        self.last_submit = Some(self.queue.submit(Some(encoder.finish())));
+        self.last_submit = Some(crate::prof::submit(&self.device, &self.queue, Some(crate::prof::finish(encoder))));
         self.belt.recall();
         self.lens_map_staged();
     }
@@ -728,6 +791,8 @@ struct FrameIn<'a> {
     /// ENHANCEMENT E12: the main pass is split for the soft sprites
     soft_split: bool,
     env: fill::FrameEnv<'a>,
+    /// ENHANCEMENT E49: the near lookup of this frame (`None` = off)
+    near: Option<fill::NearFrame>,
 }
 
 /// ENHANCEMENTS E9 / E15 / E23 / E43: this frame's sun-shadow cascades, headlight spots, street lamps and contact shadows.
@@ -749,6 +814,8 @@ struct PostFlags {
     shafts_ms: bool,
     /// the depth is kept to the end of the frame (E27 / the depth of field (photo mode, E31) / E40 / ENH-TEMPORAL)
     keep_depth: bool,
+    /// a split pass's blended half writes depth (set after the split; `true` until then)
+    blended_depth: bool,
 }
 
 /// One pass of [`Core::stage_pass`].
@@ -769,11 +836,13 @@ struct StagePass<'a> {
 }
 
 /// ENHANCEMENT ENH-TEMPORAL: the vector / mask targets every pass of a temporal main view also attaches (none in master's frame).
+/// PERF (picture identical): a mask nobody reads this frame (`Cur::tc_read`) is cleared and discarded in every pass: it never
+/// leaves tile memory.
 fn temporal_attachments(tcur: Option<&crate::temporal::Cur>, clear: bool, store: bool) -> Vec<Option<wgpu::RenderPassColorAttachment<'_>>> {
     tcur.map_or(Vec::new(), |t| {
-        [&t.mv, &t.reactive, &t.tc]
+        [(&t.mv, true), (&t.reactive, true), (&t.tc, t.tc_read)]
             .into_iter()
-            .map(|v| Some(wgpu::RenderPassColorAttachment { view: v, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: if clear { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: if store { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } } }))
+            .map(|(v, read)| Some(wgpu::RenderPassColorAttachment { view: v, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: if clear || !read { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: if store && read { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } } }))
             .collect()
     })
 }

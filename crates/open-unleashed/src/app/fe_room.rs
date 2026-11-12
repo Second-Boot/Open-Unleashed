@@ -803,7 +803,10 @@ impl App {
         // ENHANCEMENT ENH-FE3D: the room scene's and the car views' share of the enhanced game (`fe_enh.rs`)
         let room_car = self.fe.cars.iter().any(|c| c.0 == usize::MAX);
         let car_at = if dealer_drawn { self.fe.enh_car_pos } else { room_car.then_some(pos) };
-        let fx = self.fe_enh_prepare(car_at, self.scene.ambient, self.scene.sun_direction);
+        // the key light turns with the room's own models where they turn with the car (the garage, the factory, the
+        // victory room); the dealership's sections and the track room stand still
+        let room_turn = if dealer_drawn || self.fe.room.is_empty() { Quat::IDENTITY } else { room_m.to_scale_rotation_translation().1 };
+        let fx = self.fe_enh_prepare(car_at, room_turn, self.scene.ambient, self.scene.sun_direction);
         self.scene.ao = fx.ao;
         self.scene.sun_shadow = fx.shadow;
         if views.is_empty() {

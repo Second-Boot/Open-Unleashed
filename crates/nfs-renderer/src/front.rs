@@ -45,6 +45,10 @@ pub(crate) enum Cmd {
     TemporalCut,
     /// the enhanced game's switches ([`crate::Enhancements`])
     Enhancements(crate::Enhancements),
+    /// PERF (PERF-D): queue the race's pipeline sets on the builder thread
+    PrewarmPipelines,
+    /// PERF (PERF-D): the frames wait for the exact pipeline sets (a still) instead of drawing a stand-in
+    ExactPipelines(bool),
     /// ENHANCEMENT ENH-LIVETEX: a texture's HD twin (E41), a mesh's refined twin (E42), a replaced twin's memory back
     TextureTwin(TextureId, Option<TextureId>),
     MeshTwin(MeshId, Option<MeshId>),
@@ -72,6 +76,9 @@ pub(crate) struct ReflFaceJob {
     pub size: u32,
     pub clear: [f64; 4],
     pub depth_far: f32,
+    /// ENHANCEMENT E49: the face of the twelve-layer cube, with the near cars' scene drawn over it for the player's layer (`Some`);
+    /// `None` = E8's face as it was
+    pub near: Option<Scene>,
 }
 
 pub(crate) struct OffscreenJob {
@@ -661,6 +668,20 @@ impl Renderer {
     /// command list — so with the render thread (D5) they take effect in call order, at the start
     /// of the next frame handed over; only a change is recorded. The core starts with
     /// [`crate::Enhancements::ORIGINAL`].
+    /// PERF (PERF-D): a race is loading: the mesh pipeline sets its views will draw with (the main view, the rear-view mirror,
+    /// the environment faces, for the switches set now and the light states a race meets) are built on a thread of their own
+    /// meanwhile, so the race does not stop to build one. Nothing drawn changes.
+    pub fn prewarm_pipelines(&mut self) {
+        self.rec(Cmd::PrewarmPipelines);
+    }
+
+    /// PERF (PERF-D): with `on`, a frame whose pipeline set is not built yet waits for it instead of drawing with a stand-in
+    /// (a still, which is one frame: its pixels are then those of the set its lights want, as a live frame's are from the
+    /// next frame on).
+    pub fn set_exact_pipelines(&mut self, on: bool) {
+        self.rec(Cmd::ExactPipelines(on));
+    }
+
     pub fn set_enhancements(&mut self, e: crate::Enhancements) {
         if self.enhancements != e {
             self.enhancements = e;
@@ -708,7 +729,16 @@ impl Renderer {
     /// like an offscreen pass; the main view uses the map once all six faces have been drawn and
     /// `Scene::refl` is set.
     pub fn render_refl_face(&mut self, scene: &Scene, camera: &Camera, face: u32, size: u32, clear: [f64; 4], depth_far: f32) {
-        self.rec(Cmd::ReflFace(Box::new(ReflFaceJob { scene: scene.clone_without_sprites(), camera: *camera, face, size, clear, depth_far })));
+        self.rec(Cmd::ReflFace(Box::new(ReflFaceJob { scene: scene.clone_without_sprites(), camera: *camera, face, size, clear, depth_far, near: None })));
+        self.list.barrier = self.list.cmds.len();
+    }
+
+    /// ENHANCEMENT E49: [`Self::render_refl_face`] into the twelve-layer cube: `scene` (the surroundings) into layer `face` (every
+    /// car's coat), then `cars` (the near cars) drawn over the same colour and depth into layer `6 + face` (the player's own coat).
+    /// The face's eye is kept for the parallax-corrected lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_refl_face_near(&mut self, scene: &Scene, cars: &Scene, camera: &Camera, face: u32, size: u32, clear: [f64; 4], depth_far: f32) {
+        self.rec(Cmd::ReflFace(Box::new(ReflFaceJob { scene: scene.clone_without_sprites(), camera: *camera, face, size, clear, depth_far, near: Some(cars.clone_without_sprites()) })));
         self.list.barrier = self.list.cmds.len();
     }
 
@@ -734,6 +764,42 @@ impl Renderer {
         self.home().render_still(scene, camera, width, height)
     }
 
+    /// TEST GLUE (`--perf-bench`): see `Core::bench_begin` (`false` on a headless renderer).
+    pub fn bench_begin(&mut self) -> bool {
+        !self.headless && self.home().bench_begin()
+    }
+
+    /// TEST GLUE (`--perf-bench`): see `Core::bench_end`.
+    pub fn bench_end(&mut self) {
+        self.home().bench_end();
+    }
+
+    /// TEST GLUE (`--perf-bench`): see `Core::bench_frame_start`.
+    pub fn bench_frame_start(&mut self) -> std::time::Instant {
+        self.home().bench_frame_start()
+    }
+
+    /// TEST GLUE (`--perf-bench`): see `Core::bench_frame`.
+    pub fn bench_frame(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) {
+        if !self.headless {
+            self.home().bench_frame(scene, camera, width, height);
+        }
+    }
+
+    /// TEST GLUE (`--perf-bench`): see `Core::bench_frame_pipelined`.
+    pub fn bench_frame_pipelined(&mut self, inflight: &mut std::collections::VecDeque<wgpu::SubmissionIndex>, depth: usize) {
+        self.home().bench_frame_pipelined(inflight, depth);
+    }
+
+    /// TEST GLUE (`--perf-bench`): see `Core::bench_wait_idle`.
+    pub fn bench_wait_idle(&mut self) {
+        self.home().bench_wait_idle();
+    }
+
+    /// TEST GLUE (`--perf-bench`): see `Core::bench_frame_finish`.
+    pub fn bench_frame_finish(&mut self, t0: std::time::Instant) -> crate::BenchSample {
+        self.home().bench_frame_finish(t0)
+    }
 }
 
 impl Drop for Renderer {

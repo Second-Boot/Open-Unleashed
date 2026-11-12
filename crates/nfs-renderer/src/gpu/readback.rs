@@ -167,7 +167,7 @@ impl Core {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mirror tone map") });
             blit.draw(&mut encoder, &view, None, None, None);
             crate::prof::resolve(&mut encoder);
-        self.queue.submit(Some(encoder.finish()));
+        crate::prof::submit(&self.device, &self.queue, Some(crate::prof::finish(encoder)));
             self.scale_blit_mirror = Some(blit);
             crate::prof::ctx("");
             return id;
@@ -196,6 +196,64 @@ impl Core {
         // the read-back above waited for the device, so the frame's lens blocks are mapped
         self.collect_lens();
         px
+    }
+
+    /// TEST GLUE (`--perf-bench`): start the bench — the stage marks on (`false`: the device has no timestamp queries,
+    /// only the CPU is timed).
+    pub fn bench_begin(&mut self) -> bool {
+        crate::prof::marks_begin(&self.device, &self.queue)
+    }
+
+    /// TEST GLUE (`--perf-bench`): the bench is over (the marks off, its target dropped).
+    pub fn bench_end(&mut self) {
+        crate::prof::marks_end();
+        self.bench_target = None;
+    }
+
+    /// TEST GLUE (`--perf-bench`): a bench frame's start (before the mirror and the environment faces of the frame).
+    pub fn bench_frame_start(&mut self) -> std::time::Instant {
+        crate::prof::bench_frame_begin()
+    }
+
+    /// TEST GLUE (`--perf-bench`): the main view of a bench frame, drawn as [`Self::render_to_image`] draws it (one
+    /// `encode_with_gamma` into a `width x height` image of the surface's format) but into a target kept between frames
+    /// and with no read-back.
+    pub fn bench_frame(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) {
+        if !self.bench_target.as_ref().is_some_and(|t| t.0 == width && t.1 == height) {
+            let target = gfx::texture_2d(&self.device, "bench target", width, height, self.config.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+            let view = target.create_view(&Default::default());
+            self.bench_target = Some((width, height, target, view));
+        }
+        let (_, _, target, view) = self.bench_target.clone().expect("bench target");
+        let depth = self.depth_for(width, height);
+        self.encode_with_gamma(scene, camera, &view, &target, true, &depth, width, height, width as f32 / height as f32);
+    }
+
+    /// TEST GLUE (`--perf-bench`): the throughput phase's frame end: no wait for this frame, only for the one `depth` frames
+    /// back (`inflight` holds the frames' last submits), as a swap chain of `depth` images lets the CPU run ahead.
+    pub fn bench_frame_pipelined(&mut self, inflight: &mut std::collections::VecDeque<wgpu::SubmissionIndex>, depth: usize) {
+        if let Some(s) = self.last_submit.clone() {
+            inflight.push_back(s);
+        }
+        while inflight.len() > depth {
+            let s = inflight.pop_front().expect("in flight");
+            let _ = self.device.poll(wgpu::PollType::Wait { submission_index: Some(s), timeout: None });
+            self.collect_lens();
+        }
+    }
+
+    /// TEST GLUE (`--perf-bench`): wait for every frame of the throughput phase.
+    pub fn bench_wait_idle(&mut self) {
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.collect_lens();
+    }
+
+    /// TEST GLUE (`--perf-bench`): a bench frame's end — the CPU time, the wait for the device, the GPU stages read back.
+    pub fn bench_frame_finish(&mut self, t0: std::time::Instant) -> crate::prof::BenchSample {
+        let s = crate::prof::bench_frame_end(&self.device, &self.queue, t0);
+        // the device was waited for, so the frame's lens blocks are mapped (as after `render_to_image`'s read-back)
+        self.collect_lens();
+        s
     }
 
     /// PORT-DEVIATION D46 (photo mode): a still of the scene at `width x height` — the window's size times 1, 2 or 4 —

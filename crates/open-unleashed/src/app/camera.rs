@@ -203,6 +203,7 @@ impl App {
         self.audio_cam = None;
         self.cam_hist.clear();
         self.flip_side = None;
+        self.slope_wrong = None;
         self.slot_eye = None;
         // the pass's SetSlotView zeroes the wander too (0x4657A0…0x4657F3)
         self.replay_wander = Default::default();
@@ -230,6 +231,7 @@ pub(crate) struct CamSlotState {
     pub(crate) camera_tick: u64,
     pub(crate) cam_hist: std::collections::VecDeque<CamTick>,
     pub(crate) flip_side: Option<bool>,
+    pub(crate) slope_wrong: Option<bool>,
     pub(crate) slot_eye: Option<Vec3>,
     pub(crate) replay_wander: (nfs_game::camera::ReplayWander, (u16, u16, u32)),
     pub(crate) circle: (nfs_game::camera::CircleCam, u16, u32),
@@ -375,6 +377,56 @@ pub(crate) fn look_target(left: bool, right: bool, back: bool, forward: bool) ->
         t /= 2;
     }
     t
+}
+
+/// ENHANCEMENT E48: how far the car's heading must turn from the slice's perpendicular (`|forward · slice forward|`, the
+/// cosine of the angle to the slice's axis) before the slope lift's side follows a flip of the wrong-way flag. 0.5 = the
+/// heading 30° off the perpendicular (60° from the slice's axis either way). APPROXIMATION (not the original's: tuned on
+/// the CAM-JIT2 replay, where the stuck car rocks within a few degrees of the perpendicular, and wide enough that a car
+/// driven along the road — `|cos|` near 1 — and every real U-turn pass it).
+pub(crate) const STEADY_SLOPE_COS: f32 = 0.5;
+
+/// ENHANCEMENT E48: the wrong-way bit the chase / heli slope lift samples by (the step's sign, 0x461EE2…0x461EFC), given
+/// the bit the original reads (`car+0xD30 > 0`), the side the lift used last (`held`, `None` = no lift run yet in this
+/// slot) and the car's forward row · its slice's forward (`along`, what 0x4A7660 sets the counter by). A flip of the bit
+/// is taken only once the heading clearly points along or against the slice (`|along| >= STEADY_SLOPE_COS`); in the
+/// band round the perpendicular the last side is kept — so a car rocking across a slope no longer swings the eye by the
+/// lift's whole clamp range (race-logic §11.2, "Consequence (CAM-JIT2)"). Idempotent for one tick's inputs (a frame
+/// between two ticks re-runs it with the same ones). With E48 off the caller passes the bit through unchanged.
+pub(crate) fn steady_slope_wrong(held: Option<bool>, wrong: bool, along: f32) -> bool {
+    match held {
+        Some(h) if h != wrong && along.abs() < STEADY_SLOPE_COS => h,
+        _ => wrong,
+    }
+}
+
+/// ENHANCEMENT E48: the steady slope side.
+#[cfg(test)]
+mod steady_slope_tests {
+    use super::{STEADY_SLOPE_COS, steady_slope_wrong};
+
+    #[test]
+    fn a_flip_near_the_perpendicular_keeps_the_side() {
+        // the first run takes the original's bit
+        assert!(steady_slope_wrong(None, true, 0.0));
+        assert!(!steady_slope_wrong(None, false, 0.0));
+        // a car across the road rocking a few degrees either side of the perpendicular: the side holds
+        assert!(!steady_slope_wrong(Some(false), true, -0.05));
+        assert!(steady_slope_wrong(Some(true), false, 0.05));
+        // the bit agreeing with the side: unchanged
+        assert!(steady_slope_wrong(Some(true), true, 0.0));
+        assert!(!steady_slope_wrong(Some(false), false, 0.9));
+    }
+
+    #[test]
+    fn a_clear_turn_follows_the_original() {
+        // heading clearly against / along the slice: the flip is taken, as the original takes it
+        assert!(steady_slope_wrong(Some(false), true, -STEADY_SLOPE_COS));
+        assert!(steady_slope_wrong(Some(false), true, -1.0));
+        assert!(!steady_slope_wrong(Some(true), false, STEADY_SLOPE_COS));
+        // a counter held over a jump (airborne, 0x4A76E5) while the car already faces along: still the original's bit
+        assert!(steady_slope_wrong(Some(false), true, 0.95));
+    }
 }
 
 #[cfg(test)]

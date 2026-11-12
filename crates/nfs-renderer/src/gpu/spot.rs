@@ -130,7 +130,7 @@ impl Core {
             let d = l.dir.normalize_or_zero();
             u.dir[i] = [d.x, d.y, d.z, 0.0];
         }
-        u.params = [s.n as f32, CONE_OUTER_DEG.to_radians().cos(), CONE_INNER_DEG.to_radians().cos(), RANGE];
+        u.params = [(s.n as usize).min(crate::MAX_SPOTS) as f32, CONE_OUTER_DEG.to_radians().cos(), CONE_INNER_DEG.to_radians().cos(), RANGE];
         let far = RANGE + 10.0;
         let mut shadow = None;
         if level >= 2 && s.shadowed > 0 {

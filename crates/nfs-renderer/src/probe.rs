@@ -32,6 +32,10 @@ pub(crate) struct Probe {
     reset: bool,
     /// a projection has been recorded
     done: bool,
+    /// PERF: what `params` holds (written only when it changes: the reset flag, the face size)
+    params_now: Option<[f32; 4]>,
+    /// PERF: the bind group, kept while the face array's view is the same
+    bg: crate::gfx::Keyed<wgpu::TextureView, wgpu::BindGroup>,
 }
 
 impl Probe {
@@ -65,6 +69,8 @@ impl Probe {
             uniform: make("probe sh", 9 * 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             reset: true,
             done: false,
+            params_now: None,
+            bg: Default::default(),
         }
     }
 
@@ -81,22 +87,32 @@ impl Probe {
     /// Record one update: project the six faces (`faces`, `size`², `tan_inv` = 1 / tan(half fov)) and
     /// blend into the state, then copy the state into the uniform. The faces must all have been drawn.
     pub(crate) fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, faces: &wgpu::TextureView, size: u32, tan_inv: f32) {
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { p: [size as f32, tan_inv, BLEND, self.reset as u32 as f32] }));
+        // PERF (picture identical): the 16 bytes are written only when they change (a queue write is carried out before the
+        // submit's command buffers and stays in the buffer, so an unchanged one wrote the same bytes again, through a staging
+        // allocation of its own each face): the reset flag's update, then its clear, are writes of their own
+        let p = [size as f32, tan_inv, BLEND, self.reset as u32 as f32];
+        if self.params_now != Some(p) {
+            queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { p }));
+            self.params_now = Some(p);
+        }
         self.reset = false;
         self.done = true;
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("probe"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(faces) },
-                wgpu::BindGroupEntry { binding: 1, resource: self.partial.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.state.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.params.as_entire_binding() },
-            ],
+        let (layout, partial, state, params) = (&self.layout, &self.partial, &self.state, &self.params);
+        let bg = self.bg.get(faces.clone(), || {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("probe"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(faces) },
+                    wgpu::BindGroupEntry { binding: 1, resource: partial.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: state.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
+                ],
+            })
         });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("probe"), timestamp_writes: crate::prof::cp("E16 probe SH compute") });
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.set_pipeline(&self.pipe_partial);
             pass.dispatch_workgroups(6, 1, 1);
             pass.set_pipeline(&self.pipe_final);

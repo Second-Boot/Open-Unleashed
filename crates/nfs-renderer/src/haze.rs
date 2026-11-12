@@ -43,19 +43,30 @@ pub struct Haze {
     pub cover: f32,
     /// 0..1: how dark the sky is (1 night, near 0 a bright day): a headlight cone is not seen against daylight
     pub dark: f32,
+    /// a day track (`TrackAssets::is_night` false): the covered stretch's beams are scaled by [`DAY_TUNNEL_AIR`]
+    pub day: bool,
     pub n: u8,
     pub lamps: [HazeLamp; HAZE_LAMPS],
 }
 
 impl Default for Haze {
     fn default() -> Self {
-        Self { fog: 0.0, wet: 0.0, cover: 0.0, dark: 1.0, n: 0, lamps: [HazeLamp::default(); HAZE_LAMPS] }
+        Self { fog: 0.0, wet: 0.0, cover: 0.0, dark: 1.0, day: false, n: 0, lamps: [HazeLamp::default(); HAZE_LAMPS] }
     }
 }
 
 /// The beams' and the lamps' glow's overall gain (before the level's strength).
 const BEAM_GAIN: f32 = 4.5;
 const LAMP_GAIN: f32 = 4.0;
+
+/// ENHANCEMENT E36: the part of the beams' air density kept inside a covered stretch on a DAY track.
+/// Inside a tunnel the beams' air was the scene fog + rain + the tunnel's own 0.015, all at full (night) weight
+/// (`max(dark, cover)` = 1), and E15 / E24 light the player's pair at full strength there too; seen end-on from the
+/// chase camera the whole beam (3..70 m) lies on a few hundred pixels, so a dry day tunnel got a clipped white wash ahead
+/// of the car (alps 0.034 = fog 0.018 + tunnel 0.015, the cap; coastal 0.017). A dry road tunnel by day shows barely
+/// visible beams; night tracks (monaco1's tunnel) and open roads (fog, rain) keep their density. APPROXIMATION (by
+/// the stills' luminance: swept 0.1 / 0.2 / 0.35, `RE/notes/ENHANCEMENTS.md` E36).
+pub const DAY_TUNNEL_AIR: f32 = 0.15;
 
 /// How far the march goes at the most, metres (the spot's reach is 70).
 pub const MAX_DISTANCE: f32 = 72.0;
@@ -72,6 +83,8 @@ impl Haze {
         let rain = 0.02 * self.wet.clamp(0.0, 1.0);
         let tunnel = self.cover.clamp(0.0, 1.0) * tk;
         let beam = ((fog + rain + 0.015 * tunnel) * self.dark.max(self.cover.clamp(0.0, 1.0))).min(0.035);
+        // a day track's covered stretch keeps only a part of that (DAY_TUNNEL_AIR), ramped with the covered value
+        let beam = if self.day { beam * (1.0 - self.cover.clamp(0.0, 1.0) * (1.0 - DAY_TUNNEL_AIR)) } else { beam };
         let lamp = 0.010 * tunnel + 0.5 * (fog + rain) * self.dark;
         (beam, lamp)
     }
@@ -380,7 +393,7 @@ impl HazePass {
             inv_vp: f.inv_vp.to_cols_array_2d(),
             cam: [f.eye.x, f.eye.y, f.eye.z, f.planes[0]],
             fwd: [f.fwd.x, f.fwd.y, f.fwd.z, f.planes[1]],
-            air: [f.beam, f.lamp, MAX_DISTANCE, f.haze.n as f32],
+            air: [f.beam, f.lamp, MAX_DISTANCE, (f.haze.n as usize).min(HAZE_LAMPS) as f32],
             gain: [f.gain * BEAM_GAIN, f.gain * LAMP_GAIN, 0.0, 0.0],
             lamp_pos: [[0.0; 4]; HAZE_LAMPS],
             lamp_col: [[0.0; 4]; HAZE_LAMPS],
@@ -448,6 +461,24 @@ mod tests {
         // the density is capped
         let thick = Haze { fog: 1.0, wet: 1.0, cover: 1.0, ..Haze::default() };
         assert!(thick.air(2).0 <= 0.035 + 1e-6);
+    }
+
+    #[test]
+    fn a_day_tunnel_keeps_a_faint_beam_and_a_night_tunnel_its_own() {
+        // alps' tunnel by day: fog 0.00227, dark 0.6 (NFS_HAZE_LOG): the beam's air was at the cap
+        let alps = Haze { fog: 0.00227, cover: 1.0, dark: 0.6, ..Haze::default() };
+        let alps_day = Haze { day: true, ..alps };
+        assert!((alps.air(2).0 - 0.0332).abs() < 1e-3);
+        assert!((alps_day.air(2).0 - 0.0332 * DAY_TUNNEL_AIR).abs() < 1e-3);
+        // the lamps' glow is not this factor's
+        assert_eq!(alps.air(2).1, alps_day.air(2).1);
+        // open road by day (cover 0): unchanged (fog, rain)
+        let rain = Haze { fog: 0.001, wet: 1.0, dark: 0.78, ..Haze::default() };
+        assert_eq!(rain.air(2), Haze { day: true, ..rain }.air(2));
+        // half way into the tunnel: half way between
+        let half = Haze { day: true, cover: 0.5, ..alps };
+        let open = Haze { cover: 0.5, ..alps }.air(2).0;
+        assert!((half.air(2).0 - open * (1.0 - 0.5 * (1.0 - DAY_TUNNEL_AIR))).abs() < 1e-6);
     }
 
     #[test]

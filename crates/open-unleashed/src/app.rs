@@ -625,6 +625,8 @@ pub(crate) struct App {
     pub(crate) refl_next: u32,
     pub(crate) refl_size: u32,
     pub(crate) refl_eye: Vec3,
+    /// ENHANCEMENT E49: the faces were last drawn with the near objects (a change draws every face again)
+    pub(crate) refl_near: bool,
     /// ENHANCEMENT E20: the tick the running lightning strike was first seen at and the tick it was last seen
     /// at (the flicker envelope runs from the first; a gap of 32 ticks without a flash starts a new strike)
     pub(crate) flash_strike: Option<(u32, u32)>,
@@ -744,6 +746,9 @@ pub(crate) struct App {
     /// The roll-over camera's side, `+0xC3` bit 0 (0x463CC6…0x463CFB), latched on the first
     /// tilted update and dropped once the car is upright again (`+0xC2` = 0, 0x463D03).
     pub(crate) flip_side: Option<bool>,
+    /// ENHANCEMENT E48: the wrong-way side the chase / heli slope lift sampled by last (`camera::steady_slope_wrong`);
+    /// `None` with E48 off or outside a lifted view. Camera state only.
+    pub(crate) slope_wrong: Option<bool>,
     /// The chase / heli slot's eye `+0x24` as its update left it (before the build's clamps, which
     /// work on a copy, 0x4651BF…0x4651DB) — the "old eye" of the next update's ceiling test.
     pub(crate) slot_eye: Option<Vec3>,

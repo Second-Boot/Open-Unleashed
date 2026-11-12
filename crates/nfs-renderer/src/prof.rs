@@ -276,3 +276,247 @@ fn end_frame_live(device: &wgpu::Device, p: &Prof, s: &mut State) {
     s.pending.truncate(n as usize);
     s.resolved = 0;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// TEST GLUE (`--perf-bench`, not the original's): the bench's stage marks and its per-frame numbers.
+//
+// A mark is an EMPTY compute pass whose beginning writes a timestamp: the render passes keep their descriptors (no
+// `timestamp_writes` of their own, which on Apple GPUs time a pass that overlaps its neighbours), and a stage's cost is the
+// difference of two marks on one timeline. Every `Queue::submit` of a frame goes through [`submit`]: with the marks on it
+// puts a mark command buffer before and after the ones it is given, so a submit is one segment of the timeline whose span
+// (end - begin) is GPU work only (a command buffer recorded elsewhere, MetalFX / FSR, falls into the stage of the mark
+// that follows it). The frame's GPU time is the union of its segments' spans: the idle GPU between two submits (the CPU
+// still encoding) is not counted, and the overlap of two (a begin mark runs as soon as it is submitted) not twice. [`finish`] / [`submit`] also add up the CPU time of `CommandEncoder::finish` and
+// `Queue::submit`. Off (the default) each of them costs one atomic load and records nothing.
+// Measured on an M1 Pro: a mark pass touches no resource, so the GPU may start it before the render pass recorded ahead of it
+// has finished (nothing orders them); a stage's own number is then too small and the time shows in a later stage's (the
+// first that waits for the image, typically the post chain). The submit's span, and so the frame's total, is exact; for
+// the cost of one pass, A/B the frame total, or time the passes themselves with `NFS_GPU_PROFILE=1`.
+
+const MAX_MARKS: u32 = 1024;
+
+struct Marks {
+    qs: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    period_ns: f64,
+    /// a one-thread no-op dispatched in each mark pass (a pass with no work in it is not run, and writes no timestamp)
+    nop: wgpu::ComputePipeline,
+    state: Mutex<MarkState>,
+}
+
+#[derive(Default)]
+struct MarkState {
+    /// the marks recorded this frame by query index: `(label, context)`
+    labels: Vec<(&'static str, &'static str)>,
+    /// the marks recorded since the last submit (they run in it)
+    pending: Vec<usize>,
+    /// the query indices in the order the GPU runs them: per submit `SEG_BEGIN`, the submit's marks, `SEG_END`
+    order: Vec<usize>,
+    finish_ns: u64,
+    submit_ns: u64,
+}
+
+const SEG_BEGIN: &str = "\u{1}begin";
+const SEG_END: &str = "\u{1}end";
+
+static MARKS: OnceLock<Marks> = OnceLock::new();
+static MARKS_ON: AtomicBool = AtomicBool::new(false);
+
+/// One bench frame's numbers (see [`bench_frame_end`]).
+#[derive(Debug, Clone, Default)]
+pub struct BenchSample {
+    /// the GPU's busy time: the sum of the frame's submit segments, ms (`None`: no timestamp queries)
+    pub gpu_ms: Option<f64>,
+    /// the CPU's: the frame's start to its end before the wait for the device, ms
+    pub cpu_ms: f64,
+    /// ... of which in `CommandEncoder::finish` / `Queue::submit`, ms
+    pub finish_ms: f64,
+    pub submit_ms: f64,
+    /// the CPU time + the wait for the GPU (what `NFS_GPU_TIME` reports), ms
+    pub wall_ms: f64,
+    /// each stage's GPU ms (the time from the mark before it to its own; label + context), in first-seen order
+    pub stages: Vec<(String, f64)>,
+}
+
+/// Turn the marks on (built at first use); `false` when the device has no timestamp queries (the bench then times the CPU only).
+pub(crate) fn marks_begin(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    if minimal() || !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        return false;
+    }
+    let m = MARKS.get_or_init(|| {
+        let bytes = MAX_MARKS as u64 * 8;
+        Marks {
+            qs: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("bench marks"), ty: wgpu::QueryType::Timestamp, count: MAX_MARKS }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor { label: Some("bench marks resolve"), size: bytes, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
+            readback: device.create_buffer(&wgpu::BufferDescriptor { label: Some("bench marks readback"), size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+            period_ns: queue.get_timestamp_period() as f64,
+            nop: {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("bench mark"), source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()) });
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("bench mark"), layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None })
+            },
+            state: Mutex::new(MarkState::default()),
+        }
+    });
+    if let Ok(mut s) = m.state.lock() {
+        *s = MarkState::default();
+    }
+    MARKS_ON.store(true, Relaxed);
+    true
+}
+
+/// Turn the marks off.
+pub(crate) fn marks_end() {
+    MARKS_ON.store(false, Relaxed);
+}
+
+/// Record a mark pass into `encoder`; its query index (`None`: the frame's marks are used up).
+fn mark_raw(encoder: &mut wgpu::CommandEncoder, label: &'static str, ctx: &'static str) -> Option<usize> {
+    let m = MARKS.get()?;
+    let mut s = m.state.lock().ok()?;
+    let i = s.labels.len();
+    if i >= MAX_MARKS as usize {
+        return None;
+    }
+    s.labels.push((label, ctx));
+    drop(s);
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("bench mark"),
+        timestamp_writes: Some(wgpu::ComputePassTimestampWrites { query_set: &m.qs, beginning_of_pass_write_index: Some(i as u32), end_of_pass_write_index: None }),
+    });
+    pass.set_pipeline(&m.nop);
+    pass.dispatch_workgroups(1, 1, 1);
+    Some(i)
+}
+
+/// A stage mark: the GPU work recorded since the mark before it is `label`'s (in the context [`ctx`] set, e.g. the mirror).
+#[inline]
+pub(crate) fn mark(encoder: &mut wgpu::CommandEncoder, label: &'static str) {
+    if MARKS_ON.load(Relaxed) {
+        let ctx = PROF.get().and_then(|p| p.state.lock().ok().map(|s| s.ctx)).unwrap_or("");
+        if let Some(i) = mark_raw(encoder, label, ctx)
+            && let Some(m) = MARKS.get()
+            && let Ok(mut s) = m.state.lock()
+        {
+            s.pending.push(i);
+        }
+    }
+}
+
+/// `encoder.finish()`, its CPU time added up while the marks are on.
+#[inline]
+pub(crate) fn finish(encoder: wgpu::CommandEncoder) -> wgpu::CommandBuffer {
+    if !MARKS_ON.load(Relaxed) {
+        return encoder.finish();
+    }
+    let t = std::time::Instant::now();
+    let cb = encoder.finish();
+    if let Some(m) = MARKS.get() && let Ok(mut s) = m.state.lock() {
+        s.finish_ns += t.elapsed().as_nanos() as u64;
+    }
+    cb
+}
+
+/// `queue.submit(cbs)`; while the marks are on, between a segment's begin and end marks (and its CPU time added up).
+pub(crate) fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(device: &wgpu::Device, queue: &wgpu::Queue, cbs: I) -> wgpu::SubmissionIndex {
+    if !MARKS_ON.load(Relaxed) {
+        return queue.submit(cbs);
+    }
+    let seg = |label| {
+        let mut e = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench mark") });
+        let i = mark_raw(&mut e, label, "");
+        (e.finish(), i)
+    };
+    let (b, bi) = seg(SEG_BEGIN);
+    let mut all = vec![b];
+    all.extend(cbs);
+    let (e, ei) = seg(SEG_END);
+    all.push(e);
+    if let (Some(bi), Some(ei), Some(m)) = (bi, ei, MARKS.get())
+        && let Ok(mut s) = m.state.lock()
+    {
+        let pending = std::mem::take(&mut s.pending);
+        s.order.push(bi);
+        s.order.extend(pending);
+        s.order.push(ei);
+    }
+    let t = std::time::Instant::now();
+    let idx = queue.submit(all);
+    if let Some(m) = MARKS.get() && let Ok(mut s) = m.state.lock() {
+        s.submit_ns += t.elapsed().as_nanos() as u64;
+    }
+    idx
+}
+
+/// The bench frame's start: the frame's marks reset, the CPU clock started.
+pub(crate) fn bench_frame_begin() -> std::time::Instant {
+    if let Some(m) = MARKS.get() && let Ok(mut s) = m.state.lock() {
+        *s = MarkState::default();
+    }
+    std::time::Instant::now()
+}
+
+/// The bench frame's end: the CPU time, then the wait for the device, the marks read back and added up per stage.
+pub(crate) fn bench_frame_end(device: &wgpu::Device, queue: &wgpu::Queue, t0: std::time::Instant) -> BenchSample {
+    let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut out = BenchSample { cpu_ms, wall_ms, ..Default::default() };
+    let Some(m) = MARKS.get().filter(|_| MARKS_ON.load(Relaxed)) else { return out };
+    let (labels, order, finish_ns, submit_ns) = match m.state.lock() {
+        Ok(mut s) => (std::mem::take(&mut s.labels), std::mem::take(&mut s.order), s.finish_ns, s.submit_ns),
+        Err(_) => return out,
+    };
+    out.finish_ms = finish_ns as f64 / 1.0e6;
+    out.submit_ms = submit_ns as f64 / 1.0e6;
+    let n = labels.len() as u32;
+    if n == 0 {
+        out.gpu_ms = Some(0.0);
+        return out;
+    }
+    let mut e = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench marks resolve") });
+    e.resolve_query_set(&m.qs, 0..n, &m.resolve, 0);
+    e.copy_buffer_to_buffer(&m.resolve, 0, &m.readback, 0, n as u64 * 8);
+    queue.submit(Some(e.finish()));
+    let slice = m.readback.slice(..n as u64 * 8);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let Ok(view) = slice.get_mapped_range() else { return out };
+    let ts: Vec<u64> = bytemuck::cast_slice::<u8, u64>(&view).to_vec();
+    drop(view);
+    m.readback.unmap();
+    let ms = |a: u64, b: u64| if b > a { (b - a) as f64 * m.period_ns / 1.0e6 } else { 0.0 };
+    let mut stages: Vec<(String, f64)> = Vec::new();
+    let mut add = |name: String, v: f64| match stages.iter_mut().find(|(n, _)| *n == name) {
+        Some(s) => s.1 += v,
+        None => stages.push((name, v)),
+    };
+    // the submits run in order, but a submit's begin mark can run while the one before is still busy (it waits for
+    // nothing): a segment starts at its begin mark or the end of the one before, whichever is later (the union of the
+    // spans: nothing is counted twice)
+    let (mut total, mut begin, mut last, mut prev_end) = (0.0, None::<u64>, 0u64, 0u64);
+    for &i in &order {
+        let ((label, ctx), t) = (labels[i], ts[i]);
+        if label == SEG_BEGIN {
+            let b = t.max(prev_end);
+            begin = Some(b);
+            last = b;
+            continue;
+        }
+        let Some(b) = begin else { continue };
+        // a mark the GPU reached before the one recorded ahead of it (overlapping passes) costs 0, the later one takes it
+        let d = ms(last, t);
+        last = last.max(t);
+        if label == SEG_END {
+            add(format!("(rest){ctx}"), d);
+            total += ms(b, last);
+            prev_end = prev_end.max(last);
+            begin = None;
+        } else {
+            add(format!("{label}{ctx}"), d);
+        }
+    }
+    out.gpu_ms = Some(total);
+    out.stages = stages;
+    out
+}

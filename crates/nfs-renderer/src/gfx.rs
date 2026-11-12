@@ -60,8 +60,20 @@ impl<'a> Fullscreen<'a> {
 }
 
 /// A WGSL module.
+///
+/// PERF (picture identical): naga's forced loop bounding is off (`force_loop_bounding: false`; the bounds checks of every index
+/// and buffer access stay on). With it every loop of every shader carried a hidden 64-bit iteration counter and a break test
+/// (so a malformed loop cannot hang the GPU, which Metal / Vulkan compilers may otherwise treat as unreachable code): on an
+/// M1 Pro at 2560x1600 the frame's GPU time went down by 0.3-0.9 ms with the default set (alps 8.5 -> 7.8, industrial 13.2 ->
+/// 12.3, monaco1 8.9 -> 8.6 ms), 0.1-0.4 ms with MetalFX. The renderer's own shaders are trusted for this: every loop in them
+/// is a `for (var i = a; i < n; i++)`-style loop over an integer counter that only its update changes, so it ends for any
+/// value of a uniform bound (`renderer_shaders_have_only_counted_loops` checks the shape of every loop of the sources; a
+/// `loop` / `while` is refused). Backend independent: it holds on Vulkan / Android as on Metal.
 pub(crate) fn wgsl_module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModule {
-    device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(source.into()) })
+    let desc = wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(source.into()) };
+    let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
+    // SAFETY: the only check given up is the loop bounding, and every loop of the renderer's shaders terminates (above)
+    unsafe { device.create_shader_module_trusted(desc, checks) }
 }
 
 /// A pipeline layout of these bind group layouts, no immediates.
@@ -254,5 +266,84 @@ impl<K: PartialEq, V> Keyed<K, V> {
             self.0 = Some((key, make()));
         }
         &self.0.as_ref().expect("keyed value").1
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    /// The WGSL of the crate's sources: the `.wgsl` files and the raw strings of the `.rs` files that hold a shader.
+    fn shader_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let mut out = Vec::new();
+        for f in files {
+            let name = f.display().to_string();
+            let text = std::fs::read_to_string(&f).unwrap_or_default();
+            match f.extension().and_then(|e| e.to_str()) {
+                Some("wgsl") => out.push((name, text)),
+                Some("rs") => {
+                    let mut rest = text.as_str();
+                    while let Some(a) = rest.find("r#\"") {
+                        let body = &rest[a + 3..];
+                        let Some(b) = body.find("\"#") else { break };
+                        let s = &body[..b];
+                        if s.contains("@fragment") || s.contains("@compute") || s.contains("@vertex") || (s.contains("fn ") && s.contains("vec")) {
+                            out.push((name.clone(), s.to_string()));
+                        }
+                        rest = &body[b + 2..];
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The loop bounding is off for the renderer's shaders (`wgsl_module`), which is sound only while every loop in them ends:
+    /// no `loop` / `while`, and every `for` is `for (var x = ..; x <op> ..; x++ / x = x + 1 / x = x >> 1u ...)`.
+    #[test]
+    fn renderer_shaders_have_only_counted_loops() {
+        let srcs = shader_sources();
+        assert!(srcs.len() > 20, "found only {} shader sources", srcs.len());
+        let mut fors = 0;
+        for (file, src) in &srcs {
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                let words: Vec<&str> = code.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
+                assert!(!words.contains(&"loop") && !words.contains(&"while"), "{file}:{}: a `loop` / `while` in a shader: {}", n + 1, code.trim());
+                let Some(at) = code.find("for (") else { continue };
+                fors += 1;
+                let head = &code[at + 5..];
+                let head = &head[..head.find(") {").unwrap_or_else(|| panic!("{file}:{}: a `for` header on more than one line", n + 1))];
+                let parts: Vec<&str> = head.split(';').map(str::trim).collect();
+                assert_eq!(parts.len(), 3, "{file}:{}: {head}", n + 1);
+                let var = parts[0].strip_prefix("var ").and_then(|v| v.split([' ', ':', '=']).next()).unwrap_or_else(|| panic!("{file}:{}: no `var` counter: {head}", n + 1));
+                let cond_ok = ["<", "<=", ">", ">="].iter().any(|op| parts[1].starts_with(&format!("{var} {op} ")));
+                let upd = parts[2].replace(' ', "");
+                let upd_ok = upd == format!("{var}++") || upd == format!("{var}--") || upd == format!("{var}={var}+1") || upd == format!("{var}={var}+1u") || upd == format!("{var}={var}-1") || upd == format!("{var}={var}>>1u");
+                assert!(cond_ok && upd_ok, "{file}:{}: not a counted loop: for ({head})", n + 1);
+                // the counter is not assigned in the body (checked on the lines up to the loop's closing brace at its indent)
+                let indent = line.len() - line.trim_start().len();
+                for body in src.lines().skip(n + 1) {
+                    let bi = body.len() - body.trim_start().len();
+                    if bi <= indent && body.trim_start().starts_with('}') {
+                        break;
+                    }
+                    let b = body.split("//").next().unwrap_or("").trim_start();
+                    assert!(!(b.starts_with(&format!("{var} =")) || b.starts_with(&format!("{var} +=")) || b.starts_with(&format!("{var} -=")) || b.starts_with(&format!("{var}++")) || b.starts_with(&format!("{var}--"))), "{file}: the counter `{var}` of the loop at line {} is changed in its body", n + 1);
+                }
+            }
+        }
+        assert!(fors > 40, "found only {fors} loops");
     }
 }

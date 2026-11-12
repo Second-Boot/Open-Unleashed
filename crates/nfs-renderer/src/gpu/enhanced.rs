@@ -90,6 +90,8 @@ impl Core {
             mv: tg.mv_view.clone(),
             reactive: tg.reactive_view.clone(),
             tc: tg.tc_view.clone(),
+            // MetalFX temporal (`upscale/metalfx_temporal.rs`) reads the colour, depth, vectors and reactive mask only
+            tc_read: !(self.fsr_active && self.fsr_kind.is_some_and(|k| k != crate::upscale::UpscalerKind::Fsr3)),
             objects_bg: self.temporal_gpu.as_ref().expect("temporal gpu").objects_bg.clone(),
             jitter_ndc: info.jitter_ndc,
             jitter_px: info.jitter_px,
@@ -279,7 +281,7 @@ impl Core {
         if samples <= 1 {
             return None;
         }
-        let key = (width, height, samples | if hdr { HDR_KEY } else { 0 });
+        let key = (width, height, samples | if hdr { HDR_KEY as u32 } else { 0 });
         if self.ms_cache.len() > 6 && !self.ms_cache.contains_key(&key) {
             self.ms_cache.clear();
         }
@@ -406,6 +408,8 @@ impl Core {
                     let mut cx = PostCtx { device: &self.device, queue: &self.queue, layout: &self.sprite_layout, sampler: &self.sprite_sampler, encoder: &mut encoder, depth: depth_src, size: (pw, ph), camera, aspect, mirror: scene.mirror };
                     chain.out = pass.run(&mut cx, &t, &rt_tex, &rt_view, &depth3);
                 }
+                // TEST GLUE (`--perf-bench`): the post chain's stage marks (nothing is recorded without the bench)
+                crate::prof::mark(&mut encoder, "temporal pass");
             }
             // ENHANCEMENT E37: FSR 3.1 over the float scene and its vectors / masks, into a float image of the window's size (a
             // command buffer of its own, submitted before the encoder that carries the post chain); the post chain takes the
@@ -453,6 +457,7 @@ impl Core {
                 let mut cx = PostCtx { device: &self.device, queue: &self.queue, layout: &self.sprite_layout, sampler: &self.sprite_sampler, encoder: &mut encoder, depth: depth_src, size: (pw, ph), camera, aspect, mirror: scene.mirror };
                 self.post.run(&mut cx, plan, &mut chain, &rt_tex, &rt_view);
             }
+            crate::prof::mark(&mut encoder, "post chain");
             let (img_bg, _) = chain.current();
             // ENHANCEMENT E33: the tone map's second output, at the size of the image the tone map writes (the internal one with E34)
             let gain_size = if self.upscale_active && self.upscaler.is_some() { (iw, ih) } else { (width, height) };
@@ -479,8 +484,11 @@ impl Core {
                 } else {
                     blit.draw(&mut encoder, &imgs.input_view, tone_eye, img_bg, gain);
                 }
+                crate::prof::mark(&mut encoder, "tone map (+E35 SMAA)");
                 let first = std::mem::replace(&mut encoder, self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("upscale present") }));
-                cbs.push(first.finish());
+                // the upscaler's own command buffer runs between `first` and this encoder: its time is this mark's
+                crate::prof::mark(&mut encoder, "E34 upscaler");
+                cbs.push(crate::prof::finish(first));
                 let scaled = up.encode(&self.device, &imgs.input, &imgs.output);
                 let (present_bg, scaled_ok) = match scaled {
                     Some(cb) => {
@@ -505,14 +513,17 @@ impl Core {
                         present.draw(&mut encoder, &dest, None, Some(present_bg), None);
                     }
                 }
+                crate::prof::mark(&mut encoder, "upscale present (+E39 RCAS)");
             } else if smaa {
                 // ENHANCEMENT E35: the tone map writes the window-sized image SMAA reads; SMAA writes the destination
                 let sm = self.smaa.get_or_insert_with(|| crate::smaa::Smaa::new(&self.device, &self.queue, self.config.format));
                 let ldr = sm.ldr(&self.device, width, height);
                 blit.draw(&mut encoder, &ldr, tone_eye, img_bg, gain);
                 sm.run(&mut encoder, &dest);
+                crate::prof::mark(&mut encoder, "tone map (+E35 SMAA)");
             } else {
                 blit.draw(&mut encoder, &dest, tone_eye, img_bg, gain);
+                crate::prof::mark(&mut encoder, "tone map (+E35 SMAA)");
             }
             // ENHANCEMENT E33: the native-size frame (after SMAA / the upscale and its blit) before the 2D, to tell the
             // pixels the HUD / sprites touch from the 3D's own
@@ -520,10 +531,11 @@ impl Core {
                 self.edr.copy_pre_2d(&mut encoder, &dest_tex, width, height);
             }
             self.sprite_pass(&mut encoder, scene, n, &dest, depth);
+            crate::prof::mark(&mut encoder, "sprites");
             self.belt.finish();
             crate::prof::resolve(&mut encoder);
-            cbs.push(encoder.finish());
-            self.last_submit = Some(self.queue.submit(cbs));
+            cbs.push(crate::prof::finish(encoder));
+            self.last_submit = Some(crate::prof::submit(&self.device, &self.queue, cbs));
             self.belt.recall();
             self.scale_blit = Some(blit);
         }

@@ -141,7 +141,10 @@ impl IntroRun {
                 // the sound starts once the ring is full, then the clock (0x4DCB8F…0x4DCC19); the
                 // library plays it at its own level — 0x567550 takes none; a stream voice, started
                 // at priority 0x65 (0x5612A0) and so never stolen
-                *voice = audio.and_then(|a| {
+                // PORT-DEVIATION (host-side timing): a muted run's offline mixer (no device) never advances a voice's
+                // position, so a movie synced to its sound would hold its first frame forever; without a device the
+                // movie plays on the wall clock, as the player already does for a movie without sound
+                *voice = audio.filter(|a| a.has_device()).and_then(|a| {
                     let pcm = nfs_formats::schl::decode_all(&nfs_formats::mad::audio_track(data)).ok()?;
                     let clip = nfs_audio::mixer::Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None, gain: 1.0, bend_cents: 0, fx_send: pcm.fx_send, priority: nfs_audio::mixer::STREAM_PRIORITY, pan: pcm.pan, pan_scale: pcm.pan_scale, records: Vec::new(), layers: Vec::new(), tables: Vec::new() };
                     Some(a.play_word(Arc::new(clip), 1.0, nfs_audio::resample::PITCH_UNIT, 0x40, 0, false))

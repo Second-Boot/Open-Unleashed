@@ -43,7 +43,7 @@ mod haze;
 mod lbeam;
 mod shafts;
 mod sharpen;
-pub use prof::{LiveStats, live_set, live_stats, timestamps_supported};
+pub use prof::{BenchSample, LiveStats, live_set, live_stats, timestamps_supported};
 mod smaa;
 mod soft;
 mod temporal;
@@ -57,7 +57,7 @@ pub use drops::Drops;
 pub use haze::{HAZE_LAMPS, Haze, HazeLamp};
 pub use lbeam::{LBeam, LBeams, MAX_LBEAMS};
 pub use shafts::Shafts;
-pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E20, E21, E23, E24, E25, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
+pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E20, E21, E23, E24, E25, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
 pub use front::Renderer;
 pub use mipgen::MipAlpha;
 /// ENHANCEMENT E41: the E2 mip chain generator (levels 1.. of a base image), for the HD textures' own chains
@@ -350,6 +350,9 @@ pub struct DrawItem {
     /// `Scene::cover` at the patch): the patch gives way to the sun's shadow by its own place, not by the camera's. 0 elsewhere. Read
     /// only by the renderer while E9 draws shadows.
     pub cover: f32,
+    /// ENHANCEMENT E49: a part of the player's own car: its clear coat reads the environment faces that hold the near cars (the other
+    /// cars read the faces without cars, so none reflects itself). Read only with E49 on.
+    pub near_env: bool,
 }
 
 /// ENHANCEMENT E37: give every item of one object (a car's parts) a [`DrawItem::motion_id`]: a hash of `group` (the
@@ -438,7 +441,7 @@ pub const CSM_SKID: u8 = 64;
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false, mirrored: false, csm: 0, soft: 0.0, hdr_boost: 1.0, water: false, particle: 0, wet: 0.0, shadow_only: false, motion_id: 0, cover: 0.0 }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false, mirrored: false, csm: 0, soft: 0.0, hdr_boost: 1.0, water: false, particle: 0, wet: 0.0, shadow_only: false, motion_id: 0, cover: 0.0, near_env: false }
     }
 }
 
@@ -742,6 +745,10 @@ pub struct Scene {
     /// light, softer and weaker. Read only with E9 and E25 on, and only while `sun_shadow` is `None`. Nothing else
     /// (fog glow, water, particles, shafts) reads it.
     pub overcast_shadow: Option<SunShadow>,
+    /// ENHANCEMENT E50: on a night track the moon's light through the same cascades (a faint cold light, soft shadows, a weak cold
+    /// term on the cars). Read only with E9 and E50 on, and only while `sun_shadow` and `overcast_shadow` are `None`. Nothing else
+    /// (fog glow, water, particles, shafts) reads it.
+    pub moon_shadow: Option<SunShadow>,
     /// ENHANCEMENT E17: the sky the water items reflect and the sun that glints on them (the main race
     /// view and its mirror; `None` = no water reflection, the environment faces and the front end). Read only with E17 on.
     pub water: Option<WaterEnv>,
@@ -789,6 +796,10 @@ pub struct Scene {
     /// ENHANCEMENT E44: the lighthouse beam(s) of the main race view as soft volumetric light (`None` = none: every other view, E44
     /// or E7 off, a track without one, none within the view's reach). Read only with E44 and E7 on.
     pub lbeam: Option<LBeams>,
+    /// ENHANCEMENT E49 (NEAR-REFL3): the sky parts of the player's sphere-map overlay (`R3DSpecularTextureLayer`, `SPC2` / `SPC3`, one
+    /// day sky for every track) show the live faces' own sky instead: set on a night track (the original's night flag,
+    /// `nfs_assets::track::TrackAssets::is_night`), where that day sky is wrong. Read only with E49 on.
+    pub near_live_sky: bool,
 }
 
 /// ENHANCEMENT E9 (ENH-TUNPOOL): one road slice's covered volume: a box round the slice (its own axes), `half_len` along the
@@ -1119,7 +1130,7 @@ impl Scene {
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, sun_shadow: None, overcast_shadow: None, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, flash: 0.0, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), cover: Default::default(), lbeam: None }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, sun_shadow: None, overcast_shadow: None, moon_shadow: None, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, flash: 0.0, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), cover: Default::default(), lbeam: None, near_live_sky: false }
     }
 }
 

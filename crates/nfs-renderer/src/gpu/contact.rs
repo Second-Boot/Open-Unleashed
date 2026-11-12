@@ -113,7 +113,7 @@ impl Core {
             u.wheels[2 * i] = [car.wheels[0][0], car.wheels[0][1], car.wheels[1][0], car.wheels[1][1]];
             u.wheels[2 * i + 1] = [car.wheels[2][0], car.wheels[2][1], car.wheels[3][0], car.wheels[3][1]];
         }
-        u.params = [c.n as f32, STRENGTH, SOFTEN, SKIRT];
+        u.params = [(c.n as usize).min(crate::MAX_CONTACTS) as f32, STRENGTH, SOFTEN, SKIRT];
         self.contact.active = true;
         self.belt.write_buffer(encoder, &self.contact.uniform, 0, size).copy_from_slice(bytemuck::bytes_of(&u));
     }

@@ -392,6 +392,10 @@ pub(crate) static NO_FOCUS: std::sync::atomic::AtomicBool = std::sync::atomic::A
 /// (the same key path a player's skip takes) so the walk does not sit through the whole movie.
 pub(crate) static PLAY_INTRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// **TEST GLUE** (not in the original): set by `main` from `--perf-bench <frames>` (0 = off): a `--screenshot` run draws
+/// the still's frame again and again before the still and times it ([`App::run_perf_bench`]).
+pub(crate) static PERF_BENCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// `NFS_TRAFFIC=0..3`: the traffic density of a menu-less start (the one place the variable is read; the registry's
 /// `traffic_density` otherwise).
 pub(crate) fn env_traffic() -> Option<u32> {
@@ -644,7 +648,16 @@ impl App {
                         self.rebuild_scene();
                         let (cp, _) = Self::blend_pose(self.render_prev.as_ref(), self.car_pos, self.car_rot, alpha);
                         let (e, g) = (self.camera.position, self.camera.target);
-                        let _ = writeln!(w, "{frame},{},{alpha},{},{},{},{},{},{},{},{},{}", self.tick, e.x, e.y, e.z, g.x, g.y, g.z, cp.x, cp.y, cp.z);
+                        // then the drawn (E29-shaken) camera: what the renderer was given this frame
+                        let rc = self.render_camera();
+                        let (re, rg) = (rc.position, rc.target);
+                        // and the race's slice and wrong-way counter (`car+0xD30`, which the chase views' slope lift reads)
+                        let (slice, wrong) = self.race.as_ref().map_or((0, 0), |r| (r.slice, r.wrong_way_ticks));
+                        let _ = writeln!(
+                            w,
+                            "{frame},{},{alpha},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{slice},{wrong}",
+                            self.tick, e.x, e.y, e.z, g.x, g.y, g.z, cp.x, cp.y, cp.z, re.x, re.y, re.z, rg.x, rg.y, rg.z
+                        );
                     }
                     *frame += 1;
                     let k = if *fps < 0.0 { 0.6 + 0.8 * ((*frame * 2654435761 % 1000) as f64 / 1000.0) } else { 1.0 };
@@ -851,6 +864,11 @@ impl App {
         self.sync_gamma();
         // ENHANCEMENT E8: the environment faces a frame would draw (all six on the first call)
         self.render_reflections();
+        // **TEST GLUE** `--perf-bench <frames>`: the frame timed, before the still
+        let bench = PERF_BENCH.load(std::sync::atomic::Ordering::Relaxed);
+        if bench > 0 {
+            self.run_perf_bench(bench);
+        }
         let cam = self.render_camera(); // ENHANCEMENT E29: the shaken camera when a shake runs
         let rgba = self
             .renderer
@@ -905,6 +923,90 @@ impl App {
             self.test_alpha = None;
         }
         event_loop.exit();
+    }
+
+    /// **TEST GLUE** (not in the original) `--perf-bench <frames>`: the still's scene (frozen: no tick runs, the scene is not
+    /// rebuilt) drawn as a window frame draws it — the rear-view mirror, the environment face(s) of the frame, the main view
+    /// at the still's size (`NFS_SHOT_SIZE`) through the whole enhanced chain into an image of its own, no read-back — first
+    /// `frames / 5` (10..=60) warm-up frames, then `frames` back to back with two in flight (`tput_ms`: elapsed per frame, the
+    /// frame time of a GPU-bound window), then the warm-up and `frames` again, the device waited for after each. Logs one `PERF`
+    /// line (median / p95 of the GPU's busy time from the stage marks, the CPU's encode time, of which `finish` / `submit`,
+    /// and the old `NFS_GPU_TIME` wall time = CPU + the wait) and one `PERFSTAGE` line (each stage's median GPU ms).
+    /// A plain flag of the scripted still, so it runs wherever a `--screenshot` race runs.
+    pub(crate) fn run_perf_bench(&mut self, frames: u32) {
+        let (w, h, _) = shot_geometry();
+        let warm = (frames / 5).clamp(10, 60);
+        if self.renderer.is_none() {
+            return;
+        }
+        // the throughput phase first (no marks): the frames back to back with at most two in flight, as a window's swap
+        // chain runs them; a GPU-bound frame's real cost is the elapsed time per frame (the warm-up frames run ahead of it)
+        let mut inflight = std::collections::VecDeque::new();
+        let mut tput_t0 = std::time::Instant::now();
+        for i in 0..warm + frames {
+            if i == warm {
+                self.renderer.as_mut().expect("renderer").bench_wait_idle();
+                inflight.clear();
+                tput_t0 = std::time::Instant::now();
+            }
+            self.render_mirror();
+            self.render_reflections();
+            let cam = self.render_camera();
+            let r = self.renderer.as_mut().expect("renderer");
+            r.bench_frame(&self.scene, &cam, w, h);
+            r.bench_frame_pipelined(&mut inflight, 2);
+        }
+        self.renderer.as_mut().expect("renderer").bench_wait_idle();
+        let tput = tput_t0.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        let r = self.renderer.as_mut().expect("renderer");
+        let timestamps = r.bench_begin();
+        let mut samples = Vec::with_capacity(frames as usize);
+        for i in 0..warm + frames {
+            let t0 = self.renderer.as_mut().expect("renderer").bench_frame_start();
+            self.render_mirror();
+            self.render_reflections();
+            let cam = self.render_camera();
+            let r = self.renderer.as_mut().expect("renderer");
+            r.bench_frame(&self.scene, &cam, w, h);
+            let s = r.bench_frame_finish(t0);
+            if i >= warm {
+                samples.push(s);
+            }
+        }
+        self.renderer.as_mut().expect("renderer").bench_end();
+        let stat = |mut v: Vec<f64>| -> (f64, f64) {
+            if v.is_empty() {
+                return (0.0, 0.0);
+            }
+            v.sort_by(f64::total_cmp);
+            let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+            (at(0.5), at(0.95))
+        };
+        let col = |f: &dyn Fn(&nfs_renderer::BenchSample) -> f64| stat(samples.iter().map(f).collect());
+        let gpu = col(&|s| s.gpu_ms.unwrap_or(f64::NAN));
+        let (cpu, wall, fin, sub) = (col(&|s| s.cpu_ms), col(&|s| s.wall_ms), col(&|s| s.finish_ms), col(&|s| s.submit_ms));
+        let gpu_txt = if timestamps { format!("gpu_med={:.3} gpu_p95={:.3}", gpu.0, gpu.1) } else { "gpu_med=- gpu_p95=-".to_string() };
+        tracing::info!(
+            "PERF size={w}x{h} frames={frames} warmup={warm} tput_ms={tput:.3} {gpu_txt} cpu_med={:.3} cpu_p95={:.3} finish_med={:.3} submit_med={:.3} wall_med={:.3} wall_p95={:.3}",
+            cpu.0, cpu.1, fin.0, sub.0, wall.0, wall.1
+        );
+        // each stage's median over the frames (a frame without the stage counts 0)
+        let mut names: Vec<String> = Vec::new();
+        for s in &samples {
+            for (n, _) in &s.stages {
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+        }
+        let stages: Vec<String> = names
+            .iter()
+            .map(|n| {
+                let (m, _) = stat(samples.iter().map(|s| s.stages.iter().filter(|(k, _)| k == n).map(|(_, v)| *v).sum()).collect());
+                format!("{n}={m:.3}")
+            })
+            .collect();
+        tracing::info!("PERFSTAGE {}", stages.join(" | "));
     }
 
     /// **TEST GLUE** `NFS_HUD_KEYS=tick:pause` / `pauserestart` / `pausequit`, the end of the held pause: the pause is
@@ -987,6 +1089,10 @@ impl App {
                 self.rebuild_scene();
             }
         }
+        // **TEST GLUE**: nor the environment faces of E8 (E49) — the still's paint reflected nothing; all six are drawn from the
+        // car's place now (a scripted run's frames do not keep them up to date)
+        self.refl_done = 0;
+        self.render_reflections();
         let (w, h, _) = shot_geometry();
         let cam = self.render_camera(); // ENHANCEMENT E29
         if let Some(r) = self.renderer.as_mut()

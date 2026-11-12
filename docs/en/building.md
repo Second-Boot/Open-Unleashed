@@ -52,6 +52,7 @@ and `THIRD-PARTY-LICENSES.txt` — never any file of the original game.
 | `--debug-menu` | the developer text menu |
 | `--autotest <s> [--follow]` | drive for `s` seconds without a window, then exit (testing) |
 | `--screenshot <png>` | render one frame to a file |
+| `--perf-bench <frames>` | with `--screenshot`: before the still, draw the frozen frame again (warm-up, then `<frames>` measured) and log a `PERF` line (median / p95 GPU and CPU ms) and a `PERFSTAGE` line (GPU ms per stage); `scripts/perf_bench.sh` runs the fixed scenes |
 | `--record <csv>` | per-tick controls / car state (testing) |
 | `--layout <screen>` | draw a front-end screen and walk its buttons (testing) |
 

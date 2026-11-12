@@ -28,6 +28,8 @@ use pipelines::{build_mesh_pipelines, HDR_KEY};
 use post::{GammaPass, ScaleBlit};
 #[cfg(test)]
 pub(crate) use post::{blit_source, gamma_source};
+#[cfg(test)]
+pub(crate) use refl::near_mask_source;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MeshId(pub(crate) u32);
@@ -106,6 +108,14 @@ struct GlobalsUniform {
     rain_edge_val: [[f32; 4]; crate::RAIN_EDGES],
     /// ENHANCEMENT ENH-TEMPORAL: `.xy` the jitter in NDC (already in `view_proj`), `.zw` the render size in pixels (0 = off)
     temporal: [f32; 4],
+    /// ENHANCEMENT E49: `.x` 1 = the clear coat reads the near lookup (0 = off, master's value), `.y` 1 = the player's faces (the
+    /// near cars, layers 6..11) are all drawn, `.z` the proxy box's weight at the cube's eye (0 = no box: the plain lookup)
+    near: [f32; 4],
+    /// ENHANCEMENT E49: the proxy box (a covered stretch's): `[0]` its centre + half length, `[1]` forward + half width, `[2]`
+    /// lateral + the floor's height, `[3]` up + the ceiling's height
+    near_box: [[f32; 4]; 4],
+    /// ENHANCEMENT E49: each face's eye (`.xyz`; the faces are drawn a few a frame as the car moves), `[6]` the newest
+    near_eye: [[f32; 4]; 7],
 }
 
 /// ENHANCEMENT E18: a spark's colour is multiplied by this (the hot core of its ramp ends well above 1, over the bloom's threshold).
@@ -341,6 +351,14 @@ pub(crate) struct Core {
     /// environment face is being drawn now (its frame must not run the prefilter: the faces are not all in yet)
     coat: Option<crate::coat::CoatFilter>,
     refl_building: bool,
+    /// ENHANCEMENT E49: the environment face being drawn keeps its depth for the near cars' pass that follows (`Keep`), or is that
+    /// pass, drawn over the face's colour and depth (`Over`); `None` = every other pass (E8's faces as they were)
+    refl_near_pass: Option<NearPass>,
+    /// ENHANCEMENT E49: the near cars' pass first copies the face into this layer (the face without them)
+    refl_pre_copy: Option<u32>,
+    /// ENHANCEMENT E49 (NEAR-REFL2): the pass that marks a face's drawn geometry in its alpha (`refl::NEAR_MASK_WGSL`), made on first
+    /// use for the cube's format
+    near_mask: Option<(wgpu::TextureFormat, wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
     probe_dummy: wgpu::Buffer,
     compute_supported: bool,
     /// ENHANCEMENT E12: the depth converter (built on first use), and the 1 x 1 image the binding
@@ -425,13 +443,27 @@ pub(crate) struct Core {
     /// ENHANCEMENT E7: the rear-view mirror's own float image + tone map (its size differs from the
     /// main view's)
     scale_blit_mirror: Option<ScaleBlit>,
-    /// ENHANCEMENT E1 / E7: the key (sample count, | [`HDR_KEY`] for the float set) `pipelines` were built for (1 = master's 66)
-    pipeline_samples: u32,
-    /// ENHANCEMENT E1 / E7: the sets built for other keys, kept so a switch back is free
-    pipeline_sets: std::collections::HashMap<u32, Vec<wgpu::RenderPipeline>>,
+    /// ENHANCEMENT E1 / E7: every set built (key: the sample count, | [`HDR_KEY`] for the float set, the shader's parts above
+    /// bit 16; 1 = master's 66), kept so a switch back is free
+    pipeline_sets: std::collections::HashMap<u64, Vec<wgpu::RenderPipeline>>,
+    /// PERF (PERF-B): the sets of item variants 1..=3 (`classes::feat::SURFACE` / `EFFECT` parts, `ensure_pipelines`; empty =
+    /// the variant draws with an earlier set, `var_set`); variant 0 is `pipelines`
+    pipeline_vars: [Vec<wgpu::RenderPipeline>; 3],
+    /// PERF (PERF-D): the keys of the sets the four item variants draw with (the wanted ones, or their stand-ins while those
+    /// are built)
+    pipeline_cur: [u64; 4],
+    /// PERF (PERF-D): a frame waits for its exact sets instead of drawing with a stand-in (`Renderer::set_exact_pipelines`)
+    exact_sets: bool,
+    /// PERF (PERF-D): the sets built off the frame (`pipelines.rs`)
+    set_builder: pipelines::SetBuilder,
+    /// PERF (PERF-B): an item variant's set (0 = `pipelines`, k = `pipeline_vars[k - 1]`)
+    var_set: [u8; 4],
+    /// PERF (PERF-B): per item of the frame, its variant ([`fill::item_variant`])
+    item_var: Vec<u8>,
+    /// the mesh shader of the original's set (no part, `classes::mesh_shader_source(0)`)
     mesh_shader: wgpu::ShaderModule,
-    /// the mesh shader with the inert-at-level-0 blocks, built when the first switch goes on
-    mesh_shader_full: Option<wgpu::ShaderModule>,
+    /// PERF (PERF-B): the mesh shader by its parts (`classes::feat`), built when a set of switches first needs it
+    mesh_shaders: std::collections::HashMap<u32, wgpu::ShaderModule>,
     mesh_layout: wgpu::PipelineLayout,
     /// ENHANCEMENT E1: multisampled colour + depth targets by (width, height, samples)
     ms_cache: std::collections::HashMap<(u32, u32, u32), (wgpu::TextureView, wgpu::TextureView)>,
@@ -552,6 +584,8 @@ pub(crate) struct Core {
     /// `NFS_GPU_TIME`, read once, and its running (sum ms, frames)
     gpu_time_log: bool,
     gpu_time_acc: (f64, u32),
+    /// TEST GLUE (`--perf-bench`): the bench frames' target, kept between frames (width, height, texture, view)
+    bench_target: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     /// ENHANCEMENT E9: the sun shadow maps' pipelines, uniform and map
     csm: csm::CsmState,
     /// ENHANCEMENT E15: the headlight spots' uniform and shadow map
@@ -624,6 +658,9 @@ impl DrawState {
 
 /// A run of consecutive items drawn as one instanced draw: same mesh, pipeline and bind groups,
 /// object indices `first..first + count`.
+/// PERF (PERF-B): a [`Run`]'s pipeline index carries its set above this bit (0 = `Core::pipelines`, k = `pipeline_vars[k - 1]`)
+const SET_SHIFT: usize = 20;
+
 struct Run {
     first: u32,
     count: u32,
@@ -712,6 +749,31 @@ pub const REFL_FACES: [([f32; 3], [f32; 3]); 6] = [
     ([0.0, -1.0, 0.0], [0.0, 0.0, -1.0]),
 ];
 
+/// ENHANCEMENT E49: the two passes of one environment face with the near cars ([`Core::refl_near_pass`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NearPass {
+    /// the face's own scene, its depth stored
+    Keep,
+    /// the near cars over it: the colour and the depth loaded, not cleared
+    Over,
+}
+
+/// ENHANCEMENT E49: how far along a covered stretch, either way from the slice the cube's eye is in, the proxy box reaches (m).
+/// APPROXIMATION: by eye. The box is the slice's straight frame; a curved tube leaves it, but where the box's far end is hit the
+/// ray runs nearly along the tube and the parallax it corrects is small.
+pub const NEAR_BOX_HALF_LEN: f32 = 40.0;
+
+/// ENHANCEMENT E49: the floor of the proxy box under the road's centre line (m below it): the road the car stands on.
+pub const NEAR_BOX_FLOOR: f32 = -0.1;
+
+/// ENHANCEMENT E49: the parallax proxy of the environment cube at `eye`: the covered box (ENHANCEMENT E9 ENH-TUNPOOL's, one per road
+/// slice) that covers the eye most, lengthened to [`NEAR_BOX_HALF_LEN`], and its weight there (0..1, the run's 6 m ramps at a portal
+/// blend the boxed lookup into the plain one). `None` in the open.
+pub fn near_proxy(boxes: &[crate::CoverBox], eye: glam::Vec3) -> Option<(crate::CoverBox, f32)> {
+    let (b, w) = boxes.iter().map(|b| (b, b.weight(eye))).max_by(|a, b| a.1.total_cmp(&b.1))?;
+    (w > 0.0).then(|| (crate::CoverBox { half_len: NEAR_BOX_HALF_LEN, ..*b }, w))
+}
+
 /// ENHANCEMENT E8: the player's car's environment — six faces in one array texture, plus the target a
 /// face is drawn into.
 struct ReflCube {
@@ -729,6 +791,17 @@ struct ReflCube {
     face_view: wgpu::TextureView,
     /// bit `i` set once face `i` has been drawn; the shader takes the map only when all six are
     faces_done: u8,
+    /// ENHANCEMENT E49: the cube holds twelve layers — 0..5 the faces without cars (every car's coat, the probe), 6..11 the same
+    /// faces with the near cars drawn over them (the player's own coat) — and each face's eye; 6 layers (E8's cube) without
+    near: bool,
+    /// ENHANCEMENT E49: as `stale` / `faces_done`, for layers 6..11
+    stale_own: u8,
+    faces_done_own: u8,
+    /// ENHANCEMENT E49: the faces drawn with no car near (the player's layer is the face itself: its mips are copied)
+    own_same: u8,
+    /// ENHANCEMENT E49: the eye each face was drawn from, and the newest
+    eyes: [glam::Vec3; 6],
+    eye: glam::Vec3,
 }
 
 /// How many uncaptured wgpu errors the handler has seen; ENHANCEMENT: [`Core::apply`] sees the count rise and forces every
@@ -886,6 +959,8 @@ mod tests {
             "[f32;4]" => 16,
             "[[f32;4];crate::RAIN_LAMPS]" => 16 * crate::RAIN_LAMPS,
             "[[f32;4];crate::RAIN_EDGES]" => 16 * crate::RAIN_EDGES,
+            // ENHANCEMENT E49: the faces' eyes
+            "[[f32;4];7]" => 16 * 7,
             _ => panic!("Rust type `{t}` unknown to the layout test"),
         }
     }

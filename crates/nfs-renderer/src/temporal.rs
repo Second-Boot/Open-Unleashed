@@ -392,6 +392,9 @@ pub(crate) struct Cur {
     pub mv: wgpu::TextureView,
     pub reactive: wgpu::TextureView,
     pub tc: wgpu::TextureView,
+    /// PERF (picture identical): the transparency-and-composition mask has a reader this frame (FSR 3.1, the debug pass);
+    /// MetalFX's temporal scaler takes no such input, so for it the mask stays in tile memory (cleared, never stored)
+    pub tc_read: bool,
     pub objects_bg: wgpu::BindGroup,
     pub jitter_ndc: [f32; 2],
     pub jitter_px: [f32; 2],

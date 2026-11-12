@@ -9,15 +9,16 @@
 //!
 //! ```text
 //! porsche [track] [car] [sim] [--fe[=layout]] [--layout NAME] [--layout-sweep] [--debug-menu]
-//!         [--screenshot out.png] [--autotest SECS [--follow]] [--opponents N] [--laps N]
+//!         [--screenshot out.png [--perf-bench N]] [--autotest SECS [--follow]] [--opponents N] [--laps N]
 //!         [--quick-knockout] [--backwards] [--mirror] [--record run.csv] [--replay FILE]
 //!         [--career ID] [--mission] [--resim PACKAGE [--resim-out REPORT]]
 //!         [--net host[:PORT] | --net join:HOST[:PORT] [--net-name NAME]] [--net-browse SECS]
 //! ```
 
 /// The flags that take a value: the token after one of them is never a positional argument.
-const FLAGS_WITH_VALUE: [&str; 13] = [
+const FLAGS_WITH_VALUE: [&str; 14] = [
     "--screenshot",
+    "--perf-bench",
     "--autotest",
     "--opponents",
     "--record",
@@ -72,6 +73,9 @@ pub(crate) struct Cli {
     pub mirror: bool,
     /// `--screenshot <file.png>`
     pub screenshot: Option<String>,
+    /// **TEST GLUE** `--perf-bench <frames>` (with `--screenshot`): before the still, the frame is drawn again and timed,
+    /// warm-up frames then `<frames>` measured ones, and one `PERF` line is logged (`app/scripted.rs`, `run_perf_bench`)
+    pub perf_bench: Option<u32>,
     /// `--layout-sweep`
     pub layout_sweep: bool,
     /// `--fe` / `--fe=<layout>`: the layout named, `QuickRace` when none is (the first token
@@ -147,6 +151,7 @@ impl Cli {
             backwards: has("--backwards"),
             mirror: has("--mirror"),
             screenshot: value("--screenshot").cloned(),
+            perf_bench: value("--perf-bench").and_then(|v| v.parse().ok()),
             layout_sweep: has("--layout-sweep"),
             fe: args.iter().find(|a| a.starts_with("--fe")).map(|a| match a.split_once('=') {
                 Some((_, name)) if !name.is_empty() => name.to_string(),

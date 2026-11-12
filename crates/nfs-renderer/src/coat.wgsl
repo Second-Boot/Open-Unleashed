@@ -37,7 +37,7 @@ fn face_up(face: i32) -> vec3<f32> {
 }
 
 // the same face pick and projection as `refl_sample` in shader.wgsl
-fn cube_sample(d: vec3<f32>) -> vec3<f32> {
+fn cube_sample(d: vec3<f32>) -> vec4<f32> {
     let a = abs(d);
     var face = 0;
     if a.x >= a.y && a.x >= a.z {
@@ -61,7 +61,7 @@ fn cube_sample(d: vec3<f32>) -> vec3<f32> {
     let z = max(dot(d, fwd), 0.0001);
     let u = 0.5 + 0.5 * dot(d, right) / z * p.a.w;
     let v = 0.5 - 0.5 * dot(d, up) / z * p.a.w;
-    return textureSampleLevel(src, smp, vec2<f32>(u, v), face, 0.0).rgb;
+    return textureSampleLevel(src, smp, vec2<f32>(u, v), face, 0.0);
 }
 
 fn radical_inverse(i0: u32) -> f32 {
@@ -96,6 +96,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let a2 = alpha * alpha;
     var acc = vec3<f32>(0.0);
     var wsum = 0.0;
+    // ENHANCEMENT E49 (NEAR-REFL2): the faces' alpha (the geometry mask, `gpu/refl.rs` `near_mask`) filtered by the same lobe
+    var asum = 0.0;
     for (var i = 0u; i < count; i = i + 1u) {
         let xi = vec2<f32>((f32(i) + 0.5) / f32(count), radical_inverse(i));
         let phi = 6.2831853 * xi.x + rot;
@@ -106,11 +108,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let l = 2.0 * dot(n, h) * h - n;
         let nl = dot(n, l);
         if nl > 0.0 {
-            let c = min(max(cube_sample(l), vec3<f32>(0.0)), vec3<f32>(60.0));
+            let s = cube_sample(l);
+            let c = min(max(s.rgb, vec3<f32>(0.0)), vec3<f32>(60.0));
+            asum += s.a * nl;
             acc += pow(c, vec3<f32>(GAMMA)) * nl;
             wsum += nl;
         }
     }
     let lin = acc / max(wsum, 0.0001);
-    return vec4<f32>(pow(lin, vec3<f32>(1.0 / GAMMA)), 1.0);
+    return vec4<f32>(pow(lin, vec3<f32>(1.0 / GAMMA)), asum / max(wsum, 0.0001));
 }

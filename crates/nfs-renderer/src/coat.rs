@@ -87,9 +87,10 @@ impl CoatFilter {
     }
 
     /// Filter mips 1.. of the faces in `mask` (bit `i` = face `i`) of `array` (`format`, `size`², [`MIPS`] mips, six layers),
-    /// reading mip 0 and the mips filtered before; `tan_inv` = `1 / tan(half fov)` of a face.
+    /// reading mip 0 and the mips filtered before; `tan_inv` = `1 / tan(half fov)` of a face. ENHANCEMENT E49: `base` = the first
+    /// of the six layers (6: the player's faces of the twelve-layer cube; 0 = E8's cube as ever).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, array: &wgpu::Texture, format: wgpu::TextureFormat, size: u32, mask: u8, tan_inv: f32) {
+    pub(crate) fn record(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, array: &wgpu::Texture, format: wgpu::TextureFormat, size: u32, mask: u8, tan_inv: f32, base: u32) {
         if mask == 0 {
             return;
         }
@@ -110,7 +111,7 @@ impl CoatFilter {
         }
         queue.write_buffer(&self.params, 0, &data);
         for m in 1..MIPS {
-            let src = array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), base_mip_level: m - 1, mip_level_count: Some(1), ..Default::default() });
+            let src = array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), base_mip_level: m - 1, mip_level_count: Some(1), base_array_layer: base, array_layer_count: if base == 0 { None } else { Some(6) }, ..Default::default() });
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("coat prefilter"),
                 layout: &self.layout,
@@ -124,7 +125,7 @@ impl CoatFilter {
                 if mask & (1 << f) == 0 {
                     continue;
                 }
-                let dst = array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_mip_level: m, mip_level_count: Some(1), base_array_layer: f, array_layer_count: Some(1), ..Default::default() });
+                let dst = array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_mip_level: m, mip_level_count: Some(1), base_array_layer: base + f, array_layer_count: Some(1), ..Default::default() });
                 let mut pass = gfx::color_pass_untimed(encoder, "coat prefilter", &dst, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &bg, &[((m - 1) * 6 + f) * self.stride as u32]);

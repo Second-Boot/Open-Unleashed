@@ -18,7 +18,7 @@
 use nfs_assets::paths::GamePaths;
 use nfs_formats::locale::{Strings, typed_char};
 use nfs_renderer::{ENHANCEMENT_REGISTRY, EnhancementStored, EnhancementSwitch, Enhancements, MAX_ENHANCEMENT_LEVELS};
-use nfs_renderer::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E20, E21, E22, E23, E24, E25, E26, E27, E28, E29, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47};
+use nfs_renderer::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E20, E21, E22, E23, E24, E25, E26, E27, E28, E29, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::PathBuf;
@@ -473,10 +473,10 @@ const INACTIVE_COLOR: &str = "0xff8a8a8a";
 /// A group stays on one page when it fits on one (`paginate`).
 pub const GROUPS: &[([&str; 2], &[EnhancementSwitch])] = &[
     (["image", "Изображение"], &[E6, E22, E1, E2, E3, E35, E4, E5, E38, E33]),
-    (["light and shadows", "Свет и тени"], &[E7, E9, E43, E25, E14, E32, E16, E15, E24, E23, E47, E20]),
-    (["surfaces", "Поверхности"], &[E8, E17, E26, E40, E41, E42]),
+    (["light and shadows", "Свет и тени"], &[E7, E9, E51, E43, E25, E50, E14, E32, E16, E15, E24, E23, E47, E20]),
+    (["surfaces", "Поверхности"], &[E8, E49, E17, E26, E40, E41, E42]),
     (["atmosphere and effects", "Атмосфера и эффекты"], &[E10, E11, E13, E19, E36, E44, E21, E18, E12]),
-    (["camera", "Камера"], &[E27, E28, E29, E31]),
+    (["camera", "Камера"], &[E27, E28, E29, E48, E31]),
 ];
 
 /// The registry entries the upscaler choice (E38) carries as settings rows, not rows of their own.
@@ -1060,7 +1060,7 @@ mod tests {
     #[test]
     fn every_entry_has_a_row_or_is_an_upscaler_setting() {
         let mut seen: Vec<&str> = GROUPS.iter().flat_map(|(_, t)| t.iter().map(|s| s.token())).chain(SETTINGS_OF_E38.iter().map(|s| s.token())).collect();
-        for e in ENHANCEMENT_REGISTRY {
+        for e in ENHANCEMENT_REGISTRY.iter() {
             assert_eq!(seen.iter().filter(|t| **t == e.token).count(), 1, "{} is in the panel exactly once", e.token);
         }
         seen.sort_unstable();

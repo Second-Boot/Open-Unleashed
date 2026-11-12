@@ -487,7 +487,7 @@ impl App {
     /// instance matrix and their walk entry (`TrackWorld::running_flares`); the blend is the state object's 1, additive (0x4514E7), and the
     /// depth bias is carried (below). MEDIUM: the row 0x451A57 dots is taken as the
     /// camera's forward and the turn's sense as the axis-angle build's (0x539BD0).
-    fn flare_items(&self, out: &mut Vec<nfs_renderer::DrawItem>, fwd: Vec3, right: Vec3, up: Vec3, draws: &[Option<nfs_game::world::ArticleDraw>]) {
+    pub(crate) fn flare_items(&self, out: &mut Vec<nfs_renderer::DrawItem>, fwd: Vec3, right: Vec3, up: Vec3, draws: &[Option<nfs_game::world::ArticleDraw>]) {
         let Some(w) = self.world.as_ref() else { return };
         if self.flare_defs.is_empty() {
             return;

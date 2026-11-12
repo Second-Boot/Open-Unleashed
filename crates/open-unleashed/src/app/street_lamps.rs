@@ -18,8 +18,67 @@ pub(crate) struct LampSite {
     pub color: [f32; 3],
     /// the head's height over the nearest road slice (m)
     pub height: f32,
-    /// the lamp is inside a tunnel: lit on any track (a street lamp only on a night track)
+    /// the lamp is inside a tunnel: lit on any track (a street lamp only on a night track). LAMP-TUNE: a tunnel-lamp id, or a
+    /// street-lamp id standing in a covered stretch (coastal's two tunnels are lit by `ydlb` sodium lamps)
     pub tunnel: bool,
+    /// LAMP-TUNE: a tunnel-lamp id (`class_of`): E36's air glows by day take only these. The covered street lamps (coastal) light
+    /// the road and cast the cars' shadows by day but have no air glow: E36's glow of coastal's 29 sodium lamps washed the tunnel
+    /// out (its haze is tuned on the tunnel-lamp tracks)
+    pub air: bool,
+    /// LAMP-TUNE: how many flare heads make this light (a multi-head lamp post is one light, [`CLUSTER_GAP`])
+    pub heads: u8,
+    /// the light's reach (m) at the level "средне", [`lamp_radius`]
+    pub radius: f32,
+}
+
+/// LAMP-TUNE: heads of one lamp post (monaco1's casino square: three `pmal` heads 0.72 m apart on each post) closer than this (m)
+/// are one light. APPROXIMATION (the data has no post grouping; the nearest separate lamps of the census stand 2.6 m apart).
+const CLUSTER_GAP: f32 = 1.5;
+
+/// LAMP-TUNE: the brightness of a tunnel lamp lit on a DAY track (a share of E23's): the tunnel's baked colour there is already
+/// the lamps' light (the original bakes their pools into the tube), so E23's full term on top doubled it, and with the rows of
+/// lamps 7-20 m apart (each road point inside 3-5 pools) clipped the road and the walls to white (coastal by day: the road
+/// band's mean luma 61 original -> 137, 1.7 % clipped; alps' tubes alike, 49 -> 156). At this share the pools and the cars' lamp
+/// shadows show and nothing clips. Night tracks keep the whole term (their bake is the dark night). APPROXIMATION (by the
+/// histograms, `ENHANCEMENTS.md` LAMP-TUNE).
+pub(crate) const DAY_TUNNEL_GAIN: f32 = 0.35;
+
+/// LAMP-TUNE: the reach of a lamp `height` m over the road made of `heads` heads (m): E23's `clamp(1.5 h + 6, 10, 30)` per head,
+/// times `sqrt(heads)` for a post of several heads (the distance a given brightness reaches grows with the root of the
+/// intensity), at most 36: monaco1's three-head 3 m posts reach 18 m (were three 10.5 m lights). A wider single lamp was tried
+/// (`clamp(2 h + 8, 12, 32)`) and dropped: the rows of lamps 7-10 m apart (coastal's tunnels, autobahn's) then add six pools
+/// at every point and wash the road out. APPROXIMATION: the data has no radius (`ENHANCEMENTS.md` E23, authored).
+pub(crate) fn lamp_radius(height: f32, heads: u8) -> f32 {
+    ((1.5 * height + 6.0).clamp(10.0, 30.0) * (heads.max(1) as f32).sqrt()).min(36.0)
+}
+
+/// LAMP-TUNE: the heads merged into lights: heads of the same kind (tunnel or street) within [`CLUSTER_GAP`] of a light's first
+/// head join it; the light stands at their mean, its colour is their mean colour, its height their mean, its pool
+/// [`lamp_radius`] `sqrt(heads)` wider: the pool's energy (peak x radius^2) is the heads' sum, spread wider instead of a 3x
+/// hot spot (a `sqrt(heads)` peak on top was tried: alps' paired tunnel heads then gave 2.8x a pair's light, the tube clipped).
+fn cluster(heads: Vec<(LampSite, Vec3)>) -> Vec<LampSite> {
+    // (first head, sum of positions, sum of colours, sum of heights, count, tunnel, air)
+    let mut groups: Vec<(Vec3, Vec3, Vec3, f32, u8, bool, bool)> = Vec::new();
+    for (s, c) in heads {
+        match groups.iter_mut().find(|g| g.5 == s.tunnel && g.6 == s.air && g.0.distance(s.pos) < CLUSTER_GAP && g.4 < u8::MAX) {
+            Some(g) => {
+                g.1 += s.pos;
+                g.2 += c;
+                g.3 += s.height;
+                g.4 += 1;
+            }
+            None => groups.push((s.pos, s.pos, c, s.height, 1, s.tunnel, s.air)),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(_, p, c, h, n, tunnel, air)| {
+            let k = n as f32;
+            let colour = c / k;
+            let height = h / k;
+            LampSite { pos: p / k, color: colour.to_array(), height, tunnel, air, heads: n, radius: lamp_radius(height, n) }
+        })
+        .collect()
 }
 
 /// Lamps farther than this from the eye are not considered (metres).
@@ -156,7 +215,10 @@ impl App {
     /// The track's lamps, classified once per race (`None` until the first frame asks).
     pub(crate) fn street_lamp_sites(&mut self) -> &[LampSite] {
         if self.street_lamps.is_none() {
-            let mut out = Vec::new();
+            let mut heads: Vec<(LampSite, Vec3)> = Vec::new();
+            // LAMP-TUNE: the covered stretches (the original's enclosure test of the road slices, `cover.rs`): a street lamp inside one
+            // lights the tunnel on a day track too
+            let boxes = if self.world.is_some() && self.slices.is_some() { self.cover_boxes() } else { Default::default() };
             if let Some(w) = self.world.as_ref() {
                 // PERF: the slices' nearest-centre index and the `flare.dat` records by id (the first
                 // record of an id, as `iter().find` took it), built once here instead of a search per flare
@@ -174,10 +236,14 @@ impl App {
                     let m = c[0].max(c[1]).max(c[2]).max(1e-3);
                     let c = c.map(|v| v / m * 0.7 + 0.3);
                     let height = self.slices.as_ref().zip(near.as_ref()).and_then(|(t, n)| n.nearest(f.position).map(|i| t.slices[i].centre.y)).map_or(6.0, |y| f.position.y - y);
-                    out.push(LampSite { pos: f.position, color: c, height: height.clamp(2.5, 20.0), tunnel: class == LampClass::Tunnel });
+                    let covered = nfs_renderer::cover_weight(&boxes, f.position) > 0.5;
+                    tracing::debug!(id = %String::from_utf8_lossy(&f.id.to_le_bytes()), pos = ?f.position, height, covered, "street lamp head (ENHANCEMENT E23)");
+                    let site = LampSite { pos: f.position, color: c, height: height.clamp(2.5, 20.0), tunnel: class == LampClass::Tunnel || covered, air: class == LampClass::Tunnel, heads: 1, radius: 0.0 };
+                    heads.push((site, Vec3::from(c)));
                 }
             }
-            tracing::info!(lamps = out.len(), night = self.track.is_night(), "street lamps (ENHANCEMENT E23)");
+            let out = cluster(heads);
+            tracing::info!(lamps = out.len(), tunnel = out.iter().filter(|s| s.tunnel).count(), heads = out.iter().map(|s| s.heads as usize).sum::<usize>(), night = self.track.is_night(), "street lamps (ENHANCEMENT E23)");
             self.street_lamps = Some(out);
         }
         self.street_lamps.as_deref().unwrap_or(&[])
@@ -201,7 +267,7 @@ impl App {
             .street_lamp_sites()
             .iter()
             .filter(|s| night || s.tunnel)
-            .filter(|s| cone.is_none_or(|c| c.sees(s.pos, (1.5 * s.height + 6.0).clamp(10.0, 30.0) * scale)))
+            .filter(|s| cone.is_none_or(|c| c.sees(s.pos, s.radius * scale)))
             .map(|s| (s.pos.distance(eye), *s))
             .filter(|(d, _)| *d < REACH)
             .collect();
@@ -214,7 +280,9 @@ impl App {
         for (d, s) in near.iter().take(MAX_LAMPS) {
             let fade = 1.0 - ((d - 0.75 * cut) / (0.25 * cut)).clamp(0.0, 1.0);
             let k = fade * fade * (3.0 - 2.0 * fade);
-            out.lamps[out.n as usize] = StreetLamp { pos: s.pos, color: [s.color[0] * k, s.color[1] * k, s.color[2] * k], radius: (1.5 * s.height + 6.0).clamp(10.0, 30.0) * scale };
+            // LAMP-TUNE: a tunnel lamp on a day track lights at its share (the tube's bake already holds its light)
+            let k = if night { k } else { k * DAY_TUNNEL_GAIN };
+            out.lamps[out.n as usize] = StreetLamp { pos: s.pos, color: [s.color[0] * k, s.color[1] * k, s.color[2] * k], radius: s.radius * scale };
             out.n += 1;
         }
         out
@@ -223,8 +291,27 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::SliceIndex;
+    use super::{cluster, lamp_radius, LampSite, SliceIndex};
     use glam::Vec3;
+
+    /// LAMP-TUNE: the three heads of a post (0.72 m apart) are one light at their mean, sqrt(3) brighter and wider; a lamp 2.6 m
+    /// away and a tunnel head at the same spot stay lights of their own
+    #[test]
+    fn the_heads_of_a_post_are_one_light() {
+        let head = |x: f32, z: f32, tunnel: bool| (LampSite { pos: Vec3::new(x, 3.0, z), color: [1.0, 0.8, 0.5], height: 3.0, tunnel, air: tunnel, heads: 1, radius: 0.0 }, Vec3::new(1.0, 0.8, 0.5));
+        let out = cluster(vec![head(0.0, 0.0, false), head(0.72, 0.0, false), head(0.36, 0.62, false), head(2.6, 0.0, false), head(0.0, 0.0, true)]);
+        assert_eq!(out.len(), 3);
+        let post = &out[0];
+        assert_eq!(post.heads, 3);
+        assert!((post.pos - Vec3::new(0.36, 3.0, 0.62 / 3.0)).length() < 1e-5, "{:?}", post.pos);
+        assert!((post.color[0] - 1.0).abs() < 1e-5);
+        assert!((post.radius - lamp_radius(3.0, 1) * 3.0f32.sqrt()).abs() < 1e-4);
+        assert_eq!((out[1].heads, out[2].heads, out[2].tunnel), (1, 1, true));
+        // a single head keeps E23's reach
+        assert_eq!(lamp_radius(3.0, 1), 10.5);
+        assert_eq!(lamp_radius(20.0, 1), 30.0);
+        assert_eq!(lamp_radius(16.0, 4), 36.0);
+    }
 
     /// Every query of `pts` answered as the scan answers it.
     fn same(centres: &[Vec3], pts: &[Vec3]) -> usize {

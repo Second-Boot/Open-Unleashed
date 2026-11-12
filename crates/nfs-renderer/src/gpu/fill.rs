@@ -51,6 +51,8 @@ pub(super) struct GlobalsFrame<'a> {
     pub env: FrameEnv<'a>,
     /// ENHANCEMENT ENH-TEMPORAL: the jitter in NDC and the render size of a temporal main view (`None` = master's frame)
     pub temporal: Option<([f32; 2], (u32, u32))>,
+    /// ENHANCEMENT E49: the near lookup (`None` = off, master's zeros)
+    pub near: Option<NearFrame>,
 }
 
 /// `GlobalsUniform::ambient.w`: whether the fragment output keeps values above 1 — ENHANCEMENT E7's ACES level (`hdr` 1), or
@@ -62,7 +64,7 @@ fn keeps_overbright(hdr: Option<u32>, enh: &Enhancements, p_fx: bool) -> bool {
 
 /// The frame's [`GlobalsUniform`].
 pub(super) fn globals_uniform(f: &GlobalsFrame) -> GlobalsUniform {
-    let GlobalsFrame { scene, camera, vp_j, enh, hdr, no_reflections, refl_faces_done, probe_strength, soft_split, env, temporal } = *f;
+    let GlobalsFrame { scene, camera, vp_j, enh, hdr, no_reflections, refl_faces_done, probe_strength, soft_split, env, temporal, near } = *f;
     let (water_env, rain_env, p_fx) = (env.water, env.rain, env.p_fx);
     GlobalsUniform {
         view_proj: vp_j.to_cols_array_2d(),
@@ -141,6 +143,13 @@ pub(super) fn globals_uniform(f: &GlobalsFrame) -> GlobalsUniform {
         },
         // ENHANCEMENT ENH-TEMPORAL: 0 = master's value
         temporal: temporal.map_or([0.0; 4], |(jitter_ndc, size)| [jitter_ndc[0], jitter_ndc[1], size.0 as f32, size.1 as f32]),
+        // ENHANCEMENT E49: only with the switch on and the twelve-layer cube drawn; 0 is master's value
+        // (.x 2 = NEAR-REFL3's live sky in the overlay, a night track; .w TEST GLUE `NFS_NEAR_DEBUG`: the paint shows the reflection alone)
+        near: near.map_or([0.0; 4], |n| [if n.live_sky { 2.0 } else { 1.0 }, n.own as u32 as f32, n.proxy.map_or(0.0, |p| p.1), n.debug as f32]),
+        near_box: near.and_then(|n| n.proxy).map_or([[0.0; 4]; 4], |(b, _)| {
+            [b.centre.extend(b.half_len).to_array(), b.forward.extend(b.half_wid).to_array(), b.lateral.extend(NEAR_BOX_FLOOR).to_array(), b.up.extend(b.ceil).to_array()]
+        }),
+        near_eye: near.map_or([[0.0; 4]; 7], |n| std::array::from_fn(|k| n.eyes.get(k).copied().unwrap_or(n.eye).extend(1.0).to_array())),
     }
 }
 
@@ -192,6 +201,24 @@ pub(super) struct ObjectFrame<'a> {
     pub vp_j: glam::DMat4,
     /// ENHANCEMENT UPSCALE-SOFT: added to the materials' LOD bias in an upscaler's main view (`upscale::mip_bias`); 0 = master's
     pub lod_shift: f32,
+    /// ENHANCEMENT E49: the player's faces (the near cars) are drawn: a [`DrawItem::near_env`] item's `refl.w` is 1 (false = 0, master's)
+    pub near_own: bool,
+}
+
+/// ENHANCEMENT E49: the near lookup's inputs of a frame (`Core::near_frame`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NearFrame {
+    /// all six of the player's faces (layers 6..11) are drawn
+    pub own: bool,
+    /// the eye each face was drawn from, and the newest
+    pub eyes: [glam::Vec3; 6],
+    pub eye: glam::Vec3,
+    /// the covered proxy box at the eye and its weight (`gpu::near_proxy`); `None` in the open
+    pub proxy: Option<(crate::CoverBox, f32)>,
+    /// NEAR-REFL3: the overlay's sky parts take the faces' own sky (`Scene::near_live_sky`, a night track)
+    pub live_sky: bool,
+    /// TEST GLUE (`NFS_NEAR_DEBUG`): the paint shows the reflection alone (a still that makes the lookup visible)
+    pub debug: u8,
 }
 
 /// The per-item receivers the fill asks only when their effect is on this frame (`Core::csm_receive`, `spot_receive`,
@@ -204,7 +231,7 @@ pub(super) struct Receivers<'a> {
 
 /// Item `i`'s [`ObjectUniform`]; `sky_tex`: the item's sky-map pass has its section map (`sky_tex_of`).
 pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Option<MatFill>, sky_tex: bool, rx: &Receivers) -> ObjectUniform {
-    let ObjectFrame { camera, depth_far, csm: csm_frame, soft_split, spots, contact_on, env, roles, motion_index, vp_j, lod_shift } = *f;
+    let ObjectFrame { camera, depth_far, csm: csm_frame, soft_split, spots, contact_on, env, roles, motion_index, vp_j, lod_shift, near_own } = *f;
     let (water_env, rain_env, p_fx, hdr_boost) = (env.water, env.rain, env.p_fx, env.hdr_boost);
     let mat = mat.as_ref();
     let env_mix = mat.map_or(0.0, |m| m.env_mix);
@@ -262,7 +289,7 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         // .z ENHANCEMENT E16: 1 = the car ambient takes the probe (not the cabin's materials)
         // ENHANCEMENT E17: class 3 = water (a horizontal-water item while the switch and the sky are there)
         // ENHANCEMENT E26: class 4 = a wet road part (`.w` its wetness; a dry one keeps its own class), class 5 = a skid strip on one
-        refl: if item.water && water_env.is_some() { [classes::REFL_WATER, 1.0, 0.0, 0.0] } else if rain_env.is_some() && item.csm & crate::CSM_ROAD != 0 { [classes::REFL_WET_ROAD, 0.0, 0.0, item.wet] } else if rain_env.is_some() && item.csm & crate::CSM_SKID != 0 { [classes::REFL_SKID, 0.0, 0.0, item.wet] } else { mat.map_or([0.0; 4], |m| [m.reflect.class as f32, m.reflect.strength, (!m.reflect.interior && item.layer_light.is_some_and(|l| l.direction != [0.0; 3])) as u32 as f32, 0.0]) },
+        refl: if item.water && water_env.is_some() { [classes::REFL_WATER, 1.0, 0.0, 0.0] } else if rain_env.is_some() && item.csm & crate::CSM_ROAD != 0 { [classes::REFL_WET_ROAD, 0.0, 0.0, item.wet] } else if rain_env.is_some() && item.csm & crate::CSM_SKID != 0 { [classes::REFL_SKID, 0.0, 0.0, item.wet] } else { mat.map_or([0.0; 4], |m| [m.reflect.class as f32, m.reflect.strength, (!m.reflect.interior && item.layer_light.is_some_and(|l| l.direction != [0.0; 3])) as u32 as f32, (near_own && item.near_env) as u32 as f32]) },
         // ENHANCEMENT E12: the fade distance; the multiplying pair (3) fades toward white
         // ENHANCEMENT E15: .z the item's role for the headlight spots (1 car, 2 track, 0 none)
         // ENHANCEMENT ENH-TEMPORAL: .w the item's role for the masks (0 opaque-like, 1 a translucent effect, 2 a sky layer)
@@ -274,6 +301,17 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         // PORT-DEVIATION D37: master's clip transform (with the jitter in `vp_j` only while ENH-TEMPORAL is on)
         mvp: (vp_j * glam::DMat4::from_cols_array(&item.transform.to_cols_array().map(f64::from))).as_mat4().to_cols_array_2d(),
     }
+}
+
+/// PERF (PERF-B): which per-item parts of the mesh shader an item's uniform can enter, by the shader's own tests of those parts:
+/// bit 0 the surface parts (`classes::feat::SURFACE`) — a reflection class (`refl.x` > 0.5: E8's paint / glass, E17's water,
+/// E26's wet road / skid); bit 1 the effect parts (`classes::feat::EFFECT`) — a spark or a lit particle (`hdr.y` > 0, `hdr.z` >
+/// PART_LIT - 0.5, E18), a soft fade (`soft.x` > 0, E12), an HDR boost (`hdr.x` > 1, E11). Without a bit the item draws the
+/// same with a shader built without those parts.
+pub(super) fn item_variant(o: &ObjectUniform) -> u8 {
+    let surface = o.refl[0] > classes::REFL_NONE + 0.5;
+    let effect = o.hdr[1] > 0.0 || o.hdr[2] > classes::PART_LIT - 0.5 || o.soft[0] > 0.0 || o.hdr[0] > 1.0;
+    surface as u8 | (effect as u8) << 1
 }
 
 #[cfg(test)]
@@ -361,16 +399,16 @@ mod tests {
             // the inputs `encode_frame` passes with the original set: cube faces drawn or not, a probe strength (E16's gate is
             // inside `probe_strength`, but the E8 gate here must hold it off too), no split (E12 off), no temporal view
             for refl_faces_done in [false, true] {
-                let g = globals_uniform(&GlobalsFrame { scene: &scene, camera: &cam, vp_j: vp, enh: &enh, hdr: None, no_reflections, refl_faces_done, probe_strength: 0.6, soft_split: false, env, temporal: None });
+                let g = globals_uniform(&GlobalsFrame { scene: &scene, camera: &cam, vp_j: vp, enh: &enh, hdr: None, no_reflections, refl_faces_done, probe_strength: 0.6, soft_split: false, env, temporal: None, near: None });
                 let bytes = bytemuck::bytes_of(&g);
                 let master = master_globals(&scene, &cam, vp, no_reflections);
                 assert_eq!(&bytes[..master.len()], &master[..], "the fields master has");
                 let zero = [0.0f32; 4];
                 assert_eq!(g.soft, [cam.near, cam.far, 0.0, 0.0]);
-                for (name, v) in [("refl", g.refl), ("water", g.water), ("water_zenith", g.water_zenith), ("water_horizon", g.water_horizon), ("water_sun", g.water_sun), ("fx_sun", g.fx_sun), ("fogsun", g.fogsun), ("flash", g.flash), ("rain", g.rain), ("rain_zenith", g.rain_zenith), ("rain_horizon", g.rain_horizon), ("temporal", g.temporal)] {
+                for (name, v) in [("refl", g.refl), ("water", g.water), ("water_zenith", g.water_zenith), ("water_horizon", g.water_horizon), ("water_sun", g.water_sun), ("fx_sun", g.fx_sun), ("fogsun", g.fogsun), ("flash", g.flash), ("rain", g.rain), ("rain_zenith", g.rain_zenith), ("rain_horizon", g.rain_horizon), ("temporal", g.temporal), ("near", g.near)] {
                     assert_eq!(v, zero, "{name}");
                 }
-                for (name, a) in [("rain_lamp_pos", &g.rain_lamp_pos[..]), ("rain_lamp_col", &g.rain_lamp_col[..]), ("rain_edge_pos", &g.rain_edge_pos[..]), ("rain_edge_dir", &g.rain_edge_dir[..]), ("rain_edge_val", &g.rain_edge_val[..])] {
+                for (name, a) in [("rain_lamp_pos", &g.rain_lamp_pos[..]), ("rain_lamp_col", &g.rain_lamp_col[..]), ("rain_edge_pos", &g.rain_edge_pos[..]), ("rain_edge_dir", &g.rain_edge_dir[..]), ("rain_edge_val", &g.rain_edge_val[..]), ("near_box", &g.near_box[..]), ("near_eye", &g.near_eye[..])] {
                     assert!(a.iter().all(|v| *v == zero), "{name}");
                 }
             }
@@ -378,7 +416,7 @@ mod tests {
         // and the same inputs with every switch on do reach the enhancement fields (the test sees them)
         let all = Enhancements::all();
         let env = FrameEnv::new(&scene, &all, Some(2));
-        let g = globals_uniform(&GlobalsFrame { scene: &scene, camera: &cam, vp_j: vp, enh: &all, hdr: Some(2), no_reflections: false, refl_faces_done: true, probe_strength: 0.6, soft_split: true, env, temporal: Some(([0.1, -0.1], (640, 400))) });
+        let g = globals_uniform(&GlobalsFrame { scene: &scene, camera: &cam, vp_j: vp, enh: &all, hdr: Some(2), no_reflections: false, refl_faces_done: true, probe_strength: 0.6, soft_split: true, env, temporal: Some(([0.1, -0.1], (640, 400))), near: None });
         assert!(g.refl[0] > 0.0 && g.water[0] == 1.0 && g.rain[0] > 0.0 && g.flash[0] > 0.0 && g.fogsun[3] > 0.0 && g.temporal[2] == 640.0 && g.ambient[3] == 1.0);
     }
 
@@ -423,7 +461,7 @@ mod tests {
             items.push(it);
         }
         for depth_far in [700.0, 65000.0] {
-            let of = ObjectFrame { camera: &cam, depth_far, csm: None, soft_split: false, spots: false, contact_on: false, env, roles: &[], motion_index: &[], vp_j: glam::DMat4::from_cols_array(&cam.view_projection_mirrored(16.0 / 10.0, false).to_cols_array().map(f64::from)), lod_shift: 0.0 };
+            let of = ObjectFrame { camera: &cam, depth_far, csm: None, soft_split: false, spots: false, contact_on: false, env, roles: &[], motion_index: &[], vp_j: glam::DMat4::from_cols_array(&cam.view_projection_mirrored(16.0 / 10.0, false).to_cols_array().map(f64::from)), lod_shift: 0.0, near_own: false };
             for (i, item) in items.iter().enumerate() {
                 for mat in mats {
                     for sky_tex in [false, true] {

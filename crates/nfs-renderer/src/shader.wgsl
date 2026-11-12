@@ -41,6 +41,12 @@ struct Globals {
     rain_edge_val: array<vec4<f32>, 8>,
     // ENHANCEMENT ENH-TEMPORAL: .xy the jitter in NDC (the shift already applied to `view_proj`), .zw the render size in pixels
     temporal: vec4<f32>,
+    // ENHANCEMENT E49: .x 1 = the clear coat reads the near lookup, .y 1 = the player's faces (layers 6..11) are drawn, .z the
+    // proxy box's weight at the cube's eye; the box (centre + half length, forward + half width, lateral + floor, up + ceiling);
+    // each face's eye, [6] the newest
+    near: vec4<f32>,
+    near_box: array<vec4<f32>, 4>,
+    near_eye: array<vec4<f32>, 7>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 // `night.psh`'s `nght`, 128 × 128 bytes packed four to a u32
@@ -76,6 +82,12 @@ struct Csm {
     // (lateral, weight at the back face), (up, weight at the front face), (ceiling height over the centre, nominal half length, 0, 0)
     cover_n: vec4<f32>,
     cover: array<vec4<f32>, 320>,
+    // ENHANCEMENT E50: x the moon's track strength (0 = not a moon frame), y the cars' cold term, z the soft edge's radius in texels
+    moon: vec4<f32>,
+    // ENHANCEMENT E50: rgb the moon's colour
+    moon_col: vec4<f32>,
+    // ENHANCEMENT E51: x how many near cascades have a cars-only layer (0 = none), y the first of those layers
+    carsh: vec4<f32>,
 };
 @group(0) @binding(6) var t_shadow: texture_depth_2d_array;
 @group(0) @binding(7) var s_shadow: sampler_comparison;
@@ -534,6 +546,7 @@ fn fogged(in: VsOut, c: vec4<f32>) -> vec4<f32> {
     // normalised to 1 straight at the sun and cut to 0 from 90 degrees away on, so away from the sun the
     // result is exactly the original's fog. Only where there is fog (this function returned already when
     // there is none) and not for the sun's own quad (`sky_on.z`).
+    //@if FOGSUN
     if globals.fogsun.w > 0.0 && object.sky_on.z <= 0.0 {
         let v = normalize(in.world - globals.cam_pos.xyz);
         let cs = dot(v, globals.fogsun.xyz);
@@ -545,6 +558,7 @@ fn fogged(in: VsOut, c: vec4<f32>) -> vec4<f32> {
         let glow = mix(fog.rgb, vec3<f32>(1.0, 0.86, 0.62), globals.fogsun.w * ph);
         return vec4<f32>(mix(glow, c.rgb, f), c.a);
     }
+    //@endif
     return vec4<f32>(mix(fog.rgb, c.rgb, f), c.a);
 }
 
@@ -563,6 +577,27 @@ fn csm_tap(c: i32, world: vec3<f32>, n: vec3<f32>, ndl: f32) -> f32 {
     var step = 1.0 / f32(textureDimensions(t_shadow).x);
     let depth = p.z - info.x * 1.2 / info.y;
     var sum = 0.0;
+    //@if MOON
+    // ENHANCEMENT E50: the moon's soft edge: a 16-tap Vogel disc of hardware-bilinear compares, `csm.moon.z` texels across the radius.
+    // PERF: four taps on the disc's rim first; when they agree (all lit or all in shadow, nearly every pixel) the disc would too
+    if csm.moon.x > 0.0 {
+        let rim = csm.moon.z * step * 0.7071;
+        for (var k = 0; k < 4; k++) {
+            sum += textureSampleCompareLevel(t_shadow, s_shadow, uv + vec2<f32>(f32(k & 1) * 2.0 - 1.0, f32(k >> 1) * 2.0 - 1.0) * rim, c, depth);
+        }
+        if sum < 0.001 || sum > 3.999 {
+            return sum * 0.25;
+        }
+        sum = 0.0;
+        for (var i = 0; i < 16; i++) {
+            let fi = f32(i);
+            let rr = sqrt((fi + 0.5) / 16.0) * csm.moon.z * step;
+            let a = fi * 2.3999632;
+            sum += textureSampleCompareLevel(t_shadow, s_shadow, uv + vec2<f32>(cos(a), sin(a)) * rr, c, depth);
+        }
+        return sum / 16.0;
+    }
+    //@endif
     // ENHANCEMENT ENH-FE3D: the front-end car's soft shadow: a Vogel disc of 24 hardware-bilinear compares, turned per pixel
     // by interleaved gradient noise (the edge dithers instead of banding), `extra.x` texels across the radius
     if csm.extra.x > 0.0 {
@@ -693,6 +728,42 @@ fn csm_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
     return 1.0 - t.y * (1.0 - t.x);
 }
 
+//@if CARSH
+// ENHANCEMENT E51: how much of the sun reaches `world` past the CARS alone (1 = no car's shadow here, or beyond the cars-only
+// cascades): the cars-only layer of the cascade the point's view depth picks, E9's normal offset and depth bias, the four corner taps
+// of its kernel. (Tried and dropped: counting a point as lit where the full map has scenery nearer the sun than the car - it took the
+// car's shadow away in exactly the hill's shade the switch is for, coastal's cliffs being casters.)
+fn car_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+    let all = i32(csm.dir.w);
+    let vd = -(globals.view * vec4<f32>(world, 1.0)).z;
+    var c = 0;
+    for (var i = 0; i < all - 1; i++) {
+        if vd >= csm.info[i].z {
+            c = i + 1;
+        }
+    }
+    if c >= i32(csm.carsh.x) || vd >= csm.info[all - 1].z {
+        return 1.0;
+    }
+    let info = csm.info[c];
+    let ndl = dot(n, -csm.dir.xyz);
+    let off = n * (info.x * (0.6 + 1.6 * (1.0 - clamp(ndl, 0.0, 1.0))));
+    let p = csm.mats[c] * vec4<f32>(world + off, 1.0);
+    let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || p.z > 1.0 {
+        return 1.0;
+    }
+    let step = 1.0 / f32(textureDimensions(t_shadow).x);
+    let depth = p.z - info.x * 1.2 / info.y;
+    let layer = i32(csm.carsh.y) + c;
+    var sum = 0.0;
+    for (var k = 0; k < 4; k++) {
+        sum += textureSampleCompareLevel(t_shadow, s_shadow, uv + vec2<f32>(f32(k & 1) * 2.0 - 1.0, f32(k >> 1) * 2.0 - 1.0) * step, layer, depth);
+    }
+    return sum * 0.25;
+}
+//@endif
+
 // ENHANCEMENT E15: how much of the player's lamp pair reaches `world` (0 shadowed .. 1 lit): the shadow
 // frustum's perspective map, the point pushed along its normal by about a texel at its distance, the
 // depth held a few centimetres (in metres of view depth, turned into the stored depth's units) below
@@ -758,9 +829,11 @@ fn lamp_light(world: vec3<f32>, n: vec3<f32>, floor_: f32) -> vec3<f32> {
         let fall = r * r * (3.0 - 2.0 * r);
         var w = cone * fall * mix(floor_, 1.0, clamp(dot(n, l), 0.0, 1.0));
         // ENHANCEMENT E47: a lamp with a shadow slot is shadowed by the cars (only its own term)
+        //@if LSHAD
         if lamps.col[i].w > 0.5 && w > 0.0 {
             w = w * lamp_visibility(i32(lamps.col[i].w) - 1, lamps.pos[i].xyz, world, n);
         }
+        //@endif
         sum += lamps.col[i].rgb * w;
     }
     return sum * lamps.params.z;
@@ -847,6 +920,7 @@ fn held(c0: vec4<f32>) -> vec4<f32> {
     var c = c0;
     // ENHANCEMENT E11: the sun's / lens flare's bright core above white; the glow (low values) keeps
     // its shape, `m` = 1 (the layer's full colour) gets the whole boost
+    //@if HDRB
     if object.hdr.x > 1.0 {
         let m = clamp(max(c.r, max(c.g, c.b)), 0.0, 1.0);
         // ENH-TUNE: only the disc (m ~ 1) is lifted — the thin rays of the star texture (SUNA) sit lower
@@ -855,6 +929,7 @@ fn held(c0: vec4<f32>) -> vec4<f32> {
         let m8 = m2 * m2 * m2 * m2;
         c = vec4<f32>(c.rgb * (1.0 + (object.hdr.x - 1.0) * m8), c.a);
     }
+    //@endif
     if globals.ambient.w > 0.5 {
         return c;
     }
@@ -1009,6 +1084,7 @@ fn fs_layers_t(in: VsOut) -> FsOutT {
 // Smoke never goes past 1.3 x its own colour: it is not turned into a light.
 fn particle_fx(in: VsOut, c: vec4<f32>) -> vec4<f32> {
     var o = c;
+    //@if PFX
     if object.hdr.y > 0.0 {
         o = vec4<f32>(c.rgb * object.hdr.y, c.a);
     } else if object.hdr.z > PART_LIT - 0.5 && globals.fx_sun.w > 0.5 {
@@ -1016,6 +1092,7 @@ fn particle_fx(in: VsOut, c: vec4<f32>) -> vec4<f32> {
         let v = normalize(in.world - globals.cam_pos.xyz);
         let lobe = pow(max(dot(v, to_sun), 0.0), 6.0);
         var vis = 1.0;
+        //@if CSM
         if csm.dir.w > 0.5 {
             var p = in.world;
             if object.hdr.z < PART_LIT_WORLD - 0.5 {
@@ -1023,9 +1100,11 @@ fn particle_fx(in: VsOut, c: vec4<f32>) -> vec4<f32> {
             }
             vis = csm_visibility(p, to_sun);
         }
+        //@endif
         let lit = mix(0.72 + 0.1 * lobe, 1.0 + 0.3 * lobe, vis);
         o = vec4<f32>(c.rgb * lit, c.a);
     }
+    //@endif
     return o;
 }
 
@@ -1033,6 +1112,10 @@ fn particle_fx(in: VsOut, c: vec4<f32>) -> vec4<f32> {
 // `saturate((scene − own) / distance)` in view space, the scene's depth from `t_soft` (raw, through
 // the pass's planes), the sprite's own from the fragment's 1 / w. Off (`soft.x` 0): the colour as it is.
 fn soften(in: VsOut, c: vec4<f32>) -> vec4<f32> {
+    //@if !SOFT
+    return c;
+    //@endif
+    //@if SOFT
     if object.soft.x <= 0.0 || globals.soft.z < 0.5 {
         return c;
     }
@@ -1050,6 +1133,7 @@ fn soften(in: VsOut, c: vec4<f32>) -> vec4<f32> {
         o = vec4<f32>(c.rgb * f, o.a);
     }
     return o;
+    //@endif
 }
 
 // ENHANCEMENT E16: the probe's irradiance at normal `n` (world space), second-order SH: `Y00`, `Y1-1 = y`,
@@ -1132,6 +1216,91 @@ fn refl_sample_lod(d: vec3<f32>, lod: f32) -> vec3<f32> {
     return mix(a, refl_sample_mip(d, l0 + 1.0), lod - l0);
 }
 
+//@if NEAR
+// ENHANCEMENT E49: the face the direction `d` falls in (the major axis, `gpu::REFL_FACES` order)
+fn near_face(d: vec3<f32>) -> i32 {
+    let a = abs(d);
+    if a.x >= a.y && a.x >= a.z {
+        return select(0, 1, d.x < 0.0);
+    }
+    if a.z >= a.y {
+        return select(2, 3, d.z < 0.0);
+    }
+    return select(4, 5, d.y < 0.0);
+}
+
+// ENHANCEMENT E49: where `d` falls in face `face` (the basis `refl_sample_mip` reads the faces through); `d` may lean a little
+// past the face's middle 90 degrees (the face is drawn 96 wide)
+fn near_face_uv(d: vec3<f32>, face: i32) -> vec2<f32> {
+    var fwd = vec3<f32>(1.0, 0.0, 0.0);
+    var up = vec3<f32>(0.0, 1.0, 0.0);
+    if face == 1 {
+        fwd = vec3<f32>(-1.0, 0.0, 0.0);
+    } else if face == 2 {
+        fwd = vec3<f32>(0.0, 0.0, 1.0);
+    } else if face == 3 {
+        fwd = vec3<f32>(0.0, 0.0, -1.0);
+    } else if face == 4 {
+        fwd = vec3<f32>(0.0, 1.0, 0.0);
+        up = vec3<f32>(0.0, 0.0, 1.0);
+    } else if face == 5 {
+        fwd = vec3<f32>(0.0, -1.0, 0.0);
+        up = vec3<f32>(0.0, 0.0, -1.0);
+    }
+    let right = cross(up, fwd);
+    let z = max(dot(d, fwd), 0.0001);
+    return vec2<f32>(0.5 + 0.5 * dot(d, right) / z * globals.refl.y, 0.5 - 0.5 * dot(d, up) / z * globals.refl.y);
+}
+
+// ENHANCEMENT E49: the environment seen from the shading point `p` along `r`, at mip `lod`. Inside the proxy box (a covered
+// stretch's, `gpu::near_proxy`: walls, floor and ceiling) the ray is cut by the box and the face is read toward the hit from the
+// eye that face was drawn from (the faces are drawn a few a frame as the car moves), so the tunnel's walls, ceiling and lamp
+// rows stand where they are and slide over the body as it drives (a parallax-corrected, box-projected lookup); `globals.near.z`
+// (the box's weight at the eye, ramped over a portal's 6 m) blends it into the plain direction, and a point outside the box (a
+// car farther along) reads the plain direction. `own` (the player's car) reads layers 6..11, the faces with the near cars.
+fn near_env(p: vec3<f32>, r: vec3<f32>, lod: f32, own: bool) -> vec3<f32> {
+    return near_env4(p, r, lod, own).rgb;
+}
+
+// ENHANCEMENT E49: `near_env` with the faces' alpha — NEAR-REFL2: the share of drawn geometry (not sky) in the lobe, the mask of
+// `gpu/refl.rs` `near_mask` filtered with the colour (`coat.wgsl`)
+fn near_env4(p: vec3<f32>, r: vec3<f32>, lod: f32, own: bool) -> vec4<f32> {
+    var w = globals.near.z;
+    var hit = p;
+    if w > 0.0 {
+        let q = p - globals.near_box[0].xyz;
+        let f = globals.near_box[1].xyz;
+        let l = globals.near_box[2].xyz;
+        let u = globals.near_box[3].xyz;
+        let pl = vec3<f32>(dot(q, f), dot(q, l), dot(q, u));
+        let rl = vec3<f32>(dot(r, f), dot(r, l), dot(r, u));
+        let lo = vec3<f32>(-globals.near_box[0].w, -globals.near_box[1].w, globals.near_box[2].w);
+        let hi = vec3<f32>(globals.near_box[0].w, globals.near_box[1].w, globals.near_box[3].w);
+        if all(pl > lo) && all(pl < hi) {
+            // the exit through the box: per axis the plane ahead, the nearest of the three
+            let rs = select(rl, vec3<f32>(1e-5), abs(rl) < vec3<f32>(1e-5));
+            let tf = max((lo - pl) / rs, (hi - pl) / rs);
+            hit = p + r * max(min(tf.x, min(tf.y, tf.z)), 0.0);
+        } else {
+            w = 0.0;
+        }
+    }
+    let face = near_face(mix(r, normalize(hit - globals.near_eye[6].xyz + r * 1e-4), w));
+    let d = mix(r, normalize(hit - globals.near_eye[face].xyz + r * 1e-4), w);
+    let uv = near_face_uv(d, face);
+    var layer = face;
+    if own && globals.near.y > 0.5 {
+        layer = face + 6;
+    }
+    let l0 = floor(lod);
+    let a = textureSampleLevel(t_refl, s_proj, uv, layer, l0);
+    if lod - l0 < 0.001 {
+        return a;
+    }
+    return mix(a, textureSampleLevel(t_refl, s_proj, uv, layer, l0 + 1.0), lod - l0);
+}
+//@endif
+
 // ENHANCEMENT ENH-COAT: Karis' analytic fit of the split-sum environment BRDF (UE4 mobile, `EnvBRDFApprox`): the scale and
 // the bias a specular colour F0 gets, `F0 * x + y`, for a perceptual roughness and `n.v`
 fn env_brdf(rough: f32, nv: f32) -> vec2<f32> {
@@ -1145,6 +1314,12 @@ fn env_brdf(rough: f32, nv: f32) -> vec2<f32> {
 // ENHANCEMENT ENH-COAT: blending in linear light (the game's values are display values, gamma about 2.2): a 4 % reflection
 // of the sky over a dark paint is a few percent of the sky's *light*, which is as much as the paint's own
 const COAT_GAMMA: f32 = 2.2;
+
+// ENHANCEMENT E49 (NEAR-REFL2): the cube's mip the sphere-map overlay reads (GGX alpha 0.03: soft like the 256 px `SPC2` / `SPC3`
+// spread over every direction, sharp enough for the tunnel's lamps; mip 2 was compared and read flat), and the mip of the up face
+// whose centre stands for "how covered is the sky over the car" (alpha 0.45, a wide cone). APPROXIMATION: both by eye.
+const NEAR_OVER_LOD: f32 = 1.0;
+const NEAR_OVER_UP_MIP: i32 = 4;
 
 // ENHANCEMENT E17: the slope of a gentle procedural ripple at world point `p` (metres), `ph` the water
 // material's own UV-scroll phase in turns (it wraps at 1, so every term turns a whole number of times per
@@ -1252,7 +1427,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     // stage) and interpolated by the device, as the original does (`RE/notes/lighting.md` §6a)
     if object.lit_a.w > 0.5 {
         light = in.vlight;
-        //@enh-only-begin
+        //@if CSM|PROBE
         // ENHANCEMENT E9 / E16: the sun's shadow scales only the directional term and the probe only the ambient
         // slot, so while either is on the layer is made per pixel from its two parts (the original's per-vertex,
         // rounded `in.vlight` above stays the off path)
@@ -1274,6 +1449,14 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
                 }
                 sh = floor_ + (1.0 - floor_) * csm_visibility(in.world, n);
                 sun_vis = sh;
+                //@if MOON
+                // ENHANCEMENT E50: a moon frame leaves the original's own direct term unshadowed (on Industrial it comes from the same
+                // direction, but in the bake that is the street's warm light, not the moon's); the moon's cold term below has the shadow
+                if csm.moon.x > 0.0 {
+                    sh = 1.0;
+                    sun_vis = 1.0;
+                }
+                //@endif
             }
             // ENHANCEMENT E16: the ambient slot's colour takes the surroundings' direction and colour (`mix` towards
             // the probe by `globals.refl.z`; the probe's mean luminance is 1, so the slot's level stays the original's)
@@ -1282,18 +1465,32 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
                 amb = amb * max(mix(vec3<f32>(1.0), sh_irradiance(n), globals.refl.z), vec3<f32>(0.0));
             }
             light = min(amb + object.lit_d.rgb * (d * sh), vec3<f32>(1.0));
+            //@if MOON
+            // ENHANCEMENT E50: the moon's weak cold direct term on the cars (its own shadow: the cascades), added to the original's light
+            if csm.moon.y > 0.0 && object.lit_d.w > RECV_NONE + 0.5 && object.lit_d.w < RECV_CAR + 0.5 {
+                let dm = max(dot(n, -csm.orig.xyz), 0.0);
+                if dm > 0.0 {
+                    light = light + csm.moon_col.rgb * (csm.moon.y * dm * csm_visibility(in.world, n));
+                }
+            }
+            //@endif
         }
-        //@enh-only-end
+        //@endif
     }
     // ENHANCEMENT E43: the near cars' contact shadow on the track (`sky_on.w` 1: a receiver), the sky's occlusion `ao` (1 = none)
+    //@if CONTACT
     let contact_rx = contacts.params.x > 0.5 && object.sky_on.w > 0.5;
+    //@endif
     var ao = 1.0;
+    //@if CONTACT
     if contact_rx {
         ao = contact_keep(in.world, n);
     }
+    //@endif
     // ENHANCEMENT E9: the track has no direct term of its own (baked vertex light x texture), so a shadow
     // scales its colour by `1 - s (1 - visibility)`, `s` the strength x how much the face looks at the sun
     // x how bright the baked colour is (a baked shadow is not darkened twice)
+    //@if CSM
     if csm.dir.w > 0.5 && object.lit_d.w > RECV_TRACK - 0.5 {
         let facing = mix(0.35, 1.0, smoothstep(0.0, 0.25, dot(n, -csm.dir.xyz)));
         var bright = smoothstep(0.3, 0.7, dot(in.color.rgb, vec3<f32>(0.299, 0.587, 0.114)));
@@ -1307,13 +1504,41 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         if csm.params.z > 1.0 {
             bright = mix(0.6, 1.0, bright);
         }
+        //@if MOON
+        // ENHANCEMENT E50: the moon's share of a night's baked colour is the dim part of it: a pool of lamp light (bright in the bake)
+        // is the lamp's, not the moon's, so the gate turns round (full below a luma of 0.25, none above 0.6)
+        if csm.moon.x > 0.0 {
+            bright = 1.0 - smoothstep(0.25, 0.6, dot(in.color.rgb, vec3<f32>(0.299, 0.587, 0.114)));
+        }
+        //@endif
         let a0 = csm.params.x * facing;
         let s = a0 * bright;
-        if s > 0.0 || ao < 1.0 {
+        var want = s > 0.0 || ao < 1.0;
+        //@if CARSH
+        // ENHANCEMENT E51: the cars' own shadow is wanted on a dimly baked face too
+        let carsh = csm.carsh.x > 0.5 && s < a0;
+        want = want || carsh;
+        //@endif
+        if want {
             // ENHANCEMENT E9 (SHADOW-REAL): x the cascades' visibility, y the share of the sun the shadow is drawn for here (0 under
             // a covered box, beyond the cascades)
             let t = csm_split(in.world, n);
-            light = light * (1.0 - s * t.y * (1.0 - t.x));
+            var keep_sun = 1.0 - s * t.y * (1.0 - t.x);
+            //@if CARSH
+            // ENHANCEMENT E51: the cars' shadow passes the "baked dark" gate (a car's shadow is never baked into the road): the point
+            // keeps the darker of the gated shadow of everything and the ungated shadow of the cars alone (in full light, `bright` 1,
+            // the two agree and nothing changes)
+            if carsh && t.y > 0.0 {
+                keep_sun = min(keep_sun, 1.0 - a0 * t.y * (1.0 - car_visibility(in.world, n)));
+            }
+            //@endif
+            light = light * keep_sun;
+            // ENHANCEMENT E25 x E43 (LAMP-TUNE): under the overcast light both are the sky's occlusion by the same car (E25's soft
+            // shadow of the tilted overcast light, E43's of the underside): the point keeps the darker of the two, not their product
+            // (the product darkened the car's own shadow twice: 0.4 x 0.15 under the body, a heavy black patch on the sunless tracks)
+            if ao < 1.0 && csm.params.z > 1.0 {
+                ao = min(ao, keep_sun) / max(keep_sun, 0.0001);
+            }
             // ENHANCEMENT E43 (SHADOW-REAL): the contact shadow is the sky's occlusion, so it takes only the sky's (ambient) share of
             // the light, `1 - a`, and the sun's (direct) share `a` keeps the sun's visibility: of the light left at this point the
             // occlusion leaves `((1 - a) ao + a v) / ((1 - a) + a v)`. In the sun's light (v 1) it is a faint crease at the tyres and
@@ -1322,15 +1547,24 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             // blocks the sun even where the bake is dim). Under cover, at night, beyond the cascades (a 0) it is the whole occlusion,
             // as before. Not under E25's overcast light (`params.z` > 1): its soft shadow is itself a sky occlusion (the product).
             if ao < 1.0 && csm.params.z <= 1.0 {
-                let a = a0 * t.y;
+                var a = a0 * t.y;
+                //@if MOON
+                // ENHANCEMENT E50: the moon's direct share is gated like its shadow (under a lamp the baked light is the lamp's)
+                if csm.moon.x > 0.0 {
+                    a = s * t.y;
+                }
+                //@endif
                 let sky = 1.0 - a;
                 ao = (sky * ao + a * t.x) / max(sky + a * t.x, 0.0001);
             }
         }
     }
+    //@endif
+    //@if CONTACT
     if contact_rx {
         light = light * ao;
     }
+    //@endif
     var base = tex * in.color;
     // `CarExtEnv`'s pass 1 (option mask 2): its `Rs` block is `{1, 2, 0, 1, 0, −1}` — gouraud,
     // blending on, pair 0 `SRCALPHA` / `INVSRCALPHA` — and its ops are only that block, the
@@ -1359,6 +1593,39 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         if env.a * 255.0 > 10.0 {
             env_over = env;
         }
+        //@if NEAR
+        // ENHANCEMENT E49 (NEAR-REFL2): on the player's own car (`refl.w`) the sphere map's sky gives way to what the live faces
+        // see where that is not sky: the cube along the reflected view vector (box-projected, the faces with the near cars) at a
+        // soft mip, its geometry share `a` (the faces' mask: 1 track / objects / cars, 0 sky) the weight. The texel's alpha (the
+        // layer's strength) and the `x light` below stay the original's; where the faces see sky the overlay is the original's
+        // exactly. Rays below the horizon (lower panels, which see the road) take the share of the sky that is covered over the
+        // car instead (the up face's coarsest mip): in the open they keep the original's sky, under a roof they show the road.
+        if globals.near.x > 0.0 && object.refl.w > 0.5 && env_over.a > 0.0 {
+            let rv = reflect(normalize(in.world - globals.cam_pos.xyz), n);
+            let seen = near_env4(in.world, rv, NEAR_OVER_LOD, true);
+            let up = textureSampleLevel(t_refl, s_proj, vec2<f32>(0.5, 0.5), select(4, 10, globals.near.y > 0.5), f32(NEAR_OVER_UP_MIP)).a;
+            let cover = clamp(mix(up, seen.a, smoothstep(-0.25, 0.0, rv.y)), 0.0, 1.0);
+            let live = clamp(seen.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+            if globals.near.x > 1.5 {
+                // NEAR-REFL3: on a night track (`Scene::near_live_sky`) the sphere map's day sky (`SPC2` / `SPC3` are the same
+                // cloudy day sky on every track, `carcmn.fsh` from `gamedata\carmodel\`, 0x4437BB…0x4437CC / 0x441AB2…0x441AEF) is
+                // wrong in the sky parts too: they show the faces' own sky (the sky pass is in them) as well. Its colour is the
+                // live one; its strength is the texel's alpha scaled by how bright the live sky is against the painted texel
+                // (`lum(live) / lum(spc)`, at most 1): a black night sky lays no veil over the paint (it reflects nothing), a lit
+                // window, a lamp or the glowing sky of an industrial night as strongly as the original's sky. Geometry
+                // (`cover`) keeps NEAR-REFL2's full strength. APPROXIMATION: the luminance ratio as the strength (by eye).
+                let k = vec3<f32>(0.299, 0.587, 0.114);
+                let s = clamp(dot(live, k) / max(dot(env_over.rgb, k), 0.004), 0.0, 1.0);
+                env_over = vec4<f32>(live, env_over.a * mix(s, 1.0, cover));
+            } else {
+                env_over = vec4<f32>(mix(env_over.rgb, live, cover), env_over.a);
+            }
+            // TEST GLUE (`NFS_NEAR_DEBUG=5`): the overlay alone, red the weight, green the ray's own geometry share, blue the up face's
+            if globals.near.w > 2.5 {
+                env_over = vec4<f32>(cover, seen.a, up, 1.0);
+            }
+        }
+        //@endif
     }
     var lit = base.rgb * light;
     // `layered`: `lit` is the premultiplied sum of the layers so far, `cov` its coverage
@@ -1408,6 +1675,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     }
     // ENHANCEMENT E15: the headlight spots on top of what the original made (its beam, the `HEAD` decal),
     // under the car's blob shadow; `soft.z` 1 a car (a small floor), 2 a track item (a larger one)
+    //@if SPOT|LAMPS
     if object.soft.z > RECV_NONE + 0.5 && (spots.params.x > 0.5 || lamps.params.x > 0.5) {
         // (`layered`: the lights add to the premultiplied sum by the coverage)
         var tcov = 1.0;
@@ -1418,10 +1686,13 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         if object.soft.z < RECV_CAR + 0.5 {
             floor_ = 0.1;
         }
+        //@if SPOT
         if spots.params.x > 0.5 {
             lit = lit + tex.rgb * spot_light(in.world, n, floor_) * 1.25 * tcov;
         }
+        //@endif
         // ENHANCEMENT E23: the street lamps, the same receiver model
+        //@if LAMPS
         if lamps.params.x > 0.5 {
             var car_k = 1.0;
             if object.soft.z < RECV_CAR + 0.5 {
@@ -1429,7 +1700,9 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             }
             lit = lit + tex.rgb * lamp_light(in.world, n, floor_) * car_k * tcov;
         }
+        //@endif
     }
+    //@endif
     if object.shadow_on.x > 0.5 {
         let uv = vec2<f32>(dot(object.shadow_u.xyz, in.world) + object.shadow_u.w, dot(object.shadow_v.xyz, in.world) + object.shadow_v.w);
         // `sh80`'s material asks for a LOD bias of −1 (`mt+0x40`, `RE/notes/thrash.md` §7)
@@ -1442,6 +1715,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             // (not under E25's overcast light, `params.z` > 0: its car shadow is too faint to stand in for the blob)
             // (the garage's `FESH` blob, `extra.x` > 0: ENH-GARAGE fades it below, once the focus shadow has a contact core)
             // ENHANCEMENT E9 (SHADOW-REAL): by the point's own cover (`csm_share`), not by where the camera is
+            //@if CSM
             if csm.dir.w > 0.5 && csm.extra.x <= 0.0 && csm.params.z <= 0.0 {
                 blob = blob * (1.0 - csm_share(in.world));
             }
@@ -1449,11 +1723,14 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             if csm.dir.w > 0.5 && csm.extra.x > 0.0 {
                 blob = blob * (1.0 - csm.extra.w);
             }
+            //@endif
             // ENHANCEMENT E43: the same where a car's contact shadow stands in for it (under cover, at night, E9 off, E25's overcast:
             // where E9's own gate has not already taken it)
+            //@if CONTACT
             if contacts.params.x > 0.5 && csm.extra.x <= 0.0 {
                 blob = blob * (1.0 - contact_presence(in.world));
             }
+            //@endif
             if layered {
                 // the blended material's projector pass over the layers so far (`fs_layers`), by the (enhancement-eased) coverage
                 lit = lit * (1.0 - blob) + sh.rgb * light * blob;
@@ -1469,7 +1746,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     if layered {
         alpha = cov;
     }
-    //@enh-only-begin (cut from the shader of the all-off path: see `classes::mesh_shader_source`)
+    //@if CSM
     // ENHANCEMENT ENH-DBLSH (`lit_d.w` 3): a track's `sh80` ground-shadow decal gives way to the sun's shadow of the object
     // over it where the cascades cover it (open sky; fades back in toward the last cascade's end, where there is no shadow)
     if csm.dir.w > 0.5 && object.lit_d.w > RECV_DECAL - 0.5 {
@@ -1483,7 +1760,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         }
         alpha = alpha * (1.0 - g * (1.0 - f));
     }
-    //@enh-only-end
+    //@endif
     // ENHANCEMENT E8 / ENH-COAT: the car paint's clear coat (a physically based one, Filament / Unreal style) and the glass.
     // Paint (class 1: a `CarExtEnv` material with a reflection strength) is two layers: the base paint (`lit`: the original's
     // lit colour with its sphere-map / sky-map highlights) under a dielectric coat of F0 0.04 (IOR 1.5). The coat takes
@@ -1496,6 +1773,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     // with the road). Glass (class 2, `CarWindow`) is blended: its coverage grows by `Fc` (F0 0.04, a smooth lobe) and the
     // colour carries the reflection. Radiance is not clamped here (the sun above 1: a glint; `held` clamps an 8-bit target at
     // the end). Not in the rear-view mirror's pass (`ambient.z`), not on an alpha-tested-out texel.
+    //@if COAT
     if object.refl.x > REFL_PAINT - 0.5 && object.refl.x < REFL_GLASS + 0.5 && globals.refl.x > 0.0 && globals.ambient.z < 0.5 && (object.shadow_on.w <= 0.0 || alpha * 255.0 >= object.shadow_on.w) {
         var v = normalize(globals.cam_pos.xyz - in.world);
         let nv = clamp(dot(n, v), 0.001, 1.0);
@@ -1523,7 +1801,23 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         // specular occlusion: the lower hemisphere's share, from how far down the surface and the ray face
         let down = smoothstep(0.0, -0.6, n.y) * 0.5 + smoothstep(0.05, -0.5, r.y) * 0.4;
         let occ = 1.0 - clamp(down, 0.0, 0.8);
+        //@if !NEAR
         let env = min(refl_sample_lod(r, coat_lod(alpha_g)), vec3<f32>(64.0)) * horizon * occ;
+        //@endif
+        //@if NEAR
+        // ENHANCEMENT E49: from the shading point (the box-projected lookup), the player's own car from the faces with the near cars
+        var env_in = vec3<f32>(0.0);
+        if globals.near.x > 0.0 {
+            env_in = near_env(in.world, r, select(coat_lod(alpha_g), 0.0, globals.near.w > 1.5), object.refl.w > 0.5);
+        } else {
+            env_in = refl_sample_lod(r, coat_lod(alpha_g));
+        }
+        let env = min(env_in, vec3<f32>(64.0)) * horizon * occ;
+        // TEST GLUE (`NFS_NEAR_DEBUG`): the paint shows the reflection alone
+        if globals.near.w > 0.5 && globals.near.w < 2.5 {
+            fc = 1.0;
+        }
+        //@endif
         if glass {
             let k = clamp(fc, 0.0, 0.95);
             let a = alpha + k * (1.0 - alpha);
@@ -1546,11 +1840,13 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             }
         }
     }
+    //@endif
     // ENHANCEMENT E17: water (class 3: a flat water material, `nfs_assets::track::is_water`). The original
     // texture and its scroll stay as the base; over it a Fresnel-weighted reflection of the sky (the E8
     // environment map when E8 is on, else the sky's own colours), a sun glint (above 1.0: HDR where the
     // target keeps it, E7) and a faint moving ripple that only tilts the reflection. Level surfaces only
     // (a waterfall or a river on a slope is left as the original draws it).
+    //@if WATER
     if object.refl.x > REFL_WATER - 0.5 && globals.water.x > 0.5 && abs(cross(dwx, dwy).y) > 0.8 * length(cross(dwx, dwy)) {
         let vv = globals.cam_pos.xyz - in.world;
         let dist = length(vv);
@@ -1582,7 +1878,8 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         lit = mix(lit, env, k) + glint;
         alpha = clamp(alpha + (1.0 - alpha) * min(k + max(glint.r, max(glint.g, glint.b)), 1.0), 0.0, 1.0);
     }
-    //@enh-only-begin
+    //@endif
+    //@if RAIN
     // ENHANCEMENT E26: the wet road (class 4: a tarmac part, `object.refl.w` its slice's wetness 0..1 from the
     // sky `.bin`'s field 5). Over what the original made: (1) the albedo darkens (to ~60 %, more in a puddle);
     // (2) a soft Fresnel reflection of the sky (the sky pass's colours, no geometry: it is a dusk, not a
@@ -1667,10 +1964,11 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         }
         }
     }
-    //@enh-only-end
+    //@endif
     // ENHANCEMENT E20: the lightning flash lights the scene (the track, the cars, the particles; not the sky
     // pass, which the original's flash already paints, nor the flare layers): a bluish-white boost of what
     // the item shows, plus a little of its bare texture so a shadowed surface also catches the flash
+    //@if FLASH
     if globals.flash.x > 0.0 && object.sky_on.y < 0.5 && object.hdr.x <= 1.0 {
         var bare = tex.rgb;
         if layered {
@@ -1678,5 +1976,6 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         }
         lit = lit + (lit * 0.45 + bare * 0.09) * vec3<f32>(0.80, 0.92, 1.15) * globals.flash.x;
     }
+    //@endif
     return vec4<f32>(lit, alpha);
 }

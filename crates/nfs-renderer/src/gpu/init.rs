@@ -120,7 +120,7 @@ impl Core {
             queue,
             config,
             depth_view,
-            pipelines,
+            pipelines: pipelines.clone(),
             globals_buf,
             globals_bg,
             globals_layout,
@@ -140,6 +140,9 @@ impl Core {
             probe: None,
             coat: None,
             refl_building: false,
+            refl_near_pass: None,
+            refl_pre_copy: None,
+            near_mask: None,
             probe_dummy,
             compute_supported,
             soft: None,
@@ -182,10 +185,15 @@ impl Core {
             cur_temporal: None,
             motion: Default::default(),
             temporal_inputs: None,
-            pipeline_samples: 1,
-            pipeline_sets: std::collections::HashMap::new(),
+            pipeline_sets: std::collections::HashMap::from([(1, pipelines.clone())]),
             mesh_shader: shader,
-            mesh_shader_full: None,
+            mesh_shaders: std::collections::HashMap::new(),
+            pipeline_vars: [Vec::new(), Vec::new(), Vec::new()],
+            pipeline_cur: [1; 4],
+            set_builder: Default::default(),
+            exact_sets: false,
+            var_set: [0; 4],
+            item_var: Vec::new(),
             mesh_layout: pipeline_layout,
             ms_cache: std::collections::HashMap::new(),
             scale_blit: None,
@@ -245,6 +253,7 @@ impl Core {
             lens_staged: Vec::new(),
             gpu_time_log: std::env::var("NFS_GPU_TIME").is_ok(),
             gpu_time_acc: (0.0, 0),
+            bench_target: None,
             csm: csm_state,
             spot: spot_state,
             lamp: lamp_state,
@@ -438,7 +447,7 @@ impl Core {
     /// The mesh shader, the four bind group layouts of the 3-D passes, the shadow / spot / lamp / contact states and the
     /// mesh pipelines of the 8-bit set. Moved out of `new` as it was.
     fn create_mesh_setup(device: &wgpu::Device, format: wgpu::TextureFormat) -> MeshSetup {
-        let shader = gfx::wgsl_module(device, "mesh shader", &crate::classes::mesh_shader_source(false));
+        let shader = gfx::wgsl_module(device, "mesh shader", &crate::classes::mesh_shader_source(0));
         let csm_entries = csm::layout_entries();
         let spot_entries = spot::layout_entries();
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

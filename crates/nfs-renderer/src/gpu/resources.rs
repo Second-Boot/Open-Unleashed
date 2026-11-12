@@ -36,6 +36,8 @@ impl Core {
                 Cmd::Gamma(g) => self.set_gamma(g),
                 Cmd::Temporal(on) => self.temporal_flag = on,
                 Cmd::TemporalCut => self.fsr_cut(),
+                Cmd::PrewarmPipelines => self.prewarm_pipelines(),
+                Cmd::ExactPipelines(on) => self.exact_sets = on,
                 Cmd::Enhancements(e) => {
                     // ENHANCEMENT ENH-UPSCALER: the stored set has both backends' levels; the GPU side works with the chosen one's
                     let e = if self.enh_forced_off { crate::Enhancements::ORIGINAL } else { e.effective() };
@@ -72,7 +74,7 @@ impl Core {
                     self.upload_dynamic_mesh(&m);
                 }
                 Cmd::ReflUpload(size, faces) => self.upload_refl_faces(size, &faces),
-                Cmd::ReflFace(j) => self.render_refl_face(&j.scene, &j.camera, j.face, j.size, j.clear, j.depth_far),
+                Cmd::ReflFace(j) => self.render_refl_face(&j.scene, &j.camera, j.face, j.size, j.clear, j.depth_far, j.near.as_ref()),
                 Cmd::Offscreen(j) => {
                     let id = self.render_offscreen(&j.scene, &j.camera, OffscreenSpec { width: j.width, height: j.height, reuse: j.reuse, clear_colour: j.clear, depth_far: j.depth_far });
                     debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");
@@ -177,7 +179,7 @@ impl Core {
         self.flush_texture_writes(&mut encoder);
         self.flush_mesh_writes(&mut encoder);
         self.belt.finish();
-        self.last_submit = Some(self.queue.submit(Some(encoder.finish())));
+        self.last_submit = Some(crate::prof::submit(&self.device, &self.queue, Some(crate::prof::finish(encoder))));
         self.belt.recall();
     }
 
