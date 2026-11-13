@@ -3,7 +3,7 @@
 
 use crate::*;
 mod debug_menu;
-mod menu;
+pub(crate) mod menu;
 mod fe_lists;
 mod fe_colour;
 mod fe_choices;

@@ -73,8 +73,9 @@ impl App {
             self.refl_done |= 1 << face;
         }
         self.scene.refl = 1.0;
-        // ENHANCEMENT E49 (NEAR-REFL3): a night track (the original's night flag) shows the live sky in the sphere-map overlay
-        self.scene.near_live_sky = self.track.is_night();
+        // ENHANCEMENT E49: a night track (the original's night flag) shows the live sky in the sphere-map overlay (NEAR-REFL3),
+        // every other track the live sky's hue at the painted sky's strength (NEAR-REFL4)
+        self.scene.near_sky = if self.track.is_night() { nfs_renderer::NearSky::Night } else { nfs_renderer::NearSky::Hue };
     }
 
     /// One face: the sky and the track from `eye` along `REFL_FACES[face]`. ENHANCEMENT E49 (`near`: the player's pose): with the

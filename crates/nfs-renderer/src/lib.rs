@@ -796,10 +796,21 @@ pub struct Scene {
     /// ENHANCEMENT E44: the lighthouse beam(s) of the main race view as soft volumetric light (`None` = none: every other view, E44
     /// or E7 off, a track without one, none within the view's reach). Read only with E44 and E7 on.
     pub lbeam: Option<LBeams>,
-    /// ENHANCEMENT E49 (NEAR-REFL3): the sky parts of the player's sphere-map overlay (`R3DSpecularTextureLayer`, `SPC2` / `SPC3`, one
-    /// day sky for every track) show the live faces' own sky instead: set on a night track (the original's night flag,
-    /// `nfs_assets::track::TrackAssets::is_night`), where that day sky is wrong. Read only with E49 on.
-    pub near_live_sky: bool,
+    /// ENHANCEMENT E49 (NEAR-REFL3 / NEAR-REFL4): what the sky parts of the player's sphere-map overlay (`R3DSpecularTextureLayer`,
+    /// `SPC2` / `SPC3`, one day sky for every track) show. Read only with E49 on.
+    pub near_sky: NearSky,
+}
+
+/// ENHANCEMENT E49: the sky parts of the player's sphere-map overlay ([`Scene::near_sky`]; `globals.near.x` 1 / 2 / 3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NearSky {
+    /// the original's painted sky (NEAR-REFL2: only the geometry parts are live)
+    #[default]
+    Original,
+    /// NEAR-REFL3, a night track (`nfs_assets::track::TrackAssets::is_night`): the live sky, its strength scaled by its brightness
+    Night,
+    /// NEAR-REFL4, a day / dusk track: the live sky's hue at the painted texel's strength and luminance
+    Hue,
 }
 
 /// ENHANCEMENT E9 (ENH-TUNPOOL): one road slice's covered volume: a box round the slice (its own axes), `half_len` along the
@@ -1130,7 +1141,7 @@ impl Scene {
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, sun_shadow: None, overcast_shadow: None, moon_shadow: None, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, flash: 0.0, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), cover: Default::default(), lbeam: None, near_live_sky: false }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, sun_shadow: None, overcast_shadow: None, moon_shadow: None, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, flash: 0.0, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), cover: Default::default(), lbeam: None, near_sky: NearSky::Original }
     }
 }
 

@@ -529,7 +529,7 @@ fn run() -> Result<()> {
         &paths.root,
     ));
     let track_tables = nfs_game::track_list::TrackListTables::load(&paths);
-    let (track_all, track_looped) = track_tables.build(nfs_game::track_list::START_YEAR, 0);
+    let (track_all, track_looped) = track_tables.build(nfs_game::track_list::START_YEAR, app::menu::all_tracks_glue(0));
     let menu = if use_menu {
         // `GenericCar.Car`'s own list, `[0x6919EC]`, is rebuilt by `0x4F3E40` (kind-0 records only
         // — `record+0x1F4 == 0`, 0x4F400E…0x4F4087, `nfs-formats/src/fedata.rs`'s own `kind` field,

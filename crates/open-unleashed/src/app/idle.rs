@@ -187,7 +187,7 @@ impl App {
         let (w, h, s) = self.hud_geometry();
         // the front end has no `SPECIALFX` level: no mip promotion, the fake-sort mode of level `None`
         let target = (w, h, s.to_bits(), false, self.fakesort_mode(None));
-        let Scene { items: _, sprites, clear_color, sun_direction, ambient, mirror, headlight, headlight_decal, headlight_gain: _, beacon, fog, sky_fog, lens_probe: _, refl: _, sun_shadow: _, overcast_shadow: _, moon_shadow: _, spots: _, lamps: _, shafts: _, water: _, ao: _, flash: _, eye: _, motion: _, rain: _, dof: _, haze: _, drops: _, contacts: _, cover: _, lbeam: _, near_live_sky: _ } = &self.scene;
+        let Scene { items: _, sprites, clear_color, sun_direction, ambient, mirror, headlight, headlight_decal, headlight_gain: _, beacon, fog, sky_fog, lens_probe: _, refl: _, sun_shadow: _, overcast_shadow: _, moon_shadow: _, spots: _, lamps: _, shafts: _, water: _, ao: _, flash: _, eye: _, motion: _, rain: _, dof: _, haze: _, drops: _, contacts: _, cover: _, lbeam: _, near_sky: _ } = &self.scene;
         let plain = !mirror && headlight.is_none() && !headlight_decal && beacon.is_none();
         if plain
             && let Some(p) = &self.presented

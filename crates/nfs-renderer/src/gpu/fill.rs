@@ -144,8 +144,9 @@ pub(super) fn globals_uniform(f: &GlobalsFrame) -> GlobalsUniform {
         // ENHANCEMENT ENH-TEMPORAL: 0 = master's value
         temporal: temporal.map_or([0.0; 4], |(jitter_ndc, size)| [jitter_ndc[0], jitter_ndc[1], size.0 as f32, size.1 as f32]),
         // ENHANCEMENT E49: only with the switch on and the twelve-layer cube drawn; 0 is master's value
-        // (.x 2 = NEAR-REFL3's live sky in the overlay, a night track; .w TEST GLUE `NFS_NEAR_DEBUG`: the paint shows the reflection alone)
-        near: near.map_or([0.0; 4], |n| [if n.live_sky { 2.0 } else { 1.0 }, n.own as u32 as f32, n.proxy.map_or(0.0, |p| p.1), n.debug as f32]),
+        // (.x 1 the original's sky in the overlay, 2 NEAR-REFL3's live sky (a night track), 3 NEAR-REFL4's live hue (a day / dusk
+        // track); .w TEST GLUE `NFS_NEAR_DEBUG`: the paint shows the reflection alone)
+        near: near.map_or([0.0; 4], |n| [match n.sky { crate::NearSky::Original => 1.0, crate::NearSky::Night => 2.0, crate::NearSky::Hue => 3.0 }, n.own as u32 as f32, n.proxy.map_or(0.0, |p| p.1), n.debug as f32]),
         near_box: near.and_then(|n| n.proxy).map_or([[0.0; 4]; 4], |(b, _)| {
             [b.centre.extend(b.half_len).to_array(), b.forward.extend(b.half_wid).to_array(), b.lateral.extend(NEAR_BOX_FLOOR).to_array(), b.up.extend(b.ceil).to_array()]
         }),
@@ -215,8 +216,8 @@ pub(super) struct NearFrame {
     pub eye: glam::Vec3,
     /// the covered proxy box at the eye and its weight (`gpu::near_proxy`); `None` in the open
     pub proxy: Option<(crate::CoverBox, f32)>,
-    /// NEAR-REFL3: the overlay's sky parts take the faces' own sky (`Scene::near_live_sky`, a night track)
-    pub live_sky: bool,
+    /// NEAR-REFL3 / NEAR-REFL4: what the overlay's sky parts show (`Scene::near_sky`)
+    pub sky: crate::NearSky,
     /// TEST GLUE (`NFS_NEAR_DEBUG`): the paint shows the reflection alone (a still that makes the lookup visible)
     pub debug: u8,
 }

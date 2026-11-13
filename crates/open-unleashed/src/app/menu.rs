@@ -267,7 +267,7 @@ impl FeCatalogues {
 
     /// Put 0x4FBC10's two lists in, for `year` and `Game.GameType` `game_type`.
     pub(crate) fn set_track_lists(&mut self, tables: &nfs_game::track_list::TrackListTables, year: i32, game_type: u8) {
-        (self.tracks, self.looped) = tables.build(year, game_type);
+        (self.tracks, self.looped) = tables.build(year, all_tracks_glue(game_type));
         self.tracks_year = year;
     }
 
@@ -349,4 +349,11 @@ impl KoSlot {
         self.backwards = d & 1 != 0;
         self.mirror = d & 2 != 0;
     }
+}
+
+/// TEST GLUE: `NFS_ALL_TRACKS=1` builds 0x4FBC10's lists as for the network game (`Game.GameType` 3), which keeps every
+/// `nfs5.trk` record whatever the chronicle year, so the single-player screens (quick race, ...) offer every track for
+/// testing. Unset = the game type the caller gives, as the original.
+pub(crate) fn all_tracks_glue(game_type: u8) -> u8 {
+    if std::env::var_os("NFS_ALL_TRACKS").is_some_and(|v| v != "0") { nfs_game::track_list::GAME_TYPE_NETWORK } else { game_type }
 }

@@ -198,7 +198,7 @@ impl Core {
         static DEBUG: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let debug = *DEBUG.get_or_init(|| std::env::var("NFS_NEAR_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         let proxy = if debug % 2 == 0 && debug > 0 { None } else { near_proxy(&scene.cover, c.eye) };
-        on.then(|| fill::NearFrame { own: c.faces_done_own == 0x3F, eyes: c.eyes, eye: c.eye, proxy, live_sky: scene.near_live_sky, debug: match debug { 5 => 3, d if d >= 3 => 2, d => u8::from(d > 0) } })
+        on.then(|| fill::NearFrame { own: c.faces_done_own == 0x3F, eyes: c.eyes, eye: c.eye, proxy, sky: scene.near_sky, debug: match debug { 5 => 3, d if d >= 3 => 2, d => u8::from(d > 0) } })
     }
 
     /// ENHANCEMENT ENH-FE3D: fill all six faces of the environment cube from the CPU — `faces` are six `size x size`

@@ -1320,6 +1320,9 @@ const COAT_GAMMA: f32 = 2.2;
 // whose centre stands for "how covered is the sky over the car" (alpha 0.45, a wide cone). APPROXIMATION: both by eye.
 const NEAR_OVER_LOD: f32 = 1.0;
 const NEAR_OVER_UP_MIP: i32 = 4;
+// ENHANCEMENT E49 (NEAR-REFL4): the painted sky's hue, the unit opponent-colour vector (r - (g + b) / 2, sqrt(3) / 2 (g - b)) of
+// `SPC2`'s alpha-weighted mean 55/68/77 (`carcmn.fsh`, measured in NEAR-REFL3): (-17.5, -7.79) / 19.16, 204 degrees
+const NEAR_SPC_HUE: vec2<f32> = vec2<f32>(-0.9135, -0.4069);
 
 // ENHANCEMENT E17: the slope of a gentle procedural ripple at world point `p` (metres), `ph` the water
 // material's own UV-scroll phase in turns (it wraps at 1, so every term turns a whole number of times per
@@ -1606,8 +1609,8 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             let up = textureSampleLevel(t_refl, s_proj, vec2<f32>(0.5, 0.5), select(4, 10, globals.near.y > 0.5), f32(NEAR_OVER_UP_MIP)).a;
             let cover = clamp(mix(up, seen.a, smoothstep(-0.25, 0.0, rv.y)), 0.0, 1.0);
             let live = clamp(seen.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-            if globals.near.x > 1.5 {
-                // NEAR-REFL3: on a night track (`Scene::near_live_sky`) the sphere map's day sky (`SPC2` / `SPC3` are the same
+            if globals.near.x > 1.5 && globals.near.x < 2.5 {
+                // NEAR-REFL3: on a night track (`Scene::near_sky` = `NearSky::Night`) the sphere map's day sky (`SPC2` / `SPC3` are the same
                 // cloudy day sky on every track, `carcmn.fsh` from `gamedata\carmodel\`, 0x4437BB…0x4437CC / 0x441AB2…0x441AEF) is
                 // wrong in the sky parts too: they show the faces' own sky (the sky pass is in them) as well. Its colour is the
                 // live one; its strength is the texel's alpha scaled by how bright the live sky is against the painted texel
@@ -1617,6 +1620,25 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
                 let k = vec3<f32>(0.299, 0.587, 0.114);
                 let s = clamp(dot(live, k) / max(dot(env_over.rgb, k), 0.004), 0.0, 1.0);
                 env_over = vec4<f32>(live, env_over.a * mix(s, 1.0, cover));
+            } else if globals.near.x > 2.5 {
+                // NEAR-REFL4: on a day / dusk track (`Scene::near_sky` = `NearSky::Hue`) the sky parts take the faces' own sky's
+                // hue where it departs from the painted sky's: the opponent-colour hue of the live texel against the map's
+                // (`NEAR_SPC_HUE`, the alpha-weighted mean of `SPC2` 55/68/77; `SPC3` 73/83/92 has the same hue within 4
+                // degrees), weight 0 within 20 degrees, 1 past 45, and 0 for a live sky too grey to carry a hue. So the
+                // blue / grey-blue / grey day skies (forest, canyon, autobahn) keep the original's overlay, a pink / orange /
+                // peach / lavender dusk tints it. The colour is the live chroma `live / lum(live)` at the texel's own
+                // luminance and the texel's alpha stays the strength: the paint is veiled exactly as much as by the original's
+                // sky, never brighter (the sun disc, white in the faces, has no hue and gives the texel). Geometry (`cover`)
+                // keeps NEAR-REFL2's rule. APPROXIMATION: the 20..45 degree fade, the 0.05..0.15 saturation gate and the
+                // 0.004..0.02 luminance fade (by eye).
+                let k = vec3<f32>(0.299, 0.587, 0.114);
+                let ll = dot(live, k);
+                let oc = vec2<f32>(live.r - 0.5 * (live.g + live.b), 0.8660254 * (live.g - live.b));
+                let along = dot(oc, NEAR_SPC_HUE) / max(length(oc), 1e-5);
+                let w = (1.0 - smoothstep(0.7071, 0.9397, along)) * smoothstep(0.05, 0.15, length(oc) / max(ll, 0.004))
+                    * smoothstep(0.004, 0.02, ll);
+                let hue = clamp(live * (dot(env_over.rgb, k) / max(ll, 0.004)), vec3<f32>(0.0), vec3<f32>(1.0));
+                env_over = vec4<f32>(mix(mix(env_over.rgb, hue, w), live, cover), env_over.a);
             } else {
                 env_over = vec4<f32>(mix(env_over.rgb, live, cover), env_over.a);
             }
