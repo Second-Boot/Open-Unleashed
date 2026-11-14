@@ -65,6 +65,15 @@ pub struct TrackWorld {
     /// The way the sun's light travels, `−normalize(SkyBin::sun_position)` (0x43AC8D…0x43AD36);
     /// straight down when the track has no sky configuration.
     pub sun_direction: Vec3,
+    /// ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL): on a day track whose sky has no sun (`sun_direction` straight down), the light
+    /// direction its `sh80` ground-shadow decals were drawn for ([`crate::decal_sun`]: Corsica), else the light its baked vertex
+    /// colours were lit with when that bake is clearly directional ([`crate::bake_light`]: Schwarzwald); `None` elsewhere.
+    /// Render only.
+    pub data_sun: Option<Vec3>,
+    /// ENHANCEMENT E9 / E51 (SUN-FULL): whether `data_sun` drives E9's full frame (scenery + cars, E9's baked-dark gate, E51 on
+    /// top, as on a sky-sun track) instead of E51's cars-only frame, with the scenery casters' largest bounding radius (m):
+    /// [`DATA_SUN_FULL_TRACKS`]. Render only.
+    pub data_sun_full: Option<f32>,
     /// The race's smackables in `[WTrack+0x34]` order (0x4888B0): the mission scene's GEOM
     /// elements whose `animdefs.txt` definition says `kSmackable` (0x4772F0's `def+0x10 == 3`) —
     /// the skill test's cones — then the track's own placed `kSmackable` articles (signs,
@@ -1891,7 +1900,9 @@ impl TrackWorld {
     /// straight down under cover (0x473330's flags `& 0xC000`, 0x43A6E8 / 0x43AB19) or else along
     /// the negated sun of the track's sky configuration (0x43AC8D, `SkyBin::sun_position`).
     pub fn car_light(&self, pos: Vec3) -> LightBlock {
-        let g = self.collision.ground(pos.x, pos.y + 2.0, pos.z, 20.0).map(|h| [h.color[0], h.color[1], h.color[2]]).unwrap_or([1.0; 3]);
+        // 0x4746A0: the tracker's drivable patch (`word & 0xF`), not the topmost triangle — a road decal with no surface nibble
+        // (the finish line's chequered strip) is not lit from; white with no patch (0x474700's default)
+        let g = self.collision.patch_color(pos).map(|c| [c[0], c[1], c[2]]).unwrap_or([1.0; 3]);
         let m = &self.map_light;
         let mul = |a: [f32; 3], b: [f32; 3]| [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
         let amb = mul(g, m.ambient);
@@ -2063,6 +2074,27 @@ impl TrackWorld {
         }
         let map_light = MapLight::from_map(&track.map);
         let sun_direction = track.sky_bin.as_ref().map(|b| -Vec3::from(b.sun_position()).normalize_or_zero()).filter(|d| *d != Vec3::ZERO).unwrap_or(Vec3::NEG_Y);
+        // ENHANCEMENT E51 (CORSICA-SUN): a track whose sky has no sun (the cars' light straight down): the sun its `sh80` decals were
+        // drawn for, if they give one (render only, `crate::decal_sun`); SUN-ALL: else, on a day track, the light of its bake when
+        // that is clearly directional (`crate::bake_light`), or its best fit on the `WEAK_FIT_TRACKS` (APPROXIMATION)
+        let data_sun = if sun_direction.x.abs() + sun_direction.z.abs() <= 1e-3 {
+            let m = crate::decal_sun::measure(&geometry, &materials).0;
+            tracing::info!(?m, "the decals' sun (ENHANCEMENT E51)");
+            m.map(|m| m.direction).or_else(|| {
+                let b = (!track.is_night()).then(|| crate::bake_light::fit(&geometry, &materials)).flatten();
+                tracing::info!(?b, "the bake's light (ENHANCEMENT E51)");
+                b.and_then(|b| b.taken(&track.name))
+            })
+            // TEST GLUE: `NFS_DATA_SUN=<azimuth>,<elevation>` (degrees, `bake_light::travel`) sets this sun by hand, for comparison stills
+            .map_or_else(test_glue_data_sun, |d| Some(test_glue_data_sun().unwrap_or(d)))
+        } else {
+            None
+        };
+        // ENHANCEMENT E9 / E51 (SUN-FULL): which frame that sun drives (the per-track choice)
+        let data_sun_full = data_sun.and(data_sun_full_track(&track.name));
+        if data_sun.is_some() {
+            tracing::info!(full = ?data_sun_full, "the data sun's frame (ENHANCEMENT E9 full / E51 cars-only)");
+        }
         let map_sections = MapSection::all(&track.map);
         Self::mark_lit_items(track, &materials, &mat_ids, &mut items, &mut track_lods);
         // materials whose render method builds `RCustomLayers::LayerUVAnimate` (0x8001) — water
@@ -2227,6 +2259,8 @@ impl TrackWorld {
             ambient,
             map_light,
             sun_direction,
+            data_sun,
+            data_sun_full,
             map_sections,
             env_by_id,
             smackables: smackables.into_iter().chain(track_smackables).take(MAX_SMACKABLES).collect(),
@@ -4311,4 +4345,46 @@ mod sheet_tests {
         assert!(!is_translucent_sheet(&tex(&[0, 151, 231])));
         assert!(!is_translucent_sheet(&tex(&[0, 100, 128])));
     }
+}
+
+/// ENHANCEMENT E9 / E51 (SUN-FULL, 2026-11-14): the sunless day tracks whose `TrackWorld::data_sun` drives E9's FULL frame
+/// (the scenery's shadows too: signs, posts, trees, fences and houses have no shade of their own in a vertex bake; E9's
+/// "baked dark" gate keeps the bake's own shade from being darkened twice, as on alps). The others keep E51's cars-only frame.
+/// Forest by default: its direction is its own bake's (`bake_light`, r2 0.74). Canyon (the decals' sun), foothills / autobahn
+/// (the weak fit) pending a look. APPROXIMATION: an enhancement's choice, nothing of the original's (it has no sun there).
+/// Each with the largest scenery caster's bounding radius (m, E9's own limit is 60): on forest 15 m (APPROXIMATION, by eye on
+/// stills at 8 / 15 / 30 / 60 m: with 60 the slopes and the cliff (parts of 20-60 m) throw a 27-degree sun's shade over nearly
+/// the whole road, which the bake lights evenly - a contradiction, not a doubling; with 8 the trees beside the road cast
+/// nothing; 15 keeps the trees, signs, posts, fences and the covered bridge, 30 looks like 15 with more slope shade).
+pub const DATA_SUN_FULL_TRACKS: [(&str, f32); 1] = [("forest", 15.0)];
+
+/// The full E9 frame's caster radius for `track` along its data sun ([`DATA_SUN_FULL_TRACKS`]), `None` = cars-only.
+/// TEST GLUE: `NFS_DATA_SUN_FULL=<track>[:<radius>],..` replaces the list (`none` = empty; no radius = 60), for comparison stills.
+fn data_sun_full_track(track: &str) -> Option<f32> {
+    match std::env::var("NFS_DATA_SUN_FULL") {
+        Ok(list) => list.split(',').find_map(|e| {
+            let (t, r) = e.trim().split_once(':').unwrap_or((e.trim(), "60"));
+            t.eq_ignore_ascii_case(track).then(|| r.parse().unwrap_or(60.0))
+        }),
+        Err(_) => DATA_SUN_FULL_TRACKS.iter().find(|(t, _)| t.eq_ignore_ascii_case(track)).map(|&(_, r)| r),
+    }
+}
+
+#[cfg(test)]
+mod data_sun_full_tests {
+    /// the table names only the sunless day tracks, each with a radius inside E9's own 60 m caster limit
+    #[test]
+    fn the_full_frame_table_names_sunless_day_tracks_within_e9s_limit() {
+        for (t, r) in super::DATA_SUN_FULL_TRACKS {
+            assert!(["canyon", "forest", "foothills", "autobahn"].contains(&t), "{t}");
+            assert!(r > 0.0 && r <= 60.0, "{t} {r}");
+        }
+    }
+}
+
+/// TEST GLUE: `NFS_DATA_SUN=<azimuth>,<elevation>` — a hand-set sun for a sunless day track (comparison stills only).
+fn test_glue_data_sun() -> Option<Vec3> {
+    let v = std::env::var("NFS_DATA_SUN").ok()?;
+    let (a, e) = v.split_once(',')?;
+    Some(crate::bake_light::travel(a.trim().parse().ok()?, e.trim().parse().ok()?))
 }

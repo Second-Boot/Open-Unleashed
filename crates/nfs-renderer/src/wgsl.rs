@@ -126,6 +126,7 @@ mod tests {
             ("sprite".into(), include_str!("sprite.wgsl").into()),
             ("shadow".into(), include_str!("gpu/shadow.wgsl").into()),
             ("probe".into(), include_str!("probe.wgsl").into()),
+            ("carsun".into(), include_str!("gpu/carsun.wgsl").into()),
             ("eye measure".into(), crate::adapt::measure_source()),
             ("ao".into(), crate::ao::source()),
             ("bloom".into(), crate::bloom::source()),

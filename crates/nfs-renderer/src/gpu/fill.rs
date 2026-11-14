@@ -100,22 +100,21 @@ pub(super) fn globals_uniform(f: &GlobalsFrame) -> GlobalsUniform {
         // ENHANCEMENT E19: the fog's sun glow, only with the switch on and a sun (`Scene::sun_shadow`: none on a night /
         // sunless track, and not in the environment faces); 0 is master's value
         fogsun: scene.sun_shadow.filter(|s| enh.is_on(crate::E19) && s.focus.is_none()).map_or([0.0; 4], |s| (-s.direction).normalize_or_zero().extend(FOG_SUN_STRENGTH).to_array()),
-        // ENHANCEMENT E20: only with the switch on; 0 is master's value
-        flash: [if enh.is_on(crate::E20) { scene.flash.clamp(0.0, 1.0) } else { 0.0 }, 0.0, 0.0, 0.0],
         // ENHANCEMENT E26: only with the switch on and a wet track; 0 is master's value
         rain: rain_env.map_or([0.0; 4], |r| [crate::rain_gain(enh.level(crate::E26)), r.time, r.n_lamps.min(crate::RAIN_LAMPS) as f32, r.n_edges.min(crate::RAIN_EDGES) as f32]),
         rain_zenith: rain_env.map_or([0.0; 4], |r| [r.zenith[0], r.zenith[1], r.zenith[2], 0.0]),
         rain_horizon: rain_env.map_or([0.0; 4], |r| [r.horizon[0], r.horizon[1], r.horizon[2], 0.0]),
         rain_lamp_pos: {
             let mut a = [[0.0; 4]; crate::RAIN_LAMPS];
-            for (d, (p, _)) in a.iter_mut().zip(rain_env.iter().flat_map(|r| r.lamps[..r.n_lamps.min(crate::RAIN_LAMPS)].iter())) {
-                *d = [p.x, p.y, p.z, 0.0];
+            // w (AUTOBAHN-LAMPS): the light's reach squared, 0 = the shader's default (`RAIN_LAMP_REACH`)
+            for (d, (p, _, reach)) in a.iter_mut().zip(rain_env.iter().flat_map(|r| r.lamps[..r.n_lamps.min(crate::RAIN_LAMPS)].iter())) {
+                *d = [p.x, p.y, p.z, reach * reach];
             }
             a
         },
         rain_lamp_col: {
             let mut a = [[0.0; 4]; crate::RAIN_LAMPS];
-            for (d, (_, c)) in a.iter_mut().zip(rain_env.iter().flat_map(|r| r.lamps[..r.n_lamps.min(crate::RAIN_LAMPS)].iter())) {
+            for (d, (_, c, _)) in a.iter_mut().zip(rain_env.iter().flat_map(|r| r.lamps[..r.n_lamps.min(crate::RAIN_LAMPS)].iter())) {
                 *d = [c[0], c[1], c[2], 0.0];
             }
             a
@@ -323,8 +322,8 @@ mod tests {
 
     /// A scene with every input an enhancement reads set (wet, water, sun, flash, fog, headlight at full gain).
     fn busy_scene() -> Scene {
-        let mut lamps = [(Vec3::ZERO, [0.0; 3]); crate::RAIN_LAMPS];
-        lamps[0] = (Vec3::new(5.0, 6.0, 7.0), [1.0, 0.9, 0.8]);
+        let mut lamps = [(Vec3::ZERO, [0.0; 3], 0.0); crate::RAIN_LAMPS];
+        lamps[0] = (Vec3::new(5.0, 6.0, 7.0), [1.0, 0.9, 0.8], 0.0);
         let mut edges = [RainEdge::default(); crate::RAIN_EDGES];
         edges[0] = RainEdge { pos: Vec3::new(1.0, 0.0, 2.0), dir: Vec3::Z, before: 1.0, after: 0.0, half: 16.0 };
         Scene {
@@ -337,7 +336,6 @@ mod tests {
             refl: 0.8,
             sun_shadow: Some(SunShadow { direction: Vec3::new(0.3, -0.9, 0.2), lit: true, focus: None }),
             water: Some(WaterEnv { zenith: [0.1, 0.2, 0.3], horizon: [0.4, 0.5, 0.6], sun: Vec3::new(0.0, 0.7, 0.7), use_env_map: true }),
-            flash: 0.7,
             rain: Some(RainEnv { zenith: [0.3; 3], horizon: [0.4; 3], camera_wet: 1.0, time: 12.5, lamps, n_lamps: 1, edges, n_edges: 1 }),
             ..Scene::default()
         }
@@ -406,7 +404,7 @@ mod tests {
                 assert_eq!(&bytes[..master.len()], &master[..], "the fields master has");
                 let zero = [0.0f32; 4];
                 assert_eq!(g.soft, [cam.near, cam.far, 0.0, 0.0]);
-                for (name, v) in [("refl", g.refl), ("water", g.water), ("water_zenith", g.water_zenith), ("water_horizon", g.water_horizon), ("water_sun", g.water_sun), ("fx_sun", g.fx_sun), ("fogsun", g.fogsun), ("flash", g.flash), ("rain", g.rain), ("rain_zenith", g.rain_zenith), ("rain_horizon", g.rain_horizon), ("temporal", g.temporal), ("near", g.near)] {
+                for (name, v) in [("refl", g.refl), ("water", g.water), ("water_zenith", g.water_zenith), ("water_horizon", g.water_horizon), ("water_sun", g.water_sun), ("fx_sun", g.fx_sun), ("fogsun", g.fogsun), ("rain", g.rain), ("rain_zenith", g.rain_zenith), ("rain_horizon", g.rain_horizon), ("temporal", g.temporal), ("near", g.near)] {
                     assert_eq!(v, zero, "{name}");
                 }
                 for (name, a) in [("rain_lamp_pos", &g.rain_lamp_pos[..]), ("rain_lamp_col", &g.rain_lamp_col[..]), ("rain_edge_pos", &g.rain_edge_pos[..]), ("rain_edge_dir", &g.rain_edge_dir[..]), ("rain_edge_val", &g.rain_edge_val[..]), ("near_box", &g.near_box[..]), ("near_eye", &g.near_eye[..])] {
@@ -418,7 +416,7 @@ mod tests {
         let all = Enhancements::all();
         let env = FrameEnv::new(&scene, &all, Some(2));
         let g = globals_uniform(&GlobalsFrame { scene: &scene, camera: &cam, vp_j: vp, enh: &all, hdr: Some(2), no_reflections: false, refl_faces_done: true, probe_strength: 0.6, soft_split: true, env, temporal: Some(([0.1, -0.1], (640, 400))), near: None });
-        assert!(g.refl[0] > 0.0 && g.water[0] == 1.0 && g.rain[0] > 0.0 && g.flash[0] > 0.0 && g.fogsun[3] > 0.0 && g.temporal[2] == 640.0 && g.ambient[3] == 1.0);
+        assert!(g.refl[0] > 0.0 && g.water[0] == 1.0 && g.rain[0] > 0.0 && g.fogsun[3] > 0.0 && g.temporal[2] == 640.0 && g.ambient[3] == 1.0);
     }
 
     /// with [`Enhancements::ORIGINAL`] every item's first 12 fields are master's bytes and `soft` / `hdr` are 0;

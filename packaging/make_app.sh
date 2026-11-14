@@ -33,7 +33,18 @@ done
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$HOME=/build"
 cargo build --release -p open-unleashed
 if [ "$UNIVERSAL" = 1 ]; then
-  cargo build --release -p open-unleashed --target x86_64-apple-darwin
+  # PLATFORM GLUE: Rust's x86_64-apple-darwin defaults to macOS 10.12, and for a target that old Apple's linker records the
+  # Swift overlay the system frameworks pull in (libswiftCoreMedia) as `@rpath/...` with no LC_RPATH: dyld cannot find it and
+  # the Intel half did not start (issue #3, 0.1.5). macOS 11.0 = the arm64 half's minimum (the bundle asks for 13.0 anyway);
+  # the Swift libraries are then the system's and no load command names them. SDL's availability checks need clang's
+  # runtime (`__isPlatformVersionAtLeast`), which rustc's `-nodefaultlibs` link leaves out: link it by path.
+  RT="$(xcrun clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"
+  MACOSX_DEPLOYMENT_TARGET=11.0 RUSTFLAGS="$RUSTFLAGS -C link-arg=$RT" \
+    cargo build --release -p open-unleashed --target x86_64-apple-darwin
+  if otool -L target/x86_64-apple-darwin/release/open-unleashed | grep -q '@rpath/'; then
+    echo "x86_64 binary links an @rpath library (no LC_RPATH): would not start on Intel Macs" >&2
+    exit 1
+  fi
 fi
 if [ "$WITH_DATA" = 1 ]; then APP=target/$APP_ID-WithData.app; else APP=target/$APP_ID.app; fi
 rm -rf "$APP"

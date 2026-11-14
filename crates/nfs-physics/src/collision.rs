@@ -565,6 +565,41 @@ impl TriangleGrid {
         best.map(|(_, w, h)| (w, h))
     }
 
+    /// The ground colour a car is lit by, `0x4746A0`: the car's tracker copied (12 dwords, 0x4746A7…0x4746B2), `updateZone(pos, 1)`
+    /// 0x474060 on the copy — so the patch is [`Self::find_patch`]'s: a **drivable** patch (`word & 0xF`, 0x4732CC) whose plan
+    /// contains the point, the centre height nearest `p.y` — then 0x474700 on its vertex colour words (`vt+0x28`), blended
+    /// barycentrically in the x-z plane at the point (0x474610, 0x48A060), each channel clamped to 1. `None` with no patch, where
+    /// 0x474700 answers its white default (`[ebp−0x48…−0x3C] = 1.0`, the `je 0x474A5C` at 0x47472A).
+    ///
+    /// A road decal laid over the road with a flags word of no surface nibble — the finish line's chequered `fini` strip (word
+    /// 0x0000 over `rda1`'s 0xC001 on alps) — is never the tracker's patch, so it never lights the car. *(Until 2026-11-13 the port
+    /// lit the car by the topmost triangle a ray met, [`Self::ground`]: the white strip made the car flash brighter while it
+    /// crossed the finish line.)*
+    ///
+    /// Same MEDIUM as [`Self::find_patch`]: a quad is its two triangles, and the tracker copy's cached patch (`keep`) is not
+    /// carried — the nearest is taken every time.
+    pub fn patch_color(&self, p: Vec3) -> Option<[f32; 4]> {
+        // `findPatch` 0x473240: the strict `<` keeps the first of equals
+        let mut best: Option<(f32, &Triangle)> = None;
+        for (t, _) in self.patches_at(p) {
+            let d = (patch_centre_y(t) - p.y).abs();
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, t));
+            }
+        }
+        let (_, t) = best?;
+        // barycentric weights of the point's plan in the triangle's
+        let area = |a: Vec3, b: Vec3, c: Vec3| (b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x);
+        let full = area(t.a, t.b, t.c);
+        if full == 0.0 {
+            return None;
+        }
+        let (wa, wb) = (area(p, t.b, t.c) / full, area(t.a, p, t.c) / full);
+        let wc = 1.0 - wa - wb;
+        let ch = |k: usize| ((t.colors[0][k] as f32 * wa + t.colors[1][k] as f32 * wb + t.colors[2][k] as f32 * wc) / 255.0).min(1.0);
+        Some([ch(0), ch(1), ch(2), ch(3)])
+    }
+
     /// Every patch of the point's cell with a surface nibble (`word & 0xF`) whose plan contains
     /// the point, with its plane height there — the list 0x473650 builds (its radius only picks
     /// the cells, 0x484630; the footprint test vt+0xC and the nibble 0x473705 pick the patches) and
@@ -706,6 +741,37 @@ mod tests {
         assert_eq!(g.find_patch(Vec3::new(1.0, 30.0, 1.0)), 0x13, "no height window");
         assert_eq!(g.find_patch(Vec3::new(1.0, -100.0, 1.0)), 7);
         assert_eq!(g.find_patch(Vec3::new(30.0, 0.0, 30.0)), 0, "off the patches");
+    }
+
+    /// 0x4746A0: the car's ground colour is the drivable patch's (`word & 0xF`), interpolated in plan — a decal 10 cm over the
+    /// road with no surface nibble (the finish line's `fini`, word 0) is not it, though a ray down meets it first; off every
+    /// patch, `None` (0x474700's white).
+    #[test]
+    fn the_ground_colour_skips_a_decal_without_a_surface_nibble() {
+        let mut t: Vec<Triangle> = quad(0.0)
+            .into_iter()
+            .map(|mut q| {
+                q.colors = [[152, 112, 128, 255], [152, 112, 128, 255], [152, 112, 128, 255]];
+                q
+            })
+            .collect();
+        t.extend(quad(0.1).into_iter().map(|mut q| {
+            q.surface = 0;
+            q.colors = [[248; 4]; 3];
+            q
+        }));
+        let g = TriangleGrid::build(t, 5.0);
+        let p = Vec3::new(1.0, 0.5, 2.0);
+        assert_eq!(g.ground(p.x, p.y + 2.0, p.z, 20.0).unwrap().color[0], 248.0 / 255.0, "the ray meets the decal");
+        let c = g.patch_color(p).unwrap();
+        assert!((c[0] - 152.0 / 255.0).abs() < 1e-6 && (c[1] - 112.0 / 255.0).abs() < 1e-6 && (c[2] - 128.0 / 255.0).abs() < 1e-6);
+        assert!(g.patch_color(Vec3::new(30.0, 0.0, 30.0)).is_none());
+        // the blend is the plan barycentric one: a vertex's own colour at the vertex
+        let mut q = quad(0.0);
+        q[0].colors = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+        let g = TriangleGrid::build(q, 5.0);
+        let at_b = g.patch_color(Vec3::new(10.0, 0.0, -10.0)).unwrap();
+        assert_eq!((at_b[0], at_b[1], at_b[2]), (0.0, 1.0, 0.0));
     }
 
     /// 0x474060 + 0x499520: the plane point is the patch centre `(2a + b + c)/4`, kept while the

@@ -6,6 +6,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 mod csm;
+mod carsun;
 mod spot;
 mod lamps;
 mod contact;
@@ -94,8 +95,6 @@ struct GlobalsUniform {
     fx_sun: [f32; 4],
     /// ENHANCEMENT E19: `.xyz` the unit vector to the sun, `.w` the sun in-scatter strength of the fog (0 = off)
     fogsun: [f32; 4],
-    /// ENHANCEMENT E20: `.x` the lightning flash's strength 0..1 (0 = none, master's value)
-    flash: [f32; 4],
     /// ENHANCEMENT E26: `.x` the rain's strength (0 = off, master's value), `.y` the clock, `.z` the lamp count, `.w` the wetness at the camera
     rain: [f32; 4],
     rain_zenith: [f32; 4],
@@ -588,6 +587,8 @@ pub(crate) struct Core {
     bench_target: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     /// ENHANCEMENT E9: the sun shadow maps' pipelines, uniform and map
     csm: csm::CsmState,
+    /// ENHANCEMENT E51 (CARSH-FADE): the near cars' measured share of the sun (built on first use; level 1 with compute shaders)
+    car_sun: Option<carsun::CarSun>,
     /// ENHANCEMENT E15: the headlight spots' uniform and shadow map
     spot: spot::SpotState,
     /// ENHANCEMENT E23: the street lamps' uniform

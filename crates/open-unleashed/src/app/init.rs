@@ -524,7 +524,6 @@ impl App {
             rear_mirror: None,
             mirror_tex: None,
             refl_done: 0,
-            flash_strike: None,
             refl_next: 0,
             refl_size: 0,
             refl_eye: Vec3::ZERO,

@@ -139,6 +139,8 @@ impl App {
         scene.sun_shadow = None;
         scene.overcast_shadow = None;
         scene.moon_shadow = None;
+        scene.car_sun_shadow = None;
+        scene.car_sun_full = None;
         // ENHANCEMENT E17: no water reflection inside the environment faces (it would reflect the previous map)
         scene.water = None;
         if near.is_some() {

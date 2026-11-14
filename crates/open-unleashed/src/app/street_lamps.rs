@@ -43,6 +43,27 @@ const CLUSTER_GAP: f32 = 1.5;
 /// histograms, `ENHANCEMENTS.md` LAMP-TUNE).
 pub(crate) const DAY_TUNNEL_GAIN: f32 = 0.35;
 
+/// AUTOBAHN-LAMPS: the day tracks whose open street lamps light (E23) and cast the cars' shadows (E47) as on a night track.
+/// APPROXIMATION (a chosen setting, 2026-11-13): the data gives no rule — autobahn is a day track by the original's own test
+/// (no headlight layers: its cars drive unlit, which stays so) and neither the sky colour, the `.map` light nor the road's baked
+/// colour sets its rainy dusk apart from the other day tracks (`ENHANCEMENTS.md` E47, AUTOBAHN-LAMPS) — so it is named here.
+const DUSK_TRACKS: &[&str] = &["autobahn"];
+
+/// AUTOBAHN-LAMPS: the brightness of an open street lamp on a [`DUSK_TRACKS`] track, times E23's night term. The rainy dusk's baked
+/// road is much lighter than a night track's and the motorway posts are high (16-20 m: wide, faint pools), so at the night term the
+/// pools and the cars' lamp shadows hardly showed (the lower screen's mean luma +5 near a post); at 1.6 +7 there and +14 right under
+/// a post, the clipped share 0.04 -> 0.35 % (the car's lit roof). APPROXIMATION (by the stills, `ENHANCEMENTS.md` E47 AUTOBAHN-LAMPS).
+pub(crate) const DUSK_STREET_GAIN: f32 = 1.6;
+
+/// AUTOBAHN-LAMPS: whether `track` lights its open street lamps by day ([`DUSK_TRACKS`]).
+pub(crate) fn dusk_lamps(track: &str) -> bool {
+    // TEST GLUE: `NFS_DUSK_TRACKS=<a,b,..>` replaces the list (comparison stills only)
+    if let Ok(list) = std::env::var("NFS_DUSK_TRACKS") {
+        return list.split(',').any(|t| t.trim().eq_ignore_ascii_case(track));
+    }
+    DUSK_TRACKS.iter().any(|t| t.eq_ignore_ascii_case(track))
+}
+
 /// LAMP-TUNE: the reach of a lamp `height` m over the road made of `heads` heads (m): E23's `clamp(1.5 h + 6, 10, 30)` per head,
 /// times `sqrt(heads)` for a post of several heads (the distance a given brightness reaches grows with the root of the
 /// intensity), at most 36: monaco1's three-head 3 m posts reach 18 m (were three 10.5 m lights). A wider single lamp was tried
@@ -98,7 +119,10 @@ pub(crate) fn class_of(id: u32) -> Option<LampClass> {
     match &name {
         // `str?` (strg / stry / strb): the heads of the tall street lamps (Monaco, Industrial), `lopl`
         // lamp poles, `lmpy` / `lamp` lamps, `bldy` the sodium lamps
-        b"grts" | b"yrts" | b"brts" | b"lopl" | b"pmal" | b"ypml" | b"ydlb" => Some(LampClass::Street),
+        // AUTOBAHN-LAMPS: `thws` (BLUR + BLUR, blue-white) was read as a water glint; castle's 18 hang 0.2 m under the ceiling of
+        // its tunnel (slices 208-276), on the centreline every 4 slices: the tunnel's ceiling lamps. A street id, so the covered
+        // rule makes those lit on the day track and leaves alps' three in the open (8-11 m over the road, slices 721-768) unlit
+        b"grts" | b"yrts" | b"brts" | b"lopl" | b"pmal" | b"ypml" | b"ydlb" | b"thws" => Some(LampClass::Street),
         b"bnut" | b"ynut" | b"onut" | b"tnac" => Some(LampClass::Tunnel),
         _ => None,
     }
@@ -258,6 +282,8 @@ impl App {
             return Lamps::default();
         }
         let night = self.track.is_night();
+        // AUTOBAHN-LAMPS: a dusk track's open street lamps light too, at their share
+        let dusk = !night && dusk_lamps(&self.track.name);
         let eye = self.camera.position;
         // PERF: only the lamps whose pool (the radius below) reaches into the view; the 32 slots then go to lamps that
         // light something on screen, not to the ones behind the camera, and the shader loops over fewer
@@ -266,7 +292,7 @@ impl App {
         let mut near: Vec<(f32, LampSite)> = self
             .street_lamp_sites()
             .iter()
-            .filter(|s| night || s.tunnel)
+            .filter(|s| night || dusk || s.tunnel)
             .filter(|s| cone.is_none_or(|c| c.sees(s.pos, s.radius * scale)))
             .map(|s| (s.pos.distance(eye), *s))
             .filter(|(d, _)| *d < REACH)
@@ -281,7 +307,14 @@ impl App {
             let fade = 1.0 - ((d - 0.75 * cut) / (0.25 * cut)).clamp(0.0, 1.0);
             let k = fade * fade * (3.0 - 2.0 * fade);
             // LAMP-TUNE: a tunnel lamp on a day track lights at its share (the tube's bake already holds its light)
-            let k = if night { k } else { k * DAY_TUNNEL_GAIN };
+            // AUTOBAHN-LAMPS: an open street lamp of a dusk track at DUSK_STREET_GAIN
+            let k = if night {
+                k
+            } else if s.tunnel {
+                k * DAY_TUNNEL_GAIN
+            } else {
+                k * DUSK_STREET_GAIN
+            };
             out.lamps[out.n as usize] = StreetLamp { pos: s.pos, color: [s.color[0] * k, s.color[1] * k, s.color[2] * k], radius: s.radius * scale };
             out.n += 1;
         }

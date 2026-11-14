@@ -627,9 +627,6 @@ pub(crate) struct App {
     pub(crate) refl_eye: Vec3,
     /// ENHANCEMENT E49: the faces were last drawn with the near objects (a change draws every face again)
     pub(crate) refl_near: bool,
-    /// ENHANCEMENT E20: the tick the running lightning strike was first seen at and the tick it was last seen
-    /// at (the flicker envelope runs from the first; a gap of 32 ticks without a flash starts a new strike)
-    pub(crate) flash_strike: Option<(u32, u32)>,
     /// `HWrongWay`'s blink: `+0x14` ticks counted, `+0x18` the tick of the last draw, `+0x24`
     /// visible. Every draw adds the ticks since the last one, and the visible half flips off once
     /// the count passes 64, the hidden half back on once it passes 32, the count restarting

@@ -106,24 +106,22 @@ pub(crate) mod feat {
     pub const RAIN: u32 = 1 << 8;
     /// ENHANCEMENT E19: the fog's sun glow (`globals.fogsun.w` 0 without)
     pub const FOGSUN: u32 = 1 << 9;
-    /// ENHANCEMENT E20: the lightning flash (`globals.flash.x` 0 without)
-    pub const FLASH: u32 = 1 << 10;
     /// ENHANCEMENT E18: particles in HDR (`object.hdr.y` / `.z` 0 without)
-    pub const PFX: u32 = 1 << 11;
+    pub const PFX: u32 = 1 << 10;
     /// ENHANCEMENT E12: soft particles (`object.soft.x` 0 without)
-    pub const SOFT: u32 = 1 << 12;
+    pub const SOFT: u32 = 1 << 11;
     /// ENHANCEMENT E11: the sun's HDR boost (`object.hdr.x` 0 without)
-    pub const HDRB: u32 = 1 << 13;
+    pub const HDRB: u32 = 1 << 12;
     /// ENHANCEMENT E50: the moonlight through E9's cascades (`csm.moon.x` 0 without)
-    pub const MOON: u32 = 1 << 14;
+    pub const MOON: u32 = 1 << 13;
     /// ENHANCEMENT E51: the cars-only layers of E9's near cascades (`csm.carsh.x` 0 without)
-    pub const CARSH: u32 = 1 << 15;
+    pub const CARSH: u32 = 1 << 14;
     /// ENHANCEMENT E49: the clear coat reads the near faces and the covered box (`globals.near.x` 0 without; inside COAT)
-    pub const NEAR: u32 = 1 << 16;
+    pub const NEAR: u32 = 1 << 15;
     #[cfg(test)]
-    pub const ALL: u32 = (1 << 17) - 1;
+    pub const ALL: u32 = (1 << 16) - 1;
     /// The names `shader.wgsl` uses.
-    pub const NAMES: [(&str, u32); 17] = [
+    pub const NAMES: [(&str, u32); 16] = [
         ("CSM", CSM),
         ("PROBE", PROBE),
         ("CONTACT", CONTACT),
@@ -134,7 +132,6 @@ pub(crate) mod feat {
         ("WATER", WATER),
         ("RAIN", RAIN),
         ("FOGSUN", FOGSUN),
-        ("FLASH", FLASH),
         ("PFX", PFX),
         ("SOFT", SOFT),
         ("HDRB", HDRB),
@@ -168,7 +165,6 @@ pub(crate) fn mesh_features(e: &crate::Enhancements) -> u32 {
         (e.is_on(crate::E17), feat::WATER),
         (e.is_on(crate::E26), feat::RAIN),
         (e.is_on(crate::E19), feat::FOGSUN),
-        (e.is_on(crate::E20), feat::FLASH),
         (e.is_on(crate::E18), feat::PFX),
         (e.is_on(crate::E12), feat::SOFT),
         (e.is_on(crate::E11), feat::HDRB),

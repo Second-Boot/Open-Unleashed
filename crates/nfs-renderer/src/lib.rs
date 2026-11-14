@@ -57,7 +57,7 @@ pub use drops::Drops;
 pub use haze::{HAZE_LAMPS, Haze, HazeLamp};
 pub use lbeam::{LBeam, LBeams, MAX_LBEAMS};
 pub use shafts::Shafts;
-pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E20, E21, E23, E24, E25, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
+pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E21, E23, E24, E25, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
 pub use front::Renderer;
 pub use mipgen::MipAlpha;
 /// ENHANCEMENT E41: the E2 mip chain generator (levels 1.. of a base image), for the HD textures' own chains
@@ -749,6 +749,18 @@ pub struct Scene {
     /// term on the cars). Read only with E9 and E50 on, and only while `sun_shadow` and `overcast_shadow` are `None`. Nothing else
     /// (fog glow, water, particles, shafts) reads it.
     pub moon_shadow: Option<SunShadow>,
+    /// ENHANCEMENT E51 (CORSICA-SUN): on a day track whose sky has no sun (the sky's sun object overhead and off; the cars' own
+    /// light straight down) but whose `sh80` tree-shadow decals were drawn along one sun (Corsica, `canyon`): that direction, for
+    /// the cars' own shadow alone - only the cars cast, onto the track (the scenery's shade is already baked / in the decals), and
+    /// the cars' shading is left as it is. Read only with E9 and E51 on, and only while `sun_shadow` (and E25's `overcast_shadow`)
+    /// is `None`. Nothing else (fog glow, water, particles, shafts) reads it.
+    pub car_sun_shadow: Option<SunShadow>,
+    /// ENHANCEMENT E9 / E51 (SUN-FULL): `Some(r)`: `car_sun_shadow` drives E9's FULL frame instead (scenery and cars cast, the
+    /// scenery only up to a bounding radius of `r` m (at most E9's own 60 m limit: a hillside's shade along a sun the bake never
+    /// had would cover whole stretches), E9's baked-dark gate on the track, E51's cars-only layers on top when E51 is on, as on a
+    /// sky-sun track; needs E9 only). The cars still take no shadow on their shading (their light is the original's straight-down
+    /// one, not this direction), and nothing else (fog glow, the cars' sun glint, water) reads it: only the shadow frame changes.
+    pub car_sun_full: Option<f32>,
     /// ENHANCEMENT E17: the sky the water items reflect and the sun that glints on them (the main race
     /// view and its mirror; `None` = no water reflection, the environment faces and the front end). Read only with E17 on.
     pub water: Option<WaterEnv>,
@@ -758,8 +770,6 @@ pub struct Scene {
     /// ENHANCEMENT E14: this scene takes the corner shading (the race's main view only; the front
     /// end, the mirror and the environment faces stay `false`). Read only with E14 on.
     pub ao: bool,
-    /// ENHANCEMENT E20: the lightning flash's strength 0..1 for this view (0 = none). Read only with E20 on.
-    pub flash: f32,
     /// ENHANCEMENT E21: this scene's float image feeds the eye adaptation (the race's main view only). Read only with E21 and E7 on.
     pub eye: bool,
     /// ENHANCEMENT E13: the sun's screen point for the light shafts of the main race view (read only
@@ -789,6 +799,11 @@ pub struct Scene {
     /// ENHANCEMENT E43: the near cars' poses for the soft contact shadow on the road under them (empty = none: the front end,
     /// the mirror, the environment faces, E43 off). Read only with E43 on.
     pub contacts: Contacts,
+    /// ENHANCEMENT E51 (CARSH-FADE): the near cars whose share of the sun is measured on the shadow map (level 1 «где светит
+    /// солнце»: a car's own ungated shadow fades as a whole where the car stands in the scenery's broad shade; empty = none: the
+    /// mirror, the front end, other levels). Filled whatever E43 is (that list stands in for the blob patch). Read only with E51
+    /// at level 1.
+    pub sun_cars: SunCars,
     /// ENHANCEMENT E9 (ENH-TUNPOOL): the covered stretches of the road (tunnels, galleries) as boxes along the slices, the whole
     /// track's, shared; the renderer sends the nearest ones to the shader, which skips E9's sun-shadow darkening of the
     /// track's baked colour for a fragment inside one (the baked colour there has no sun in it already).
@@ -872,9 +887,10 @@ pub struct RainEnv {
     pub camera_wet: f32,
     /// Seconds on the race clock (the splash ripples' phase; frozen while the race is paused).
     pub time: f32,
-    /// Lights near the camera that reflect in the road as vertical streaks (at most [`RAIN_LAMPS`]): position and
-    /// linear colour x intensity.
-    pub lamps: [(Vec3, [f32; 3]); RAIN_LAMPS],
+    /// Lights near the camera that reflect in the road as vertical streaks (at most [`RAIN_LAMPS`]): position,
+    /// linear colour x intensity and (AUTOBAHN-LAMPS) the light's reach in metres, the distance from the lamp at which
+    /// its streak is down to half (`1 / (1 + d² / reach²)`); 0 = [`RAIN_LAMP_REACH`], the street lamps' reach.
+    pub lamps: [(Vec3, [f32; 3], f32); RAIN_LAMPS],
     /// How many of `lamps` are used.
     pub n_lamps: usize,
     /// The nearest wetness edges (where the original's field 5 steps between slices), at most [`RAIN_EDGES`]: the road
@@ -885,6 +901,10 @@ pub struct RainEnv {
 
 /// ENHANCEMENT E26: the most lights the road reflects per frame.
 pub const RAIN_LAMPS: usize = 12;
+
+/// ENHANCEMENT E26: the reach (m) of a light whose [`RainEnv::lamps`] entry gives none: the street and tunnel lamps' streak
+/// falls to half 63 m from the lamp (`d² = 4000`, the first version's constant for every light).
+pub const RAIN_LAMP_REACH: f32 = 63.245_55;
 
 /// ENHANCEMENT E26: the most wetness edges the shader knows per frame.
 pub const RAIN_EDGES: usize = 8;
@@ -964,6 +984,45 @@ impl Default for Contacts {
 impl Contacts {
     /// Append a car (ignored past [`MAX_CONTACTS`]).
     pub fn push(&mut self, c: ContactCar) {
+        if (self.n as usize) < MAX_CONTACTS {
+            self.cars[self.n as usize] = c;
+            self.n += 1;
+        }
+    }
+}
+
+/// ENHANCEMENT E51 (CARSH-FADE): one car of [`Scene::sun_cars`]: its pose (the contact shadow's, [`ContactCar`]) and a key that
+/// stays the car's from frame to frame (the renderer eases each car's share of the sun over time under it, `gpu/carsun.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct SunCar {
+    /// below [`SUN_CAR_KEYS`]: the player 0, the opponents 1 + seat, the police 64 + index, the traffic 128 + index (mod 128)
+    pub key: u16,
+    pub pose: ContactCar,
+}
+
+/// ENHANCEMENT E51 (CARSH-FADE): how many keys a [`SunCar`] may have.
+pub const SUN_CAR_KEYS: usize = 256;
+
+/// ENHANCEMENT E51 (CARSH-FADE): the cars of a frame whose sun share is measured (the nearest to the camera first, at most
+/// [`MAX_CONTACTS`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunCars {
+    pub n: u8,
+    pub cars: [SunCar; MAX_CONTACTS],
+    /// the draw clock (s: the game ticks and the frame's fraction of the next over 64 Hz): the ease runs on it, so a paused race
+    /// holds and a scripted still (one frame per tick or fewer) eases by the race time between its frames, not the wall clock's
+    pub clock: f64,
+}
+
+impl Default for SunCars {
+    fn default() -> Self {
+        Self { n: 0, cars: [SunCar::default(); MAX_CONTACTS], clock: 0.0 }
+    }
+}
+
+impl SunCars {
+    /// Append a car (ignored past [`MAX_CONTACTS`]).
+    pub fn push(&mut self, c: SunCar) {
         if (self.n as usize) < MAX_CONTACTS {
             self.cars[self.n as usize] = c;
             self.n += 1;
@@ -1141,7 +1200,7 @@ impl Scene {
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, sun_shadow: None, overcast_shadow: None, moon_shadow: None, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, flash: 0.0, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), cover: Default::default(), lbeam: None, near_sky: NearSky::Original }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, sun_shadow: None, overcast_shadow: None, moon_shadow: None, car_sun_shadow: None, car_sun_full: None, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), sun_cars: SunCars::default(), cover: Default::default(), lbeam: None, near_sky: NearSky::Original }
     }
 }
 

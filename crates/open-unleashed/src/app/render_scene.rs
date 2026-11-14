@@ -186,6 +186,9 @@ impl App {
         // ENHANCEMENT E43: the cars' contact shadows of this view (the main view only); a car that has one has no `SHAD` patch laid
         let contact_on = !mirror_pass && self.enh.is_on(nfs_renderer::E43);
         let mut contact_cars: Vec<(f32, nfs_renderer::ContactCar)> = Vec::new();
+        // ENHANCEMENT E51 (CARSH-FADE): the cars whose share of the sun the renderer measures (level 1, the main view only)
+        let sun_cars_on = !mirror_pass && self.enh.level(nfs_renderer::E51) == 1;
+        let mut sun_cars: Vec<(f32, nfs_renderer::SunCar)> = Vec::new();
         let mut spot_others: Vec<nfs_renderer::SpotLamp> = Vec::new();
         // ENHANCEMENT E15 (ENH-CONES): the original's beam strips of this view, faded once the spots are chosen
         let mut cone_log: Vec<crate::app::car_lights::BeamLog> = Vec::new();
@@ -261,6 +264,10 @@ impl App {
                     contact_cars.push((ca.origin.distance_squared(self.camera.position), ca));
                     true
                 };
+                if sun_cars_on {
+                    let ca = contact_car(p + (c.position - c.draw_origin()), r, c.half_extents, tr.bodies.get(i));
+                    sun_cars.push((ca.origin.distance_squared(self.camera.position), nfs_renderer::SunCar { key: 128 + (i % 128) as u16, pose: ca }));
+                }
                 if !contact
                     && let Some(mat) = shadow_material
                     && let Some(q) = self.shadow_quad(p + (c.position - c.draw_origin()), r, c.half_extents, &mut shadow_verts)
@@ -336,6 +343,10 @@ impl App {
                     contact_cars.push((ca.origin.distance_squared(self.camera.position), ca));
                     true
                 };
+                if sun_cars_on {
+                    let ca = contact_car(p + (c.position - c.draw_origin()), r, c.half_extents, Some(&c.body));
+                    sun_cars.push((ca.origin.distance_squared(self.camera.position), nfs_renderer::SunCar { key: 64 + (i % 64) as u16, pose: ca }));
+                }
                 if !contact
                     && let Some(mat) = shadow_material
                     && let Some(q) = self.shadow_quad(p + (c.position - c.draw_origin()), r, c.half_extents, &mut shadow_verts)
@@ -399,6 +410,10 @@ impl App {
                 contact_cars.push((ca.origin.distance_squared(self.camera.position), ca));
                 true
             };
+            if sun_cars_on {
+                let ca = contact_car(p + (o.vehicle.position - o.vehicle.draw_origin()), r, o.vehicle.half_extents, Some(&o.vehicle));
+                sun_cars.push((ca.origin.distance_squared(self.camera.position), nfs_renderer::SunCar { key: 1 + (i % 63) as u16, pose: ca }));
+            }
             if !contact
                 && let Some(mat) = shadow_material
                 && !(followed_here && own_view <= 1)
@@ -476,6 +491,13 @@ impl App {
                 contact_cars.push((ca.origin.distance_squared(self.camera.position), ca));
                 true
             });
+        if sun_cars_on
+            && !own_skipped
+            && let Some(v) = self.vehicle.as_ref()
+        {
+            let ca = contact_car(local_pos, local_rot, v.half_extents, Some(v));
+            sun_cars.push((ca.origin.distance_squared(self.camera.position), nfs_renderer::SunCar { key: 0, pose: ca }));
+        }
         if !own_contact
             && let (Some(mat), Some(v)) = (shadow_material, self.vehicle.as_ref())
             && !(followed.is_none() && own_view <= 1)
@@ -620,6 +642,13 @@ impl App {
                 contacts.push(c);
             }
             self.scene.contacts = contacts;
+            // ENHANCEMENT E51 (CARSH-FADE): the nearest cars whose sun share is measured
+            sun_cars.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut list = nfs_renderer::SunCars { clock: (self.tick as f64 + f64::from(alpha)) / 64.0, ..Default::default() };
+            for (_, c) in sun_cars {
+                list.push(c);
+            }
+            self.scene.sun_cars = list;
             // ENHANCEMENT E23: the street lamps of the main view
             self.scene.lamps = self.frame_lamps();
         }
@@ -941,6 +970,15 @@ impl App {
         self.scene.overcast_shadow = (self.vehicle.is_some() && !self.track.is_night() && self.scene.sun_shadow.is_none())
             .then(|| self.world.as_ref().filter(|w| w.sun_direction.length_squared() > 0.5).map(|_| nfs_renderer::SunShadow { direction: OVERCAST_LIGHT.normalize(), lit, focus: None }))
             .flatten();
+        // ENHANCEMENT E51 (CORSICA-SUN): a day track with no sun in its sky (the cars' light straight down) whose `sh80` tree-shadow
+        // decals were drawn along one sun (Corsica) or whose bake was lit by one (SUN-ALL: Schwarzwald; `TrackWorld::data_sun`): the
+        // cars' own shadow along it (the renderer draws only the cars into that map, and leaves their shading as it is)
+        self.scene.car_sun_shadow = (self.vehicle.is_some() && !self.track.is_night() && self.scene.sun_shadow.is_none())
+            .then(|| self.world.as_ref().and_then(|w| w.data_sun).map(|direction| nfs_renderer::SunShadow { direction, lit, focus: None }))
+            .flatten();
+        // ENHANCEMENT E9 / E51 (SUN-FULL): on the tracks of `nfs_game::world::DATA_SUN_FULL_TRACKS` that sun drives E9's full frame
+        // (the scenery casts too: a vertex bake has no shade of the signs, posts, trees); the cars' shading stays the original's
+        self.scene.car_sun_full = self.scene.car_sun_shadow.and(self.world.as_ref().and_then(|w| w.data_sun_full));
         // ENHANCEMENT E50: a night track's moon. Where the sky's sun object is on at night (Industrial: `SkyBin::sun_active`, 40 degrees up;
         // its sky layer "blocks the sun", no disc shows) it stands for the moon: the cars are already lit from it (`TrackWorld::sun_direction`,
         // 0x43AC8D); a sky without one (the Monaco circuits) takes `MOON_LIGHT`
@@ -1207,8 +1245,6 @@ impl App {
         // `[0x657DB4]` SKYOFF (the config row `SKYOFF`, id 0x5A, 0x4B14C4 — `fe.txt`'s `skyoff`, absent
         // in the shipped one): 0x468AF9 skips the whole sky pass 0x45D7D0, update and draw, for every
         // view; `[0x619799]`, the third gate there, is only ever written 0 (0x44E89D)
-        // ENHANCEMENT E20: no flash unless the sky below says so
-        self.scene.flash = 0.0;
         if self.sky_off() {
             let n = self.scene.items.len();
             self.sky_item_range = (n, n);
@@ -1218,24 +1254,6 @@ impl App {
         if let (Some(s), Some(r)) = (self.sky.as_mut(), self.renderer.as_mut()) {
             let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
             s.update(r, self.camera.position, cam_slice as i32, lap, self.tick, &mut self.fe_rng);
-        }
-        // ENHANCEMENT E20: the running lightning flash also lights the scene, by the sky flash's own strength
-        if self.enh.is_on(nfs_renderer::E20) && self.vehicle.is_some() {
-            let strength = self.sky.as_ref().map_or(0.0, |s| s.flash_strength());
-            // ENH-TUNE: the flash flickers over the strike's first half second (2-4 quick flashes, decaying) and
-            // then holds a weaker plateau; deterministic from the strike's first tick (the sim tick, so a replay
-            // looks the same). The sky keeps the original's curve.
-            let tick = self.tick as u32;
-            if strength > 0.0 {
-                let start = match self.flash_strike {
-                    Some((start, last)) if tick.wrapping_sub(last) <= 32 => start,
-                    _ => tick,
-                };
-                self.flash_strike = Some((start, tick));
-                self.scene.flash = strength * nfs_game::sky::flash_envelope(tick.wrapping_sub(start) as f32 / 64.0, start);
-            } else {
-                self.scene.flash = 0.0;
-            }
         }
         if let Some(s) = &self.sky {
             // in metres around the eye, clipped by the far plane 700 as the sky pass 0x45D4F0 does
@@ -1478,7 +1496,9 @@ impl App {
             // ENHANCEMENT E9 (SHADOWFIX): casters from a sphere round the camera, not the view's walk (which drops what is
             // outside the frustum or behind an occluder: shadows popped in at the screen edge and out with the occlusion);
             // `shadow_only` items, drawn into the shadow map alone, after everything else
-            if (self.scene.sun_shadow.is_some() || self.scene.overcast_shadow.is_some() || self.scene.moon_shadow.is_some()) && self.enh.is_on(nfs_renderer::E9) {
+            // (SUN-FULL: and the full frame along a sunless track's data sun)
+            let data_full = self.scene.car_sun_full.is_some() && self.scene.car_sun_shadow.is_some();
+            if (self.scene.sun_shadow.is_some() || self.scene.overcast_shadow.is_some() || self.scene.moon_shadow.is_some() || data_full) && self.enh.is_on(nfs_renderer::E9) {
                 if let Some(w) = &self.world {
                     w.shadow_casters(&self.article_draws, self.camera.position, SHADOW_CASTER_REACH, &mut self.scene.items);
                 }

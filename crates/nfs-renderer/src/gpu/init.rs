@@ -255,6 +255,7 @@ impl Core {
             gpu_time_acc: (0.0, 0),
             bench_target: None,
             csm: csm_state,
+            car_sun: None,
             spot: spot_state,
             lamp: lamp_state,
             contact: contact_state,

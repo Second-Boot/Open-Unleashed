@@ -25,14 +25,12 @@ struct Globals {
     fx_sun: vec4<f32>,
     // ENHANCEMENT E19: .xyz the unit vector to the sun, .w the fog's sun in-scatter strength (0 = off)
     fogsun: vec4<f32>,
-    // ENHANCEMENT E20: .x the lightning flash's strength 0..1 (0 = none)
-    flash: vec4<f32>,
     // ENHANCEMENT E26: .x the rain's strength (0 = off: 1 on, 1.5 strong), .y the race clock in seconds, .z the number of lamps, .w the wetness at the camera
     rain: vec4<f32>,
     // the sky the wet road reflects: straight up / at the horizon
     rain_zenith: vec4<f32>,
     rain_horizon: vec4<f32>,
-    // the lights whose streaks the road shows: xyz the position, and the colour x intensity
+    // the lights whose streaks the road shows: xyz the position + w its reach squared (0 = 4000), and the colour x intensity
     rain_lamp_pos: array<vec4<f32>, 12>,
     rain_lamp_col: array<vec4<f32>, 12>,
     // the wetness edges (planes along the track): pos.xyz + ramp half width, dir.xyz + wetness before, val.x wetness after
@@ -86,8 +84,14 @@ struct Csm {
     moon: vec4<f32>,
     // ENHANCEMENT E50: rgb the moon's colour
     moon_col: vec4<f32>,
-    // ENHANCEMENT E51: x how many near cascades have a cars-only layer (0 = none), y the first of those layers
+    // ENHANCEMENT E51: x how many near cascades have a cars-only layer (0 = none), y the first of those layers, z 1 = each car's
+    // shadow scaled by its share of the sun (level 1, CARSH-FADE), w how many cars `carsh_cars` lists
     carsh: vec4<f32>,
+    // ENHANCEMENT E51 (CARSH-FADE): per measured car its body's centre (xyz) and the radius (w) a receiver's ray toward the sun
+    // passes it within
+    carsh_cars: array<vec4<f32>, 16>,
+    // ENHANCEMENT E51 (CARSH-FADE): the cars' eased shares of their own shadow (1 all .. 0 none), four to a vec4 (`gpu/carsun.rs`)
+    carsh_k: array<vec4<f32>, 4>,
 };
 @group(0) @binding(6) var t_shadow: texture_depth_2d_array;
 @group(0) @binding(7) var s_shadow: sampler_comparison;
@@ -731,8 +735,8 @@ fn csm_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
 //@if CARSH
 // ENHANCEMENT E51: how much of the sun reaches `world` past the CARS alone (1 = no car's shadow here, or beyond the cars-only
 // cascades): the cars-only layer of the cascade the point's view depth picks, E9's normal offset and depth bias, the four corner taps
-// of its kernel. (Tried and dropped: counting a point as lit where the full map has scenery nearer the sun than the car - it took the
-// car's shadow away in exactly the hill's shade the switch is for, coastal's cliffs being casters.)
+// of its kernel. Level 1 (`carsh.z`, CARSH-FADE): where that finds a car's shadow, it is drawn at the share of the sun the car
+// itself gets (`car_sun_share`: one value per car, measured on the map and eased in time - never cut texel by texel).
 fn car_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let all = i32(csm.dir.w);
     let vd = -(globals.view * vec4<f32>(world, 1.0)).z;
@@ -760,7 +764,33 @@ fn car_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
     for (var k = 0; k < 4; k++) {
         sum += textureSampleCompareLevel(t_shadow, s_shadow, uv + vec2<f32>(f32(k & 1) * 2.0 - 1.0, f32(k >> 1) * 2.0 - 1.0) * step, layer, depth);
     }
-    return sum * 0.25;
+    // ENHANCEMENT E51 (CARSH-FADE): only where a car's shadow is found (most of the road reads no car: the cheap taps above decide)
+    let v = sum * 0.25;
+    if csm.carsh.z > 0.5 && sum < 3.999 {
+        return 1.0 - car_sun_share(world) * (1.0 - v);
+    }
+    return v;
+}
+
+// ENHANCEMENT E51 (CARSH-FADE, level 1): the share of its own shadow the car whose shadow falls on `world` draws (1 all .. 0 none):
+// the measured car whose body the point's ray toward the sun passes nearest (within its radius); 1 when none does (a car past the
+// list's 16 keeps the level-2 shadow). A car stands in the scenery's broad shade (a gorge, a wall's, a cliff's) or it does not: the
+// value is one per car, so its shadow fades as a whole, never in patches.
+fn car_sun_share(world: vec3<f32>) -> f32 {
+    let l = -csm.dir.xyz;
+    var best = 1e9;
+    var k = 1.0;
+    for (var i = 0; i < i32(csm.carsh.w); i++) {
+        let c = csm.carsh_cars[i];
+        let d = c.xyz - world;
+        let along = dot(d, l);
+        let perp = dot(d, d) - along * along;
+        if along > -1.0 && perp < c.w * c.w && perp < best {
+            best = perp;
+            k = csm.carsh_k[i >> 2u][i & 3];
+        }
+    }
+    return k;
 }
 //@endif
 
@@ -1972,7 +2002,10 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
                 }
                 let sa = 0.035 + 0.02 * pud;
                 let e = exp(-(az / sa) * (az / sa) - (dv / sv) * (dv / sv));
-                streak += globals.rain_lamp_col[i].rgb * (e / (1.0 + dl * dl / 4000.0));
+                // AUTOBAHN-LAMPS: the light's own reach (`w` = reach squared; 0 = the street lamps' 4000): a car's
+                // tail light no longer streaks as far and as bright as a street lamp
+                let r2 = select(4000.0, globals.rain_lamp_pos[i].w, globals.rain_lamp_pos[i].w > 0.0);
+                streak += globals.rain_lamp_col[i].rgb * (e / (1.0 + dl * dl / r2));
             }
         }
         lit = lit + streak * (0.13 + 0.22 * fres) * (0.35 + 0.65 * pud) * wetf;
@@ -1985,18 +2018,6 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             lit = lit + sky * 0.3 * wetf;
         }
         }
-    }
-    //@endif
-    // ENHANCEMENT E20: the lightning flash lights the scene (the track, the cars, the particles; not the sky
-    // pass, which the original's flash already paints, nor the flare layers): a bluish-white boost of what
-    // the item shows, plus a little of its bare texture so a shadowed surface also catches the flash
-    //@if FLASH
-    if globals.flash.x > 0.0 && object.sky_on.y < 0.5 && object.hdr.x <= 1.0 {
-        var bare = tex.rgb;
-        if layered {
-            bare = bare * alpha;
-        }
-        lit = lit + (lit * 0.45 + bare * 0.09) * vec3<f32>(0.80, 0.92, 1.15) * globals.flash.x;
     }
     //@endif
     return vec4<f32>(lit, alpha);

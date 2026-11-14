@@ -211,8 +211,15 @@ pub(super) struct CsmUniform {
     moon: [f32; 4],
     /// ENHANCEMENT E50: rgb the moon's colour
     moon_col: [f32; 4],
-    /// ENHANCEMENT E51: x how many near cascades have a cars-only layer (0 = none), y the first of those layers in the map
+    /// ENHANCEMENT E51: x how many near cascades have a cars-only layer (0 = none), y the first of those layers in the map,
+    /// z 1 when each car's shadow is scaled by its share of the sun (level 1, CARSH-FADE), w how many cars `carsh_cars` lists
     carsh: [f32; 4],
+    /// ENHANCEMENT E51 (CARSH-FADE): per measured car its body's centre (xyz) and the radius (w) within which a receiver's ray
+    /// toward the sun passes the car
+    carsh_cars: [[f32; 4]; crate::MAX_CONTACTS],
+    /// ENHANCEMENT E51 (CARSH-FADE): the cars' eased shares of their own shadow (1 all .. 0 none), four to a vec4; written on the
+    /// GPU by `carsun.rs` (copied in after the shadow passes)
+    carsh_k: [[f32; 4]; crate::MAX_CONTACTS / 4],
 }
 
 /// The most covered boxes the shader knows (the nearest to the camera go in).
@@ -267,6 +274,15 @@ pub(super) struct CsmFrame {
     moon: u8,
     /// ENHANCEMENT E51: how many near cascades get a cars-only layer (0 = none: E51 off, not a sun frame)
     car_layers: usize,
+    /// ENHANCEMENT E51 (CARSH-FADE): level 1: each car's ungated shadow scaled by its share of the sun (`carsun.rs`, measured on
+    /// the map per car and eased in time); level 2 draws it wherever the car's layer has it
+    car_sunlit: bool,
+    /// ENHANCEMENT E51 (CORSICA-SUN): a frame of `Scene::car_sun_shadow`: the cascades themselves hold the cars alone (the
+    /// near ones, no extra layers: `car_layers` then names the cascades' own), the scenery casts nothing
+    cars_only: bool,
+    /// ENHANCEMENT E9: the largest caster's bounding radius (m): `MAX_CASTER_RADIUS`, or the smaller one of a sunless track's
+    /// full frame along its data sun (SUN-FULL, `Scene::car_sun_full`)
+    caster_radius: f32,
 }
 
 impl CsmFrame {
@@ -274,7 +290,8 @@ impl CsmFrame {
     /// end's focus, not E25's overcast light, whose shadows are too faint to stand in for them)
     pub(super) fn decal_fades(&self) -> bool {
         // ENHANCEMENT E50: nor the moon's (faint like the overcast light's)
-        self.focus.is_none() && !self.overcast && self.moon == 0
+        // ENHANCEMENT E51 (CORSICA-SUN): nor the cars-only frame (no scenery shadow stands in for the decals)
+        self.focus.is_none() && !self.overcast && self.moon == 0 && !self.cars_only
     }
 
     /// ENHANCEMENT E50: whether this is the moon's frame (the mesh shader's MOON part runs)
@@ -406,10 +423,24 @@ impl Core {
         // ENHANCEMENT E25: no sun disc -> the overcast light (straight down), with the soft / faint parameters
         // ENHANCEMENT E50: a night track -> the moon's light, fainter and softer still
         let moon_level = self.enhancements.level(crate::E50);
-        let (sun, overcast, moon) = match (scene.sun_shadow, scene.overcast_shadow.filter(|_| self.enhancements.is_on(crate::E25))) {
-            (Some(s), _) => (s, false, 0),
-            (None, Some(s)) => (s, true, 0),
-            (None, None) => (scene.moon_shadow.filter(|_| moon_level > 0)?, false, moon_level),
+        // ENHANCEMENT E51 (CORSICA-SUN): a sunless day track whose decals give a sun -> the cars' own shadow alone along it
+        // ENHANCEMENT E9 / E51 (SUN-FULL): or, on the tracks of `Scene::car_sun_full`, E9's full frame along that sun (the scenery
+        // casts too, E51's layers on top as on a sky-sun track); E9 alone is enough for it
+        // (with the scenery casters' own radius limit, `caster_radius`)
+        let car_sun = scene.car_sun_shadow.filter(|_| scene.car_sun_full.is_some() || self.enhancements.is_on(crate::E51));
+        let mut caster_radius = MAX_CASTER_RADIUS;
+        let (sun, overcast, moon, cars_only) = match (scene.sun_shadow, scene.overcast_shadow.filter(|_| self.enhancements.is_on(crate::E25))) {
+            (Some(s), _) => (s, false, 0, false),
+            (None, Some(s)) => (s, true, 0, false),
+            (None, None) => match car_sun {
+                Some(s) => {
+                    if let Some(r) = scene.car_sun_full {
+                        caster_radius = r.min(MAX_CASTER_RADIUS);
+                    }
+                    (s, false, 0, scene.car_sun_full.is_none())
+                }
+                None => (scene.moon_shadow.filter(|_| moon_level > 0)?, false, moon_level, false),
+            },
         };
         if sun.direction.length_squared() < 0.5 {
             return None;
@@ -429,6 +460,9 @@ impl Core {
         let orig = sun.direction.normalize();
         let shadow_dir = lift_elevation(orig);
         let (size, splits) = level_config(self.enhancements.level(crate::E9));
+        // ENHANCEMENT E51 (CORSICA-SUN): the cars-only frame keeps the near cascades only (E51's own reach: a car's shadow farther
+        // away is a few pixels)
+        let splits = if cars_only { &splits[..CAR_CASCADES.min(splits.len())] } else { splits };
         // ENHANCEMENT ENH-FE3D: a front-end car's volume: one cascade round the car
         let cascades = match sun.focus {
             Some(f) => vec![fit_focus(f.centre, f.radius, shadow_dir, size, FOCUS_CASTER_REACH)],
@@ -439,7 +473,8 @@ impl Core {
         }
         // ENHANCEMENT E51: a sun frame of the race has a cars-only layer per near cascade after the cascades' own
         let car_layers = if sun.focus.is_none() && !overcast && moon == 0 && self.enhancements.is_on(crate::E51) { CAR_CASCADES.min(splits.len()) } else { 0 };
-        let layers = if sun.focus.is_some() { 1 } else { (splits.len() + car_layers) as u32 };
+        // (CORSICA-SUN: in the cars-only frame those are the cascades themselves, no layers of their own)
+        let layers = if sun.focus.is_some() { 1 } else if cars_only { splits.len() as u32 } else { (splits.len() + car_layers) as u32 };
         if self.csm.map.as_ref().is_none_or(|m| m.size != size || m.layers != layers) {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("sun shadow map"),
@@ -459,7 +494,10 @@ impl Core {
             self.csm.map = Some(ShadowMap { size, layers, _texture: texture, array_view, layer_views });
             self.rebuild_globals_bg();
         }
-        Some(CsmFrame { cascades, dir: shadow_dir, orig, gate: self.csm.gate, overcast, focus: sun.focus, moon, car_layers })
+        // ENHANCEMENT E51 (CARSH-FADE): level 1 asks per car how much of the sun reaches it past the scenery (the cars-only frame
+        // has no scenery in its map: nothing to ask; without compute shaders level 1 draws as level 2)
+        let car_sunlit = car_layers > 0 && !cars_only && self.compute_supported && self.enhancements.level(crate::E51) == 1;
+        Some(CsmFrame { cascades, dir: shadow_dir, orig, gate: self.csm.gate, overcast, focus: sun.focus, moon, car_layers, car_sunlit, cars_only, caster_radius })
     }
 
     /// An item the shadow pass draws: a car's opaque part (its own light's direction is the sun's),
@@ -527,7 +565,7 @@ impl Core {
             let t = &item.transform;
             let scale = t.x_axis.truncate().length().max(t.y_axis.truncate().length()).max(t.z_axis.truncate().length());
             let (centre, radius) = (t.transform_point3(Vec3::from(mesh.bounds.0)), mesh.bounds.1 * scale);
-            if radius > MAX_CASTER_RADIUS {
+            if radius > frame.caster_radius {
                 continue;
             }
             let mat = &self.materials[item.material.0 as usize];
@@ -564,9 +602,21 @@ impl Core {
         }
         // ENHANCEMENT E51: the cars-only layers follow the cascades' own in the map
         let car_layers = frame.car_layers.min(cascades.len());
-        let car_base = self.csm.map.as_ref().map_or(0, |m| m.layers as usize - frame.car_layers);
+        // (CORSICA-SUN: the cars-only frame's cascades are the cars-only layers: the shader's `car_visibility` reads them from 0)
+        let car_base = if frame.cars_only { 0 } else { self.csm.map.as_ref().map_or(0, |m| m.layers as usize - frame.car_layers) };
+        // ENHANCEMENT E51 (CARSH-FADE): level 1: the measured cars (their shares come from the compute after the passes)
+        let mut sun_cars = 0;
         if car_layers > 0 {
-            u.carsh = [car_layers as f32, car_base as f32, 0.0, 0.0];
+            let sunlit = if frame.car_sunlit { 1.0 } else { 0.0 };
+            if frame.car_sunlit {
+                let centres = self.car_sun.get_or_insert_with(|| super::carsun::CarSun::new(&self.device)).prepare(&self.queue, cascades, camera.view(), &scene.sun_cars, (car_layers, car_base));
+                sun_cars = centres.len();
+                for (i, c) in centres.into_iter().enumerate() {
+                    u.carsh_cars[i] = c;
+                }
+                u.carsh_k = [[1.0; 4]; crate::MAX_CONTACTS / 4];
+            }
+            u.carsh = [car_layers as f32, car_base as f32, sunlit, sun_cars as f32];
         }
         // ENHANCEMENT E9 (ENH-TUNPOOL): the covered stretches near the camera; a fragment inside one takes no sun-shadow darkening
         // (the shader's `cover_at`), whatever the camera is doing: a tunnel's pools look the same from outside and inside
@@ -595,7 +645,9 @@ impl Core {
 
         let map = self.csm.map.as_ref().expect("shadow map made");
         // ENHANCEMENT E51: after the cascades, the near ones again with the cars alone into the cars-only layers
-        let passes = (0..cascades.len()).map(|ci| (ci, ci, false)).chain((0..car_layers).map(|ci| (ci, car_base + ci, true)));
+        // (CORSICA-SUN: the cars-only frame draws its cascades with the cars alone and has no extra layers)
+        let extra = if frame.cars_only { 0 } else { car_layers };
+        let passes = (0..cascades.len()).map(|ci| (ci, ci, frame.cars_only)).chain((0..extra).map(|ci| (ci, car_base + ci, true)));
         for (ci, layer, cars_only) in passes {
             let c = &cascades[ci];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -642,6 +694,13 @@ impl Core {
                 crate::prof::count_draw(u64::from(mesh.index_count / 3));
                 pass.draw_indexed(0..mesh.index_count, 0, idx..idx + 1);
             }
+        }
+        // ENHANCEMENT E51 (CARSH-FADE): the cars' shares of the sun, from the map just drawn, into the uniform the main pass reads
+        if sun_cars > 0
+            && let Some(cs) = self.car_sun.as_mut()
+        {
+            let offset = std::mem::offset_of!(CsmUniform, carsh_k) as u64;
+            cs.record(&self.device, encoder, sun_cars, (&map.array_view, &self.csm.sampler), (&self.csm.uniform, offset));
         }
     }
 }

@@ -542,7 +542,7 @@ mod tests {
         let fam = feat::CSM | feat::SPOT | feat::COAT | feat::PFX;
         let s = |feats| SetSpec { feats, samples: 4, hdr: true, temporal: false };
         let other_family = SetSpec { feats: feat::COAT, samples: 1, hdr: true, temporal: false };
-        let keys = [s(fam).key(), s(feat::CSM | feat::COAT | feat::PFX).key(), s(feat::COAT | feat::FLASH).key(), other_family.key()];
+        let keys = [s(fam).key(), s(feat::CSM | feat::COAT | feat::PFX).key(), s(feat::COAT | feat::FOGSUN).key(), other_family.key()];
         assert_eq!(superset_of(keys.iter().copied(), s(feat::COAT), fam), Some(s(feat::CSM | feat::COAT | feat::PFX).key()));
         assert_eq!(superset_of(keys.iter().copied(), s(feat::SPOT), fam), Some(s(fam).key()));
         assert_eq!(superset_of(keys[2..].iter().copied(), s(feat::COAT), fam), None);

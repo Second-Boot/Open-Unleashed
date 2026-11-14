@@ -583,41 +583,6 @@ struct Lightning {
     thunder: Option<ThunderCall>,
 }
 
-/// ENHANCEMENT E20: the flicker of the lightning's light on the SCENE inside a strike (the sky keeps the
-/// original's curve): `t` seconds since the strike's first tick, `seed` that tick. 2-4 quick flashes in the
-/// first ~0.5 s, each a sharp rise and an exponential decay (about 70 ms), then a plateau at 40 %.
-/// Deterministic from `seed` alone. Not in the original.
-pub fn flash_envelope(t: f32, seed: u32) -> f32 {
-    const PLATEAU: f32 = 0.4;
-    if t < 0.0 {
-        return 0.0;
-    }
-    if t >= 0.75 {
-        return PLATEAU;
-    }
-    // a small integer hash of the seed -> flash count 2..=4 and the gaps / strengths of each
-    let mut h = seed.wrapping_mul(0x9E37_79B1) ^ 0x85EB_CA6B;
-    let mut next = || {
-        h ^= h >> 15;
-        h = h.wrapping_mul(0x2C1B_3C6D);
-        h ^= h >> 12;
-        (h & 0xFFFF) as f32 / 65535.0
-    };
-    let n = 2 + (next() * 2.99) as u32;
-    let (mut at, mut env) = (0.0f32, PLATEAU);
-    for k in 0..n {
-        let amp = if k == 0 { 1.0 } else { 0.6 + 0.4 * next() };
-        if t >= at {
-            // 25 ms attack, then the decay
-            let d = t - at;
-            let pulse = amp * if d < 0.025 { d / 0.025 } else { (-(d - 0.025) / 0.07).exp() };
-            env = env.max(pulse);
-        }
-        at += 0.09 + 0.1 * next();
-    }
-    env.min(1.0)
-}
-
 impl Lightning {
     fn new(bin: &nfs_formats::sky::SkyBin, ltmp: Option<&nfs_assets::texture::TextureImage>) -> Self {
         let mut t = [[0xFF; 4]; 49];
@@ -694,17 +659,6 @@ impl Lightning {
 }
 
 impl MapBlend {
-    /// ENHANCEMENT E20: how far the running flash has lifted this stream over the copy it saved when it
-    /// began — the biggest R / G / B step of any entry, 0…255 (0 while no flash runs). It is the sky's own
-    /// brightening (the bolts' `level · ticks` sums held to the `ltmp` caps, 0x45E550), so it follows the
-    /// original's flash curve to the tick.
-    fn flash_lift(&self) -> i32 {
-        if !self.flash.active {
-            return 0;
-        }
-        self.stream.iter().zip(&self.flash.saved).enumerate().filter(|(k, _)| k % 4 != 3).map(|(_, (a, b))| *a as i32 - *b as i32).max().unwrap_or(0).max(0)
-    }
-
     /// 0x45DF50(t, ticks): a running flash puts the saved stream back and steps; a lightning with
     /// no flash running starts one — the stream saved, the strike's cell truncated, the kind's
     /// numbers taken and every bolt set up again — and the stream stays as it is; otherwise the
@@ -1124,17 +1078,6 @@ impl Sky {
         self.slice
     }
 
-    /// ENHANCEMENT E20: the lightning flash's strength 0…1 now — the sky's own brightening by the running
-    /// flash (`MapBlend::flash_lift`, the biggest over the levels' colour streams) over the `ltmp` map's
-    /// cap (the most a bolt can lift an entry to; 0x7D = 125 on Autobahn and Industrial), so 1 is a fully
-    /// built-up flash and 0 is none. Not in the original: the original only paints the sky.
-    pub fn flash_strength(&self) -> f32 {
-        let Some(l) = &self.lightning else { return 0.0 };
-        let cap = l.ltmp.iter().flat_map(|e| e[1..4].iter().copied()).max().unwrap_or(255).max(1);
-        let lift = self.grids.iter().map(|g| g.colours.flash_lift()).max().unwrap_or(0);
-        (lift as f32 / cap as f32).clamp(0.0, 1.0)
-    }
-
     /// The thunder the last strike called (0x4A8340), taken once: the audio update hands it to the
     /// thunder's countdown 0x4A8380. A second strike before the take replaces it, as the original's
     /// globals `[0x656494]`, `[0x656834]`, `[0x656498]` are overwritten.
@@ -1431,36 +1374,6 @@ mod stage_tests {
             }
             assert_eq!(a.vertices[1].color[0], ((k + 6) % 16) as f32);
             assert_eq!(b.vertices[1].color[0], ((k + 1) % 16) as f32);
-        }
-    }
-}
-
-#[cfg(test)]
-mod flash_envelope_tests {
-    use super::flash_envelope;
-
-    #[test]
-    fn flickers_then_holds_the_plateau_deterministically() {
-        for seed in [1u32, 977, 123_456, 0xFFFF_FFF0] {
-            // deterministic
-            assert_eq!(flash_envelope(0.2, seed), flash_envelope(0.2, seed));
-            // after the flicker: the plateau
-            assert_eq!(flash_envelope(1.0, seed), 0.4);
-            assert_eq!(flash_envelope(30.0, seed), 0.4);
-            // the first flash peaks near full and everything stays in 0.4..=1
-            let (mut peak, mut dips) = (0.0f32, 0);
-            let mut prev = 0.0;
-            for i in 0..=75 {
-                let e = flash_envelope(i as f32 * 0.01, seed);
-                assert!((0.4..=1.0).contains(&e));
-                peak = peak.max(e);
-                if e > prev + 0.05 {
-                    dips += 1;
-                }
-                prev = e;
-            }
-            assert!(peak > 0.9, "{seed}: peak {peak}");
-            assert!(dips >= 2, "{seed}: rises {dips}");
         }
     }
 }

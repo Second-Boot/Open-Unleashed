@@ -180,9 +180,9 @@ impl App {
         }
         // **TEST GLUE** (not in the original): `NFS_NET_TELEPORT=<tick>:<slices>[,<tick>:<slices>…]` moves the human car forward along the
         // road by that many slices (6 m each) on that tick, so the remote machine's dead reckoning sees the block jump (the snap arm of 0x4A04A0,
-        // `d > 20`). A network race only; the car keeps its velocity and orientation, the tracker finds its patch on the next tick.
+        // `d > 20`). The car keeps its velocity and orientation, the tracker finds its patch on the next tick. In a single-player race it
+        // takes a scripted still to a far place of the road (the finish line) without driving there
         if let Some(spec) = nfs_game::config::cfg().nfs_net_teleport.as_str()
-            && self.net.session.is_some()
             && let (Some(v), Some(t), Some(r)) = (self.vehicle.as_mut(), self.slices.as_ref(), self.race.as_ref())
         {
             for hop in spec.split(',') {
@@ -193,6 +193,13 @@ impl App {
                     let (a, b) = (&t.slices[r.slice], &t.slices[t.add(r.slice, n)]);
                     let lateral = (v.position - a.centre).dot(a.lateral);
                     v.position = b.centre + b.lateral * lateral + Vec3::Y * (v.position.y - a.centre.y);
+                    // TEST GLUE (review stills): `NFS_TELEPORT_TURN=1` also turns the car (and its velocity) by the road's change of heading
+                    if std::env::var_os("NFS_TELEPORT_TURN").is_some() {
+                        let yaw = |f: Vec3| f.x.atan2(f.z);
+                        let r = glam::Mat3::from_rotation_y(yaw(b.forward) - yaw(a.forward));
+                        v.orientation = r * v.orientation;
+                        v.velocity = r * v.velocity;
+                    }
                     tracing::info!(tick = self.tick, slices = n, pos = ?v.position, "NFS_NET_TELEPORT: the human car moved ahead");
                 }
             }

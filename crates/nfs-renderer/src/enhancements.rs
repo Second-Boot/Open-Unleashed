@@ -263,16 +263,6 @@ pub const REGISTRY: &[Entry] = &[
         default_level: 1,
     },
     Entry {
-        token: "E20",
-        name: ["lightning lights the scene", "вспышки молнии освещают сцену"],
-        help: [
-            "on Autobahn and Industrial the lightning flash also lights the track and the cars with a brief bluish-white boost, timed by the original's own flash (the sky bolts are the original's)",
-            "на Автобане и в Индастриале вспышка молнии освещает ещё и трассу с машинами коротким голубовато-белым всплеском, по времени точно как вспышка оригинала (молнии на небе остаются оригинальными)",
-        ],
-        levels: ON_OFF,
-        default_level: 1,
-    },
-    Entry {
         token: "E21",
         name: ["eye adaptation", "адаптация глаза"],
         help: [
@@ -597,14 +587,17 @@ pub const REGISTRY: &[Entry] = &[
     // ENHANCEMENT E51: the cars' own sun shadow on dimly baked roads (registered after E50). E9's track receiver leaves a shadow out
     // where the baked colour is already dark (a baked shadow must not be darkened twice); a car's shadow is never baked into the
     // road, so a second, cars-only map of the near cascades lets the cars' shadows past that gate. Needs E9.
+    // ALPS-CARSH / CARSH-FADE: level 1 scales each car's shadow by how much of the sun reaches that car (the car and the ground
+    // round it in the scenery's shade: a gorge, a rock wall, a cliff), one value per car eased in time (`gpu/carsun.rs`); level 2
+    // keeps the first rule (wherever the car's own map has it).
     Entry {
         token: "E51",
         name: ["car shadow on dark roads", "тень машины на тёмной дороге"],
         help: [
-            "the cars' sun shadow is drawn in full on roads whose baked colour is already dim (the coast at dusk, a hill's shade): the sun shadows (E9) leave the darkening out there so that a shadow baked into the road is not darkened twice, which also took the car's own shadow away; a car's shadow is never baked, so it now passes (the shadows of trees, rocks and buildings keep the rule). Needs the sun shadows (E9). Only the picture changes",
-            "солнечная тень машин рисуется полностью и на дороге, чей запечённый цвет уже тёмный (побережье в сумерках, тень холма): тени от солнца (E9) там не затемняют, чтобы не затемнить второй раз тень, запечённую в дорогу, и вместе с ней пропадала тень самой машины; тень машины никогда не запечена, поэтому теперь она рисуется (тени деревьев, скал и домов по-прежнему следуют правилу). Нужны тени от солнца (E9). Меняется только картинка",
+            "the cars' sun shadow is drawn in full on roads whose baked colour is already dim: the sun shadows (E9) leave the darkening out there so that a shadow baked into the road is not darkened twice, which also took the car's own shadow away; a car's shadow is never baked, so it now passes (the shadows of trees, rocks and buildings keep the rule). «where the sun reaches»: decided for each car as a whole - when the car and the ground round it stand in the sun shadow of a gorge, a rock wall or a cliff, its shadow fades out smoothly (and back in when it leaves); a house, a tree or a post that shades only the car leaves it; «always»: wherever the car blocks the sun, also inside such a shadow (the coast at dusk). Needs the sun shadows (E9). Only the picture changes",
+            "солнечная тень машин рисуется полностью и на дороге, чей запечённый цвет уже тёмный: тени от солнца (E9) там не затемняют, чтобы не затемнить второй раз тень, запечённую в дорогу, и вместе с ней пропадала тень самой машины; тень машины никогда не запечена, поэтому теперь она рисуется (тени деревьев, скал и домов по-прежнему следуют правилу). «где светит солнце»: решается для машины целиком - когда машина и земля вокруг неё стоят в тени ущелья, скальной стены или утёса, её тень плавно гаснет (и так же плавно возвращается); дом, дерево или столб, затеняющие одну машину, тень не убирают; «всегда»: везде, где машина заслоняет солнце, и внутри такой тени (побережье в сумерках). Нужны тени от солнца (E9). Меняется только картинка",
         ],
-        levels: ON_OFF,
+        levels: &[["off", "выкл"], ["where the sun reaches", "где светит солнце"], ["always", "всегда"]],
         default_level: 1,
     },
 ];
@@ -685,67 +678,67 @@ switches! {
     E18 = 17,
     /// ENHANCEMENT E19 fog sun in-scatter + output dither
     E19 = 18,
-    /// ENHANCEMENT E20 lightning lights the scene
-    E20 = 19,
+    // index 19 was E20 (lightning lights the scene), removed 2026-11-13; the later switches moved down by one,
+    // as when E30 left (an old file's "E20" key is ignored, an `NFS_ENH` "E20" is reported unknown)
     /// ENHANCEMENT E21 eye adaptation
-    E21 = 20,
+    E21 = 19,
     /// ENHANCEMENT E23 street lamps as lights
-    E23 = 21,
+    E23 = 20,
     /// ENHANCEMENT E24 headlights light up in tunnels (render side only)
-    E24 = 22,
+    E24 = 21,
     /// ENHANCEMENT E25 soft shadows on the sunless tracks
-    E25 = 23,
+    E25 = 22,
     /// ENHANCEMENT E22 frame rate limit
-    E22 = 24,
+    E22 = 23,
     /// ENHANCEMENT E27 motion blur
-    E27 = 25,
+    E27 = 24,
     /// ENHANCEMENT E28 lens dirt
-    E28 = 26,
+    E28 = 25,
     /// ENHANCEMENT E29 camera shake
-    E29 = 27,
+    E29 = 26,
     /// ENHANCEMENT E26 wet road and rain
-    E26 = 28,
+    E26 = 27,
     // index 29 was E30 (photo mode), removed 2026-10-27 (photo mode is always on now, PORT-DEVIATION D46 of master); the
     // later switches moved down by one. Nothing stores an index: `enhancements.json` and `NFS_ENH` name the tokens, which are
     // unchanged (an old file's "E30" key is ignored, an `NFS_ENH` "E30" is reported unknown)
     /// ENHANCEMENT E31 depth of field in replays
-    E31 = 29,
+    E31 = 28,
     /// ENHANCEMENT E32 baked bounce light (global illumination)
-    E32 = 30,
+    E32 = 29,
     /// ENHANCEMENT E35 SMAA 1x over the tone-mapped image
-    E35 = 31,
+    E35 = 30,
     /// ENHANCEMENT E36 tunnel haze and visible headlight beams in fog / rain / tunnels
-    E36 = 32,
+    E36 = 31,
     /// ENHANCEMENT E34 MetalFX upscaling (registered on every platform, after E36, so the other indices do not move; only macOS has the backend)
-    E34 = 33,
+    E34 = 32,
     /// ENHANCEMENT E33 HDR display / EDR output (registered on every platform, after E34; the backend is macOS only)
-    E33 = 34,
+    E33 = 33,
     /// ENHANCEMENT E37 FSR 3.1 temporal upscaling (registered last, on every platform; the backend is Windows / Linux, macOS only with `NFS_FSR_FORCE`)
-    E37 = 35,
+    E37 = 34,
     /// ENHANCEMENT ENH-UPSCALER: the upscaler choice (0 off, 1 MetalFX, 2 FSR 3.1; registered after E37, on every platform, level 1 is macOS only)
-    E38 = 36,
+    E38 = 35,
     /// ENHANCEMENT ENH-UPSCALER: the upscaler's RCAS sharpness (0 off, then 0.2 / 0.3 / 0.5 / 0.8; FSR's own, MetalFX's through `sharpen.rs`)
-    E39 = 37,
+    E39 = 36,
     /// ENHANCEMENT E40 raindrops on the windscreen of the driver view (registered last, after E39)
-    E40 = 38,
+    E40 = 37,
     /// ENHANCEMENT E41 the HD texture pack: 0 off, 1 on (registered last, after E40; read by the asset loaders, no GPU pass)
-    E41 = 39,
+    E41 = 38,
     /// ENHANCEMENT E42 rounded details of the cars: 0 off, 1 soft, 2 strong (registered last, after E41; read by the car loader, no GPU pass)
-    E42 = 40,
+    E42 = 39,
     /// ENHANCEMENT E43 the soft contact shadow under the cars: 0 off, 1 on (registered last, after E42)
-    E43 = 41,
+    E43 = 40,
     /// ENHANCEMENT E44 the lighthouse beam as soft volumetric light: 0 off, 1 on (registered last, after E43; needs E7)
-    E44 = 42,
+    E44 = 41,
     /// ENHANCEMENT E47 the cars' shadows from the street / tunnel lamps (E23): 0 off, 1 on (registered last, after E44; needs E23)
-    E47 = 43,
+    E47 = 42,
     /// ENHANCEMENT E48 the chase / heli cameras' steady slope lift: 0 off (the original), 1 on (registered last, after E47)
-    E48 = 44,
+    E48 = 43,
     /// ENHANCEMENT E49 reflections of nearby objects: 0 off, 1 on (registered after E48; needs E8)
-    E49 = 45,
+    E49 = 44,
     /// ENHANCEMENT E50 moonlight on the night tracks: 0 off, 1 weak, 2 normal (registered after E49; needs E9)
-    E50 = 46,
-    /// ENHANCEMENT E51 the cars' own sun shadow on dimly baked roads: 0 off, 1 on (registered after E50; needs E9)
-    E51 = 47,
+    E50 = 45,
+    /// ENHANCEMENT E51 the cars' own sun shadow on dimly baked roads: 0 off, 1 where the sun reaches the car, 2 always (registered after E50; needs E9)
+    E51 = 46,
 }
 
 /// ENHANCEMENT E34: its levels 1..=this are the temporal ones (MetalFX temporal scaler); the levels above are the spatial ('simple') ones
@@ -917,7 +910,6 @@ pub const LITE_PRESET: &[(Switch, u8)] = &[
     (E17, 1), // water: 0 where there is none, ~0 where there is
     (E18, 1), // particles in HDR
     (E19, 1), // fog sun glow + dither: +0.3 ms
-    (E20, 1), // lightning (two tracks)
     (E21, 1), // eye adaptation: +0.3 ms
     (E23, 1), // street lamps, soft: 0 by day, +5.6 ms on a night street (the one costly entry kept: the night look)
     (E24, 1), // headlights in tunnels
@@ -1521,7 +1513,11 @@ mod tests {
         assert_eq!(REGISTRY[E18.0 as usize].default_level, 1); // particles in HDR: on
         assert_eq!(REGISTRY[E19.0 as usize].token, "E19");
         assert_eq!(REGISTRY[E19.0 as usize].default_level, 1); // fog and sky: on
-        assert_eq!(REGISTRY[E20.0 as usize].token, "E20");
+        // 2026-11-13: E20 (lightning lights the scene) removed; an old "E20" is unknown
+        assert!(!REGISTRY.iter().any(|e| e.token == "E20"));
+        let mut unknown = Vec::new();
+        assert_eq!(Enhancements::parse_override("E20,E21=1", &mut unknown).map(|e| e.level(E21)), Some(1));
+        assert_eq!(unknown, vec!["E20".to_string()]);
         assert_eq!(REGISTRY[E21.0 as usize].token, "E21");
         assert_eq!(REGISTRY[E21.0 as usize].default_level, 1); // eye adaptation: on (2026-10-03)
         assert_eq!(REGISTRY[E23.0 as usize].token, "E23");
@@ -1570,20 +1566,20 @@ mod tests {
         assert_eq!(REGISTRY[E37.0 as usize].levels.len(), 5);
         assert!(REGISTRY[E37.0 as usize].available());
         // ENHANCEMENT ENH-UPSCALER: E38 / E39 follow E37; E34 / E37 keep their levels (every index after 28 moved down by one when
-        // E30 left the registry 2026-10-27: nothing stores an index)
-        assert_eq!((E34.0, E37.0, E38.0, E39.0), (33, 35, 36, 37));
+        // E30 left the registry 2026-10-27, every index after 18 when E20 left 2026-11-13: nothing stores an index)
+        assert_eq!((E34.0, E37.0, E38.0, E39.0), (32, 34, 35, 36));
         assert_eq!(REGISTRY[E38.0 as usize].token, "E38");
         assert_eq!(REGISTRY[E39.0 as usize].token, "E39");
         assert_eq!(E51.0 as usize, REGISTRY.len() - 1); // ENHANCEMENT E51 is the last entry
-        assert_eq!((E39.0, E40.0, E41.0, E42.0, E43.0, E44.0, E47.0), (37, 38, 39, 40, 41, 42, 43));
-        // ENHANCEMENT E48: the steady slope lift of the chase cameras, index 44, on by default, off / on
-        assert_eq!(E48.0, 44);
+        assert_eq!((E39.0, E40.0, E41.0, E42.0, E43.0, E44.0, E47.0), (36, 37, 38, 39, 40, 41, 42));
+        // ENHANCEMENT E48: the steady slope lift of the chase cameras, index 43, on by default, off / on
+        assert_eq!(E48.0, 43);
         assert_eq!(REGISTRY[E48.0 as usize].token, "E48");
         assert_eq!(REGISTRY[E48.0 as usize].default_level, 1);
         assert_eq!(REGISTRY[E48.0 as usize].levels.len(), 2);
-        assert_eq!((E50.0, E51.0), (46, 47));
-        // ENHANCEMENT E49: reflections of nearby objects, index 45, on by default; needs E8 (its cube)
-        assert_eq!(E49.0, 45);
+        assert_eq!((E50.0, E51.0), (45, 46));
+        // ENHANCEMENT E49: reflections of nearby objects, index 44, on by default; needs E8 (its cube)
+        assert_eq!(E49.0, 44);
         assert_eq!(REGISTRY[E49.0 as usize].token, "E49");
         assert_eq!(REGISTRY[E49.0 as usize].default_level, 1);
         assert_eq!(REGISTRY[E49.0 as usize].levels.len(), 2);
@@ -1595,8 +1591,8 @@ mod tests {
         assert_eq!(REGISTRY[E50.0 as usize].default_level, 2); // moonlight: normal
         assert_eq!(REGISTRY[E50.0 as usize].levels.len(), 3);
         assert_eq!(REGISTRY[E51.0 as usize].token, "E51");
-        assert_eq!(REGISTRY[E51.0 as usize].default_level, 1); // the cars' shadow on dim roads: on
-        assert_eq!(REGISTRY[E51.0 as usize].levels.len(), 2);
+        assert_eq!(REGISTRY[E51.0 as usize].default_level, 1); // the cars' shadow on dim roads: where the sun reaches the car
+        assert_eq!(REGISTRY[E51.0 as usize].levels.len(), 3); // ALPS-CARSH: off / where the sun reaches the car / always
         assert_eq!(REGISTRY[E47.0 as usize].token, "E47");
         assert_eq!(REGISTRY[E47.0 as usize].default_level, 1); // lamp shadows: on
         assert_eq!(REGISTRY[E47.0 as usize].levels.len(), 2);

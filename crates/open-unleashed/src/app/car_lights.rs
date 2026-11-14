@@ -241,6 +241,13 @@ impl App {
         };
         let right = view.cross(self.camera.up).normalize_or_zero();
         let eye_ground = self.eye_road_height();
+        // ENHANCEMENT E26 (AUTOBAHN-LAMPS): on a wet stretch every car is also a box that can hide another light's streak
+        let streaks = wet > 0.05 && self.enh.is_on(nfs_renderer::E26);
+        let car = streaks.then(|| {
+            let mut cars = self.rain.cars.borrow_mut();
+            cars.push(super::rain::CarBox { pos, rot, min: model.bbox_min, max: model.bbox_max });
+            cars.len() - 1
+        });
         // `cam[+0xC]` = `far · near / (far − near)` of the view's planes (0x467247…0x467261)
         let (far, z_near) = if front_end { (super::fe_room::FE_FAR, super::fe_room::FE_NEAR) } else { (self.view_far, self.camera.near) };
         let k = far * z_near / (far - z_near);
@@ -276,10 +283,13 @@ impl App {
                 let alpha = (((b * 255.0) as i32) & 0xFF) as f32 / 255.0;
                 let c = l.colour[0];
                 let tint = [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0];
-                // ENHANCEMENT E26: a lit lamp near wet road is also a light the road shows a streak of (render only)
-                if wet > 0.05 && self.enh.is_on(nfs_renderer::E26) {
+                // ENHANCEMENT E26: a lit lamp near wet road is also a light the road shows a streak of (render only).
+                // AUTOBAHN-LAMPS: with a car lamp's own reach (a headlight's, else a tail / brake / reverse lamp's) and its
+                // car, which does not hide its own lamps
+                if streaks {
                     let s = b.min(1.0) * 1.3;
-                    self.rain.lamps.borrow_mut().push((world, [tint[0] * s, tint[1] * s, tint[2] * s]));
+                    let reach = if l.night { super::rain::HEADLIGHT_REACH } else { super::rain::TAIL_LIGHT_REACH };
+                    self.rain.lamps.borrow_mut().push(super::rain::RainLight { pos: world, colour: [tint[0] * s, tint[1] * s, tint[2] * s], reach, car });
                 }
                 // a billboard: the corners are the lamp's centre plus the camera's two rows `+0xF4` /
                 // `+0xE8` times the 2-D corner offsets (0x43D301…0x43D399), so the quad faces the
