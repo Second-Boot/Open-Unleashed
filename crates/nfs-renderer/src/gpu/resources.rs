@@ -2,7 +2,12 @@
 //! mips, deferred level writes), the twins (ENHANCEMENT E41 / E42), release and the counts. Moved out of gpu.rs as it was.
 
 use crate::gfx;
+use super::kit;
 use super::*;
+
+/// BC7's block: 4 x 4 texels in 16 bytes.
+const BC_BLOCK: u32 = 4;
+const BC_BLOCK_BYTES: u32 = 16;
 
 impl Core {
     /// Execute a frame's command list (`front::CmdList`) in call order — the start of the frame's
@@ -24,6 +29,13 @@ impl Core {
             }
         }
         for c in cmds.drain(..) {
+            // PERF (picture identical): the mirror's and the environment faces' passes stay in the frame's open encoder, to be
+            // submitted with the frame; the vertex / texture writes are queued for that encoder too. Any other command may write
+            // through the queue (a `Queue::write_*` lands before the whole next submit) or change what the passes recorded so
+            // far bind: those passes are submitted first, so every command sees the order it always saw
+            if !matches!(c, Cmd::ReflFace(_) | Cmd::Offscreen(_) | Cmd::WriteMesh { .. } | Cmd::UpdateTextureLevel { .. }) {
+                self.submit_frame();
+            }
             match c {
                 Cmd::WriteMesh { mesh, start, len } => self.defer_mesh_write(MeshId(mesh), &bytes[start..start + len]),
                 Cmd::UpdateTextureLevel { texture, level, width, height, start, len } => self.queue_texture_level(TextureId(texture), level, width, height, &bytes[start..start + len]),
@@ -34,7 +46,6 @@ impl Core {
                 Cmd::Trilinear(on) => self.set_trilinear(on),
                 Cmd::FakeSort(m) => self.set_fakesort_mode(m),
                 Cmd::Gamma(g) => self.set_gamma(g),
-                Cmd::Temporal(on) => self.temporal_flag = on,
                 Cmd::TemporalCut => self.fsr_cut(),
                 Cmd::PrewarmPipelines => self.prewarm_pipelines(),
                 Cmd::ExactPipelines(on) => self.exact_sets = on,
@@ -74,7 +85,7 @@ impl Core {
                     self.upload_dynamic_mesh(&m);
                 }
                 Cmd::ReflUpload(size, faces) => self.upload_refl_faces(size, &faces),
-                Cmd::ReflFace(j) => self.render_refl_face(&j.scene, &j.camera, j.face, j.size, j.clear, j.depth_far, j.near.as_ref()),
+                Cmd::ReflFace(j) => self.render_refl_face(&j),
                 Cmd::Offscreen(j) => {
                     let id = self.render_offscreen(&j.scene, &j.camera, OffscreenSpec { width: j.width, height: j.height, reuse: j.reuse, clear_colour: j.clear, depth_far: j.depth_far });
                     debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");
@@ -126,7 +137,7 @@ impl Core {
         self.arena_bytes += vertex_len + index_len;
         let serial = self.buffer_serial;
         self.buffer_serial += 1;
-        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0, bounds: { let (c, r, _) = csm::mesh_bounds(&mesh.vertices); (c, r * 1.25) }, flat: false, arena: false, cap: (vertex_len, index_len), released: false });
+        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0, bounds: { let (c, r, _) = csm::mesh_bounds(&mesh.vertices); (c, r * DYNAMIC_BOUNDS_SLACK) }, flat: false, arena: false, cap: (vertex_len, index_len), released: false });
         MeshId(self.meshes.len() as u32 - 1)
     }
 
@@ -170,17 +181,17 @@ impl Core {
     /// left queued, the vertex writes of every skipped frame (a few hundred KB each, thousands of
     /// frames a second while hidden) piled up to gigabytes and were all copied by the next drawn
     /// frame (`RE/notes/PERF.md` PERF2).
+    /// The passes the command list recorded for the frame (the mirror, the faces) are submitted with them.
     pub(super) fn flush_writes(&mut self) {
-        if self.pending_writes.is_empty() && self.pending_textures.is_empty() {
+        if self.pending_writes.is_empty() && self.pending_textures.is_empty() && self.frame_cmds.is_empty() {
             return;
         }
         self.seal_arena();
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("writes") });
+        let mut encoder = self.frame_cmds.take(&self.device);
         self.flush_texture_writes(&mut encoder);
         self.flush_mesh_writes(&mut encoder);
-        self.belt.finish();
-        self.last_submit = Some(crate::prof::submit(&self.device, &self.queue, Some(crate::prof::finish(encoder))));
-        self.belt.recall();
+        self.frame_cmds.park(encoder);
+        self.submit_frame();
     }
 
     /// ENHANCEMENT ENH-LIVELEAK: a static mesh's table slot - a recycled one (a released twin's, see [`Self::recycle_released`]) or a new one.
@@ -213,6 +224,9 @@ impl Core {
     }
 
     pub fn upload_mesh(&mut self, mesh: &MeshData) -> MeshId {
+        // a queued write below lands before the next submit: the passes recorded so far (which may draw a released mesh's
+        // ranges this one reuses) go first
+        self.submit_frame();
         let vbytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
         let ibytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
         let (vlen, ilen) = (vbytes.len() as u64, ibytes.len() as u64);
@@ -275,7 +289,8 @@ impl Core {
         }
         a.vertex_used += vreserve;
         a.index_used += ireserve;
-        let g = GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0, bounds: { let (c, r, _) = csm::mesh_bounds(&mesh.vertices); (c, r) }, flat: csm::mesh_bounds(&mesh.vertices).2, arena: true, cap: (vreserve, ireserve), released: false };
+        let (centre, radius, flat) = csm::mesh_bounds(&mesh.vertices);
+        let g = GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0, bounds: (centre, radius), flat, arena: true, cap: (vreserve, ireserve), released: false };
         self.add_mesh(g)
     }
 
@@ -296,7 +311,7 @@ impl Core {
     /// [`Self::upload_texture`] over borrowed levels, so a caller that keeps its pixels does not
     /// clone a whole mip chain just to hand it over.
     pub fn upload_texture_mips(&mut self, width: u32, height: u32, mips: &[Vec<u8>]) -> TextureId {
-        let t = Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, width, height, mips, None);
+        let t = self.tex_maker().rgba(width, height, mips, None);
         self.add_texture(t)
     }
 
@@ -312,20 +327,8 @@ impl Core {
     /// with ONE level then gets a generated chain (ENHANCEMENT E2, the track's single-level
     /// textures; sampled at level 0 only while E2 is off). Items with levels of their own keep them.
     pub fn upload_textures_gen(&mut self, items: &[(u32, u32, &[Vec<u8>], Option<crate::mipgen::MipAlpha>)]) -> Vec<TextureId> {
-        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(items.len());
-        let built: Vec<GpuTexture> = if workers <= 1 {
-            items.iter().map(|&(w, h, m, g)| Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, w, h, m, g)).collect()
-        } else {
-            let (device, queue, layout, sampler) = (&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler);
-            let chunk = items.len().div_ceil(workers);
-            std::thread::scope(|s| {
-                let handles: Vec<_> = items
-                    .chunks(chunk)
-                    .map(|c| s.spawn(move || c.iter().map(|&(w, h, m, g)| Self::make_texture(device, queue, layout, sampler, w, h, m, g)).collect::<Vec<_>>()))
-                    .collect();
-                handles.into_iter().flat_map(|h| h.join().expect("texture worker")).collect()
-            })
-        };
+        let mk = self.tex_maker();
+        let built = kit::par_build(items, |&(w, h, m, g)| mk.rgba(w, h, m, g));
         built.into_iter().map(|t| self.add_texture(t)).collect()
     }
 
@@ -334,7 +337,7 @@ impl Core {
     /// no mips for. Sampled at level 0 only while E2 is off.
     pub fn upload_texture_generated(&mut self, width: u32, height: u32, rgba: &[u8], alpha: crate::mipgen::MipAlpha) -> TextureId {
         let one = vec![rgba.to_vec()];
-        let t = Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, width, height, &one, Some(alpha));
+        let t = self.tex_maker().rgba(width, height, &one, Some(alpha));
         self.add_texture(t)
     }
 
@@ -348,90 +351,15 @@ impl Core {
     /// [`Self::upload_textures_gen`]. Sampled exactly like an `Rgba8Unorm` texture of the same size (UNORM, not sRGB: the game's surface
     /// is a byte surface). `generated` is `None`: the chain is the file's own.
     pub fn upload_textures_bc7(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
-        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(items.len());
-        let built: Vec<GpuTexture> = if workers <= 1 {
-            items.iter().map(|&(w, h, m)| Self::make_texture_bc7(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, w, h, m)).collect()
-        } else {
-            let (device, queue, layout, sampler) = (&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler);
-            let chunk = items.len().div_ceil(workers);
-            std::thread::scope(|s| {
-                let handles: Vec<_> = items.chunks(chunk).map(|c| s.spawn(move || c.iter().map(|&(w, h, m)| Self::make_texture_bc7(device, queue, layout, sampler, w, h, m)).collect::<Vec<_>>())).collect();
-                handles.into_iter().flat_map(|h| h.join().expect("texture worker")).collect()
-            })
-        };
+        let mk = self.tex_maker();
+        let built = kit::par_build(items, |&(w, h, m)| mk.bc7(w, h, m));
         built.into_iter().map(|t| self.add_texture(t)).collect()
     }
 
-    pub(super) fn make_texture_bc7(device: &wgpu::Device, queue: &wgpu::Queue, sprite_layout: &wgpu::BindGroupLayout, sprite_sampler: &wgpu::Sampler, width: u32, height: u32, levels: &[Vec<u8>]) -> GpuTexture {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("texture bc7"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: levels.len().max(1) as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bc7RgbaUnorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let (mut w, mut h) = (width, height);
-        for (level, data) in levels.iter().enumerate() {
-            // a level's copy covers its PHYSICAL size (whole 4x4 blocks), also for the 2x2 and 1x1 levels at the end of the chain
-            let (pw, ph) = (w.next_multiple_of(4), h.next_multiple_of(4));
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                data,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pw / 4 * 16), rows_per_image: Some(ph / 4) },
-                wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 },
-            );
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
-        }
-        let view = texture.create_view(&Default::default());
-        let sprite_bg = Some(gfx::tex_sampler_bg(device, "sprite tex bc7", sprite_layout, &view, sprite_sampler));
-        GpuTexture { _texture: texture, view, sprite_bg, generated: None, size: (width, height) }
+    /// What a texture is made with (every part `Sync`: the textures of a batch are made on worker threads).
+    fn tex_maker(&self) -> TexMaker<'_> {
+        TexMaker { device: &self.device, queue: &self.queue, sprite_layout: &self.sprite_layout, sprite_sampler: &self.sprite_sampler }
     }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn make_texture(device: &wgpu::Device, queue: &wgpu::Queue, sprite_layout: &wgpu::BindGroupLayout, sprite_sampler: &wgpu::Sampler, width: u32, height: u32, mips: &[Vec<u8>], generate: Option<crate::mipgen::MipAlpha>) -> GpuTexture {
-        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-        // ENHANCEMENT E2: one level in, `generate` set (and `width x height` really that long):
-        // the chain follows; nothing else enters here with `generate` None
-        let chained: Vec<Vec<u8>>;
-        let (mips, generated) = match generate {
-            Some(mode) if mips.len() == 1 && width.max(height) > 1 && mips[0].len() >= (4 * width * height) as usize => {
-                chained = std::iter::once(mips[0].clone()).chain(crate::mipgen::chain(&mips[0], width, height, mode)).collect();
-                (chained.as_slice(), Some(mode))
-            }
-            _ => (mips, None),
-        };
-        let mip_level_count = mips.len().max(1) as u32;
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("texture"),
-            size,
-            mip_level_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let (mut w, mut h) = (width, height);
-        for (level, data) in mips.iter().enumerate() {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                data,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
-        }
-        let view = texture.create_view(&Default::default());
-        let sprite_bg = Some(gfx::tex_sampler_bg(device, "sprite tex", sprite_layout, &view, sprite_sampler));
-        tracing::debug!(w = width, h = height, "texture uploaded");
-        GpuTexture { _texture: texture, view, sprite_bg, generated, size: (width, height) }
-    }
-
     /// One mip level of `Renderer::update_texture`: `data` holds `h` rows of `4 · w` bytes (or more; the
     /// rest is ignored; less and the level is skipped).
     pub(crate) fn queue_texture_level(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
@@ -527,7 +455,7 @@ impl Core {
             return;
         }
         if self.stub_texture.is_none() {
-            self.stub_texture = Some(Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, 1, 1, &[vec![255; 4]], None));
+            self.stub_texture = Some(self.tex_maker().rgba(1, 1, &[vec![255; 4]], None));
         }
         self.pending_textures.retain(|w| w.texture != id.0);
         self.textures[id.0 as usize] = self.stub_texture.clone().expect("stub made");
@@ -596,5 +524,71 @@ impl Core {
             return t.0;
         }
         id
+    }
+}
+
+/// The device, queue, sprite layout and sampler a texture is made with ([`Core::tex_maker`]).
+#[derive(Clone, Copy)]
+struct TexMaker<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    sprite_layout: &'a wgpu::BindGroupLayout,
+    sprite_sampler: &'a wgpu::Sampler,
+}
+
+impl TexMaker<'_> {
+    /// An 8-bit RGBA texture of `mips` (level 0 first).
+    fn rgba(self, width: u32, height: u32, mips: &[Vec<u8>], generate: Option<crate::mipgen::MipAlpha>) -> GpuTexture {
+        let TexMaker { device, queue, sprite_layout, sprite_sampler } = self;
+        let size = kit::extent(width, height);
+        // ENHANCEMENT E2: one level in, `generate` set (and `width x height` really that long):
+        // the chain follows; nothing else enters here with `generate` None
+        let chained: Vec<Vec<u8>>;
+        let (mips, generated) = match generate {
+            Some(mode) if mips.len() == 1 && width.max(height) > 1 && mips[0].len() >= (4 * width * height) as usize => {
+                chained = std::iter::once(mips[0].clone()).chain(crate::mipgen::chain(&mips[0], width, height, mode)).collect();
+                (chained.as_slice(), Some(mode))
+            }
+            _ => (mips, None),
+        };
+        let mip_level_count = mips.len().max(1) as u32;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("texture"),
+            size,
+            mip_level_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TEXTURE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        kit::write_levels(queue, &texture, width, height, mips, |w, h| (kit::extent(w, h), 4 * w, h));
+        let view = texture.create_view(&Default::default());
+        let sprite_bg = Some(gfx::tex_sampler_bg(device, "sprite tex", sprite_layout, &view, sprite_sampler));
+        tracing::debug!(w = width, h = height, "texture uploaded");
+        GpuTexture { _texture: texture, view, sprite_bg, generated, size: (width, height) }
+    }
+
+    /// A BC7 texture of `levels` (`Core::upload_textures_bc7`).
+    fn bc7(self, width: u32, height: u32, levels: &[Vec<u8>]) -> GpuTexture {
+        let TexMaker { device, queue, sprite_layout, sprite_sampler } = self;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("texture bc7"),
+            size: kit::extent(width, height),
+            mip_level_count: levels.len().max(1) as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bc7RgbaUnorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // a level's copy covers its PHYSICAL size (whole 4x4 blocks of 16 bytes), also for the 2x2 and 1x1 levels at the end of the chain
+        kit::write_levels(queue, &texture, width, height, levels, |w, h| {
+            let (pw, ph) = (w.next_multiple_of(BC_BLOCK), h.next_multiple_of(BC_BLOCK));
+            (kit::extent(pw, ph), pw / BC_BLOCK * BC_BLOCK_BYTES, ph / BC_BLOCK)
+        });
+        let view = texture.create_view(&Default::default());
+        let sprite_bg = Some(gfx::tex_sampler_bg(device, "sprite tex bc7", sprite_layout, &view, sprite_sampler));
+        GpuTexture { _texture: texture, view, sprite_bg, generated: None, size: (width, height) }
     }
 }

@@ -27,14 +27,29 @@ pub(crate) const CAP: f32 = 3.0;
 /// over white is lifted by `t^2 / (t + KNEE)` (slope 0 at white, no threshold; 0.3 over white lifts 0.11, 1.0 lifts 0.67).
 pub(crate) const KNEE: f32 = 0.5;
 
-/// The WGSL of the tone map's EDR entry point, appended to the blit's source; `EXPOSURE` / `//EYE_APPLY` are
-/// replaced with the rest. The SDR output is exactly `fs`'s.
-pub(crate) const TONE_EDR_WGSL: &str = r#"
-// ENHANCEMENT E33: the sRGB transfer function, extended above 1 (the value is the display-referred one)
+/// ENHANCEMENT E33: the sRGB transfer function (display value -> linear light), extended above 1, ONE piece for the tone map's
+/// `fs_edr` and the present pass (a macro so that `concat!` can splice it into [`TONE_EDR_WGSL`]). The `max(v, 0)` is the identity
+/// for the present pass's input (a ramp output, 0..1): both passes decode bit-identically to before.
+macro_rules! edr_dec_wgsl {
+    () => {
+        r#"
 fn edr_dec(v: vec3<f32>) -> vec3<f32> {
     let a = max(v, vec3<f32>(0.0));
     return select(pow((a + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), a / 12.92, a <= vec3<f32>(0.04045));
 }
+"#
+    };
+}
+
+/// The shared decode as a string (the present pass composes it).
+#[cfg(target_os = "macos")]
+const EDR_DEC_WGSL: &str = edr_dec_wgsl!();
+
+/// The WGSL of the tone map's EDR entry point, appended to the blit's source; `//TONE` (the tone map, `gpu/post.rs`
+/// `with_tone`) / `//EYE_APPLY` are replaced with the rest. The SDR output is exactly `fs`'s.
+pub(crate) const TONE_EDR_WGSL: &str = concat!(
+    edr_dec_wgsl!(),
+    r#"
 // the soft shoulder of ONE channel (linear light, white = 1): the identity up to white, above it a rise that starts
 // flat (the overshoot of ordinary additive layers, sky and specular, stays SDR white: `h` grows as t^2 / (t + KNEE),
 // slope 0 at white, no threshold) and bends to EDR_CAP exponentially. Monotone and C1 above white, continuous at it.
@@ -56,8 +71,7 @@ struct EdrOut { @location(0) color: vec4<f32>, @location(1) gain: vec4<f32> };
     if MODE == 0u {
         o.color = dither(c, in.pos.xy);
     } else {
-        let lin = pow(max(c.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)) * EXPOSURE;
-        let mapped = aces(lin) / aces(vec3<f32>(EXPOSURE));
+        //TONE
         o.color = dither(vec4<f32>(pow(clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2)), c.a), in.pos.xy);
         dv = pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     }
@@ -69,7 +83,8 @@ struct EdrOut { @location(0) color: vec4<f32>, @location(1) gain: vec4<f32> };
     o.gain = vec4<f32>(gain, 1.0);
     return o;
 }
-"#;
+"#
+);
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -85,16 +100,13 @@ mod mac {
 // x = the gamma ramp's g (state 0x2E), y = the ceiling (the display's headroom), z = 1 when the frame has a gain map
 @group(0) @binding(3) var<uniform> u: vec4<f32>;
 @group(0) @binding(4) var gs: sampler;
-fn dec(v: vec3<f32>) -> vec3<f32> {
-    return select(pow((v + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), v / 12.92, v <= vec3<f32>(0.04045));
-}
 @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let p = vec2<i32>(pos.xy);
     let c = textureLoad(frame, p, 0);
     // the display ramp exactly as GammaPass writes it (identity at g = 1)
     let i = round(c.rgb * 255.0);
     let w = min(floor(i * 257.0 * u.x), vec3<f32>(65535.0)) / 65535.0;
-    var lin = dec(w);
+    var lin = edr_dec(w);
     if u.z > 0.5 {
         // a pixel the 2D (HUD, front end) did not touch: byte-equal to the copy taken before the sprites
         let before = textureLoad(pre2d, p, 0);
@@ -147,7 +159,7 @@ fn dec(v: vec3<f32>) -> vec3<f32> {
             let info = surface.display_hdr_info(adapter);
             let potential = info.headroom.and_then(|h| h.potential).filter(|h| h.is_finite());
             // diagnostic: `NFS_EDR_HEADROOM=<x>` pretends the display has that headroom (a display without EDR, an asleep screen)
-            let potential = std::env::var("NFS_EDR_HEADROOM").ok().and_then(|v| v.parse::<f32>().ok()).or(potential);
+            let potential = crate::dbg::flags().edr_headroom.or(potential);
             let ok = supported && potential.is_some_and(|h| h > 1.0);
             tracing::info!(supported, headroom = ?info.headroom, ok, "E33 EDR probe (Rgba16Float + ExtendedSrgbLinear, display headroom)");
             Self { ok, headroom: potential.unwrap_or(1.0), on: false, pass: false, gain_used: false, pipeline: None, targets: None, gain: None, bind_group: None }
@@ -209,7 +221,7 @@ fn dec(v: vec3<f32>) -> vec3<f32> {
         pub fn gain_view(&mut self, device: &wgpu::Device, size: (u32, u32)) -> Option<wgpu::TextureView> {
             self.targets.as_ref()?;
             if self.gain.as_ref().is_none_or(|g| g.0 != size) {
-                let tex = gfx::texture_2d(device, "edr gain", size.0.max(1), size.1.max(1), wgpu::TextureFormat::Rgba16Float, gfx::RT_USAGE);
+                let tex = gfx::texture_2d(device, "edr gain", size.0.max(1), size.1.max(1), crate::gpu::HDR_FORMAT, gfx::RT_USAGE);
                 let view = tex.create_view(&Default::default());
                 self.gain = Some((size, tex, view));
                 self.bind_group = None;
@@ -251,25 +263,18 @@ fn dec(v: vec3<f32>) -> vec3<f32> {
         }
 
         /// The present pass into the `Rgba16Float` surface view.
-        pub fn present(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, surface_view: &wgpu::TextureView, gamma: f32) {
+        /// Recorded in the frame's `encoder` after the frame (its uniform through the belt).
+        pub fn present(&mut self, device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, surface_view: &wgpu::TextureView, gamma: f32) {
             self.ensure_bind_group(device);
             let (Some((pipeline, _, uniform, _)), Some(bind_group)) = (self.pipeline.as_ref(), self.bind_group.as_ref()) else { return };
-            queue.write_buffer(uniform, 0, bytemuck::cast_slice(&[gamma, self.ceiling(), if self.gain_used { 1.0f32 } else { 0.0 }, 0.0]));
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("edr present") });
-            {
-                let mut pass = gfx::color_pass(&mut enc, "edr present", "edr present", surface_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-            crate::prof::resolve(&mut enc);
-            queue.submit(Some(enc.finish()));
+            gfx::belt_write(belt, encoder, uniform, bytemuck::cast_slice(&[gamma, self.ceiling(), if self.gain_used { 1.0f32 } else { 0.0 }, 0.0]));
+            gfx::fullscreen_pass(encoder, "edr present", "edr present", surface_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK), pipeline, &[bind_group]);
         }
     }
 
     /// The present pass's shader.
     pub(crate) fn present_source() -> String {
-        wgsl::compose(&[wgsl::FULLSCREEN_VS, PRESENT_WGSL])
+        wgsl::compose(&[wgsl::FULLSCREEN_VS, super::EDR_DEC_WGSL, PRESENT_WGSL])
     }
 
     fn build_present(device: &wgpu::Device) -> Present {
@@ -281,9 +286,9 @@ fn dec(v: vec3<f32>) -> vec3<f32> {
         );
         let module = gfx::wgsl_module(device, "edr present", &present_source());
         let pl = gfx::pipeline_layout(device, "edr present", &[&layout]);
-        let pipeline = Fullscreen::new("edr present", &pl, &module).build(device, &[gfx::target(wgpu::TextureFormat::Rgba16Float, None)]);
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("edr present"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() });
+        let pipeline = Fullscreen::new("edr present", &pl, &module).build(device, &[gfx::target(crate::gpu::HDR_FORMAT, None)]);
+        let uniform = gfx::uniform_buf::<[f32; 4]>(device, "edr present");
+        let sampler = gfx::linear_clamp_sampler(device, None);
         (pipeline, layout, uniform, sampler)
     }
 }

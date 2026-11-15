@@ -12,9 +12,95 @@ const TEMPORAL_KEY: u64 = 1 << 9;
 /// original's shader's (`classes::mesh_shader_source(0)`)
 const FEATS_SHIFT: u32 = 16;
 
-/// The mesh pipelines (54: blend group × cull × depth, see `Core::new`'s notes; with `samples > 1`
-/// six more, the alpha-to-coverage opaque group 9 — ENHANCEMENT E1; then the two layered groups, 12 — master's 9 / 10)
-/// for a target of `samples`.
+/// The cull mode of a mesh pipeline: `Back` the view's own, `None` both faces, `Front` the other face (a material whose cull is
+/// the view's, drawn in a mirrored world, 0x468C45).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Cull {
+    Back,
+    None,
+    Front,
+}
+
+impl Cull {
+    const ALL: [Cull; 3] = [Cull::Back, Cull::None, Cull::Front];
+
+    fn face(self) -> Option<wgpu::Face> {
+        match self {
+            Cull::Back => Some(wgpu::Face::Back),
+            Cull::None => None,
+            Cull::Front => Some(wgpu::Face::Front),
+        }
+    }
+}
+
+/// The blend group of a mesh pipeline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Group {
+    /// blend off
+    Opaque,
+    /// Thrash state 0x38's pair `pair` (0 the plain alpha pair, 1..=3 the others, `pair_state`); `zwrite`: with depth writes
+    /// (the material's `device_states`)
+    Blend { pair: u8, zwrite: bool },
+    /// ENHANCEMENT E1: the opaque pipeline with alpha-to-coverage, for the alpha-TESTED opaque draws (foliage, fences); only in a
+    /// multisampled set (a 1-sample set draws them with `Opaque`)
+    AlphaToCoverage,
+    /// the layered passes of a blended material (`fs_layers`, the plain pair), without / with depth writes
+    Layered { zwrite: bool },
+}
+
+/// The Thrash 0x38 pairs a [`Group::Blend`] takes (0 = the plain alpha pair).
+const BLEND_PAIRS: u8 = 4;
+
+impl Group {
+    /// The group's place in a set: 0 opaque, 1..=4 the pairs, 5..=8 the pairs with depth writes, then E1's alpha-to-coverage
+    /// group (`multisampled` sets only), then the two layered groups (master's 9 / 10).
+    fn slot(self, multisampled: bool) -> usize {
+        let layered = if multisampled { 10 } else { 9 };
+        match self {
+            Group::Opaque => 0,
+            Group::Blend { pair, zwrite } => 1 + pair as usize + if zwrite { BLEND_PAIRS as usize } else { 0 },
+            Group::AlphaToCoverage if multisampled => 9,
+            Group::AlphaToCoverage => 0,
+            Group::Layered { zwrite } => layered + zwrite as usize,
+        }
+    }
+
+    /// The groups of a set in their order ([`Self::slot`]).
+    fn all(multisampled: bool) -> impl Iterator<Item = Group> {
+        let blends = |zwrite| (0..BLEND_PAIRS).map(move |pair| Group::Blend { pair, zwrite });
+        std::iter::once(Group::Opaque)
+            .chain(blends(false))
+            .chain(blends(true))
+            .chain(multisampled.then_some(Group::AlphaToCoverage))
+            .chain([false, true].map(|zwrite| Group::Layered { zwrite }))
+    }
+}
+
+/// One mesh pipeline of a set: its blend group, cull mode and depth test. A set holds every key, six a group (cull × depth).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct PipelineKey {
+    pub group: Group,
+    pub cull: Cull,
+    pub depth_test: bool,
+}
+
+/// A pipeline set's cull × depth combinations per group.
+const PER_GROUP: usize = 6;
+
+impl PipelineKey {
+    /// The pipeline's index in a set (`multisampled`: the set has E1's alpha-to-coverage group).
+    pub(super) fn index(self, multisampled: bool) -> usize {
+        self.group.slot(multisampled) * PER_GROUP + self.cull as usize * 2 + !self.depth_test as usize
+    }
+
+    /// Every key of a set, in index order.
+    fn set(multisampled: bool) -> impl Iterator<Item = PipelineKey> {
+        Group::all(multisampled).flat_map(|group| Cull::ALL.into_iter().flat_map(move |cull| [true, false].map(|depth_test| PipelineKey { group, cull, depth_test })))
+    }
+}
+
+/// The mesh pipelines (54: blend group × cull × depth, [`PipelineKey`]; with `samples > 1` six more, the alpha-to-coverage
+/// opaque group 9 — ENHANCEMENT E1; then the two layered groups, 12 — master's 9 / 10) for a target of `samples`.
 pub(super) fn build_mesh_pipelines(device: &wgpu::Device, shader: &wgpu::ShaderModule, pipeline_layout: &wgpu::PipelineLayout, format: wgpu::TextureFormat, samples: u32, temporal: bool) -> Vec<wgpu::RenderPipeline> {
     build_mesh_pipelines_on(device, shader, pipeline_layout, format, samples, temporal, std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8))
 }
@@ -123,41 +209,19 @@ fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, p
             cache: None,
         })
     };
-    // six a group — the cull (back, none, front) × depth (on, off), `2·cull + !depth` — and the
-    // groups: 0 blend off, 1 the plain alpha pair, 2…4 the other pairs, 5…8 every pair again
-    // with depth writes on (`device_states`), then the layered passes (see below)
-    const CULLS: [Option<wgpu::Face>; 3] = [Some(wgpu::Face::Back), None, Some(wgpu::Face::Front)];
-    // (the 54 pipelines compile independently: built on worker threads, kept in the same order)
-    let mut specs = Vec::with_capacity(72);
-    for (blend, pair, zwrite) in [(false, 0, false), (true, 0, false), (true, 1, false), (true, 2, false), (true, 3, false), (true, 0, true), (true, 1, true), (true, 2, true), (true, 3, true)] {
-        for i in 0..6 {
-            specs.push((blend, pair, CULLS[i / 2], i % 2 == 0, zwrite, false, false));
-        }
-    }
-    // ENHANCEMENT E1: the opaque pipelines again with alpha-to-coverage (group 9), for the
-    // alpha-TESTED opaque draws (foliage, fences) — only when multisampled
-    if samples > 1 {
-        for i in 0..6 {
-            specs.push((false, 0, CULLS[i / 2], i % 2 == 0, false, true, false));
-        }
-    }
-    // the last two groups (always, after E1's group 9 where it exists): the layered passes of a blended material
-    // (`fs_layers`, plain pair) without and with depth writes (`Core::layered_group`)
-    for zwrite in [false, true] {
-        for i in 0..6 {
-            specs.push((true, 0, CULLS[i / 2], i % 2 == 0, zwrite, false, true));
-        }
-    }
-    let workers = workers.max(1);
-    let pipelines: Vec<wgpu::RenderPipeline> = std::thread::scope(|sc| {
-        let make_pipeline = &make_pipeline;
-        let handles: Vec<_> = specs
-            .chunks(specs.len().div_ceil(workers))
-            .map(|c| sc.spawn(move || c.iter().map(|&(blend, pair, cull, depth, zwrite, a2c, layers)| make_pipeline(blend, pair, cull, depth, zwrite, a2c, layers)).collect::<Vec<_>>()))
-            .collect();
-        handles.into_iter().flat_map(|h| h.join().expect("pipeline worker")).collect()
-    });
-    pipelines
+    // (the pipelines compile independently: built on worker threads, kept in the set's order)
+    let specs: Vec<_> = PipelineKey::set(samples > 1)
+        .map(|k| {
+            let (blend, pair, zwrite, a2c, layers) = match k.group {
+                Group::Opaque => (false, 0, false, false, false),
+                Group::Blend { pair, zwrite } => (true, pair, zwrite, false, false),
+                Group::AlphaToCoverage => (false, 0, false, true, false),
+                Group::Layered { zwrite } => (true, 0, zwrite, false, true),
+            };
+            (blend, pair, k.cull.face(), k.depth_test, zwrite, a2c, layers)
+        })
+        .collect();
+    super::kit::par_build_on(&specs, workers, |&(blend, pair, cull, depth, zwrite, a2c, layers)| make_pipeline(blend, pair, cull, depth, zwrite, a2c, layers))
 }
 
 
@@ -169,13 +233,16 @@ const PREWARM_DEPTH: u32 = 1;
 
 /// PERF (PERF-D): the light parts a frame can leave out (`shut` of `ensure_pipelines`), as the groups that go together.
 /// (ENHANCEMENT E50 / E51: the moon's part and the cars-only layers' part are groups of their own: by day the first is off, at night the second)
-const LIGHT_GROUPS: [u32; 6] = [
+const LIGHT_GROUPS: [u32; 8] = [
     crate::classes::feat::CSM,
     crate::classes::feat::SPOT,
     crate::classes::feat::LAMPS | crate::classes::feat::LSHAD,
     crate::classes::feat::CONTACT,
     crate::classes::feat::MOON,
     crate::classes::feat::CARSH,
+    // (SHADOW-REFACTOR: the front end's focus kernel, E25's overcast kernel)
+    crate::classes::feat::FOCUS,
+    crate::classes::feat::OVERCAST,
 ];
 
 /// PERF (PERF-D): a mesh pipeline set's build parameters (the key's low bits, the parts above them).
@@ -196,7 +263,7 @@ impl SetSpec {
 /// The low bits of a set's key (sample count, float, temporal): its family without the parts.
 const BASE_MASK: u64 = (1 << FEATS_SHIFT) - 1;
 
-/// PERF (PERF-D): the parts of item variant `v` of the parts `feats` (`fill::item_variant`: bit 0 the surface parts, bit 1 the
+/// PERF (PERF-D): the parts of item variant `v` of the parts `feats` (`fill::ItemVariant`: bit 0 the surface parts, bit 1 the
 /// effect parts).
 fn variant_feats(feats: u32, v: usize) -> u32 {
     use crate::classes::feat;
@@ -297,7 +364,7 @@ fn builder_thread(shared: Shared, tx: std::sync::mpsc::Sender<BuiltSet>) {
         let s = job.spec;
         let module = job.module.unwrap_or_else(|| crate::gfx::wgsl_module(&job.device, "mesh shader (parts)", &crate::classes::mesh_shader_source(s.feats)));
         let set = build_mesh_pipelines_on(&job.device, &module, &job.layout, job.format, s.samples, s.temporal, if job.need { need_workers } else { warm_workers });
-        if tx.send(BuiltSet { spec: s, module, set, ms: t0.elapsed().as_secs_f32() * 1000.0 }).is_err() {
+        if tx.send(BuiltSet { spec: s, module, set, ms: crate::prof::elapsed_ms(t0) as f32 }).is_err() {
             return;
         }
     }
@@ -351,7 +418,7 @@ impl Core {
     /// frame after it is done takes it. The picture is the wanted set's: the parts beyond it are ones this frame's uniforms
     /// switch off — a shut light's uniform is zeroed (`csm.dir.w`, `spots.params.x`, `lamps.params.x`, `contacts.params.x` 0:
     /// `csm_pass`, `spot_pass`, `lamp_pass`, `contact_pass`; LSHAD runs inside the lamps' loop only), a per-item part tests the
-    /// item's own uniform (`fill::item_variant` is those tests) — which is how the one uber shader drew every frame before
+    /// item's own uniform (`fill::ItemVariant::of` is those tests) — which is how the one uber shader drew every frame before
     /// PERF-B. The family's whole set (every part its switches can run: the superset of all its sets) is the one set a frame
     /// waits for, the first time the family (sample count, float / temporal target, the mirror's cut, the switches) is drawn:
     /// built in the frame, or waited for when the race load's prewarm (`prewarm_pipelines`) has it queued.
@@ -369,7 +436,7 @@ impl Core {
             self.prewarm_family(full, shut, PREWARM_DEPTH);
         }
         // PERF (PERF-B): the per-item parts (`classes::feat::SURFACE`: a reflection class; `classes::feat::EFFECT`: a particle /
-        // soft / HDR boost role) only in the sets of the items that can take them (`fill::item_variant`): variant `v` has the
+        // soft / HDR boost role) only in the sets of the items that can take them (`fill::ItemVariant`): variant `v` has the
         // surface parts with bit 0, the effect parts with bit 1. A variant whose set is an earlier one's draws with that set.
         let feats = fam & !shut;
         let mut chosen = [0u64; 4];
@@ -394,6 +461,7 @@ impl Core {
             var_set[v] = (0..v).find(|&u| chosen[u] == chosen[v]).map_or(v as u8, |u| var_set[u]);
         }
         self.pipelines = self.pipeline_sets[&chosen[0]].clone();
+        self.multisampled_set = samples > 1;
         for v in 1..4 {
             self.pipeline_vars[v - 1] = if var_set[v] as usize == v { self.pipeline_sets[&chosen[v]].clone() } else { Vec::new() };
         }
@@ -434,7 +502,7 @@ impl Core {
                 }
             }
             if self.pipeline_sets.contains_key(&key) {
-                tracing::info!(parts = format_args!("{:#06x}", spec.feats), ms = t0.elapsed().as_secs_f32() * 1000.0, "mesh pipeline set waited for");
+                tracing::info!(parts = format_args!("{:#06x}", spec.feats), ms = crate::prof::elapsed_ms(t0) as f32, "mesh pipeline set waited for");
                 return;
             }
         }
@@ -445,7 +513,7 @@ impl Core {
         let shader = if spec.feats != 0 { &self.mesh_shaders[&spec.feats] } else { &self.mesh_shader };
         let (layout, format) = self.set_target(spec);
         let set = build_mesh_pipelines(&self.device, shader, &layout, format, spec.samples, spec.temporal);
-        tracing::info!(samples = spec.samples, hdr = spec.hdr, temporal = spec.temporal, parts = format_args!("{:#06x}", spec.feats), ms = t0.elapsed().as_secs_f32() * 1000.0, "mesh pipeline set built (in the frame)");
+        tracing::info!(samples = spec.samples, hdr = spec.hdr, temporal = spec.temporal, parts = format_args!("{:#06x}", spec.feats), ms = crate::prof::elapsed_ms(t0) as f32, "mesh pipeline set built (in the frame)");
         self.pipeline_sets.insert(key, set);
     }
 
@@ -510,7 +578,7 @@ impl Core {
             return;
         }
         let hdr = self.enhancements.is_on(crate::E7) && self.hdr_ok;
-        let temporal = hdr && self.temporal_gpu.is_some() && (self.temporal.is_some() || self.temporal_flag || self.temporal_want().is_some());
+        let temporal = hdr && self.temporal_gpu.is_some() && (self.temporal.is_some() || self.temporal_want().is_some());
         let mirror_hdr = hdr && crate::tonemap_mode(self.enhancements.level(crate::E7)) != 0;
         let mut fams = vec![
             SetSpec { feats: fam, samples: if temporal { 1 } else { self.enh_samples(hdr) }, hdr, temporal },
@@ -524,7 +592,8 @@ impl Core {
         }
         // (the main view meets the most light states; the others are prewarmed in their start state only)
         // (ENHANCEMENT E50: and no moon)
-        let start = crate::classes::feat::LAMPS | crate::classes::feat::LSHAD | crate::classes::feat::MOON;
+        // (SHADOW-REFACTOR: nor the front end's focus or E25's overcast kernels)
+        let start = crate::classes::feat::LAMPS | crate::classes::feat::LSHAD | crate::classes::feat::MOON | crate::classes::feat::FOCUS | crate::classes::feat::OVERCAST;
         for (i, f) in fams.into_iter().enumerate() {
             self.prewarm_family(f, start, if i == 0 { PREWARM_DEPTH } else { 0 });
         }
@@ -549,5 +618,36 @@ mod tests {
         // variant 0 has no per-item part, variant 3 all of them
         assert_eq!(variant_feats(fam, 0), feat::CSM | feat::SPOT);
         assert_eq!(variant_feats(fam, 3), fam);
+    }
+
+    /// The keys' indices are the hand-written scheme they replaced: `group * 6 + 2 * cull + !depth`, the blend groups `1 + pair`
+    /// and `5 + pair` (with depth writes), E1's alpha-to-coverage group 9 when the set has more than 66 pipelines, the layered
+    /// groups `len / 6 - 2` and one after it; and `PipelineKey::set` lists every key once, in index order.
+    #[test]
+    fn the_pipeline_keys_are_the_old_index_scheme() {
+        for ms in [false, true] {
+            let len = if ms { 72 } else { 66 };
+            let keys: Vec<_> = PipelineKey::set(ms).collect();
+            assert_eq!(keys.len(), len);
+            for (i, k) in keys.iter().enumerate() {
+                assert_eq!(k.index(ms), i, "{k:?}");
+            }
+            for (ci, cull) in Cull::ALL.into_iter().enumerate() {
+                for depth_test in [true, false] {
+                    let sub = ci * 2 + !depth_test as usize;
+                    let idx = |group| PipelineKey { group, cull, depth_test }.index(ms);
+                    assert_eq!(idx(Group::Opaque), sub);
+                    for pair in 0..4u8 {
+                        let plain = if pair > 0 { 1 + pair as usize } else { 1 };
+                        assert_eq!(idx(Group::Blend { pair, zwrite: false }), plain * 6 + sub);
+                        assert_eq!(idx(Group::Blend { pair, zwrite: true }), (5 + pair as usize) * 6 + sub);
+                    }
+                    assert_eq!(idx(Group::AlphaToCoverage), if len > 66 { 9 * 6 + sub } else { sub });
+                    let first = len / 6 - 2;
+                    assert_eq!(idx(Group::Layered { zwrite: false }), first * 6 + sub);
+                    assert_eq!(idx(Group::Layered { zwrite: true }), (first + 1) * 6 + sub);
+                }
+            }
+        }
     }
 }

@@ -6,6 +6,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 mod csm;
+mod shadowmap;
 mod carsun;
 mod spot;
 mod lamps;
@@ -21,16 +22,22 @@ mod frame;
 mod pipelines;
 mod post;
 mod chain;
+mod kit;
 #[cfg(target_os = "macos")]
 mod diag;
 
 // the items the rest of gpu/ names from the two modules above (their own glob `use super::*` sees these)
 use pipelines::{build_mesh_pipelines, HDR_KEY};
-use post::{GammaPass, ScaleBlit};
+use post::{GammaPass, ScaleBlit, ToneKey};
+use frame::FrameDesc;
 #[cfg(test)]
 pub(crate) use post::{blit_source, gamma_source};
 #[cfg(test)]
 pub(crate) use refl::near_mask_source;
+#[cfg(test)]
+pub(crate) use carsun::source as carsun_source;
+#[cfg(test)]
+pub(crate) use csm::shadow_source;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MeshId(pub(crate) u32);
@@ -261,6 +268,7 @@ struct SpriteVertex {
     alpha_ref: f32,
 }
 
+#[derive(Clone)]
 struct GpuMaterial {
     bind_group: wgpu::BindGroup,
     /// `false_sort`'s single-draw arm (`SPECIALFX` below 2, `RE/notes/thrash.md` §6d.4): the same
@@ -294,23 +302,54 @@ struct GpuMaterial {
     reflect: crate::Reflect,
 }
 
+/// A scene sampler: the address modes (`clamp_*`: clamp to the edge, else repeat; `w` always repeats), the magnification /
+/// minification and mip filters, `anisotropy_clamp` and `lod_max_clamp`.
+#[derive(Clone, Copy)]
+struct SamplerSpec {
+    clamp_u: bool,
+    clamp_v: bool,
+    filter: wgpu::FilterMode,
+    mip: wgpu::MipmapFilterMode,
+    anisotropy: u16,
+    lod_max: f32,
+}
+
+impl SamplerSpec {
+    /// wgpu's default `lod_max_clamp`: every level.
+    const ALL_LEVELS: f32 = 32.0;
+
+    /// The sampler of key `k`'s address modes, every level, no anisotropy.
+    fn of_key(k: materials::SamplerKey, filter: wgpu::FilterMode, mip: wgpu::MipmapFilterMode) -> Self {
+        Self { clamp_u: k.clamp[0], clamp_v: k.clamp[1], filter, mip, anisotropy: 1, lod_max: Self::ALL_LEVELS }
+    }
+
+    /// The same sampling level 0 only.
+    fn level0(self) -> Self {
+        Self { lod_max: 0.0, ..self }
+    }
+
+    fn build(self, device: &wgpu::Device, label: &str) -> wgpu::Sampler {
+        let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
+        device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some(label),
+            address_mode_u: mode(self.clamp_u),
+            address_mode_v: mode(self.clamp_v),
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: self.filter,
+            min_filter: self.filter,
+            mipmap_filter: self.mip,
+            lod_max_clamp: self.lod_max,
+            anisotropy_clamp: self.anisotropy,
+            ..Default::default()
+        })
+    }
+}
+
 /// ENHANCEMENT E2: a scene sampler by address mode — linear magnification / minification, the
 /// given mip filter, `anisotropy_clamp` (wgpu wants every filter linear for anything above 1) and an
 /// optional `lod_max_clamp`.
 fn make_scene_sampler(device: &wgpu::Device, clamp_u: bool, clamp_v: bool, mip: wgpu::MipmapFilterMode, anisotropy: u16, lod_max: Option<f32>) -> wgpu::Sampler {
-    let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
-    device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("scene E2"),
-        address_mode_u: mode(clamp_u),
-        address_mode_v: mode(clamp_v),
-        address_mode_w: wgpu::AddressMode::Repeat,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: mip,
-        lod_max_clamp: lod_max.unwrap_or(32.0),
-        anisotropy_clamp: anisotropy,
-        ..Default::default()
-    })
+    SamplerSpec { clamp_u, clamp_v, filter: wgpu::FilterMode::Linear, mip, anisotropy, lod_max: lod_max.unwrap_or(SamplerSpec::ALL_LEVELS) }.build(device, "scene E2")
 }
 
 pub(crate) struct Core {
@@ -321,7 +360,10 @@ pub(crate) struct Core {
     /// the present modes the surface supports (ENHANCEMENT E6 picks among them)
     present_modes: Vec<wgpu::PresentMode>,
     depth_view: wgpu::TextureView,
-    pipelines: Vec<wgpu::RenderPipeline>, // see `make_pipeline`'s loops for the index
+    /// the mesh pipelines of the set the frame draws with, by [`pipelines::PipelineKey::index`]
+    pipelines: Vec<wgpu::RenderPipeline>,
+    /// ENHANCEMENT E1: the sets drawn with are multisampled (they have the alpha-to-coverage group)
+    multisampled_set: bool,
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     globals_layout: wgpu::BindGroupLayout,
@@ -332,7 +374,6 @@ pub(crate) struct Core {
     headlight_map_buf: wgpu::Buffer,
     proj_tex: Option<TextureId>,
     head_tex: Option<TextureId>,
-    object_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
     /// the car's section map for `R3DSkyMapTextureLayer`, one bind group per texture (group 3)
     sky_layout: wgpu::BindGroupLayout,
@@ -363,6 +404,9 @@ pub(crate) struct Core {
     /// ENHANCEMENT E12: the depth converter (built on first use), and the 1 x 1 image the binding
     /// holds while no soft depth is bound
     soft: Option<crate::soft::SoftDepth>,
+    /// ENHANCEMENT E12: the split pass's globals bind group with the soft depth image bound, and the image and the plain globals
+    /// bind group it was made from ([`Core::soft_globals_bg`])
+    soft_globals: Option<(wgpu::TextureView, wgpu::BindGroup, wgpu::BindGroup)>,
     /// ENHANCEMENT E14: the corner-shading passes (built on first use)
     ssao: Option<crate::ao::Ssao>,
     /// ENHANCEMENT E13: the light-shafts pass (built on first use)
@@ -457,8 +501,8 @@ pub(crate) struct Core {
     set_builder: pipelines::SetBuilder,
     /// PERF (PERF-B): an item variant's set (0 = `pipelines`, k = `pipeline_vars[k - 1]`)
     var_set: [u8; 4],
-    /// PERF (PERF-B): per item of the frame, its variant ([`fill::item_variant`])
-    item_var: Vec<u8>,
+    /// PERF (PERF-B): per item of the frame, its variant ([`fill::ItemVariant::of`])
+    item_var: Vec<fill::ItemVariant>,
     /// the mesh shader of the original's set (no part, `classes::mesh_shader_source(0)`)
     mesh_shader: wgpu::ShaderModule,
     /// PERF (PERF-B): the mesh shader by its parts (`classes::feat`), built when a set of switches first needs it
@@ -469,47 +513,18 @@ pub(crate) struct Core {
     /// ENHANCEMENT E3: the scaled 3D image and the blit that lays it over the window-sized image
     scale_blit: Option<ScaleBlit>,
     /// ENHANCEMENT ENH-TEMPORAL: the temporal foundation (jitter, motion vectors, masks, the debug pass), made when
-    /// `NFS_TEMPORAL_DEBUG` is set or [`Self::temporal_flag`] is raised; `None` = off, master's frame
+    /// `NFS_TEMPORAL_DEBUG` is set or a temporal upscaler is on ([`Self::temporal_want`]); `None` = off, master's frame
     temporal: Option<crate::temporal::Temporal>,
-    /// ENHANCEMENT ENH-TEMPORAL: a temporal upscaler (phase B: FSR 3.1 / MetalFX temporal) is active: the main view is
-    /// jittered, writes the vectors and masks, and renders at 1 sample. `false` until one is wired.
-    temporal_flag: bool,
     /// ENHANCEMENT ENH-TEMPORAL: the object pass's second layout (the reprojection matrices), made at first use
     temporal_gpu: Option<crate::temporal::Gpu>,
     /// ENHANCEMENT ENH-TEMPORAL: the targets and bind group of the frame being encoded (set around `encode_frame`)
     cur_temporal: Option<crate::temporal::Cur>,
     /// ENHANCEMENT ENH-TEMPORAL: the reprojection matrices of the frame being encoded (kept between frames)
     motion: crate::temporal::Motion,
-    /// ENHANCEMENT ENH-TEMPORAL: the last temporal main view's inputs for an upscaler (phase B)
-    #[allow(dead_code)]
+    /// ENHANCEMENT ENH-TEMPORAL: the last temporal main view's inputs for an upscaler
     temporal_inputs: Option<crate::temporal::Inputs>,
-    /// ENHANCEMENT E37: the FSR 3.1 backend (built at first use) and its state, 0 = not tried, 1 = ready, 2 = unavailable (logged once)
-    fsr: Option<Box<dyn crate::upscale::Upscaler>>,
-    fsr_state: u8,
-    /// ENHANCEMENT E34 (temporal levels): the same slot also holds MetalFX's temporal scaler (macOS): which backend `fsr` is, and E34's own
-    /// state (0 = not tried, 1 = ready, 2 = unavailable / failed)
-    fsr_kind: Option<crate::upscale::UpscalerKind>,
-    #[cfg(target_os = "macos")]
-    mfxt_state: u8,
-    /// ENHANCEMENT E37: the frame being encoded goes through FSR
-    fsr_active: bool,
-    /// ENHANCEMENT E37: FSR's float output (display size) and the bind group the post chain reads it by: `(size, texture, view, bind group)`
-    fsr_out: Option<crate::gfx::RtImage>,
-    /// ENHANCEMENT E37: `encode_with_gamma_inner` calls so far, and the call number of the last FSR frame (a frame in between
-    /// that was not one - a menu, a loading screen, another view - drops the history)
-    frame_no: u64,
-    fsr_last_frame: u64,
-    /// ENHANCEMENT E34: the upscaler backend (built at first use), 0 = not tried, 1 = ready, 2 = unavailable (logged once)
-    upscaler: Option<Box<dyn crate::upscale::Upscaler>>,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    upscale_state: u8,
-    /// ENHANCEMENT E34: the frame being encoded goes through the upscaler (set by `encode_with_gamma_inner`)
-    upscale_active: bool,
-    /// ENHANCEMENT E34: the scaler's input / output images and the plain blit that lays its output over the window image
-    upscale_images: Option<crate::upscale::UpscaleImages>,
-    upscale_present: Option<ScaleBlit>,
-    /// ENHANCEMENT E39 (UPSCALE-SOFT): the sharpening after the MetalFX scalers (built at first use)
-    sharpen: Option<crate::sharpen::Sharpen>,
+    /// ENHANCEMENTS E37 / E34 / E39: the upscalers ([`Upscaling`])
+    up: Upscaling,
     /// ENHANCEMENT UPSCALE-SOFT: the texture LOD bias added to every material's own while an upscaler's main view is encoded
     /// (`upscale::mip_bias`); 0 otherwise, and then the object uniforms are master's bytes
     cur_lod_shift: f32,
@@ -546,6 +561,8 @@ pub(crate) struct Core {
     materials: Vec<GpuMaterial>,
     white: TextureId,
     sprite_pipeline: wgpu::RenderPipeline,
+    /// `sprite_pipeline` for a sprite pass with no depth image (no sprite of the frame has a depth state)
+    sprite_flat_pipeline: wgpu::RenderPipeline,
     /// The front end's depth-state sprites (`Sprite::depth`): depth writes on, the alpha test, the
     /// compare `LESSEQUAL` \[0\] / `GREATEREQUAL` \[1\].
     sprite_depth_pipelines: [wgpu::RenderPipeline; 2],
@@ -557,6 +574,12 @@ pub(crate) struct Core {
     /// dynamic meshes' vertices) is a copy out of a recycled mapped chunk, recorded into the
     /// frame's own encoder — `Queue::write_buffer` makes a fresh staging buffer per call
     belt: wgpu::util::StagingBelt,
+    /// the frame's command buffers not yet submitted (PERF, picture identical): the mirror, the environment faces, their
+    /// coat prefilter and probe and the main frame are recorded in call order into one encoder and submitted in up to three
+    /// parts ([`Core::submit_frame`]): ahead of the main view, ahead of its post chain, at the frame's end
+    frame_cmds: FrameCmds,
+    /// the main view is being recorded ([`Core::whole_frame`]): its post chain is submitted apart from its 3-D image
+    frame_main: bool,
     /// `write_mesh_vertices` / `update_mesh_vertices` calls waiting for the next frame's encoder,
     /// in call order (the last write to a mesh wins, as with `write_buffer`)
     pending_writes: Vec<PendingWrite>,
@@ -580,6 +603,8 @@ pub(crate) struct Core {
     lens_done: Vec<LensRead>,
     /// blocks copied into the frame being encoded, mapped after its submit
     lens_staged: Vec<(wgpu::Buffer, bool, bool)>,
+    /// read-back buffers collected and unmapped, for the next copies ([`LENS_POOL`])
+    lens_free: Vec<wgpu::Buffer>,
     /// `NFS_GPU_TIME`, read once, and its running (sum ms, frames)
     gpu_time_log: bool,
     gpu_time_acc: (f64, u32),
@@ -599,6 +624,85 @@ pub(crate) struct Core {
     /// submission of the frame being built ([`Self::frame_begin`])
     frames_in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
     last_submit: Option<wgpu::SubmissionIndex>,
+}
+
+/// The frame's recorded work in submit order: the command buffers finished so far (an upscaler's own sits between two of
+/// ours) and the encoder still open, whose copies come from the staging belt. Empty between frames.
+#[derive(Default)]
+pub(crate) struct FrameCmds {
+    done: Vec<wgpu::CommandBuffer>,
+    open: Option<wgpu::CommandEncoder>,
+}
+
+impl FrameCmds {
+    /// The frame's open encoder (a new one when none is open), taken to record into; hand it back with [`Self::park`].
+    pub(crate) fn take(&mut self, device: &wgpu::Device) -> wgpu::CommandEncoder {
+        self.open.take().unwrap_or_else(|| device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }))
+    }
+
+    /// The encoder back, still open: what is recorded next follows what it holds.
+    pub(crate) fn park(&mut self, encoder: wgpu::CommandEncoder) {
+        debug_assert!(self.open.is_none(), "one open encoder a frame");
+        self.open = Some(encoder);
+    }
+
+    /// Close `encoder` (the frame's so far) ahead of a command buffer recorded elsewhere that must run after it.
+    pub(crate) fn close(&mut self, encoder: wgpu::CommandEncoder) {
+        self.done.push(crate::prof::finish(encoder));
+    }
+
+    /// A command buffer recorded elsewhere (FSR, MetalFX), run after what is closed so far.
+    pub(crate) fn push(&mut self, cb: wgpu::CommandBuffer) {
+        self.done.push(cb);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.open.is_none() && self.done.is_empty()
+    }
+}
+
+/// ENHANCEMENTS E34 / E37: an upscaler backend's state, made at its first use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BackendState {
+    /// not tried yet
+    #[default]
+    Untried,
+    Ready,
+    /// it could not be made, or it failed: the switch behaves as off for the rest of the run
+    Unavailable,
+}
+
+/// ENHANCEMENTS E37 / E34 / E39: the upscalers' backends (each built at its first use), their images and the frame's choice
+/// (`encode_with_gamma_inner`).
+#[derive(Default)]
+struct Upscaling {
+    /// ENHANCEMENT E37: the FSR 3.1 backend (built at first use) and its state (unavailable: logged once)
+    fsr: Option<Box<dyn crate::upscale::Upscaler>>,
+    fsr_state: BackendState,
+    /// ENHANCEMENT E34 (temporal levels): the same slot also holds MetalFX's temporal scaler (macOS): which backend `fsr` is, and E34's own
+    /// state (unavailable / failed)
+    fsr_kind: Option<crate::upscale::UpscalerKind>,
+    #[cfg(target_os = "macos")]
+    mfxt_state: BackendState,
+    /// ENHANCEMENT E37: the frame being encoded goes through FSR
+    fsr_active: bool,
+    /// ENHANCEMENT E37: FSR's float output (display size) and the bind group the post chain reads it by
+    fsr_out: Option<crate::gfx::RtImage>,
+    /// ENHANCEMENT E37: `encode_with_gamma_inner` calls so far, and the call number of the last FSR frame (a frame in between
+    /// that was not one - a menu, a loading screen, another view - drops the history)
+    frame_no: u64,
+    fsr_last_frame: u64,
+    /// ENHANCEMENT E34: the upscaler backend (built at first use) and its state (unavailable: logged once)
+    upscaler: Option<Box<dyn crate::upscale::Upscaler>>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    upscale_state: BackendState,
+    /// ENHANCEMENT E34: the frame being encoded goes through the upscaler (set by `encode_with_gamma_inner`)
+    upscale_active: bool,
+    /// ENHANCEMENT E34: the scaler's input / output images and the plain blit that lays its output over the window image
+    upscale_images: Option<crate::upscale::UpscaleImages>,
+    upscale_present: Option<ScaleBlit>,
+    /// ENHANCEMENT E39 (UPSCALE-SOFT): the sharpening after the MetalFX scalers (built at first use)
+    sharpen: Option<crate::sharpen::Sharpen>,
 }
 
 /// At most this many frames are queued to the GPU ahead of the one being built (host pacing, no
@@ -621,6 +725,16 @@ struct LensPending {
 
 /// The copy's row pitch: `COPY_BYTES_PER_ROW_ALIGNMENT`.
 const LENS_ROW: u64 = 256;
+
+/// How many collected lens read-back buffers are kept for the next copies (a frame copies at most two blocks).
+const LENS_POOL: usize = 4;
+
+/// The most lens read-backs left waiting; older ones are dropped (a read-back that never completes does not pile up).
+const LENS_PENDING_MAX: usize = 8;
+
+/// The size-keyed target caches (E1's multisampled targets, the depth targets) hold at most this many sizes before they are
+/// emptied (a window being resized asks for a new size every frame).
+const TARGET_CACHE_SIZES: usize = 6;
 
 /// One deferred vertex write: `len` bytes at `pending_bytes[start..]` into mesh `mesh`'s buffer.
 struct PendingWrite {
@@ -662,6 +776,23 @@ impl DrawState {
 /// PERF (PERF-B): a [`Run`]'s pipeline index carries its set above this bit (0 = `Core::pipelines`, k = `pipeline_vars[k - 1]`)
 const SET_SHIFT: usize = 20;
 
+/// One item's draw as `encode_frame`'s walk ([`Core::bucket_items`]) records it, for every pass of the frame that draws it.
+#[derive(Clone, Copy)]
+struct ItemDraw {
+    /// the pipeline without depth writes (a `FakeSort` item's first draw) and the one it draws with
+    plain: pipelines::PipelineKey,
+    group: pipelines::PipelineKey,
+    /// `LayerFalseSort1` / `2`'s double draw: `plain`, then `group`, never merged into a run
+    twice: bool,
+    /// `material * 2 + point-filtered bind group`
+    material: u32,
+    /// the sky-map pass's section map (the white texture when there is none), and whether there is one
+    sky: u32,
+    sky_on: bool,
+    /// the mesh drawn (ENHANCEMENT ENH-LIVETEX: a refined twin, `Core::shown_mesh`)
+    mesh: u32,
+}
+
 struct Run {
     first: u32,
     count: u32,
@@ -699,17 +830,22 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// ENHANCEMENT E19: how far the fog colour is pulled toward the sun's warm colour straight at the sun (a phase
 /// function normalised to 1 there and 0 from 90 degrees away on); modest, the glow only reads as a glow.
 const FOG_SUN_STRENGTH: f32 = 0.5;
-/// ENHANCEMENT E7, the extended-range (EDR / HDR) output seam — NOT enabled. The surface is the
-/// original's byte surface (`Bgra8Unorm`, `Default` = wgpu's sRGB) and the tone map above writes
-/// display-referred 0...1 values into it. EDR on macOS would be a surface of `Rgba16Float` configured
-/// with `wgpu::SurfaceColorSpace::ExtendedSrgbLinear` (the caps list it per format,
-/// `SurfaceCapabilities::format_capabilities`) and a last pass that writes linear light (the tone
-/// map's output decoded with 2.2, white scaled to the display's headroom) instead of the encoded
-/// value; this function and the `format` choice in `Core::new` are the two places that would select
-/// it, and `cfg(target_os = "macos")` is where it would start.
-fn surface_color_space() -> wgpu::SurfaceColorSpace {
-    wgpu::SurfaceColorSpace::default()
+/// The 8-bit texture format of the game's textures, the projector default and the dummy images (UNORM, not sRGB: the game's
+/// surface is a byte surface).
+const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// A surface format stores blue first (the read-backs swap it into RGBA).
+fn is_bgra(format: wgpu::TextureFormat) -> bool {
+    matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb)
 }
+
+/// ENHANCEMENT E9: a dynamic mesh's bounding sphere (the shadow casters' cull) is the uploaded vertices' grown by this, as its
+/// vertices are rewritten every frame (`write_mesh_vertices`) and move a little around where they started.
+const DYNAMIC_BOUNDS_SLACK: f32 = 1.25;
+
+/// ENHANCEMENT E8: the bits of all six environment faces (`ReflCube::faces_done`).
+const ALL_FACES: u8 = 0x3F;
+
 /// ENHANCEMENT E7: the 3D scene's float target format.
 pub(crate) const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const MAX_OBJECTS: u64 = 8192;
@@ -803,6 +939,8 @@ struct ReflCube {
     /// ENHANCEMENT E49: the eye each face was drawn from, and the newest
     eyes: [glam::Vec3; 6],
     eye: glam::Vec3,
+    /// ENHANCEMENT E16: a face was drawn into the full cube since the probe last projected it (`Core::refl_probe`: once a frame)
+    probe_due: bool,
 }
 
 /// How many uncaptured wgpu errors the handler has seen; ENHANCEMENT: [`Core::apply`] sees the count rise and forces every
@@ -863,6 +1001,41 @@ struct FrameScratch {
     roles: Vec<f32>,
     /// the 2D pass's sprite vertices, built here and copied into the belt (wgpu's mapped views are write-only)
     sprites: Vec<SpriteVertex>,
+    /// the items' draw records ([`ItemDraw`])
+    draws: Vec<ItemDraw>,
+    /// ENHANCEMENT E9 / E15 / E47: the frame's casters ([`Core::frame_casters`])
+    casters: Vec<shadowmap::Caster>,
+}
+
+/// Where a window-sized frame ([`Core::encode_with_gamma`]) goes: `view` of `tex` (`width x height`, the surface's format), the
+/// depth image of that size, whether `tex` may be copied from (`can_copy`: the lens flare's read-back) and the 3-D view's aspect.
+#[derive(Clone, Copy)]
+struct FrameOut<'a> {
+    view: &'a wgpu::TextureView,
+    tex: &'a wgpu::Texture,
+    depth: &'a wgpu::TextureView,
+    can_copy: bool,
+    width: u32,
+    height: u32,
+    aspect: f32,
+}
+
+impl<'a> FrameOut<'a> {
+    /// A frame into `tex` (its own size; the aspect is the image's).
+    fn of(view: &'a wgpu::TextureView, tex: &'a wgpu::Texture, depth: &'a wgpu::TextureView) -> Self {
+        let (width, height) = (tex.width(), tex.height());
+        Self { view, tex, depth, can_copy: true, width, height, aspect: width as f32 / height as f32 }
+    }
+}
+
+/// ENHANCEMENT E1 / E3 / E7 / ENH-TEMPORAL: how [`Core::encode_enhanced`] draws the 3-D image: its sample count, its scale of the
+/// window's size, the float scene's tone-map mode (`None` = 8-bit) and whether it is a temporal main view.
+#[derive(Clone, Copy)]
+struct EnhancedFrame {
+    samples: u32,
+    scale: f32,
+    hdr: Option<u32>,
+    temporal: bool,
 }
 
 /// ENHANCEMENT E1: the multisampled colour / depth a 3D pass draws into (resolved into the pass's
@@ -962,6 +1135,12 @@ mod tests {
             "[[f32;4];crate::RAIN_EDGES]" => 16 * crate::RAIN_EDGES,
             // ENHANCEMENT E49: the faces' eyes
             "[[f32;4];7]" => 16 * 7,
+            // ENHANCEMENT E9 / E51 (SHADOW-REFACTOR): the cascades' uniform
+            "[[[f32;4];4];MAX_CASCADES]" => 64 * super::csm::MAX_CASCADES,
+            "[[f32;4];MAX_CASCADES]" => 16 * super::csm::MAX_CASCADES,
+            "[[f32;4];MAX_COVER*COVER_VEC4S]" => 16 * super::csm::MAX_COVER * 5,
+            "[[f32;4];crate::MAX_CONTACTS]" => 16 * crate::MAX_CONTACTS,
+            "[[f32;4];crate::MAX_CONTACTS/4]" => 16 * (crate::MAX_CONTACTS / 4),
             _ => panic!("Rust type `{t}` unknown to the layout test"),
         }
     }
@@ -972,8 +1151,13 @@ mod tests {
     /// place only and this fails.
     #[test]
     fn wgsl_structs_match_the_rust_uniforms() {
-        let rust_src = include_str!("gpu.rs");
-        let cases: [(&str, &str, usize); 2] = [("Globals", "GlobalsUniform", size_of::<GlobalsUniform>()), ("Object", "ObjectUniform", size_of::<ObjectUniform>())];
+        let gpu_src = include_str!("gpu.rs");
+        // (SHADOW-REFACTOR: and E9's cascades, `Csm` / `CsmUniform`)
+        let cases: [(&str, &str, usize, &str); 3] = [
+            ("Globals", "GlobalsUniform", size_of::<GlobalsUniform>(), gpu_src),
+            ("Object", "ObjectUniform", size_of::<ObjectUniform>(), gpu_src),
+            ("Csm", "CsmUniform", size_of::<super::csm::CsmUniform>(), include_str!("gpu/csm.rs")),
+        ];
         // every .wgsl file under src/ that declares one of the two structs (a new module is picked up by itself)
         let mut files = Vec::new();
         let mut dirs = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
@@ -987,20 +1171,22 @@ mod tests {
                 }
             }
         }
+        // (and the WGSL pieces the Rust side holds: the items' `struct Object`, `classes.rs`)
+        let mut sources: Vec<(String, String)> = files.iter().map(|f| (f.display().to_string(), std::fs::read_to_string(f).unwrap())).collect();
+        sources.push(("classes.rs OBJECT_WGSL".into(), crate::classes::OBJECT_WGSL.into()));
         let mut checked = 0;
-        for (wgsl_name, rust_name, size) in cases {
+        for (wgsl_name, rust_name, size, rust_src) in cases {
             let rust = struct_fields(rust_src, rust_name).expect("the Rust struct");
             assert_eq!(rust.iter().map(|(_, t)| rust_size(t)).sum::<usize>(), size, "{rust_name}: the parsed fields do not add up to size_of (padding?)");
-            for f in &files {
-                let src = std::fs::read_to_string(f).unwrap();
-                let Some(wgsl) = struct_fields(&src, wgsl_name) else { continue };
+            for (name, src) in &sources {
+                let Some(wgsl) = struct_fields(src, wgsl_name) else { continue };
                 checked += 1;
                 let (rn, wn): (Vec<_>, Vec<_>) = (rust.iter().map(|(n, _)| n.as_str()).collect(), wgsl.iter().map(|(n, _)| n.as_str()).collect());
-                assert_eq!(rn, wn, "{}: `struct {wgsl_name}` fields differ from {rust_name}", f.display());
-                assert_eq!(wgsl.iter().map(|(_, t)| wgsl_size(t)).sum::<usize>(), size, "{}: `struct {wgsl_name}` is not {size} bytes ({rust_name})", f.display());
+                assert_eq!(rn, wn, "{name}: `struct {wgsl_name}` fields differ from {rust_name}");
+                assert_eq!(wgsl.iter().map(|(_, t)| wgsl_size(t)).sum::<usize>(), size, "{name}: `struct {wgsl_name}` is not {size} bytes ({rust_name})");
             }
         }
-        assert!(checked >= 3, "expected shader.wgsl's Globals + Object and shadow.wgsl's Object, checked {checked}");
+        assert!(checked >= 3, "expected shader.wgsl's Globals + Csm and classes.rs's Object, checked {checked}");
     }
 
     /// ENHANCEMENT E7: the lens probe's half-float decode (IEEE binary16).

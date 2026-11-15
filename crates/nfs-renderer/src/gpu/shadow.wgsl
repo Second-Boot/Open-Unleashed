@@ -1,26 +1,7 @@
 // ENHANCEMENT E9: the sun's shadow map pass — depth only, one cascade per pass. The vertex stage reads
 // the same object storage buffer as the main pass (`first_instance` names the item); the cut-out
 // variant tests the texture's alpha so foliage and fences cast their silhouette.
-struct Object {
-    model: mat4x4<f32>,
-    env_mix: vec4<f32>,
-    light: vec4<f32>,
-    lit_a: vec4<f32>,
-    lit_d: vec4<f32>,
-    lit_dir: vec4<f32>,
-    shadow_u: vec4<f32>,
-    shadow_v: vec4<f32>,
-    shadow_on: vec4<f32>,
-    sky_u: vec4<f32>,
-    sky_v: vec4<f32>,
-    sky_on: vec4<f32>,
-    refl: vec4<f32>,
-    // the main shader's `soft` / `hdr` (E12 / E11 / E18): not read here, but the array stride must match `ObjectUniform` (SHADOWFIX: without
-    // them `objects[i]` read the item at i * 13 / 15, so a caster took another item's transform and alpha test whenever its index changed)
-    soft: vec4<f32>,
-    hdr: vec4<f32>,
-    mvp: mat4x4<f32>,
-};
+// `struct Object` is the mesh shader's (`classes.rs` `OBJECT_WGSL`, put in front of this file: one array stride, SHADOWFIX)
 @group(0) @binding(0) var<uniform> light_vp: mat4x4<f32>;
 @group(1) @binding(0) var<storage, read> objects: array<Object>;
 @group(2) @binding(0) var t_diffuse: texture_2d<f32>;
@@ -53,6 +34,9 @@ fn vs_main(in: VsIn, @builtin(instance_index) inst: u32) -> VsOut {
     return out;
 }
 
+// a channel's top value in bytes (`shadow_on.w` is in bytes)
+const BYTE: f32 = 255.0;
+
 @fragment
 fn fs_cut(in: VsOut) {
     let o = objects[in.obj];
@@ -60,7 +44,7 @@ fn fs_cut(in: VsOut) {
     // the item's own alpha test where it has one (reference + 1/2 in bytes), else half
     var thr = 0.5;
     if o.shadow_on.w > 0.0 {
-        thr = o.shadow_on.w / 255.0;
+        thr = o.shadow_on.w / BYTE;
     }
     if a < thr {
         discard;

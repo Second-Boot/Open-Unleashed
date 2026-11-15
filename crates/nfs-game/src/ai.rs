@@ -297,7 +297,7 @@ impl AiDriver {
 
     /// Per-track road-width normaliser and speed zones (0x4A2DC0).
     pub fn set_track(&mut self, track: &str, backwards: bool, family: &str) {
-        self.wf_div = crate::zones::width_divisor(track);
+        self.wf_div = crate::zones::width_divisor(TrackId::from_name(track));
         self.track = track.to_ascii_lowercase();
         self.backwards = backwards;
         // `carSpecs[0x140] *= 0x4A2950(family)` (0x49CB16) — the steering factor is per track and
@@ -956,7 +956,7 @@ mod track_family_table_pin {
                     fnv(&mut h, &curve_factor_dir(t, f, back).to_bits().to_le_bytes());
                 }
             }
-            fnv(&mut h, &width_divisor(t).to_bits().to_le_bytes());
+            fnv(&mut h, &width_divisor(crate::track_id::TrackId::from_name(t)).to_bits().to_le_bytes());
             for back in [false, true] {
                 fnv(&mut h, &(zones_for(t, back).len() as u32).to_le_bytes());
                 for s in 0..3000usize {
@@ -964,6 +964,6 @@ mod track_family_table_pin {
                 }
             }
         }
-        assert_eq!(h, 13469399165449465643, "pinned hash of the track / family tables");
+        assert_eq!(h, 15609029976206145371, "pinned hash of the track / family tables (width_divisor for \"castle2\" / \"forestx\" is 12: 0x4A2DC0 compares whole names)");
     }
 }

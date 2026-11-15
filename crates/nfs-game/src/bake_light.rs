@@ -35,7 +35,7 @@
 //! **Elevation** is the fit's (forest 27 degrees; the bins' 80th-percentile luma instead of the median gives 42: the
 //! elevation is the loosest part of the fit, APPROXIMATION).
 //!
-//! Render only: nothing reads it but the renderer's E51 frame (`Scene::car_sun_shadow`), like `decal_sun`'s.
+//! Render only: nothing reads it but the renderer's shadow frame (`ShadowLights::data_sun`, via `crate::data_sun`), like `decal_sun`'s.
 
 use glam::{Vec2, Vec3};
 use nfs_assets::track::TrackGeometry;
@@ -78,19 +78,12 @@ impl BakeFit {
         (self.r2 >= MIN_R2 && self.r2 - self.r2_overhead >= MIN_GAIN).then_some(self.direction)
     }
 
-    /// The light taken for `track`: the accepted one, or on a track of [`WEAK_FIT_TRACKS`] the best fit even below the
-    /// thresholds.
-    pub fn taken(&self, track: &str) -> Option<Vec3> {
-        self.accepted().or_else(|| WEAK_FIT_TRACKS.iter().any(|t| t.eq_ignore_ascii_case(track)).then_some(self.direction))
+    /// The light taken: the accepted one, or with `weak_fit` (a track whose row of [`crate::data_sun::SUNLESS_DAY_TRACKS`] says so:
+    /// a chosen setting, APPROXIMATION) the best fit even below the thresholds.
+    pub fn taken(&self, weak_fit: bool) -> Option<Vec3> {
+        self.accepted().or_else(|| weak_fit.then_some(self.direction))
     }
 }
-
-/// The sunless day tracks whose bake's best fit is used although it is not clearly directional (r2 below [`MIN_R2`], hardly
-/// better than the light overhead): foothills (Pyrénées, 144 / 63 deg, r2 0.49 vs 0.34) and autobahn (-135 / 78 deg, r2 0.48
-/// vs 0.47). The choice (2026-11-14, comparison stills: "as now" / E25's overcast shadows / this sun) so that every day
-/// track has the cars' sun shadow; the light is nearly overhead, so the shadow is short. APPROXIMATION: the direction is
-/// the fit's, not proven by the data.
-pub const WEAK_FIT_TRACKS: [&str; 2] = ["foothills", "autobahn"];
 
 /// The light's travel direction for an azimuth / elevation in degrees.
 pub fn travel(azimuth: f32, elevation: f32) -> Vec3 {

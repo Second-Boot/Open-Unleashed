@@ -121,6 +121,17 @@ pub fn zone_mult_of(track: Option<TrackId>, backwards: bool, slice: usize) -> f3
 }
 
 /// Road-width normaliser `[0x5E6E34]`: 12 by default, 10 on castle, 9 on forest (0x4A2DC0).
+///
+/// **How the original selects it.** The prologue stores 12.0 (`0x41400000`, 0x4A2DE1). The track
+/// is chosen by the per-track `_stricmp` chain on `[0x657444]` (0x5AE3C0 = ASCII case-insensitive,
+/// whole-string compare; `castle` block 0x4A3C67, `forest` block 0x4A4291) — **not** by a prefix and
+/// not by the tier: `castle2` / `forestx` / any other name matches no block and keeps 12. The
+/// other writers are all inside those two blocks, after both direction arms have merged:
+/// castle stores 10.0 (`0x41200000`) at 0x4A3EB2, before the tier test (`cmp esi, 4` / `jl`), so
+/// every tier gets it; forest stores 9.0 (`0x41100000`) in each of its four tier tails
+/// (0x4A4482 tier 5, 0x4A449B tier 4, 0x4A44B4 tier 3, 0x4A44C8 the rest). No other arm writes
+/// it (a scan of the image finds exactly those six stores). Hence the key is [`TrackId`] (exact,
+/// case-insensitive), `None` = a name no block matches.
 /// **Why a slot can read `Zone(0, …)`.** 0x4A2DC0 opens with a reset (0x4A2DE1…0x4A2E02): the ten
 /// multipliers at `0x5E74FC` are `rep stosd`-filled with **1.0** and the twenty range dwords at
 /// `0x5E74AC` are zeroed. A track arm then stores only the slots it uses, so a slot whose `from` is
@@ -130,14 +141,11 @@ pub fn zone_mult_of(track: Option<TrackId>, backwards: bool, slice: usize) -> f3
 /// resolve are `monaco2 back` 0 (`ebx`, xor-zeroed at 0x4A2DF0, with `to` = `eax` = 0x46 set at
 /// 0x4A301E **after** the direction branch), `monaco3 back` **7** (0x4A31A9), `monaco4 back` **5**
 /// (0x4A3446) and `monaco5 back` 0 (never stored).
-pub fn width_divisor(track: &str) -> f32 {
-    let t = track.to_ascii_lowercase();
-    if t.starts_with("castle") {
-        10.0
-    } else if t.starts_with("forest") {
-        9.0
-    } else {
-        12.0
+pub fn width_divisor(track: Option<TrackId>) -> f32 {
+    match track {
+        Some(TrackId::Castle) => 10.0,
+        Some(TrackId::Forest) => 9.0,
+        _ => 12.0,
     }
 }
 
@@ -202,9 +210,20 @@ mod tests {
         assert_eq!(zone_mult("castle", true, 3385), 1.4);
         assert_eq!(zone_mult("castle", true, 3390), 1.0);
         assert_eq!(zone_mult("castle", true, 3380), 1.0);
-        assert_eq!(width_divisor("castle"), 10.0);
-        assert_eq!(width_divisor("forest"), 9.0);
-        assert_eq!(width_divisor("alps"), 12.0);
+        let w = |n: &str| width_divisor(TrackId::from_name(n));
+        assert_eq!(w("castle"), 10.0);
+        assert_eq!(w("Castle"), 10.0);
+        assert_eq!(w("forest"), 9.0);
+        // 0x4A2DC0 compares whole names (_stricmp): a longer name matches no block
+        assert_eq!((w("castle2"), w("forestx"), w("")), (12.0, 12.0, 12.0));
+        for t in TrackId::ALL {
+            let want = match t {
+                TrackId::Castle => 10.0,
+                TrackId::Forest => 9.0,
+                _ => 12.0,
+            };
+            assert_eq!(width_divisor(Some(t)), want, "{t:?}");
+        }
         assert!(zones_for("skidpad", false).is_empty());
     }
 }

@@ -13,7 +13,7 @@
 //! What differs: full-precision reciprocals instead of the approximate ones; zero-range guards; and, for the float scene, the taps
 //! go through the invertible `c / (1 + max(c))` (RCAS's limits assume 0..1; the float scene's highlights go above 1).
 
-use crate::gfx::{self, Fullscreen, RtImage};
+use crate::gfx::{self, Fullscreen, RtImage, Variants};
 use crate::wgsl;
 
 /// The pass's shader.
@@ -31,7 +31,8 @@ pub(crate) fn rcas_con(sharpness: f32) -> f32 {
 pub(crate) struct Sharpen {
     module: wgpu::ShaderModule,
     layout: wgpu::PipelineLayout,
-    pipes: Vec<((wgpu::TextureFormat, bool, u32), wgpu::RenderPipeline)>,
+    /// the pipeline per (target format, float source, `CON`'s bits), built at its first use
+    pipes: Variants<(wgpu::TextureFormat, bool, u32), wgpu::RenderPipeline>,
     image: Option<RtImage>,
 }
 
@@ -40,28 +41,20 @@ impl Sharpen {
     pub(crate) fn new(device: &wgpu::Device, src_layout: &wgpu::BindGroupLayout) -> Self {
         let module = gfx::wgsl_module(device, "sharpen", &source());
         let layout = gfx::pipeline_layout(device, "sharpen", &[src_layout]);
-        Self { module, layout, pipes: Vec::new(), image: None }
+        Self { module, layout, pipes: Variants::default(), image: None }
     }
 
     fn pipe(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, hdr: bool, con: f32) -> &wgpu::RenderPipeline {
-        let key = (format, hdr, con.to_bits());
-        if let Some(i) = self.pipes.iter().position(|(k, _)| *k == key) {
-            return &self.pipes[i].1;
-        }
-        let p = Fullscreen::new("sharpen", &self.layout, &self.module).constants(&[("CON", con as f64), ("HDR", hdr as u32 as f64)]).build(device, &[gfx::target(format, None)]);
-        self.pipes.push((key, p));
-        &self.pipes.last().expect("pipe").1
+        let (layout, module) = (&self.layout, &self.module);
+        self.pipes.get((format, hdr, con.to_bits()), || Fullscreen::new("sharpen", layout, module).constants(&[("CON", con as f64), ("HDR", hdr as u32 as f64)]).build(device, &[gfx::target(format, None)]))
     }
 
     /// Sharpen `src` (a bind group of the sprite layout, an image of `dest`'s size) into `dest` (`format`). `hdr`: the source is the
     /// float scene. One full-screen pass into `encoder`, timed as "sharpen".
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, src: &wgpu::BindGroup, dest: &wgpu::TextureView, format: wgpu::TextureFormat, hdr: bool, sharpness: f32) {
-        let pipe = self.pipe(device, format, hdr, rcas_con(sharpness)).clone();
-        let mut pass = gfx::color_pass(encoder, "sharpen pass", "sharpen", dest, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
-        pass.set_pipeline(&pipe);
-        pass.set_bind_group(0, src, &[]);
-        pass.draw(0..3, 0..1);
+        let pipe = self.pipe(device, format, hdr, rcas_con(sharpness));
+        gfx::fullscreen_pass(encoder, "sharpen pass", "sharpen", dest, wgpu::LoadOp::Clear(wgpu::Color::BLACK), pipe, &[src]);
     }
 
     /// The temporal case: sharpen the float scene `src` into this module's own float image of `size` and return that image (its bind

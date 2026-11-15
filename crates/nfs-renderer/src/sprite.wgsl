@@ -32,10 +32,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 // `ALPHAFUNC` `GREATER`, `ALPHAREF` the sprite's, over the pixel's alpha after the texture stage
 // (`ALPHAOP` `MODULATE`: texture × diffuse). A dropped pixel writes neither colour nor depth. A
 // reference of −1 is the test switched off (Thrash 0x24 ← 0): nothing is dropped.
+// a channel's top value in bytes (the reference is in bytes)
+const BYTE: f32 = 255.0;
+
 @fragment
 fn fs_alpha_test(in: VsOut) -> @location(0) vec4<f32> {
     let c = textureSample(t_sprite, s_sprite, in.uv) * in.color;
-    if round(clamp(c.a, 0.0, 1.0) * 255.0) <= in.alpha_ref {
+    if round(clamp(c.a, 0.0, 1.0) * BYTE) <= in.alpha_ref {
         discard;
     }
     return c;

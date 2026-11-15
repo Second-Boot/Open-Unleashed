@@ -27,7 +27,7 @@
 //! (Tried: the castle-scaled median, 67 degrees on Corsica: the car's shadow then lies almost wholly under the body and, with
 //! E43's contact shadow handing the sun's share to it, the car looked less grounded than with the original's blob.)
 //!
-//! Render only: nothing reads it but the renderer's E51 frame (`Scene::car_sun_shadow`).
+//! Render only: nothing reads it but the renderer's shadow frame (`ShadowLights::data_sun`, via `crate::data_sun`).
 
 use glam::{Mat4, Vec2, Vec3};
 use nfs_assets::track::TrackGeometry;

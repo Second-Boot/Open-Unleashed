@@ -4,56 +4,70 @@
 
 use crate::gfx::{PostCtx, RtImage};
 use super::*;
+use crate::prof::Stage;
+
+/// `NFS_GPU_TIME` (diagnostic): the frames one logged mean is taken over.
+const GPU_TIME_FRAMES: u32 = 30;
 
 impl Core {
     /// [`Self::encode_with_gamma_inner`], timed when `NFS_GPU_TIME=1` (diagnostic, off by default):
-    /// the frame's encode + GPU time, the device waited for after the submit, averaged over 30 frames.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn encode_with_gamma(&mut self, scene: &Scene, camera: &Camera, target: &wgpu::TextureView, target_tex: &wgpu::Texture, can_copy: bool, depth: &wgpu::TextureView, width: u32, height: u32, aspect: f32) {
+    /// the frame's encode + GPU time, the device waited for after the submit, averaged over [`GPU_TIME_FRAMES`] frames.
+    pub(super) fn encode_with_gamma(&mut self, scene: &Scene, camera: &Camera, out: FrameOut) {
+        self.whole_frame(|core| core.encode_with_gamma_inner(scene, camera, out));
+    }
+
+    /// One frame: what the command list recorded ahead of the main view submitted first ([`Self::submit_ahead_of_main`]),
+    /// then `record` (the main view; its post chain is submitted apart, `encode_enhanced`), then the frame's last submit
+    /// ([`Self::submit_frame`]) and the profiler's frame end; timed when `NFS_GPU_TIME=1`.
+    fn whole_frame(&mut self, record: impl FnOnce(&mut Self)) {
         let t0 = self.gpu_time_log.then(std::time::Instant::now);
-        self.encode_with_gamma_inner(scene, camera, target, target_tex, can_copy, depth, width, height, aspect);
+        self.submit_ahead_of_main();
+        self.frame_main = true;
+        record(self);
+        self.frame_main = false;
+        self.submit_frame();
         crate::prof::end_frame(&self.device);
         if let Some(t0) = t0 {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-            self.gpu_time_acc.0 += t0.elapsed().as_secs_f64() * 1000.0;
+            self.gpu_time_acc.0 += crate::prof::elapsed_ms(t0);
             self.gpu_time_acc.1 += 1;
-            if self.gpu_time_acc.1 == 30 {
-                tracing::info!(avg_ms = self.gpu_time_acc.0 / 30.0, enh = %self.enhancements.describe(), "frame encode + gpu time");
+            if self.gpu_time_acc.1 == GPU_TIME_FRAMES {
+                tracing::info!(avg_ms = self.gpu_time_acc.0 / f64::from(GPU_TIME_FRAMES), enh = %self.enhancements.describe(), "frame encode + gpu time");
                 self.gpu_time_acc = (0.0, 0);
             }
         }
     }
 
-    /// Draw a frame into `target` (`width × height`, the surface's format): straight in at gamma
-    /// 1, otherwise into the gamma pass's own image and then through the ramp into `target`.
-    #[allow(clippy::too_many_arguments)]
-    /// `can_copy`: `target_tex` (or the gamma pass's own image) may be copied from — the lens
+    /// Draw a frame into `out.view` (`width × height`, the surface's format): straight in at gamma
+    /// 1, otherwise into the gamma pass's own image and then through the ramp into `out.view`.
+    /// `out.can_copy`: `out.tex` (or the gamma pass's own image) may be copied from — the lens
     /// flare's blocks read the frame **before** the ramp, as `THRASH_readrect` reads the back
     /// buffer and the ramp is the display's.
-    pub(super) fn encode_with_gamma_inner(&mut self, scene: &Scene, camera: &Camera, target: &wgpu::TextureView, target_tex: &wgpu::Texture, can_copy: bool, depth: &wgpu::TextureView, width: u32, height: u32, aspect: f32) {
+    pub(super) fn encode_with_gamma_inner(&mut self, scene: &Scene, camera: &Camera, out: FrameOut) {
+        let FrameOut { view: target, tex: target_tex, can_copy, depth, width, height, aspect } = out;
         // ENHANCEMENT E1 / E3: a multisampled and / or scaled 3D image; with both at level 0 this
         // function is master's below
         // ENHANCEMENT E7: ... and / or drawn into a float image and tone-mapped
         let hdr = self.enh_hdr(scene);
         // ENHANCEMENT ENH-TEMPORAL: the main view of a temporal frame renders at one sample (a temporal upscaler replaces
         // MSAA; E1's level is overridden for this frame, the setting is not changed)
-        self.frame_no += 1;
+        self.up.frame_no += 1;
         // ENHANCEMENT E37: FSR 3.1 (built here at first use) replaces MSAA, E34's scaler, E3's scale and E35's SMAA
         let fsr = self.enh_fsr(scene, hdr.is_some());
-        self.fsr_active = fsr.is_some();
+        self.up.fsr_active = fsr.is_some();
         let temporal = self.temporal_frame(scene, hdr.is_some());
         // ENHANCEMENT E34: the upscaler's internal scale replaces E3's
         let up = if fsr.is_some() { None } else { self.enh_upscale(scene) };
-        self.upscale_active = up.is_some();
+        self.up.upscale_active = up.is_some();
         let (samples, scale) = (if temporal { 1 } else { self.enh_samples(hdr.is_some()) }, fsr.or(up).unwrap_or_else(|| self.enh_scale()));
         // ENHANCEMENT E35: SMAA needs the tone-mapped image of the scaled path (the 3D image, then the blit)
         let smaa = self.enh_smaa(scene) && fsr.is_none();
         if samples > 1 || scale != 1.0 || hdr.is_some() || smaa {
-            self.encode_enhanced(scene, camera, target, target_tex, can_copy, depth, width, height, aspect, samples, scale, hdr, temporal);
+            self.encode_enhanced(scene, camera, out, EnhancedFrame { samples, scale, hdr, temporal });
             return;
         }
         if self.gamma == 1.0 {
-            self.encode_frame(scene, scene.clear_color, true, camera, target, target_tex, can_copy, depth, aspect, VIEW_FAR, None);
+            self.encode_frame(FrameDesc { scene, clear: scene.clear_color, with_sprites: true, camera, view: target, target: target_tex, can_copy, depth, aspect, depth_far: VIEW_FAR, ms: None });
             return;
         }
         let mut pass = match self.gamma_pass.take() {
@@ -61,17 +75,19 @@ impl Core {
             None => GammaPass::new(&self.device, self.config.format),
         };
         let (src_tex, src) = pass.source(&self.device, self.config.format, width, height);
-        self.encode_frame(scene, scene.clear_color, true, camera, &src, &src_tex, true, depth, aspect, VIEW_FAR, None);
-        pass.resolve(&self.device, &self.queue, target, self.gamma);
+        self.encode_frame(FrameDesc { scene, clear: scene.clear_color, with_sprites: true, camera, view: &src, target: &src_tex, can_copy: true, depth, aspect, depth_far: VIEW_FAR, ms: None });
+        let mut encoder = self.frame_cmds.take(&self.device);
+        pass.resolve(&mut self.belt, &mut encoder, target, self.gamma);
+        self.frame_cmds.park(encoder);
         self.gamma_pass = Some(pass);
     }
 
-    /// ENHANCEMENT ENH-TEMPORAL: this frame is a temporal main view — the foundation is on (`NFS_TEMPORAL_DEBUG`, or the flag a
-    /// temporal upscaler raises) and the frame is the race's main view in the float scene (E7 on; the mirror, the environment
+    /// ENHANCEMENT ENH-TEMPORAL: this frame is a temporal main view — the foundation is on (`NFS_TEMPORAL_DEBUG`, or a temporal
+    /// upscaler wants it, `temporal_want`) and the frame is the race's main view in the float scene (E7 on; the mirror, the environment
     /// faces, the front end and the 2D screens are not).
     pub(super) fn temporal_frame(&self, scene: &Scene, hdr: bool) -> bool {
         // ENHANCEMENT E37: FSR 3.1 raises the flag itself while its switch is on (and the backend did not fail)
-        (self.temporal.is_some() || self.temporal_flag || self.temporal_want().is_some()) && hdr && scene.eye && !scene.items.is_empty() && !self.no_reflections
+        (self.temporal.is_some() || self.temporal_want().is_some()) && hdr && scene.eye && !scene.items.is_empty() && !self.no_reflections
     }
 
     /// ENHANCEMENT ENH-TEMPORAL: start a temporal main-view frame of the internal size `size` (the display being `display_width`
@@ -80,7 +96,7 @@ impl Core {
         if self.temporal_gpu.is_none() {
             self.temporal_gpu = Some(crate::temporal::Gpu::new(&self.device, &self.globals_layout, &self.material_layout, &self.sky_layout, &self.object_buf, std::mem::size_of::<ObjectUniform>() as u64, MAX_OBJECTS));
         }
-        let t = self.temporal.get_or_insert_with(|| crate::temporal::Temporal::new(crate::temporal::Config { view: crate::temporal::View::Plain, no_obj: false, no_mv: false, no_id: std::env::var("NFS_TEMPORAL_NOID").is_ok_and(|v| v != "0") }));
+        let t = self.temporal.get_or_insert_with(|| crate::temporal::Temporal::new(crate::temporal::Config { view: crate::temporal::View::Plain, no_obj: false, no_mv: false, no_id: crate::dbg::flags().temporal_noid }));
         let info = t.begin(camera, aspect, mirror, size, display_width);
         if t.targets.as_ref().is_none_or(|x| x.size != size) {
             t.targets = Some(crate::temporal::Targets::new(&self.device, size));
@@ -91,7 +107,7 @@ impl Core {
             reactive: tg.reactive_view.clone(),
             tc: tg.tc_view.clone(),
             // MetalFX temporal (`upscale/metalfx_temporal.rs`) reads the colour, depth, vectors and reactive mask only
-            tc_read: !(self.fsr_active && self.fsr_kind.is_some_and(|k| k != crate::upscale::UpscalerKind::Fsr3)),
+            tc_read: !(self.up.fsr_active && self.up.fsr_kind.is_some_and(|k| k != crate::upscale::UpscalerKind::Fsr3)),
             objects_bg: self.temporal_gpu.as_ref().expect("temporal gpu").objects_bg.clone(),
             jitter_ndc: info.jitter_ndc,
             jitter_px: info.jitter_px,
@@ -148,6 +164,13 @@ impl Core {
         scene.dof
     }
 
+    /// ENHANCEMENTS E10 / E28: the bloom's level and the lens dirt on its last add (the tone map's key), `None` = no bloom
+    /// (`hdr`: the float scene; `dbg_only`: a temporal debug view, no chain).
+    pub(super) fn bloom_key(&self, hdr: bool, dbg_only: bool) -> Option<(u8, bool)> {
+        let level = if hdr && !dbg_only { self.enhancements.level(crate::E10) } else { 0 };
+        (level > 0).then(|| (level, self.enhancements.is_on(crate::E28)))
+    }
+
     /// ENHANCEMENTS E27 / the depth of field (photo mode, E31) / E40 / E10 / E28: which passes of the post chain run this frame (`size`: the chain's;
     /// `hdr`: the float scene; `dbg_only`: a temporal debug view, no chain). The eye adaptation (E21) is the caller's.
     pub(super) fn post_plan(&self, scene: &Scene, camera: &Camera, aspect: f32, hdr: bool, dbg_only: bool, size: (u32, u32)) -> chain::PostPlan {
@@ -160,7 +183,7 @@ impl Core {
             blur: self.enh_blur(scene, hdr).filter(|_| !dbg_only),
             dof: self.enh_dof(scene, hdr).filter(|_| !dbg_only),
             drops,
-            bloom_level: if hdr && !dbg_only { self.enhancements.level(crate::E10) } else { 0 },
+            bloom_level: self.bloom_key(hdr, dbg_only).map_or(0, |b| b.0),
             dirt: self.enhancements.is_on(crate::E28),
             eye: false,
         }
@@ -175,65 +198,65 @@ impl Core {
             return None;
         }
         let (kind, sw) = self.temporal_want()?;
-        if self.fsr_kind != Some(kind) {
+        if self.up.fsr_kind != Some(kind) {
             // the other backend's frame (a level change between FSR and MetalFX): its objects go, the output image is remade
-            self.fsr = None;
-            self.fsr_out = None;
-            self.fsr_kind = None;
+            self.up.fsr = None;
+            self.up.fsr_out = None;
+            self.up.fsr_kind = None;
         }
-        if self.fsr.is_none() {
+        if self.up.fsr.is_none() {
             match crate::upscale::create(kind, &self.device, &self.queue) {
                 Ok(u) => {
                     tracing::info!("upscaler (ENHANCEMENT {}): {}", crate::enhancements::REGISTRY[sw.0 as usize].token, u.name());
-                    self.fsr = Some(u);
-                    self.fsr_kind = Some(kind);
-                    *self.temporal_state_mut(kind) = 1;
+                    self.up.fsr = Some(u);
+                    self.up.fsr_kind = Some(kind);
+                    *self.temporal_state_mut(kind) = BackendState::Ready;
                 }
                 Err(why) => {
                     tracing::warn!("upscaler (ENHANCEMENT {}) unavailable, behaving as off: {why}", crate::enhancements::REGISTRY[sw.0 as usize].token);
-                    *self.temporal_state_mut(kind) = 2;
+                    *self.temporal_state_mut(kind) = BackendState::Unavailable;
                     return None;
                 }
             }
         }
-        if self.fsr_last_frame + 1 != self.frame_no {
+        if self.up.fsr_last_frame + 1 != self.up.frame_no {
             self.fsr_cut();
         }
-        self.fsr_last_frame = self.frame_no;
-        self.fsr.as_ref().map(|u| u.render_scale(self.enhancements.level(sw)))
+        self.up.fsr_last_frame = self.up.frame_no;
+        self.up.fsr.as_ref().map(|u| u.render_scale(self.enhancements.level(sw)))
     }
 
     /// ENHANCEMENT E37 / E34: the temporal upscaler this frame wants - FSR 3.1 (E37), else on macOS MetalFX's temporal scaler (E34 levels
     /// 1..=4; the levels above are the spatial ones) - unless that backend was found unavailable or failed.
     pub(super) fn temporal_want(&self) -> Option<(crate::upscale::UpscalerKind, crate::enhancements::Switch)> {
-        if self.enhancements.is_on(crate::E37) && self.fsr_state != 2 {
+        if self.enhancements.is_on(crate::E37) && self.up.fsr_state != BackendState::Unavailable {
             return Some((crate::upscale::UpscalerKind::Fsr3, crate::E37));
         }
         #[cfg(target_os = "macos")]
-        if (1..=crate::E34_TEMPORAL_LEVELS).contains(&self.enhancements.level(crate::E34)) && self.mfxt_state != 2 {
+        if (1..=crate::E34_TEMPORAL_LEVELS).contains(&self.enhancements.level(crate::E34)) && self.up.mfxt_state != BackendState::Unavailable {
             return Some((crate::upscale::UpscalerKind::MetalFxTemporal, crate::E34));
         }
         None
     }
 
-    pub(super) fn temporal_state_mut(&mut self, kind: crate::upscale::UpscalerKind) -> &mut u8 {
+    pub(super) fn temporal_state_mut(&mut self, kind: crate::upscale::UpscalerKind) -> &mut BackendState {
         match kind {
-            crate::upscale::UpscalerKind::Fsr3 => &mut self.fsr_state,
+            crate::upscale::UpscalerKind::Fsr3 => &mut self.up.fsr_state,
             #[cfg(target_os = "macos")]
-            _ => &mut self.mfxt_state,
+            _ => &mut self.up.mfxt_state,
         }
     }
 
     /// The temporal backend in use failed: it behaves as off from the next frame.
     pub(super) fn temporal_dead(&mut self) {
-        if let Some(kind) = self.fsr_kind {
-            *self.temporal_state_mut(kind) = 2;
+        if let Some(kind) = self.up.fsr_kind {
+            *self.temporal_state_mut(kind) = BackendState::Unavailable;
         }
     }
 
     /// ENHANCEMENT E37: a camera cut: FSR's history and the vectors' previous frame are dropped.
     pub(super) fn fsr_cut(&mut self) {
-        if let Some(f) = self.fsr.as_mut() {
+        if let Some(f) = self.up.fsr.as_mut() {
             f.reset_history();
         }
         if let Some(t) = self.temporal.as_mut() {
@@ -249,20 +272,20 @@ impl Core {
         if self.enhancements.level(crate::E34) <= crate::E34_TEMPORAL_LEVELS || scene.items.is_empty() {
             return None;
         }
-        if self.upscale_state == 0 {
+        if self.up.upscale_state == BackendState::Untried {
             match crate::upscale::create(crate::upscale::UpscalerKind::MetalFx, &self.device, &self.queue) {
                 Ok(u) => {
                     tracing::info!("upscaler (ENHANCEMENT E34): {}", u.name());
-                    self.upscaler = Some(u);
-                    self.upscale_state = 1;
+                    self.up.upscaler = Some(u);
+                    self.up.upscale_state = BackendState::Ready;
                 }
                 Err(why) => {
                     tracing::warn!("upscaler (ENHANCEMENT E34) unavailable, behaving as off: {why}");
-                    self.upscale_state = 2;
+                    self.up.upscale_state = BackendState::Unavailable;
                 }
             }
         }
-        self.upscaler.as_ref().map(|u| u.render_scale(self.enhancements.level(crate::E34)))
+        self.up.upscaler.as_ref().map(|u| u.render_scale(self.enhancements.level(crate::E34)))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -282,7 +305,7 @@ impl Core {
             return None;
         }
         let key = (width, height, samples | if hdr { HDR_KEY as u32 } else { 0 });
-        if self.ms_cache.len() > 6 && !self.ms_cache.contains_key(&key) {
+        if self.ms_cache.len() > TARGET_CACHE_SIZES && !self.ms_cache.contains_key(&key) {
             self.ms_cache.clear();
         }
         let device = &self.device;
@@ -315,8 +338,9 @@ impl Core {
     /// ENHANCEMENT E1 / E3: a frame whose 3D image is multisampled (`samples > 1`) and / or drawn at
     /// `scale` of the window's size and scaled to it. The 2D sprites (HUD, front end) are drawn at the
     /// window's size after the scaled 3D image, 1 sample; the gamma ramp runs last on the whole.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn encode_enhanced(&mut self, scene: &Scene, camera: &Camera, target: &wgpu::TextureView, target_tex: &wgpu::Texture, can_copy: bool, depth: &wgpu::TextureView, width: u32, height: u32, aspect: f32, samples: u32, scale: f32, hdr: Option<u32>, temporal: bool) {
+    pub(super) fn encode_enhanced(&mut self, scene: &Scene, camera: &Camera, out: FrameOut, how: EnhancedFrame) {
+        let FrameOut { view: target, tex: target_tex, can_copy, depth, width, height, aspect } = out;
+        let EnhancedFrame { samples, scale, hdr, temporal } = how;
         let mut pass = None;
         // the window-sized image the frame is composed in: the target itself at gamma 1
         let (dest, dest_tex, dest_copy) = if self.gamma == 1.0 {
@@ -331,11 +355,11 @@ impl Core {
             (v, t, true)
         };
         // ENHANCEMENT E37: FSR 3.1 replaces SMAA (and MSAA, the scale)
-        let fsr_on = self.fsr_active;
+        let fsr_on = self.up.fsr_active;
         let smaa = self.enh_smaa(scene) && !fsr_on;
         if scale == 1.0 && hdr.is_none() && !smaa && !fsr_on {
             let ms = self.ms_targets(width, height, samples, false);
-            self.encode_frame(scene, scene.clear_color, true, camera, &dest, &dest_tex, dest_copy, depth, aspect, VIEW_FAR, ms.as_ref());
+            self.encode_frame(FrameDesc { scene, clear: scene.clear_color, with_sprites: true, camera, view: &dest, target: &dest_tex, can_copy: dest_copy, depth, aspect, depth_far: VIEW_FAR, ms: ms.as_ref() });
         } else {
             let max = self.device.limits().max_texture_dimension_2d;
             let (iw, ih) = (((width as f32 * scale).round() as u32).clamp(1, max), ((height as f32 * scale).round() as u32).clamp(1, max));
@@ -350,13 +374,29 @@ impl Core {
             let dither = hdr.is_some() && self.enhancements.is_on(crate::E19);
             // ENHANCEMENT E33: the tone map also writes the highlight gain map for the EDR present pass
             let edr = hdr.is_some() && self.edr.pass;
+            // ENHANCEMENT E10 (PERF): the tone map adds the bloom's last level (the chain is made here: the tone map takes its group's
+            // layout)
+            let bloom = self.bloom_key(hdr.is_some(), dbg_only);
+            if bloom.is_some() && self.post.bloom.is_none() {
+                self.post.bloom = Some(crate::bloom::BloomPass::new(&self.device, &self.sprite_layout));
+            }
+            let key = ToneKey { hdr, dither, eye, edr, bloom };
             let mut blit = match self.scale_blit.take() {
-                Some(b) if b.hdr == hdr && b.dither == dither && b.eye == eye && b.edr == edr => b,
-                _ => ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, hdr, dither, if eye { self.post.eye.as_ref().map(|e| &e.state_layout) } else { None }, edr),
+                Some(b) if b.key == key => b,
+                _ => {
+                    let eye_layout = if eye { self.post.eye.as_ref().map(|e| &e.state_layout) } else { None };
+                    let bloom_layout = if bloom.is_some() { self.post.bloom.as_ref().map(|b| &b.tone_layout) } else { None };
+                    ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, key, eye_layout, bloom_layout)
+                }
             };
             let (rt_tex, rt_view) = blit.target(&self.device, &self.sprite_layout, &self.sprite_sampler, iw, ih);
-            let depth3 = self.depth_for(iw, ih);
             let ms = self.ms_targets(iw, ih, samples, hdr.is_some());
+            // the single-sample depth of the scaled 3-D image; a multisampled frame draws and reads its samples' depth only
+            // (`FrameTargets::depth`, `chain::depth_src`), so it takes no image of its own
+            let depth3 = match &ms {
+                Some(m) => m.depth.clone(),
+                None => self.depth_for(iw, ih),
+            };
             // ENHANCEMENT E37: the post chain (E27 / the depth of field / E10 / E21 / the tone map) works at this size: the window's with FSR
             // (it runs on FSR's output), the internal one otherwise
             let (pw, ph) = if fsr_on { (width, height) } else { (iw, ih) };
@@ -369,15 +409,21 @@ impl Core {
             // window's pixel (`upscale::mip_bias`); E3's plain scale and the debug TAA keep the materials' own bias
             self.cur_lod_shift = if fsr_on {
                 crate::upscale::mip_bias(iw, width, true)
-            } else if self.upscale_active && self.upscaler.is_some() {
+            } else if self.up.upscale_active && self.up.upscaler.is_some() {
                 crate::upscale::mip_bias(iw, width, false)
             } else {
                 0.0
             };
-            self.encode_frame(scene, scene.clear_color, false, camera, &rt_view, &rt_tex, true, &depth3, aspect, VIEW_FAR, ms.as_ref());
+            self.encode_frame(FrameDesc { scene, clear: scene.clear_color, with_sprites: false, camera, view: &rt_view, target: &rt_tex, can_copy: true, depth: &depth3, aspect, depth_far: VIEW_FAR, ms: ms.as_ref() });
             self.cur_lod_shift = 0.0;
             self.cur_hdr = None;
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scale blit") });
+            // PERF (picture identical): the main view's 3-D image goes to the GPU before its post chain is encoded, so the GPU
+            // draws it while the CPU records the chain (the queue runs the submits in order; RE/notes/RENDER-AUDIT-2026-11-15.md §12)
+            if self.frame_main {
+                self.submit_frame();
+            }
+            // the post chain follows the 3-D image's passes in the frame's encoder
+            let mut encoder = self.frame_cmds.take(&self.device);
             let mut sprites = std::mem::take(&mut self.frame_scratch.sprites);
             let n = self.upload_sprites(&mut encoder, scene, true, aspect, &mut sprites);
             self.frame_scratch.sprites = sprites;
@@ -405,32 +451,36 @@ impl Core {
                 let (view, no_mv) = (tp.cfg.view, tp.cfg.no_mv);
                 if !fsr_on {
                     let pass = tp.pass.get_or_insert_with(|| crate::temporal::Pass::new(&self.device, view, no_mv));
-                    let mut cx = PostCtx { device: &self.device, queue: &self.queue, layout: &self.sprite_layout, sampler: &self.sprite_sampler, encoder: &mut encoder, depth: depth_src, size: (pw, ph), camera, aspect, mirror: scene.mirror };
+                    let mut cx = PostCtx { device: &self.device, queue: &self.queue, layout: &self.sprite_layout, sampler: &self.sprite_sampler, encoder: &mut encoder, belt: &mut self.belt, depth: depth_src, size: (pw, ph), camera, aspect, mirror: scene.mirror };
                     chain.out = pass.run(&mut cx, &t, &rt_tex, &rt_view, &depth3);
                 }
                 // TEST GLUE (`--perf-bench`): the post chain's stage marks (nothing is recorded without the bench)
-                crate::prof::mark(&mut encoder, "temporal pass");
+                crate::prof::mark(&mut encoder, Stage::TemporalPass);
             }
             // ENHANCEMENT E37: FSR 3.1 over the float scene and its vectors / masks, into a float image of the window's size (a
-            // command buffer of its own, submitted before the encoder that carries the post chain); the post chain takes the
-            // result as the scene. A dispatch that fails switches the backend off for good (this frame keeps the stale image)
-            let mut fsr_cb = None;
+            // command buffer of its own, run after the frame's encoder so far - the scene - and before the one that carries the
+            // post chain); the post chain takes the result as the scene. A dispatch that fails switches the backend off for good
+            // (this frame keeps the stale image)
+            let mut fsr_ok = false;
             if fsr_on {
                 let out_size = (width, height);
-                if !self.fsr_out.as_ref().is_some_and(|o| o.size == out_size) {
-                    let up = self.fsr.as_ref().expect("fsr backend");
+                if !self.up.fsr_out.as_ref().is_some_and(|o| o.size == out_size) {
+                    let up = self.up.fsr.as_ref().expect("fsr backend");
                     let img = RtImage::new(&self.device, "fsr output", &self.sprite_layout, &self.sprite_sampler, width, height, up.output_format(), up.output_usage() | wgpu::TextureUsages::TEXTURE_BINDING);
                     crate::upscale::mark_written(&self.device, &self.queue, &img.tex);
-                    self.fsr_out = Some(img);
+                    self.up.fsr_out = Some(img);
                 }
-                let RtImage { tex: out_tex, view: out_view, bg: out_bg, .. } = self.fsr_out.as_ref().expect("fsr output");
-                match (self.temporal_inputs.as_ref(), self.fsr.as_mut()) {
+                let RtImage { tex: out_tex, view: out_view, bg: out_bg, .. } = self.up.fsr_out.as_ref().expect("fsr output");
+                match (self.temporal_inputs.as_ref(), self.up.fsr.as_mut()) {
                     (Some(inp), Some(up)) => {
                         // ENHANCEMENT ENH-UPSCALER: FSR's RCAS strength follows E39 (MetalFX: the RCAS pass below, UPSCALE-SOFT)
                         up.set_sharpness(crate::enhancements::fsr_sharpness(self.enhancements.level(crate::E39)));
                         match up.encode_temporal(&self.device, &self.queue, inp, out_tex) {
                             Some(cb) => {
-                                fsr_cb = Some(cb);
+                                let scene = std::mem::replace(&mut encoder, self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("post chain") }));
+                                self.frame_cmds.close(scene);
+                                self.frame_cmds.push(cb);
+                                fsr_ok = true;
                                 chain.out = Some((out_bg.clone(), out_view.clone()));
                             }
                             None => {
@@ -443,39 +493,43 @@ impl Core {
                 }
                 // ENHANCEMENT E39 (UPSCALE-SOFT): MetalFX's temporal scaler has no sharpening of its own: RCAS over its float output
                 // (window size, before the post chain), at E39's strength. FSR's RCAS is inside the backend
-                let mfx = self.fsr_kind.is_some_and(|k| k != crate::upscale::UpscalerKind::Fsr3);
-                if let (true, Some(_), Some(strength)) = (mfx, fsr_cb.as_ref(), crate::enhancements::fsr_sharpness(self.enhancements.level(crate::E39))) {
-                    let format = self.fsr.as_ref().expect("temporal backend").output_format();
-                    let sh = self.sharpen.get_or_insert_with(|| crate::sharpen::Sharpen::new(&self.device, &self.sprite_layout));
-                    let src = &self.fsr_out.as_ref().expect("temporal output").bg;
+                let mfx = self.up.fsr_kind.is_some_and(|k| k != crate::upscale::UpscalerKind::Fsr3);
+                if let (true, true, Some(strength)) = (mfx, fsr_ok, crate::enhancements::fsr_sharpness(self.enhancements.level(crate::E39))) {
+                    let format = self.up.fsr.as_ref().expect("temporal backend").output_format();
+                    let sh = self.up.sharpen.get_or_insert_with(|| crate::sharpen::Sharpen::new(&self.device, &self.sprite_layout));
+                    let src = &self.up.fsr_out.as_ref().expect("temporal output").bg;
                     chain.out = Some(sh.run_float(&self.device, &mut encoder, &self.sprite_layout, &self.sprite_sampler, src, (width, height), format, strength));
                 }
             }
             // ENHANCEMENTS E27 / the depth of field (photo mode, E31) / E40 / E10 / E21: the post chain over the scene (`chain`), at the chain's size
             let plan = chain::PostPlan { eye, ..self.post_plan(scene, camera, aspect, hdr.is_some(), dbg_only, (pw, ph)) };
             {
-                let mut cx = PostCtx { device: &self.device, queue: &self.queue, layout: &self.sprite_layout, sampler: &self.sprite_sampler, encoder: &mut encoder, depth: depth_src, size: (pw, ph), camera, aspect, mirror: scene.mirror };
+                let mut cx = PostCtx { device: &self.device, queue: &self.queue, layout: &self.sprite_layout, sampler: &self.sprite_sampler, encoder: &mut encoder, belt: &mut self.belt, depth: depth_src, size: (pw, ph), camera, aspect, mirror: scene.mirror };
                 self.post.run(&mut cx, plan, &mut chain, &rt_tex, &rt_view);
             }
-            crate::prof::mark(&mut encoder, "post chain");
+            crate::prof::mark(&mut encoder, Stage::PostChain);
             let (img_bg, _) = chain.current();
             // ENHANCEMENT E33: the tone map's second output, at the size of the image the tone map writes (the internal one with E34)
-            let gain_size = if self.upscale_active && self.upscaler.is_some() { (iw, ih) } else { (width, height) };
+            let gain_size = if self.up.upscale_active && self.up.upscaler.is_some() { (iw, ih) } else { (width, height) };
             let gain_view = if edr { self.edr.gain_view(&self.device, gain_size) } else { None };
             let gain = gain_view.as_ref();
+            // the tone map's groups after the image's: ENHANCEMENT E21's eye, E10's bloom (the chain this frame made)
             let tone_eye = if eye { self.post.eye.as_ref().map(|e| e.tone_group()) } else { None };
-            let mut cbs = Vec::new();
-            // ENHANCEMENT E37: FSR's command buffer runs before the encoder that carries the post chain over its output
-            cbs.extend(fsr_cb);
-            if self.upscale_active && self.upscaler.is_some() {
+            let tone_bloom = if bloom.is_some() { self.post.bloom.as_ref().and_then(|b| b.tone()).map(|t| t.1) } else { None };
+            let tone_groups: Vec<&wgpu::BindGroup> = tone_eye.into_iter().chain(tone_bloom).collect();
+            let tone_eye = &tone_groups[..];
+            // the frame's command buffers in submit order: ENHANCEMENT E37: FSR's runs before the encoder that carries the post
+            // chain over its output; ENHANCEMENT E34: the tone map's encoder and the upscaler's own run before the last
+            let mut sprites_done = false;
+            if self.up.upscale_active && self.up.upscaler.is_some() {
                 // ENHANCEMENT E34: tone map into the internal-size 8-bit image, (E35: SMAA over it at the INTERNAL size),
                 // the upscaler (a command buffer of its own, between the two wgpu encoders), then a plain blit of its
                 // output over the window image
-                let up = self.upscaler.as_mut().expect("upscaler");
-                if !self.upscale_images.as_ref().is_some_and(|i| i.size == (iw, ih, width, height)) {
-                    self.upscale_images = Some(crate::upscale::UpscaleImages::new(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, up.as_ref(), self.config.format, iw, ih, width, height));
+                let up = self.up.upscaler.as_mut().expect("upscaler");
+                if !self.up.upscale_images.as_ref().is_some_and(|i| i.size == (iw, ih, width, height)) {
+                    self.up.upscale_images = Some(crate::upscale::UpscaleImages::new(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, up.as_ref(), self.config.format, iw, ih, width, height));
                 }
-                let imgs = self.upscale_images.as_ref().expect("upscale images");
+                let imgs = self.up.upscale_images.as_ref().expect("upscale images");
                 if smaa {
                     let sm = self.smaa.get_or_insert_with(|| crate::smaa::Smaa::new(&self.device, &self.queue, self.config.format));
                     let ldr = sm.ldr(&self.device, iw, ih);
@@ -484,15 +538,15 @@ impl Core {
                 } else {
                     blit.draw(&mut encoder, &imgs.input_view, tone_eye, img_bg, gain);
                 }
-                crate::prof::mark(&mut encoder, "tone map (+E35 SMAA)");
+                crate::prof::mark(&mut encoder, Stage::ToneMap);
                 let first = std::mem::replace(&mut encoder, self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("upscale present") }));
                 // the upscaler's own command buffer runs between `first` and this encoder: its time is this mark's
-                crate::prof::mark(&mut encoder, "E34 upscaler");
-                cbs.push(crate::prof::finish(first));
+                crate::prof::mark(&mut encoder, Stage::Upscaler);
+                self.frame_cmds.close(first);
                 let scaled = up.encode(&self.device, &imgs.input, &imgs.output);
                 let (present_bg, scaled_ok) = match scaled {
                     Some(cb) => {
-                        cbs.push(cb);
+                        self.frame_cmds.push(cb);
                         (&imgs.output_bg, true)
                     }
                     None => {
@@ -505,42 +559,48 @@ impl Core {
                 // (it takes the place of the present blit, a 1:1 copy); off (E39 = 0) or a failed scale = the plain blit
                 match crate::enhancements::fsr_sharpness(self.enhancements.level(crate::E39)).filter(|_| scaled_ok) {
                     Some(strength) => {
-                        let sh = self.sharpen.get_or_insert_with(|| crate::sharpen::Sharpen::new(&self.device, &self.sprite_layout));
+                        let sh = self.up.sharpen.get_or_insert_with(|| crate::sharpen::Sharpen::new(&self.device, &self.sprite_layout));
                         sh.run(&self.device, &mut encoder, present_bg, &dest, self.config.format, false, strength);
                     }
                     None => {
-                        let present = self.upscale_present.get_or_insert_with(|| ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, None, false, None, false));
-                        present.draw(&mut encoder, &dest, None, Some(present_bg), None);
+                        let present = self.up.upscale_present.get_or_insert_with(|| ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, ToneKey::PLAIN, None, None));
+                        present.draw(&mut encoder, &dest, &[], Some(present_bg), None);
                     }
                 }
-                crate::prof::mark(&mut encoder, "upscale present (+E39 RCAS)");
+                crate::prof::mark(&mut encoder, Stage::UpscalePresent);
             } else if smaa {
                 // ENHANCEMENT E35: the tone map writes the window-sized image SMAA reads; SMAA writes the destination
                 let sm = self.smaa.get_or_insert_with(|| crate::smaa::Smaa::new(&self.device, &self.queue, self.config.format));
                 let ldr = sm.ldr(&self.device, width, height);
                 blit.draw(&mut encoder, &ldr, tone_eye, img_bg, gain);
                 sm.run(&mut encoder, &dest);
-                crate::prof::mark(&mut encoder, "tone map (+E35 SMAA)");
+                crate::prof::mark(&mut encoder, Stage::ToneMap);
+            } else if n > 0 && gain.is_none() && !scene.sprites.iter().take(n).any(|s| s.depth.is_some()) {
+                // PERF (picture identical): the plain path draws the 2D in the tone map's own pass, after its triangle (the
+                // sprite pass would load the image the tone map just stored); only without E33's gain map (two targets, a
+                // copy of the frame between) and with no depth-state sprite (the pass has no depth image)
+                sprites_done = blit.draw_then(&mut encoder, &dest, tone_eye, img_bg, gain, |pass| self.draw_sprites(pass, scene, n, false));
+                crate::prof::mark(&mut encoder, Stage::ToneMap);
             } else {
                 blit.draw(&mut encoder, &dest, tone_eye, img_bg, gain);
-                crate::prof::mark(&mut encoder, "tone map (+E35 SMAA)");
+                crate::prof::mark(&mut encoder, Stage::ToneMap);
             }
             // ENHANCEMENT E33: the native-size frame (after SMAA / the upscale and its blit) before the 2D, to tell the
             // pixels the HUD / sprites touch from the 3D's own
             if gain_view.is_some() {
                 self.edr.copy_pre_2d(&mut encoder, &dest_tex, width, height);
             }
-            self.sprite_pass(&mut encoder, scene, n, &dest, depth);
-            crate::prof::mark(&mut encoder, "sprites");
-            self.belt.finish();
-            crate::prof::resolve(&mut encoder);
-            cbs.push(crate::prof::finish(encoder));
-            self.last_submit = Some(crate::prof::submit(&self.device, &self.queue, cbs));
-            self.belt.recall();
+            if !sprites_done {
+                self.sprite_pass(&mut encoder, scene, n, &dest, depth);
+            }
+            crate::prof::mark(&mut encoder, Stage::Sprites);
+            self.frame_cmds.park(encoder);
             self.scale_blit = Some(blit);
         }
         if let Some(p) = pass {
-            p.resolve(&self.device, &self.queue, target, self.gamma);
+            let mut encoder = self.frame_cmds.take(&self.device);
+            p.resolve(&mut self.belt, &mut encoder, target, self.gamma);
+            self.frame_cmds.park(encoder);
             self.gamma_pass = Some(p);
         }
     }
@@ -548,25 +608,31 @@ impl Core {
     /// ENHANCEMENT E33: one frame through the EDR chain (see `edr.rs`). The frame is encoded exactly as for the 8-bit
     /// surface, into the EDR module's own 8-bit image, with the gamma ramp held back (the present pass applies it
     /// after the 2D, so that the "pixel untouched by the 2D" test compares like with like).
+    /// `size` / `aspect` / `depth`: the window frame's.
     #[cfg(target_os = "macos")]
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn render_edr(&mut self, scene: &Scene, camera: &Camera, surface_view: &wgpu::TextureView, w: u32, h: u32, aspect: f32, depth: &wgpu::TextureView) {
+    pub(super) fn render_edr(&mut self, scene: &Scene, camera: &Camera, surface_view: &wgpu::TextureView, size: (u32, u32), aspect: f32, depth: &wgpu::TextureView) {
+        let (w, h) = size;
         let (tex, view, ..) = self.edr.targets(&self.device, self.config.format, (w, h));
         let gamma = self.gamma;
         self.gamma = 1.0;
         self.edr.pass = true;
         self.edr.gain_used = false;
-        self.encode_with_gamma(scene, camera, &view, &tex, true, depth, w, h, aspect);
-        self.edr.pass = false;
-        self.gamma = gamma;
-        self.edr.present(&self.device, &self.queue, surface_view, gamma);
+        // the present pass follows the frame in its encoder: in its last submit
+        self.whole_frame(|core| {
+            core.encode_with_gamma_inner(scene, camera, FrameOut { view: &view, tex: &tex, depth, can_copy: true, width: w, height: h, aspect });
+            core.edr.pass = false;
+            core.gamma = gamma;
+            let mut encoder = core.frame_cmds.take(&core.device);
+            core.edr.present(&core.device, &mut core.belt, &mut encoder, surface_view, gamma);
+            core.frame_cmds.park(encoder);
+        });
         // diagnostic: `NFS_EDR_PROBE=<prefix>` in a windowed run measures frame 20 (the E34 / E35 paths do not run in a still)
         self.edr_frames += 1;
         if self.edr_frames == 20
             && let Some(prefix) = crate::dbg::flags().edr_probe.as_deref()
         {
             let pre2d = self.edr.pre2d();
-            self.edr_probe_stats(&tex, &pre2d, w, h, gamma, true, prefix);
+            self.edr_probe_stats(&tex, &pre2d, gamma, true, prefix);
         }
     }
 

@@ -26,7 +26,7 @@ pub(crate) struct FeEnh {
     pub refl: f32,
     /// `Scene::ao`
     pub ao: bool,
-    /// `Scene::sun_shadow`, for the room's own car only
+    /// `ShadowLights::sun`, for the room's own car only
     pub shadow: Option<SunShadow>,
 }
 
@@ -131,7 +131,7 @@ impl App {
             let (forward, up) = (Vec3::from(dir), Vec3::from(up));
             let cam = Camera { position: eye, target: eye + forward, up, fov_y_radians: 2.0 * tan.atan(), near: 0.1, far: 200.0 };
             if let Some(r) = self.renderer.as_mut() {
-                r.render_refl_face(&scene, &cam, face, size, scene.clear_color, nfs_renderer::VIEW_FAR);
+                r.render_refl_face(&scene, &cam, nfs_renderer::EnvFace { face, size, clear: scene.clear_color, depth_far: nfs_renderer::VIEW_FAR });
             }
             self.fe.enh_env_done |= 1 << face;
         }

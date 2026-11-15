@@ -58,7 +58,7 @@ pub use haze::{HAZE_LAMPS, Haze, HazeLamp};
 pub use lbeam::{LBeam, LBeams, MAX_LBEAMS};
 pub use shafts::Shafts;
 pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E21, E23, E24, E25, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
-pub use front::Renderer;
+pub use front::{EnvFace, Renderer};
 pub use mipgen::MipAlpha;
 /// ENHANCEMENT E41: the E2 mip chain generator (levels 1.. of a base image), for the HD textures' own chains
 pub use mipgen::chain as mip_chain;
@@ -359,18 +359,11 @@ pub struct DrawItem {
 /// object's own number: the player, an opponent, a traffic / police car), the item's mesh and the count of items of
 /// that mesh before it in `items` (a car's four wheels share one mesh and keep their order). Never 0.
 pub fn assign_motion_ids(items: &mut [DrawItem], group: u32) {
-    let mut seen: Vec<(u32, u32)> = Vec::new();
-    for it in items.iter_mut() {
-        let k = match seen.iter_mut().find(|(m, _)| *m == it.mesh.0) {
-            Some(e) => {
-                e.1 += 1;
-                e.1
-            }
-            None => {
-                seen.push((it.mesh.0, 0));
-                0
-            }
-        };
+    for i in 0..items.len() {
+        let mesh = items[i].mesh.0;
+        // (a car has a few dozen items: counting the earlier ones of the mesh allocates nothing)
+        let k = items[..i].iter().filter(|p| p.mesh.0 == mesh).count() as u32;
+        let it = &mut items[i];
         // FNV-1a over the three numbers
         let mut h = 0x811C_9DC5u32;
         for v in [group, it.mesh.0, k] {
@@ -443,6 +436,12 @@ impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
         Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false, mirrored: false, csm: 0, soft: 0.0, hdr_boost: 1.0, water: false, particle: 0, wet: 0.0, shadow_only: false, motion_id: 0, cover: 0.0, near_env: false }
     }
+
+    /// A car's part: its `R3DLightLayer` has a direction (the shadow maps' "car" caster / receiver; the track's lit items have
+    /// none).
+    pub(crate) fn car_lit(&self) -> bool {
+        self.layer_light.is_some_and(|l| l.direction != [0.0; 3])
+    }
 }
 
 /// Thrash state 0x18's `b` as the offset it makes in the screen z: `b · 2^-15` (0x540500 /
@@ -457,35 +456,7 @@ pub fn depth_bias_offset(b: i32) -> f32 {
     b as f32 / 32768.0
 }
 
-/// The view depth whose screen z is that of `z` with the bias `b` added — what the offset of
-/// [`depth_bias_offset`] amounts to in metres for the view's `near` / `far`:
-/// `sz(z') = sz(z) + b · 2^-15` with `sz(z) = far/(far − near) · (1 − near / z)`, so
-/// `1/z' = 1/z − b · 2^-15 · (far − near) / (far · near)`. `None` where the biased screen z reaches
-/// `far / (far − near)` (no finite depth has it) or falls to 0 or below (in front of the near plane).
-pub fn biased_view_depth(z: f64, b: i32, near: f64, far: f64) -> Option<f64> {
-    let a = far / (far - near);
-    let sz = a * (1.0 - near / z) + b as f64 / 32768.0;
-    if sz <= 0.0 || sz >= a {
-        return None;
-    }
-    Some(near / (1.0 - sz / a))
-}
-
-/// The `+0xC` list's flush, farthest first (`0x466660`'s walk of the tree the original builds with
-/// `0x466A90`, `RE/RENDERING.md` "The view's lists"): each entry keyed by its own `round(d²)` /
-/// `round(v)` (a `fistp`-rounded, unsigned-compared `u32` — `RE/notes/thrash.md` §6d.6, 0x466ad3's
-/// `jbe`/`ja`, never signed), sorted descending, **ties kept in the order they were given here** —
-/// the original's tree inserts an equal key to the right, so it keeps its queueing order
-/// (0x466933 / 0x466AD3, and `Vec::sort_by_key`'s own stability). One list holds every kind's
-/// entries in the original — the track's flag-1 / flag-4 parts, the cars and the skid marks
-/// (`RE/notes/thrash.md` §6d.6) — so the caller merges them into one `Vec` before calling this,
-/// rather than sorting each kind's block on its own.
-pub fn farthest_first(mut items: Vec<(u32, DrawItem)>) -> Vec<DrawItem> {
-    items.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
-    items.into_iter().map(|(_, i)| i).collect()
-}
-
-/// The entries of `items` in the order [`farthest_first`] (`descending`) or an ascending stable sort
+/// The entries of `items` in the order [`farthest_first_into`] (`descending`) or an ascending stable sort
 /// by key gives, as `(key, index)` pairs in `order` (cleared first) — the fat items are not moved.
 /// The index breaks every tie, so equal keys keep the order they were given in, as a stable sort
 /// does (`sort_unstable` on the pairs is therefore the same order); a descending key is sorted as
@@ -496,8 +467,16 @@ pub fn sort_order(items: &[(u32, DrawItem)], descending: bool, order: &mut Vec<(
     order.sort_unstable();
 }
 
-/// [`farthest_first`] without consuming or moving the items: `items` stays as it was, the run is
-/// appended to `out`, and `order` is the scratch the sort uses.
+/// The `+0xC` list's flush, farthest first (`0x466660`'s walk of the tree the original builds with
+/// `0x466A90`, `RE/RENDERING.md` "The view's lists"): each entry keyed by its own `round(d²)` /
+/// `round(v)` (a `fistp`-rounded, unsigned-compared `u32` — `RE/notes/thrash.md` §6d.6, 0x466ad3's
+/// `jbe`/`ja`, never signed), sorted descending, **ties kept in the order they were given here** —
+/// the original's tree inserts an equal key to the right, so it keeps its queueing order
+/// (0x466933 / 0x466AD3, and a stable sort's own stability). One list holds every kind's
+/// entries in the original — the track's flag-1 / flag-4 parts, the cars and the skid marks
+/// (`RE/notes/thrash.md` §6d.6) — so the caller merges them into one list before calling this,
+/// rather than sorting each kind's block on its own. The items are not consumed or moved: `items` stays as it was, the run
+/// is appended to `out`, and `order` is the scratch the sort uses.
 pub fn farthest_first_into(items: &[(u32, DrawItem)], order: &mut Vec<(u32, u32)>, out: &mut Vec<DrawItem>) {
     sort_order(items, true, order);
     out.extend(order.iter().map(|&(_, i)| items[i as usize].1));
@@ -506,6 +485,26 @@ pub fn farthest_first_into(items: &[(u32, DrawItem)], order: &mut Vec<(u32, u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The view depth whose screen z is that of `z` with the bias `b` added — what the offset of
+    /// [`depth_bias_offset`] amounts to in metres for the view's `near` / `far`:
+    /// `sz(z') = sz(z) + b · 2^-15` with `sz(z) = far/(far − near) · (1 − near / z)`, so
+    /// `1/z' = 1/z − b · 2^-15 · (far − near) / (far · near)`. `None` where the biased screen z reaches
+    /// `far / (far − near)` (no finite depth has it) or falls to 0 or below (in front of the near plane).
+    fn biased_view_depth(z: f64, b: i32, near: f64, far: f64) -> Option<f64> {
+        let a = far / (far - near);
+        let sz = a * (1.0 - near / z) + b as f64 / 32768.0;
+        if sz <= 0.0 || sz >= a {
+            return None;
+        }
+        Some(near / (1.0 - sz / a))
+    }
+
+    /// The reference of [`farthest_first_into`]: a stable descending sort by key, consuming the items.
+    fn farthest_first(mut items: Vec<(u32, DrawItem)>) -> Vec<DrawItem> {
+        items.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
+        items.into_iter().map(|(_, i)| i).collect()
+    }
 
     fn item(n: u32) -> DrawItem {
         // `mesh`/`material` carry no data of their own here — only `depth_bias` distinguishes
@@ -737,30 +736,9 @@ pub struct Scene {
     pub sky_fog: Option<Fog>,
     /// The lens flare's frame read-backs for this frame ([`LensProbe`]), if any.
     pub lens_probe: Option<LensProbe>,
-    /// ENHANCEMENT E9: the sun the main race view's shadows come from; `None` (the front end, a
-    /// night track, an offscreen view) draws none. Read only with E9 on.
-    pub sun_shadow: Option<SunShadow>,
-    /// ENHANCEMENT E25: on a track whose sky configuration has no sun disc (the sun is straight overhead, so the cars'
-    /// light travels straight down: autobahn, canyon, foothills, forest) the same shadow pass runs with that vertical
-    /// light, softer and weaker. Read only with E9 and E25 on, and only while `sun_shadow` is `None`. Nothing else
-    /// (fog glow, water, particles, shafts) reads it.
-    pub overcast_shadow: Option<SunShadow>,
-    /// ENHANCEMENT E50: on a night track the moon's light through the same cascades (a faint cold light, soft shadows, a weak cold
-    /// term on the cars). Read only with E9 and E50 on, and only while `sun_shadow` and `overcast_shadow` are `None`. Nothing else
-    /// (fog glow, water, particles, shafts) reads it.
-    pub moon_shadow: Option<SunShadow>,
-    /// ENHANCEMENT E51 (CORSICA-SUN): on a day track whose sky has no sun (the sky's sun object overhead and off; the cars' own
-    /// light straight down) but whose `sh80` tree-shadow decals were drawn along one sun (Corsica, `canyon`): that direction, for
-    /// the cars' own shadow alone - only the cars cast, onto the track (the scenery's shade is already baked / in the decals), and
-    /// the cars' shading is left as it is. Read only with E9 and E51 on, and only while `sun_shadow` (and E25's `overcast_shadow`)
-    /// is `None`. Nothing else (fog glow, water, particles, shafts) reads it.
-    pub car_sun_shadow: Option<SunShadow>,
-    /// ENHANCEMENT E9 / E51 (SUN-FULL): `Some(r)`: `car_sun_shadow` drives E9's FULL frame instead (scenery and cars cast, the
-    /// scenery only up to a bounding radius of `r` m (at most E9's own 60 m limit: a hillside's shade along a sun the bake never
-    /// had would cover whole stretches), E9's baked-dark gate on the track, E51's cars-only layers on top when E51 is on, as on a
-    /// sky-sun track; needs E9 only). The cars still take no shadow on their shading (their light is the original's straight-down
-    /// one, not this direction), and nothing else (fog glow, the cars' sun glint, water) reads it: only the shadow frame changes.
-    pub car_sun_full: Option<f32>,
+    /// ENHANCEMENT E9 / E25 / E50 / E51: the lights this view's shadow cascades may be drawn for (none: the mirror, the environment
+    /// faces, a front-end view without a car). The renderer draws one of them a frame ([`ShadowLights`]).
+    pub shadows: ShadowLights,
     /// ENHANCEMENT E17: the sky the water items reflect and the sun that glints on them (the main race
     /// view and its mirror; `None` = no water reflection, the environment faces and the front end). Read only with E17 on.
     pub water: Option<WaterEnv>,
@@ -928,7 +906,21 @@ pub struct StreetLamp {
     pub color: [f32; 3],
     /// the reach of this lamp, metres
     pub radius: f32,
+    /// MONACO-TUNNEL: the track's baked colour already holds this lamp's light (a tunnel lamp: a luminaire painted into a lit
+    /// tunnel's texture, or a flare lamp in a covered stretch, round 2): where E47 shadows it, the shadow also takes
+    /// [`BAKED_SHADOW`] of the baked colour, not only the lamp's added term
+    pub baked: bool,
 }
+
+/// ENHANCEMENT E47 (MONACO-TUNNEL): how much of a track point's baked colour a [`StreetLamp::baked`] lamp's shadow takes where the lamp
+/// lights it fully (scaled by the lamp's falloff and cone there; the losses of several lamps add, held to [`BAKED_SHADOW_MAX`]). A
+/// tunnel lit by its bake gets E23's lamps at a small share (the bake already is their light), so a shadow that only removed that
+/// share was invisible; the bake's own share of the lamp is what a car standing in its light really blocks. APPROXIMATION (by the
+/// stills, `RE/notes/ENHANCEMENTS.md` E47 MONACO-TUNNEL).
+pub const BAKED_SHADOW: f32 = 0.65;
+/// ENHANCEMENT E47 (MONACO-TUNNEL): the most a point's baked colour loses to the baked lamps' shadows together (`shader.wgsl`
+/// `lamp_light`, emitted by `classes.rs`). APPROXIMATION (as [`BAKED_SHADOW`]).
+pub const BAKED_SHADOW_MAX: f32 = 0.6;
 
 /// The most street lamps a frame lights.
 pub const MAX_LAMPS: usize = 32;
@@ -1002,6 +994,39 @@ pub struct SunCar {
 
 /// ENHANCEMENT E51 (CARSH-FADE): how many keys a [`SunCar`] may have.
 pub const SUN_CAR_KEYS: usize = 256;
+
+/// ENHANCEMENT E51 (CARSH-FADE): the key ranges of [`SunCar::key`] (first key, count): the player, the opponents, the police, the
+/// traffic.
+const SUN_KEYS_PLAYER: u16 = 0;
+const SUN_KEYS_OPPONENTS: (u16, usize) = (1, 63);
+const SUN_KEYS_POLICE: (u16, usize) = (64, 64);
+const SUN_KEYS_TRAFFIC: (u16, usize) = (128, 128);
+
+impl SunCar {
+    fn keyed((first, count): (u16, usize), i: usize, pose: ContactCar) -> Self {
+        Self { key: first + (i % count) as u16, pose }
+    }
+
+    /// The player's car.
+    pub fn player(pose: ContactCar) -> Self {
+        Self { key: SUN_KEYS_PLAYER, pose }
+    }
+
+    /// Opponent `seat` (its index in the race's opponents).
+    pub fn opponent(seat: usize, pose: ContactCar) -> Self {
+        Self::keyed(SUN_KEYS_OPPONENTS, seat, pose)
+    }
+
+    /// Police car `i`.
+    pub fn police(i: usize, pose: ContactCar) -> Self {
+        Self::keyed(SUN_KEYS_POLICE, i, pose)
+    }
+
+    /// Traffic car `i`.
+    pub fn traffic(i: usize, pose: ContactCar) -> Self {
+        Self::keyed(SUN_KEYS_TRAFFIC, i, pose)
+    }
+}
 
 /// ENHANCEMENT E51 (CARSH-FADE): the cars of a frame whose sun share is measured (the nearest to the camera first, at most
 /// [`MAX_CONTACTS`]).
@@ -1082,6 +1107,52 @@ pub struct SunShadow {
     pub focus: Option<ShadowFocus>,
 }
 
+/// ENHANCEMENT E9: the lights a view's sun-shadow cascades can be drawn for, one field per kind. The renderer draws ONE frame of
+/// cascades a frame, for the first kind in this order that is set and whose switch is on (`gpu/csm.rs`, `ShadowMode::pick`): the
+/// sky's sun (E9; or a front-end car's [`SunShadow::focus`]), the overcast light (E25), the data sun (E51 / SUN-FULL), the moon
+/// (E50). Besides the cascades only [`Self::sun`] is read (the fog glow, the particles' and the water's sun).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShadowLights {
+    /// ENHANCEMENT E9: the sun the race's main view (or a front-end car) is lit with; `None` on a night or a sunless track. Read
+    /// only with E9 on.
+    pub sun: Option<SunShadow>,
+    /// ENHANCEMENT E25: on a track whose sky configuration has no sun disc (the sun is straight overhead, so the cars' light
+    /// travels straight down: autobahn, canyon, foothills, forest) the same shadow pass runs with that vertical light, softer and
+    /// weaker. Read only with E9 and E25 on.
+    pub overcast: Option<SunShadow>,
+    /// ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL) / E9 (SUN-FULL): a sunless day track's sun from its data ([`DataSun`]). Read only
+    /// with E9 on, and with E51 on unless it drives E9's full frame.
+    pub data_sun: Option<DataSun>,
+    /// ENHANCEMENT E50: on a night track the moon's light through the same cascades (a faint cold light, soft shadows, a weak cold
+    /// term on the cars). Read only with E9 and E50 on.
+    pub moon: Option<SunShadow>,
+}
+
+impl ShadowLights {
+    /// No shadow light (the `Default`, usable in a `const`).
+    pub const NONE: Self = Self { sun: None, overcast: None, data_sun: None, moon: None };
+
+    /// Whether a frame of these lights can draw the scenery's shadows (any light but the cars-only data sun): the race then adds
+    /// the casters round the camera (`TrackWorld::shadow_casters`). By the lights set, not by the switches.
+    pub fn casts_scenery(&self) -> bool {
+        self.sun.is_some() || self.overcast.is_some() || self.moon.is_some() || self.data_sun.is_some_and(|d| d.scenery_radius.is_some())
+    }
+}
+
+/// ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL) / E9 (SUN-FULL): the sun of a day track whose sky has none (the sky's sun object overhead
+/// and off; the cars' own light straight down) but whose data gives one: its `sh80` tree-shadow decals were drawn along it
+/// (Corsica, `canyon`) or its bake was lit by it (Schwarzwald, `nfs_game::bake_light`). The cars' shading is left as it is (their
+/// light is the original's straight-down one), and nothing but the cascades reads it (not the fog glow, the cars' glint, water).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DataSun {
+    pub light: SunShadow,
+    /// `None`: E51's cars-only frame (only the cars cast, onto the track; the scenery's shade is already baked / in the decals).
+    /// `Some(r)` (SUN-FULL): E9's FULL frame (scenery and cars cast, the scenery only up to a bounding radius of `r` m, held to E9's
+    /// own limit: a hillside's shade along a sun the bake never had would cover whole stretches), E9's baked-dark gate on the
+    /// track, E51's cars-only layers on top when E51 is on, as on a sky-sun track.
+    pub scenery_radius: Option<f32>,
+}
+
 /// ENHANCEMENT ENH-FE3D: a front-end car's shadow volume.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowFocus {
@@ -1121,6 +1192,9 @@ pub struct WaterEnv {
     /// night harbour) instead of the sky colours alone (the sea seen from a road far above it).
     pub use_env_map: bool,
 }
+
+/// The game's 640 × 480 screen the lens flare's probe point is given in ([`LensProbe::x`] / `y`).
+pub(crate) const LENS_SCREEN: [f32; 2] = [640.0, 480.0];
 
 /// The sun's lens flare reads a 4 × 4 block of the frame at the sun's screen point
 /// (`THRASH_readrect`, 0x460525 and 0x4603FF; `RE/notes/lighting.md` §7): once right after the sky
@@ -1200,7 +1274,7 @@ impl Scene {
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, sun_shadow: None, overcast_shadow: None, moon_shadow: None, car_sun_shadow: None, car_sun_full: None, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), sun_cars: SunCars::default(), cover: Default::default(), lbeam: None, near_sky: NearSky::Original }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, shadows: ShadowLights::NONE, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), sun_cars: SunCars::default(), cover: Default::default(), lbeam: None, near_sky: NearSky::Original }
     }
 }
 

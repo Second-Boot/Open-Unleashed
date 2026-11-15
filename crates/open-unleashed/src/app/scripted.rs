@@ -392,6 +392,14 @@ pub(crate) static NO_FOCUS: std::sync::atomic::AtomicBool = std::sync::atomic::A
 /// (the same key path a player's skip takes) so the walk does not sit through the whole movie.
 pub(crate) static PLAY_INTRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// **TEST GLUE** (not in the original) `NFS_REFL_LIVE=<tick>`: from that game tick of a scripted race on, a window frame is drawn
+/// every tick (the environment faces at their cadence, then the main view, [`App::refl_live_frame`]) and `NFS_SHOT_TICKS` stills
+/// show the faces as those frames left them — for judging the reflections' lag in motion. Unset = the scripted run as before.
+fn refl_live_from() -> Option<u64> {
+    static FROM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *FROM.get_or_init(|| std::env::var("NFS_REFL_LIVE").ok().and_then(|v| v.trim().parse().ok()))
+}
+
 /// **TEST GLUE** (not in the original): set by `main` from `--perf-bench <frames>` (0 = off): a `--screenshot` run draws
 /// the still's frame again and again before the still and times it ([`App::run_perf_bench`]).
 pub(crate) static PERF_BENCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -619,10 +627,15 @@ impl App {
                 }
                 continue;
             }
-            if smack_frames && t % 2 == 1 {
+            // **TEST GLUE** `NFS_REFL_LIVE=<tick>`: from that game tick on, a frame every tick (see [`refl_live_from`])
+            let live = refl_live_from().is_some_and(|from| self.tick >= from);
+            if (smack_frames && t % 2 == 1) || live {
                 // the windowed frame's billboard key first, as `RedrawRequested` takes it
                 self.billboard_key_frame();
                 self.rebuild_scene();
+                if live {
+                    self.refl_live_frame();
+                }
                 self.shot_at_tick();
             }
             let phase = t as f32 / ticks as f32;
@@ -925,13 +938,28 @@ impl App {
         event_loop.exit();
     }
 
+    /// **TEST GLUE** `NFS_REFL_LIVE=<tick>`: one window frame of a scripted run — this frame's environment faces of E8 (its
+    /// cadence: the faces lag the car as in a window) and the main view at the still's size into an image of its own (the coat
+    /// prefilter and E16's probe run as the frame runs them), waited for. Every tick from `<tick>` on (about a 64 Hz window),
+    /// so a still of those ticks shows the reflections as they move, not all six faces drawn afresh.
+    fn refl_live_frame(&mut self) {
+        let (w, h, _) = shot_geometry();
+        self.render_reflections();
+        let cam = self.render_camera();
+        if let Some(r) = self.renderer.as_mut() {
+            r.bench_frame(&self.scene, &cam, w, h);
+            r.bench_wait_idle();
+        }
+    }
+
     /// **TEST GLUE** (not in the original) `--perf-bench <frames>`: the still's scene (frozen: no tick runs, the scene is not
     /// rebuilt) drawn as a window frame draws it — the rear-view mirror, the environment face(s) of the frame, the main view
     /// at the still's size (`NFS_SHOT_SIZE`) through the whole enhanced chain into an image of its own, no read-back — first
     /// `frames / 5` (10..=60) warm-up frames, then `frames` back to back with two in flight (`tput_ms`: elapsed per frame, the
     /// frame time of a GPU-bound window), then the warm-up and `frames` again, the device waited for after each. Logs one `PERF`
     /// line (median / p95 of the GPU's busy time from the stage marks, the CPU's encode time, of which `finish` / `submit`,
-    /// and the old `NFS_GPU_TIME` wall time = CPU + the wait) and one `PERFSTAGE` line (each stage's median GPU ms).
+    /// and the old `NFS_GPU_TIME` wall time = CPU + the wait; their p99 after them, and `pace_*`: median / p95 / p99 of the
+    /// throughput phase's frame-to-frame interval, the frame pacing) and one `PERFSTAGE` line (each stage's median GPU ms).
     /// A plain flag of the scripted still, so it runs wherever a `--screenshot` race runs.
     pub(crate) fn run_perf_bench(&mut self, frames: u32) {
         let (w, h, _) = shot_geometry();
@@ -943,11 +971,16 @@ impl App {
         // chain runs them; a GPU-bound frame's real cost is the elapsed time per frame (the warm-up frames run ahead of it)
         let mut inflight = std::collections::VecDeque::new();
         let mut tput_t0 = std::time::Instant::now();
+        // the throughput phase's frame pacing: the time between one frame's hand-over (`bench_frame_pipelined`, which waits
+        // while two are in flight) and the next's, a GPU-bound window's frame-to-frame interval
+        let mut paces = Vec::with_capacity(frames as usize);
+        let mut last = tput_t0;
         for i in 0..warm + frames {
             if i == warm {
                 self.renderer.as_mut().expect("renderer").bench_wait_idle();
                 inflight.clear();
                 tput_t0 = std::time::Instant::now();
+                last = tput_t0;
             }
             self.render_mirror();
             self.render_reflections();
@@ -955,6 +988,11 @@ impl App {
             let r = self.renderer.as_mut().expect("renderer");
             r.bench_frame(&self.scene, &cam, w, h);
             r.bench_frame_pipelined(&mut inflight, 2);
+            if i >= warm {
+                let now = std::time::Instant::now();
+                paces.push(now.duration_since(last).as_secs_f64() * 1000.0);
+                last = now;
+            }
         }
         self.renderer.as_mut().expect("renderer").bench_wait_idle();
         let tput = tput_t0.elapsed().as_secs_f64() * 1000.0 / frames as f64;
@@ -974,21 +1012,28 @@ impl App {
             }
         }
         self.renderer.as_mut().expect("renderer").bench_end();
-        let stat = |mut v: Vec<f64>| -> (f64, f64) {
+        // median, p95, p99 (the frame pacing's tail)
+        let stat3 = |mut v: Vec<f64>| -> (f64, f64, f64) {
             if v.is_empty() {
-                return (0.0, 0.0);
+                return (0.0, 0.0, 0.0);
             }
             v.sort_by(f64::total_cmp);
             let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
-            (at(0.5), at(0.95))
+            (at(0.5), at(0.95), at(0.99))
         };
-        let col = |f: &dyn Fn(&nfs_renderer::BenchSample) -> f64| stat(samples.iter().map(f).collect());
+        let stat = |v: Vec<f64>| -> (f64, f64) {
+            let (m, p95, _) = stat3(v);
+            (m, p95)
+        };
+        let col = |f: &dyn Fn(&nfs_renderer::BenchSample) -> f64| stat3(samples.iter().map(f).collect());
         let gpu = col(&|s| s.gpu_ms.unwrap_or(f64::NAN));
         let (cpu, wall, fin, sub) = (col(&|s| s.cpu_ms), col(&|s| s.wall_ms), col(&|s| s.finish_ms), col(&|s| s.submit_ms));
+        let pace = stat3(paces);
         let gpu_txt = if timestamps { format!("gpu_med={:.3} gpu_p95={:.3}", gpu.0, gpu.1) } else { "gpu_med=- gpu_p95=-".to_string() };
+        let gpu_p99 = if timestamps { format!("{:.3}", gpu.2) } else { "-".to_string() };
         tracing::info!(
-            "PERF size={w}x{h} frames={frames} warmup={warm} tput_ms={tput:.3} {gpu_txt} cpu_med={:.3} cpu_p95={:.3} finish_med={:.3} submit_med={:.3} wall_med={:.3} wall_p95={:.3}",
-            cpu.0, cpu.1, fin.0, sub.0, wall.0, wall.1
+            "PERF size={w}x{h} frames={frames} warmup={warm} tput_ms={tput:.3} {gpu_txt} cpu_med={:.3} cpu_p95={:.3} finish_med={:.3} submit_med={:.3} wall_med={:.3} wall_p95={:.3} gpu_p99={gpu_p99} cpu_p99={:.3} wall_p99={:.3} pace_med={:.3} pace_p95={:.3} pace_p99={:.3}",
+            cpu.0, cpu.1, fin.0, sub.0, wall.0, wall.1, cpu.2, wall.2, pace.0, pace.1, pace.2
         );
         // each stage's median over the frames (a frame without the stage counts 0)
         let mut names: Vec<String> = Vec::new();
@@ -1090,9 +1135,12 @@ impl App {
             }
         }
         // **TEST GLUE**: nor the environment faces of E8 (E49) — the still's paint reflected nothing; all six are drawn from the
-        // car's place now (a scripted run's frames do not keep them up to date)
-        self.refl_done = 0;
-        self.render_reflections();
+        // car's place now (a scripted run's frames do not keep them up to date). With `NFS_REFL_LIVE` they are: the still shows
+        // the faces as the frames left them (this tick's own faces drawn by its frame, [`Self::refl_live_frame`])
+        if !refl_live_from().is_some_and(|from| self.tick >= from) {
+            self.refl_done = 0;
+            self.render_reflections();
+        }
         let (w, h, _) = shot_geometry();
         let cam = self.render_camera(); // ENHANCEMENT E29
         if let Some(r) = self.renderer.as_mut()

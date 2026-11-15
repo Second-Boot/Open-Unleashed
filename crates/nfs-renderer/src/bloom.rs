@@ -10,11 +10,16 @@
 //! last mip added onto the scene with the level's intensity. All of it is plain wgpu / WGSL
 //! (`Rgba16Float` render + blend + filter, which `hdr_ok` already checked for E7).
 //!
-//! The pass runs between the resolved float image and the tone map. The lens-flare probe reads the
+//! PERF (RENDER-AUDIT phase 3, 2026-11-15): that last add is not a pass of its own (a full-size read-modify-write of
+//! the float scene) but part of the tone map ([`TONE_WGSL`]: the same tent and E28 dirt, summed in f32 where the pass stored
+//! the sum in half floats); E21's eye measure, which used to read the scene after the add, adds the chain's first mip itself
+//! ([`TONE_WGSL`]'s `bloom_coarse`).
+//!
+//! The chain runs between the resolved float image and the tone map. The lens-flare probe reads the
 //! image before it (inside `encode_frame`), so the probe is untouched; the rear-view mirror, the HUD
 //! and every 2D screen never see it.
 
-use crate::gfx::{self, Fullscreen, PostCtx, RtImage};
+use crate::gfx::{self, Fullscreen, PostCtx, RtImage, Variants};
 use crate::wgsl;
 use crate::gpu::HDR_FORMAT;
 
@@ -37,34 +42,39 @@ pub(crate) fn params(level: u8) -> Params {
     }
 }
 
+/// The 3x3 tent of `tx` round `uv` (its texel size): the chain's upsample and the last add's.
+const TENT_WGSL: &str = r#"
+fn tent9(tx: texture_2d<f32>, sm: sampler, uv: vec2<f32>) -> vec3<f32> {
+    let px = 1.0 / vec2<f32>(textureDimensions(tx));
+    var r = textureSampleLevel(tx, sm, uv, 0.0).rgb * 4.0;
+    r = r + (textureSampleLevel(tx, sm, uv + vec2<f32>(-px.x, 0.0), 0.0).rgb + textureSampleLevel(tx, sm, uv + vec2<f32>(px.x, 0.0), 0.0).rgb + textureSampleLevel(tx, sm, uv + vec2<f32>(0.0, -px.y), 0.0).rgb + textureSampleLevel(tx, sm, uv + vec2<f32>(0.0, px.y), 0.0).rgb) * 2.0;
+    r = r + textureSampleLevel(tx, sm, uv + vec2<f32>(-px.x, -px.y), 0.0).rgb + textureSampleLevel(tx, sm, uv + vec2<f32>(px.x, -px.y), 0.0).rgb + textureSampleLevel(tx, sm, uv + vec2<f32>(-px.x, px.y), 0.0).rgb + textureSampleLevel(tx, sm, uv + vec2<f32>(px.x, px.y), 0.0).rgb;
+    return r / 16.0;
+}
+"#;
+
 const WGSL: &str = r#"
-// threshold / knee / intensity come in as pipeline constants
+// threshold / knee come in as pipeline constants
 override THRESHOLD: f32 = 1.0;
 override KNEE: f32 = 0.1;
-override INTENSITY: f32 = 1.0;
-// ENHANCEMENT E28: the lens dirt's gain on the bloom's last add
-override DIRT: f32 = 0.0;
-@group(1) @binding(0) var dirt_t: texture_2d<f32>;
-@group(1) @binding(1) var dirt_s: sampler;
-// ... and the wide mip of the chain the dirt scatters
-@group(2) @binding(0) var wide_t: texture_2d<f32>;
-@group(2) @binding(1) var wide_s: sampler;
 @group(0) @binding(0) var t: texture_2d<f32>;
 @group(0) @binding(1) var s: sampler;
 fn tap(uv: vec2<f32>) -> vec3<f32> {
     return textureSampleLevel(t, s, uv, 0.0).rgb;
 }
 fn lum(c: vec3<f32>) -> f32 {
-    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return dot(c, LUMA_709);
 }
-// the soft-knee bright pass (the quadratic knee of Unity's / Bevy's prefilter); also capped so a
-// single hot texel cannot flicker the whole chain
+// the soft-knee bright pass (the quadratic knee of Unity's / Bevy's prefilter); also capped (HOT) so a
+// single hot texel cannot flicker the whole chain; EPS keeps the divisions finite
+const HOT: f32 = 8.0;
+const EPS: f32 = 0.0001;
 fn bright(c0: vec3<f32>) -> vec3<f32> {
-    let c = min(max(c0, vec3<f32>(0.0)), vec3<f32>(8.0));
+    let c = min(max(c0, vec3<f32>(0.0)), vec3<f32>(HOT));
     let l = lum(c);
     var rq = clamp(l - THRESHOLD + KNEE, 0.0, 2.0 * KNEE);
-    rq = rq * rq / (4.0 * KNEE + 0.0001);
-    let w = max(rq, l - THRESHOLD) / max(l, 0.0001);
+    rq = rq * rq / (4.0 * KNEE + EPS);
+    let w = max(rq, l - THRESHOLD) / max(l, EPS);
     return c * max(w, 0.0);
 }
 // the 13 taps of the Call of Duty downsample, `first` = with the bright pass and Karis weights
@@ -102,18 +112,26 @@ fn down13(uv: vec2<f32>, first: bool) -> vec3<f32> {
 }
 // the 3x3 tent, the source being the smaller mip
 @fragment fn fs_up(in: VsOut) -> @location(0) vec4<f32> {
-    let px = 1.0 / vec2<f32>(textureDimensions(t));
-    var r = tap(in.uv) * 4.0;
-    r = r + (tap(in.uv + vec2<f32>(-px.x, 0.0)) + tap(in.uv + vec2<f32>(px.x, 0.0)) + tap(in.uv + vec2<f32>(0.0, -px.y)) + tap(in.uv + vec2<f32>(0.0, px.y))) * 2.0;
-    r = r + tap(in.uv + vec2<f32>(-px.x, -px.y)) + tap(in.uv + vec2<f32>(px.x, -px.y)) + tap(in.uv + vec2<f32>(-px.x, px.y)) + tap(in.uv + vec2<f32>(px.x, px.y));
-    return vec4<f32>(r / 16.0 * INTENSITY, 0.0);
+    return vec4<f32>(tent9(t, s, in.uv), 0.0);
 }
+"#;
+
+/// ENHANCEMENT E10: the bloom's last add as the tone map (and E21's measure) read it: group `BLOOM_GROUP` = the chain's
+/// first mip (0), the sampler (1), E28's lens dirt (2) and the wide mip it scatters (3) ([`BloomPass::tone_layout`]); the
+/// level's intensity and the dirt's gain (0 = no dirt) are the pipeline constants `BLOOM_INTENSITY` / `BLOOM_DIRT`.
+pub(crate) const TONE_WGSL: &str = r#"
+override BLOOM_INTENSITY: f32 = 0.0;
+override BLOOM_DIRT: f32 = 0.0;
+@group(BLOOM_GROUP) @binding(0) var bloom_t: texture_2d<f32>;
+@group(BLOOM_GROUP) @binding(1) var bloom_s: sampler;
+@group(BLOOM_GROUP) @binding(2) var bloom_dirt_t: texture_2d<f32>;
+@group(BLOOM_GROUP) @binding(3) var bloom_wide_t: texture_2d<f32>;
 // ENHANCEMENT E28 (ENH-SUNEDGE): the wide mip (1/16 of the scene) read with a cubic B-spline (four bilinear taps,
 // GPU Gems 2 ch. 20) instead of one bilinear tap. Bilinear over a 16x magnification is piecewise linear: its slope
 // jumps on every texel line, and the dirt multiplies the glow by up to DIRT x INTENSITY (17.5), so round the HDR sun
 // those jumps drew straight vertical / horizontal creases (the texel grid) into the dirt's glow. The B-spline is C2.
 fn wide_bspline(uv: vec2<f32>) -> vec3<f32> {
-    let size = vec2<f32>(textureDimensions(wide_t));
+    let size = vec2<f32>(textureDimensions(bloom_wide_t));
     let p = uv * size - 0.5;
     let i = floor(p);
     let f = p - i;
@@ -128,69 +146,86 @@ fn wide_bspline(uv: vec2<f32>) -> vec3<f32> {
     // the two bilinear sample points per axis (texel centres at +0.5)
     let c0 = (i - 0.5 + w1 / g0) / size;
     let c1 = (i + 1.5 + w3 / g1) / size;
-    let s00 = textureSampleLevel(wide_t, wide_s, vec2<f32>(c0.x, c0.y), 0.0).rgb;
-    let s10 = textureSampleLevel(wide_t, wide_s, vec2<f32>(c1.x, c0.y), 0.0).rgb;
-    let s01 = textureSampleLevel(wide_t, wide_s, vec2<f32>(c0.x, c1.y), 0.0).rgb;
-    let s11 = textureSampleLevel(wide_t, wide_s, vec2<f32>(c1.x, c1.y), 0.0).rgb;
+    let s00 = textureSampleLevel(bloom_wide_t, bloom_s, vec2<f32>(c0.x, c0.y), 0.0).rgb;
+    let s10 = textureSampleLevel(bloom_wide_t, bloom_s, vec2<f32>(c1.x, c0.y), 0.0).rgb;
+    let s01 = textureSampleLevel(bloom_wide_t, bloom_s, vec2<f32>(c0.x, c1.y), 0.0).rgb;
+    let s11 = textureSampleLevel(bloom_wide_t, bloom_s, vec2<f32>(c1.x, c1.y), 0.0).rgb;
     return (s00 * g0.x + s10 * g1.x) * g0.y + (s01 * g0.x + s11 * g1.x) * g1.y;
 }
-// ENHANCEMENT E28: the same last add, plus the dirt lit by the wide glow (the chain's coarse mip): black where
-// nothing is bright, and the farther from a light the weaker
-@fragment fn fs_fin_dirt(in: VsOut) -> @location(0) vec4<f32> {
-    let px = 1.0 / vec2<f32>(textureDimensions(t));
-    var r = tap(in.uv) * 4.0;
-    r = r + (tap(in.uv + vec2<f32>(-px.x, 0.0)) + tap(in.uv + vec2<f32>(px.x, 0.0)) + tap(in.uv + vec2<f32>(0.0, -px.y)) + tap(in.uv + vec2<f32>(0.0, px.y))) * 2.0;
-    r = r + tap(in.uv + vec2<f32>(-px.x, -px.y)) + tap(in.uv + vec2<f32>(px.x, -px.y)) + tap(in.uv + vec2<f32>(-px.x, px.y)) + tap(in.uv + vec2<f32>(px.x, px.y));
-    let d = textureSampleLevel(dirt_t, dirt_s, in.uv, 0.0).r;
-    let wide = wide_bspline(in.uv);
-    return vec4<f32>(r / 16.0 * INTENSITY + wide * (d * DIRT * INTENSITY), 0.0);
+// the last add: the first mip's tent at the level's intensity; ENHANCEMENT E28: plus the dirt lit by the wide glow (the
+// chain's coarse mip): black where nothing is bright, and the farther from a light the weaker
+fn bloom_add(uv: vec2<f32>) -> vec3<f32> {
+    let r = tent9(bloom_t, bloom_s, uv) * BLOOM_INTENSITY;
+    if BLOOM_DIRT == 0.0 {
+        return r;
+    }
+    let d = textureSampleLevel(bloom_dirt_t, bloom_s, uv, 0.0).r;
+    return r + wide_bspline(uv) * (d * BLOOM_DIRT * BLOOM_INTENSITY);
+}
+// ENHANCEMENT E21: the same add as the eye measure's taps read it: one bilinear tap of the first mip and of the wide one
+// (the tent and the B-spline only smooth what a 16 x 16 grid of taps averages anyway)
+fn bloom_coarse(uv: vec2<f32>) -> vec3<f32> {
+    let r = textureSampleLevel(bloom_t, bloom_s, uv, 0.0).rgb * BLOOM_INTENSITY;
+    if BLOOM_DIRT == 0.0 {
+        return r;
+    }
+    let d = textureSampleLevel(bloom_dirt_t, bloom_s, uv, 0.0).r;
+    return r + textureSampleLevel(bloom_wide_t, bloom_s, uv, 0.0).rgb * (d * BLOOM_DIRT * BLOOM_INTENSITY);
 }
 "#;
 
 /// The bloom's shader.
 pub(crate) fn source() -> String {
-    wgsl::compose(&[wgsl::FULLSCREEN_VS_UV, WGSL])
+    wgsl::compose(&[wgsl::FULLSCREEN_VS_UV, wgsl::LUMA_709, TENT_WGSL, WGSL])
 }
 
-pub(crate) struct BloomPass {
-    pub level: u8,
-    /// ENHANCEMENT E28: the last add goes through the lens dirt
-    pub dirt: bool,
+/// ENHANCEMENT E10: the WGSL a pass that adds the bloom's last level needs ([`TONE_WGSL`] and the tent), its group `group`.
+pub(crate) fn tone_source(group: u32) -> String {
+    format!("{TENT_WGSL}{}", TONE_WGSL.replace("BLOOM_GROUP", &group.to_string()))
+}
+
+/// ENHANCEMENT E10 / E28: the pipeline constants of [`TONE_WGSL`] for `level` and the dirt (`dirt`).
+pub(crate) fn tone_constants(level: u8, dirt: bool) -> [(&'static str, f64); 2] {
+    [("BLOOM_INTENSITY", params(level).intensity as f64), ("BLOOM_DIRT", if dirt { crate::camfx::DIRT_GAIN as f64 } else { 0.0 })]
+}
+
+/// The chain's pipelines for one level (its numbers are pipeline constants).
+struct Pipes {
     down_first: wgpu::RenderPipeline,
     down: wgpu::RenderPipeline,
     up: wgpu::RenderPipeline,
-    fin: wgpu::RenderPipeline,
+}
+
+/// The bloom chain: the shader and its layouts (made once), the pipelines per level (built at the first frame of a level and
+/// kept, so a toggle in the menu does not rebuild the module), the mips and the last add's group for the tone map.
+pub(crate) struct BloomPass {
+    module: wgpu::ShaderModule,
+    pl: wgpu::PipelineLayout,
+    /// the group [`TONE_WGSL`] reads: the first mip, the sampler, E28's dirt and the wide mip (the tone map's and E21's
+    /// measure's layouts take it)
+    pub tone_layout: wgpu::BindGroupLayout,
+    pipes: Variants<u8, Pipes>,
     size: (u32, u32),
     mips: Vec<RtImage>,
+    /// the group of [`Self::tone_layout`] over the current mips (and the dirt, when there is one)
+    tone_bg: gfx::Keyed<(wgpu::TextureView, Option<wgpu::TextureView>), wgpu::BindGroup>,
 }
 
 impl BloomPass {
-    pub fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, level: u8, dirt: bool) -> Self {
-        let p = params(level);
+    pub fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Self {
         let module = gfx::wgsl_module(device, "bloom", &source());
         let pl = gfx::pipeline_layout(device, "bloom", &[layout]);
-        // ENHANCEMENT E28: the dirt's texture + sampler is the sprite layout again, as group 1
-        let pl_dirt = gfx::pipeline_layout(device, "bloom dirt", &[layout, layout, layout]);
-        let add = wgpu::BlendState {
-            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+        let tex = |binding| gfx::bgl_tex(binding, wgpu::TextureSampleType::Float { filterable: true }, false);
+        let tone_layout = gfx::bgl(device, "bloom (tone map)", &[tex(0), gfx::bgl_sampler(1, wgpu::SamplerBindingType::Filtering), tex(2), tex(3)]);
+        Self { module, pl, tone_layout, pipes: Variants::default(), size: (0, 0), mips: Vec::new(), tone_bg: gfx::Keyed::default() }
+    }
+
+    fn build(device: &wgpu::Device, module: &wgpu::ShaderModule, pl: &wgpu::PipelineLayout, level: u8) -> Pipes {
+        let p = params(level);
+        let make = |fs: &str, blend: Option<wgpu::BlendState>| {
+            Fullscreen::new(fs, pl, module).fs(fs).constants(&[("THRESHOLD", p.threshold as f64), ("KNEE", p.knee as f64)]).build(device, &[gfx::target(HDR_FORMAT, blend)])
         };
-        let make = |fs: &str, blend: Option<wgpu::BlendState>, intensity: f32| {
-            Fullscreen::new(fs, if fs == "fs_fin_dirt" { &pl_dirt } else { &pl }, &module)
-                .fs(fs)
-                .constants(&[("THRESHOLD", p.threshold as f64), ("KNEE", p.knee as f64), ("INTENSITY", intensity as f64), ("DIRT", crate::camfx::DIRT_GAIN as f64)])
-                .build(device, &[gfx::target(HDR_FORMAT, blend)])
-        };
-        Self {
-            level,
-            dirt,
-            down_first: make("fs_down_first", None, 1.0),
-            down: make("fs_down", None, 1.0),
-            up: make("fs_up", Some(add), 1.0),
-            fin: make(if dirt { "fs_fin_dirt" } else { "fs_up" }, Some(add), p.intensity),
-            size: (0, 0),
-            mips: Vec::new(),
-        }
+        Pipes { down_first: make("fs_down_first", None), down: make("fs_down", None), up: make("fs_up", Some(gfx::blend::ADD_KEEP_ALPHA)) }
     }
 
     fn ensure(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, width: u32, height: u32) {
@@ -201,7 +236,7 @@ impl BloomPass {
         let (mut w, mut h) = ((width / 2).max(1), (height / 2).max(1));
         for _ in 0..MIPS {
             self.mips.push(RtImage::new(device, "bloom mip", layout, sampler, w, h, HDR_FORMAT, gfx::RT_USAGE));
-            if w <= 4 || h <= 4 {
+            if w <= SMALLEST_MIP || h <= SMALLEST_MIP {
                 break;
             }
             w = (w / 2).max(1);
@@ -210,32 +245,49 @@ impl BloomPass {
         self.size = (width, height);
     }
 
-    /// Bloom of `scene` (its bind group `scene_bg`, size `cx.size`) added onto `scene_view`.
-    pub fn encode(&mut self, cx: &mut PostCtx, scene_bg: &wgpu::BindGroup, scene_view: &wgpu::TextureView, dirt_bg: Option<&wgpu::BindGroup>) {
+    /// The chain of `level` (above 0) over `scene` (its bind group `scene_bg`, size `cx.size`), up to the first mip; the last add
+    /// is the tone map's, through [`Self::tone`] (ENHANCEMENT E28: with `dirt`, the lens dirt's view, it scatters the wide mip
+    /// through the dirt).
+    pub fn encode(&mut self, cx: &mut PostCtx, level: u8, scene_bg: &wgpu::BindGroup, dirt: Option<&wgpu::TextureView>) {
         let (width, height) = cx.size;
         self.ensure(cx.device, cx.layout, cx.sampler, width, height);
+        let (device, module, pl) = (cx.device, &self.module, &self.pl);
+        let p = self.pipes.get(level, || Self::build(device, module, pl, level));
         let encoder = &mut *cx.encoder;
-        let run = |encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::RenderPipeline, src: &wgpu::BindGroup, dst: &wgpu::TextureView, load: bool, dirt: Option<(&wgpu::BindGroup, &wgpu::BindGroup)>| {
-            let mut pass = gfx::color_pass(encoder, "bloom", "bloom", dst, gfx::load_or_clear(load));
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, src, &[]);
-            if let Some((d, wide)) = dirt {
-                pass.set_bind_group(1, d, &[]);
-                pass.set_bind_group(2, wide, &[]);
-            }
-            pass.draw(0..3, 0..1);
+        let run = |encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::RenderPipeline, groups: &[&wgpu::BindGroup], dst: &wgpu::TextureView, load: bool| {
+            gfx::fullscreen_pass(encoder, "bloom", "bloom", dst, gfx::load_or_clear(load), pipeline, groups);
         };
         let n = self.mips.len();
-        run(encoder, &self.down_first, scene_bg, &self.mips[0].view, false, None);
+        run(encoder, &p.down_first, &[scene_bg], &self.mips[0].view, false);
         for i in 1..n {
-            run(encoder, &self.down, &self.mips[i - 1].bg, &self.mips[i].view, false, None);
+            run(encoder, &p.down, &[&self.mips[i - 1].bg], &self.mips[i].view, false);
         }
         for i in (1..n).rev() {
-            run(encoder, &self.up, &self.mips[i].bg, &self.mips[i - 1].view, true, None);
+            run(encoder, &p.up, &[&self.mips[i].bg], &self.mips[i - 1].view, true);
         }
-        run(encoder, &self.fin, &self.mips[0].bg, scene_view, true, if self.dirt { dirt_bg.map(|d| (d, &self.mips[WIDE.min(n - 1)].bg)) } else { None });
+        let (first, wide) = (&self.mips[0].view, &self.mips[WIDE.min(n - 1)].view);
+        let (layout, sampler) = (&self.tone_layout, cx.sampler);
+        // without the dirt its two slots hold the first mip (the shader does not read them: `BLOOM_DIRT` is 0)
+        self.tone_bg.get((first.clone(), dirt.cloned()), || {
+            fn view(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+                wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
+            }
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bloom (tone map)"),
+                layout,
+                entries: &[view(0, first), wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) }, view(2, dirt.unwrap_or(first)), view(3, if dirt.is_some() { wide } else { first })],
+            })
+        });
+    }
+
+    /// The group (and its layout) the tone map and E21's measure read the last [`Self::encode`]'s chain through.
+    pub fn tone(&self) -> Option<(&wgpu::BindGroupLayout, &wgpu::BindGroup)> {
+        self.tone_bg.value().map(|bg| (&self.tone_layout, bg))
     }
 }
+
+/// The chain stops at the first mip this small on a side.
+const SMALLEST_MIP: u32 = 4;
 
 /// ENHANCEMENT E28: the mip of the chain (1/16 of the scene) whose glow the lens dirt scatters.
 const WIDE: usize = 3;

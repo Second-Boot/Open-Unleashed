@@ -38,9 +38,9 @@ pub const SHARPNESS: f32 = 0.3;
 pub fn render_scale_of(level: u8) -> f32 {
     match level {
         0 | 1 => 1.0,
-        2 => 1.0 / 1.5,
-        3 => 1.0 / 1.7,
-        _ => 0.5,
+        2 => super::preset_scale(0),
+        3 => super::preset_scale(1),
+        _ => super::preset_scale(2),
     }
 }
 
@@ -107,18 +107,7 @@ impl Fsr3 {
             self.last = None;
         }
         if self.scratch.as_ref().is_none_or(|s| s.render != render) {
-            let make = |label, format| {
-                device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: render[0], height: render[1], depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-            };
+            let make = |label, format| crate::gfx::texture_2d(device, label, render[0], render[1], format, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING);
             self.scratch = Some(Scratch {
                 render,
                 dilated_depth: make("fsr dilated depth", wgpu::TextureFormat::R32Float),
@@ -225,9 +214,7 @@ impl Upscaler for Fsr3 {
 /// A dispatch on tiny images (the library's own smoke test): `Err` with the validation message when the device refuses any part.
 fn probe(device: &wgpu::Device, queue: &wgpu::Queue, ctx: &FsrContext) -> Result<(), String> {
     let (rs, us) = ([64u32, 64], [96u32, 96]);
-    let tex = |label, size: [u32; 2], format, usage| {
-        device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
-    };
+    let tex = |label, size: [u32; 2], format, usage| crate::gfx::texture_2d(device, label, size[0], size[1], format, usage);
     let sampled = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
     let storage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
     let info = FsrDispatchInfo {

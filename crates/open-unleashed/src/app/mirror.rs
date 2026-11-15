@@ -2,6 +2,14 @@
 
 use crate::*;
 
+/// The mirror tray's size in the 640 × 480 layout (pixels at HiDPI scale 1): the view's viewport (0x4691D0).
+pub(crate) const MIRROR_TRAY: (f32, f32) = (240.0, 84.0);
+/// The mirror view's far plane (0x4691D0): its projection, its depth bias, the camera's clip.
+pub(crate) const MIRROR_FAR: f32 = 65000.0;
+/// The mirror pass's walk distance `+0x124` = `max([0x6197CC] / 3, 50)` (`[0x5B2680]`, `[0x5B251C]`, 0x468D3B…0x468D82).
+const MIRROR_DRAW_DIV: f32 = 3.0;
+const MIRROR_DRAW_MIN: f32 = 50.0;
+
 impl App {
     /// The slice the mirror's sky pass saves into `[sky+0x50]` (0x45D587 → 0x481400 from the
     /// mirror's eye, the search starting at the slice the main pass saved) — what its fog
@@ -49,9 +57,19 @@ impl App {
     }
 
     fn render_mirror_pass(&mut self, cam: Camera) {
+        // the frame's options as the main pass read them (`RenderOptions`)
+        let opts = self.dyn_pose.map_or_else(|| crate::app::render_scene::RenderOptions::read(self), |p| p.opts);
         // the tray's 240 × 84 **pixels** (constant, the port's HiDPI mapping), times the HiDPI scale
         let k = self.hud_geometry().2;
-        let (w, h) = ((240.0 * k).round() as u32, (84.0 * k).round() as u32);
+        let (w, h) = ((MIRROR_TRAY.0 * k).round() as u32, (MIRROR_TRAY.1 * k).round() as u32);
+        // the pass's frustum (its walk's and its cars'): the eye and axes the rear build gives, the tray's aspect
+        let view = {
+            let forward = (cam.target - cam.position).normalize_or_zero();
+            let right = forward.cross(cam.up).normalize_or_zero();
+            let up = right.cross(forward).normalize_or_zero();
+            let tan_v = (cam.fov_y_radians * 0.5).tan();
+            nfs_game::world::CullView { eye: cam.position, forward, right, up, tan_h: tan_v * (MIRROR_TRAY.0 / MIRROR_TRAY.1), tan_v, near: cam.near, draw: (self.draw_distance / MIRROR_DRAW_DIV).max(MIRROR_DRAW_MIN), reach: 1.0 }
+        };
         // the cars' and skid marks' entries for the mirror's own eye: the same draw 0x4430A0 in its
         // pass (`dyn_items`) — the camera's own car is not queued, the others are culled and picked
         // by the mirror's view, their shadows and skid marks pulled toward its eye with its far 65000
@@ -59,13 +77,9 @@ impl App {
         mirror_dyn.clear();
         match self.dyn_pose {
             Some(pose) if self.vehicle.is_some() => {
-                let forward = (cam.target - cam.position).normalize_or_zero();
-                let right = forward.cross(cam.up).normalize_or_zero();
-                let tan_v = (cam.fov_y_radians * 0.5).tan();
-                let cull = nfs_game::world::CullView { eye: cam.position, forward, right, up: right.cross(forward).normalize_or_zero(), tan_h: tan_v * (240.0 / 84.0), tan_v, near: cam.near, draw: (self.draw_distance / 3.0).max(50.0), reach: 1.0 };
                 let render_w = self.renderer.as_ref().map_or(640.0, |r| r.size().0.max(1) as f32);
-                let p = DynPose { mirror_pass: true, cull: Some(cull), lod: (w.max(1) as f32, h.max(1) as f32), ref_width: render_w, ..pose };
-                let (saved_cam, saved_far) = (std::mem::replace(&mut self.camera, cam), std::mem::replace(&mut self.view_far, 65000.0));
+                let p = DynPose { pass: PassKind::Mirror, cull: Some(view), lod: (w.max(1) as f32, h.max(1) as f32), ref_width: render_w, ..pose };
+                let (saved_cam, saved_far) = (std::mem::replace(&mut self.camera, cam), std::mem::replace(&mut self.view_far, MIRROR_FAR));
                 let mut pools = self.pool_used;
                 self.dyn_items(&p, &mut pools, &mut mirror_dyn);
                 (self.camera, self.view_far) = (saved_cam, saved_far);
@@ -80,11 +94,7 @@ impl App {
         // `+0x10` the article's `d²` from the *mirror's* eye) and the particle draws 0x455260 /
         // 0x43F6E0 with the mirror's eye, axes and far 65000 (`Self::effect_items`)
         let mirror_fx = if self.world.is_some() {
-            let forward = (cam.target - cam.position).normalize_or_zero();
-            let right = forward.cross(cam.up).normalize_or_zero();
-            let up = right.cross(forward).normalize_or_zero();
-            let tan_v = (cam.fov_y_radians * 0.5).tan();
-            let view = nfs_game::world::CullView { eye: cam.position, forward, right, up, tan_h: tan_v * (240.0 / 84.0), tan_v, near: cam.near, draw: (self.draw_distance / 3.0).max(50.0), reach: 1.0 };
+            let (forward, right, up) = (view.forward, view.right, view.up);
             // the mirror's walk is 0x488CC0's next count (0x47FB49): the eighth re-registers
             self.walk_calls = self.walk_calls.wrapping_add(1);
             if self.walk_calls & 7 == 0
@@ -100,7 +110,7 @@ impl App {
             if let (Some(w), Some(p)) = (self.world.as_ref(), self.track_particles.as_mut()) {
                 p.draw(self.draw_distance, |e| w.effect_run(&draws, e.article, e.part, 3));
             }
-            let (saved_cam, saved_far) = (std::mem::replace(&mut self.camera, cam), std::mem::replace(&mut self.view_far, 65000.0));
+            let (saved_cam, saved_far) = (std::mem::replace(&mut self.camera, cam), std::mem::replace(&mut self.view_far, MIRROR_FAR));
             let mut effects = std::mem::take(&mut self.scratch.effects);
             self.effect_items(forward, right, up, &draws, false, &mut effects);
             (self.camera, self.view_far) = (saved_cam, saved_far);
@@ -111,7 +121,7 @@ impl App {
         // the mirror's sky pass: its own eye and heading for the ring, and the sun between the two level
         // runs (0x45D6F6) through the mirror's view (`sun_items`). Its range lies before the track's.
         // (`[0x657DB4]` SKYOFF skips it, 0x468AF9, as in the main view)
-        let sky_items: Option<Vec<nfs_renderer::DrawItem>> = self.sky.as_ref().filter(|_| !self.sky_off()).map(|s| {
+        let sky_items: Option<Vec<nfs_renderer::DrawItem>> = self.sky.as_ref().filter(|_| !opts.sky_off).map(|s| {
             let forward = (cam.target - cam.position).normalize_or_zero();
             let view = nfs_game::sky::SkyView { eye: cam.position, forward, up: cam.up, main: false };
             let sun = self.sun_items(&cam, w.max(1) as f32 / h.max(1) as f32, SUN_VIEW_MIRROR);
@@ -202,7 +212,7 @@ impl App {
         let mirror_slice = self.mirror_slice(cam.position);
         let mut clear = [0x77 as f64 / 255.0, 0xBB as f64 / 255.0, 1.0, 1.0];
         if let Some(bin) = self.track.sky_bin.as_ref() {
-            if let Some(c) = bin.background_at(self.sky_level(), 1, main_slice, lap) {
+            if let Some(c) = bin.background_at(opts.sky_level, 1, main_slice, lap) {
                 clear = [c[0] as f64, c[1] as f64, c[2] as f64, 1.0];
             }
             let fog = |sky: bool| bin.fog_at(sky, mirror_slice, lap).filter(|_| self.ini.fog).map(|(colour, density)| nfs_renderer::Fog { colour, density });
@@ -214,7 +224,7 @@ impl App {
             // or sky-map pass on the cars in it. Its own far plane, 65000 (0x4691D0), scales its
             // depth bias and is the camera's clip
             r.set_mirror_view(true);
-            self.mirror_tex = Some(r.render_offscreen(&scene, &cam, nfs_renderer::OffscreenSpec { width: w, height: h, reuse: self.mirror_tex, clear_colour: Some(sky), depth_far: Some(65000.0) }));
+            self.mirror_tex = Some(r.render_offscreen(&scene, &cam, nfs_renderer::OffscreenSpec { width: w, height: h, reuse: self.mirror_tex, clear_colour: Some(sky), depth_far: Some(MIRROR_FAR) }));
             r.set_mirror_view(false);
         }
         self.scratch.mirror_items = scene.items;

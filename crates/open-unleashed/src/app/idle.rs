@@ -44,6 +44,11 @@ fn same_sprite(a: &Sprite, b: &Sprite) -> bool {
         && *depth == b.depth
 }
 
+/// ENHANCEMENT E22 «auto»: the cap on the battery (frames a second).
+const BATTERY_FPS: f64 = 60.0;
+/// ENHANCEMENT E6 «immediate»: the front end's cap without a vsync (frames a second).
+const IMMEDIATE_FE_FPS: f64 = 120.0;
+
 impl App {
     /// The frame cap in frames a second, `None` = uncapped. In priority order: `NFS_FPS_CAP=<n>`
     /// (the port's own switch, D4: tests rely on it); ENHANCEMENT E22 (the menu row «ограничение
@@ -55,22 +60,21 @@ impl App {
         }
         // ENHANCEMENT E22: the menu's cap. "Display" with the display's own sync on (E6 off) is the
         // sync itself: capping at exactly the refresh rate would only add a beat against it.
+        use nfs_renderer::Enhancements as Lvl;
+        let own_sync = self.enh.level(nfs_renderer::E6) != 0;
         match self.enh.level(nfs_renderer::E22) {
-            1 => return Some(30.0),
-            2 => return Some(60.0),
-            3 => return Some(120.0),
-            4 => return Some(240.0),
-            5 if self.enh.level(nfs_renderer::E6) != 0 => return Some(self.display_refresh_hz()),
+            l @ 1..=4 => return Some(Lvl::E22_FPS[l as usize - 1]),
+            Lvl::E22_DISPLAY if own_sync => return Some(self.display_refresh_hz()),
             // ENHANCEMENT E22 «auto»: on the battery 60 frames a second (the GPU is what heats the machine), on mains
             // power as «display»
-            6 if self.on_battery() => return Some(60.0),
-            6 if self.enh.level(nfs_renderer::E6) != 0 => return Some(self.display_refresh_hz()),
+            Lvl::E22_AUTO if self.on_battery() => return Some(BATTERY_FPS),
+            Lvl::E22_AUTO if own_sync => return Some(self.display_refresh_hz()),
             _ => {}
         }
         // ENHANCEMENT E6 (immediate): without a vsync the present does not pace the loop, so the
         // front end (a 640x480 menu) would spin a core at full speed on every animated screen;
         // hold it to 120 frames a second. The race stays uncapped (that is the point of the level).
-        (self.enh.level(nfs_renderer::E6) == 2 && self.race.is_none() && self.vehicle.is_none()).then_some(120.0)
+        (self.enh.level(nfs_renderer::E6) == Lvl::E6_IMMEDIATE && self.race.is_none() && self.vehicle.is_none()).then_some(IMMEDIATE_FE_FPS)
     }
 
     /// ENHANCEMENT E22 «auto»: whether the machine runs on its battery, asked of the OS every five seconds (a
@@ -187,7 +191,7 @@ impl App {
         let (w, h, s) = self.hud_geometry();
         // the front end has no `SPECIALFX` level: no mip promotion, the fake-sort mode of level `None`
         let target = (w, h, s.to_bits(), false, self.fakesort_mode(None));
-        let Scene { items: _, sprites, clear_color, sun_direction, ambient, mirror, headlight, headlight_decal, headlight_gain: _, beacon, fog, sky_fog, lens_probe: _, refl: _, sun_shadow: _, overcast_shadow: _, moon_shadow: _, car_sun_shadow: _, car_sun_full: _, spots: _, lamps: _, shafts: _, water: _, ao: _, eye: _, motion: _, rain: _, dof: _, haze: _, drops: _, contacts: _, sun_cars: _, cover: _, lbeam: _, near_sky: _ } = &self.scene;
+        let Scene { items: _, sprites, clear_color, sun_direction, ambient, mirror, headlight, headlight_decal, headlight_gain: _, beacon, fog, sky_fog, lens_probe: _, refl: _, shadows: _, spots: _, lamps: _, shafts: _, water: _, ao: _, eye: _, motion: _, rain: _, dof: _, haze: _, drops: _, contacts: _, sun_cars: _, cover: _, lbeam: _, near_sky: _ } = &self.scene;
         let plain = !mirror && headlight.is_none() && !headlight_decal && beacon.is_none();
         if plain
             && let Some(p) = &self.presented

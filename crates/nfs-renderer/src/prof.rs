@@ -16,6 +16,14 @@ use std::sync::{Mutex, OnceLock};
 
 const MAX_PASSES: u32 = 512;
 
+/// Nanoseconds a millisecond.
+const NS_PER_MS: f64 = 1.0e6;
+
+/// The milliseconds since `t0`.
+pub(crate) fn elapsed_ms(t0: std::time::Instant) -> f64 {
+    t0.elapsed().as_secs_f64() * 1000.0
+}
+
 struct Prof {
     qs: &'static wgpu::QuerySet,
     resolve: wgpu::Buffer,
@@ -35,6 +43,8 @@ struct State {
     resolved: u32,
     frames: u32,
     acc: BTreeMap<String, (f64, u32)>,
+    /// the submits of the frames in `acc` ([`SUBMITS`])
+    submits: u32,
     /// live mode: a read-back of `pending.len()` passes is mapped (or being mapped); no pass is timed meanwhile
     pending: Vec<String>,
 }
@@ -46,6 +56,8 @@ static PROF: OnceLock<Prof> = OnceLock::new();
 static LIVE: AtomicBool = AtomicBool::new(false);
 static DRAWS: AtomicU32 = AtomicU32::new(0);
 static TRIS: AtomicU64 = AtomicU64::new(0);
+/// Every `Queue::submit` that carries the frames' command buffers ([`submit`]), for the profile's "submits per frame" line.
+static SUBMITS: AtomicU32 = AtomicU32::new(0);
 
 /// What the panel shows of the renderer: the last frame's draw calls and triangles submitted, and the last GPU timing read back.
 #[derive(Debug, Clone, Default)]
@@ -96,12 +108,12 @@ pub(crate) fn count_draw(tris: u64) {
 
 /// `NFS_GPU_PROFILE=minimal`: a device with no optional feature.
 pub(crate) fn minimal() -> bool {
-    std::env::var("NFS_GPU_PROFILE").is_ok_and(|v| v.eq_ignore_ascii_case("minimal"))
+    crate::dbg::flags().gpu_profile.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("minimal"))
 }
 
 /// Whether the feature is to be requested at device creation: only with the env var set to something but `minimal` / `0`.
 pub(crate) fn wanted() -> bool {
-    std::env::var("NFS_GPU_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("minimal"))
+    crate::dbg::flags().gpu_profile.as_deref().is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("minimal"))
 }
 
 /// Whether the adapter's timestamp queries are to be requested at device creation: the profiler wants them, or the race panel may
@@ -195,6 +207,7 @@ pub(crate) fn end_frame(device: &wgpu::Device) {
         end_frame_live(device, p, &mut s);
         return;
     }
+    s.submits += SUBMITS.swap(0, Relaxed);
     let n = s.resolved;
     if n == 0 {
         return;
@@ -211,7 +224,7 @@ pub(crate) fn end_frame(device: &wgpu::Device) {
     let mut total = 0.0;
     for (i, l) in labels.iter().take(n as usize).enumerate() {
         let (b, e) = (data[i * 2], data[i * 2 + 1]);
-        let ms = if e > b { (e - b) as f64 * p.period_ns / 1.0e6 } else { 0.0 };
+        let ms = if e > b { (e - b) as f64 * p.period_ns / NS_PER_MS } else { 0.0 };
         total += ms;
         let a = s.acc.entry(l.clone()).or_default();
         a.0 += ms;
@@ -226,6 +239,8 @@ pub(crate) fn end_frame(device: &wgpu::Device) {
         for (l, (ms, runs)) in &s.acc {
             line.push_str(&format!("\n  {:<40} {:7.3} ms/frame  x{:.2}", l, ms / f, *runs as f64 / f));
         }
+        line.push_str(&format!("\n  queue submits per frame: {:.2}", s.submits as f64 / f));
+        s.submits = 0;
         tracing::info!("GPU profile, mean of {} frames:{}", s.frames, line);
         s.acc.clear();
         s.frames = 0;
@@ -247,7 +262,7 @@ fn end_frame_live(device: &wgpu::Device, p: &Prof, s: &mut State) {
             let mut total = 0.0;
             for (i, l) in labels.iter().enumerate() {
                 let (b, e) = (data[i * 2], data[i * 2 + 1]);
-                let ms = if e > b { (e - b) as f64 * p.period_ns / 1.0e6 } else { 0.0 };
+                let ms = if e > b { (e - b) as f64 * p.period_ns / NS_PER_MS } else { 0.0 };
                 total += ms;
                 *passes.entry(l.clone()).or_default() += ms;
             }
@@ -389,9 +404,65 @@ fn mark_raw(encoder: &mut wgpu::CommandEncoder, label: &'static str, ctx: &'stat
     Some(i)
 }
 
-/// A stage mark: the GPU work recorded since the mark before it is `label`'s (in the context [`ctx`] set, e.g. the mirror).
+/// TEST GLUE (`--perf-bench`): the stage marks of a frame ([`mark`]), and the profiler's names of the frame core's passes
+/// ([`rp`]); [`Stage::label`] is the name the bench prints (`PERFSTAGE`) and `NFS_GPU_PROFILE` logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stage {
+    Uploads,
+    SunShadow,
+    LampPairShadow,
+    StreetLamps,
+    ContactShadow,
+    LensReference,
+    MainPass,
+    SoftDepthAo,
+    MainPassBlended,
+    DepthConversion2,
+    Shafts,
+    LighthouseBeam,
+    Haze,
+    LensTest,
+    Overlay,
+    Sprites,
+    TemporalPass,
+    PostChain,
+    ToneMap,
+    Upscaler,
+    UpscalePresent,
+}
+
+impl Stage {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Stage::Uploads => "uploads",
+            Stage::SunShadow => "E9 sun shadow",
+            Stage::LampPairShadow => "E15 lamp-pair shadow",
+            Stage::StreetLamps => "E23/E47 street lamps",
+            Stage::ContactShadow => "E43 contact shadow",
+            Stage::LensReference => "lens reference",
+            Stage::MainPass => "main pass",
+            Stage::SoftDepthAo => "E12/E14 soft depth + AO",
+            Stage::MainPassBlended => "main pass blended (split)",
+            Stage::DepthConversion2 => "depth conversion 2 (E13/E36)",
+            Stage::Shafts => "E13 shafts",
+            Stage::LighthouseBeam => "E44 lighthouse beam",
+            Stage::Haze => "E36 haze",
+            Stage::LensTest => "lens test",
+            Stage::Overlay => "overlay",
+            Stage::Sprites => "sprites",
+            Stage::TemporalPass => "temporal pass",
+            Stage::PostChain => "post chain",
+            Stage::ToneMap => "tone map (+E35 SMAA)",
+            Stage::Upscaler => "E34 upscaler",
+            Stage::UpscalePresent => "upscale present (+E39 RCAS)",
+        }
+    }
+}
+
+/// A stage mark: the GPU work recorded since the mark before it is `stage`'s (in the context [`ctx`] set, e.g. the mirror).
 #[inline]
-pub(crate) fn mark(encoder: &mut wgpu::CommandEncoder, label: &'static str) {
+pub(crate) fn mark(encoder: &mut wgpu::CommandEncoder, stage: Stage) {
+    let label = stage.label();
     if MARKS_ON.load(Relaxed) {
         let ctx = PROF.get().and_then(|p| p.state.lock().ok().map(|s| s.ctx)).unwrap_or("");
         if let Some(i) = mark_raw(encoder, label, ctx)
@@ -419,6 +490,7 @@ pub(crate) fn finish(encoder: wgpu::CommandEncoder) -> wgpu::CommandBuffer {
 
 /// `queue.submit(cbs)`; while the marks are on, between a segment's begin and end marks (and its CPU time added up).
 pub(crate) fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(device: &wgpu::Device, queue: &wgpu::Queue, cbs: I) -> wgpu::SubmissionIndex {
+    SUBMITS.fetch_add(1, Relaxed);
     if !MARKS_ON.load(Relaxed) {
         return queue.submit(cbs);
     }
@@ -458,17 +530,17 @@ pub(crate) fn bench_frame_begin() -> std::time::Instant {
 
 /// The bench frame's end: the CPU time, then the wait for the device, the marks read back and added up per stage.
 pub(crate) fn bench_frame_end(device: &wgpu::Device, queue: &wgpu::Queue, t0: std::time::Instant) -> BenchSample {
-    let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let cpu_ms = elapsed_ms(t0);
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let wall_ms = elapsed_ms(t0);
     let mut out = BenchSample { cpu_ms, wall_ms, ..Default::default() };
     let Some(m) = MARKS.get().filter(|_| MARKS_ON.load(Relaxed)) else { return out };
     let (labels, order, finish_ns, submit_ns) = match m.state.lock() {
         Ok(mut s) => (std::mem::take(&mut s.labels), std::mem::take(&mut s.order), s.finish_ns, s.submit_ns),
         Err(_) => return out,
     };
-    out.finish_ms = finish_ns as f64 / 1.0e6;
-    out.submit_ms = submit_ns as f64 / 1.0e6;
+    out.finish_ms = finish_ns as f64 / NS_PER_MS;
+    out.submit_ms = submit_ns as f64 / NS_PER_MS;
     let n = labels.len() as u32;
     if n == 0 {
         out.gpu_ms = Some(0.0);
@@ -485,7 +557,7 @@ pub(crate) fn bench_frame_end(device: &wgpu::Device, queue: &wgpu::Queue, t0: st
     let ts: Vec<u64> = bytemuck::cast_slice::<u8, u64>(&view).to_vec();
     drop(view);
     m.readback.unmap();
-    let ms = |a: u64, b: u64| if b > a { (b - a) as f64 * m.period_ns / 1.0e6 } else { 0.0 };
+    let ms = |a: u64, b: u64| if b > a { (b - a) as f64 * m.period_ns / NS_PER_MS } else { 0.0 };
     let mut stages: Vec<(String, f64)> = Vec::new();
     let mut add = |name: String, v: f64| match stages.iter_mut().find(|(n, _)| *n == name) {
         Some(s) => s.1 += v,

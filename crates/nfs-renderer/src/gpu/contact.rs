@@ -33,8 +33,8 @@
 //! boxes): in a tunnel it is the whole occlusion, at the mouth it turns into the split over the boxes' 6 m ramp, in space. Cost:
 //! one uniform (16 cars x 6 vec4), a loop with an early-out in the fragment shader of the track's items; no pass, no texture.
 
+use super::shadowmap::UniformSlot;
 use super::*;
-use bytemuck::Zeroable;
 
 /// How strongly the contact shadow darkens at its darkest (deep under the body, at the tyres), 0..1, of the light it takes (all of
 /// it without a sun, the ambient share in the sun). APPROXIMATION (enhancement content, by eye; was 0.9 before CONTACT-LAMPS).
@@ -63,27 +63,10 @@ pub(super) struct ContactUniform {
     params: [f32; 4],
 }
 
-pub(super) struct ContactState {
-    pub uniform: wgpu::Buffer,
-    active: bool,
-}
-
-impl ContactState {
-    pub(super) fn new(device: &wgpu::Device) -> Self {
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("contact uniform"), size: std::mem::size_of::<ContactUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: true });
-        // zeroed: car count 0, the shader's "off"
-        uniform.unmap();
-        Self { uniform, active: false }
-    }
-}
+pub(super) type ContactState = UniformSlot<ContactUniform>;
 
 pub(super) fn layout_entry() -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding: 24,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-        count: None,
-    }
+    crate::gfx::bgl_uniform(crate::classes::binding::CONTACTS, wgpu::ShaderStages::FRAGMENT)
 }
 
 impl Core {
@@ -95,16 +78,12 @@ impl Core {
     /// Write this frame's uniform; without cars it is zeroed once if it was on. (SHADOW-REAL: no frame-wide weakening where E9's
     /// sun shadow is drawn: the shader splits the light per pixel.)
     pub(super) fn contact_pass(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &Scene) {
-        let size = wgpu::BufferSize::new(std::mem::size_of::<ContactUniform>() as u64).expect("contact size");
         if !self.contact_on(scene) {
-            if self.contact.active {
-                self.contact.active = false;
-                self.belt.write_buffer(encoder, &self.contact.uniform, 0, size).copy_from_slice(bytemuck::bytes_of(&ContactUniform::zeroed()));
-            }
+            self.contact.clear(&mut self.belt, encoder);
             return;
         }
         let c = &scene.contacts;
-        let mut u = ContactUniform::zeroed();
+        let mut u = <ContactUniform as bytemuck::Zeroable>::zeroed();
         for (i, car) in c.cars.iter().take(c.n as usize).enumerate() {
             u.pos[i] = [car.origin.x, car.origin.y, car.origin.z, car.half[0]];
             u.ax[i] = [car.axes[0].x, car.axes[0].y, car.axes[0].z, car.half[1]];
@@ -114,13 +93,21 @@ impl Core {
             u.wheels[2 * i + 1] = [car.wheels[2][0], car.wheels[2][1], car.wheels[3][0], car.wheels[3][1]];
         }
         u.params = [(c.n as usize).min(crate::MAX_CONTACTS) as f32, STRENGTH, SOFTEN, SKIRT];
-        self.contact.active = true;
-        self.belt.write_buffer(encoder, &self.contact.uniform, 0, size).copy_from_slice(bytemuck::bytes_of(&u));
+        self.contact.write(&mut self.belt, encoder, &u);
     }
 
     /// Whether an item is a receiver of the contact shadow: a track item the E9 receiving also takes (drivable ground, walls ...; the
     /// shader keeps only faces that look up in the car's frame), never a front-end room's piece.
     pub(super) fn contact_receive(&self, item: &crate::DrawItem) -> bool {
-        item.csm & crate::CSM_ROOM == 0 && item.layer_light.is_none_or(|l| l.direction == [0.0; 3]) && self.csm_receive(item) > 1.5
+        item.csm & crate::CSM_ROOM == 0 && !item.car_lit() && self.csm_receive(item) == crate::classes::RECV_TRACK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The mesh shader's `Contacts` is this uniform, byte for byte in size (its arrays' lengths are emitted from the Rust ones).
+    #[test]
+    fn the_shader_reads_the_uniform() {
+        assert_eq!(crate::classes::tests::mesh_struct_size("Contacts") as usize, std::mem::size_of::<super::ContactUniform>());
     }
 }

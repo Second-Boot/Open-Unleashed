@@ -1,13 +1,14 @@
 // ENHANCEMENT E14 (corner shading, weak GTAO): screen-space ambient occlusion from the opaque
 // part's depth. Ground-truth AO (horizon based) after Intel's XeGTAO, as ported in Bevy's
 // `bevy_pbr/src/ssao` (MIT / Apache-2.0, https://github.com/bevyengine/bevy): the slice / horizon
-// integral and the falloff are theirs; adapted here to a single full-resolution pass with the
-// normal rebuilt from the depth (no normal pre-pass), a fixed 4 x 4 interleaved pattern (no
-// temporal accumulation, so nothing flickers) and a depth-aware 4 x 4 blur folded into the apply.
+// integral and the falloff are theirs; adapted here to a half-size occlusion with the normal
+// rebuilt from the depth (no normal pre-pass), a fixed 4 x 4 interleaved pattern (no temporal
+// accumulation, so nothing flickers), a depth-aware blur and upsample (the upsample inside the apply).
 //
-// Passes: `fs_ao` (depth -> raw visibility), `fs_blur` (horizontal), `fs_apply_1` / `fs_apply_ms`
-// (vertical blur, then a multiply over the opaque colour; the multisampled one shades per sample so
-// a sample of another surface, or of the sky, keeps its colour: no halo at silhouettes).
+// Passes: `fs_ao` (depth -> raw visibility, half size), `fs_blur` / `fs_blur_v` (the horizontal and
+// the vertical blur, half size), `fs_apply_1` /
+// `fs_apply_ms` (the depth-aware upsample to full size and a multiply over the opaque colour; the multisampled one shades per sample so a
+// sample of another surface, or of the sky, keeps its colour: no halo at silhouettes).
 struct Params {
     // tan(half fov x), tan(half fov y), near, far
     cam: vec4<f32>,
@@ -30,7 +31,7 @@ const HALF_PI: f32 = 1.57079633;
 const BAYER = array<u32, 16>(0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u, 3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
 
 fn view_z(d: f32) -> f32 {
-    return p.cam.z * p.cam.w / max(p.cam.w - d * (p.cam.w - p.cam.z), 0.0001);
+    return linear_z(d, p.cam.z, p.cam.w);
 }
 fn clamp_px(q: vec2<i32>) -> vec2<i32> {
     return clamp(q, vec2<i32>(0), vec2<i32>(p.size.xy) - vec2<i32>(1));
@@ -51,6 +52,16 @@ fn at(c: vec2<f32>) -> vec3<f32> {
     return view_pos(vec2<f32>(q) + 0.5, load_z(q));
 }
 const SKY: f32 = 0.99999;
+// the radius on the screen: at most this many pixels, under this many nothing is done
+const MAX_RADIUS_PX: f32 = 48.0;
+const MIN_RADIUS_PX: f32 = 2.0;
+// the falloff's share of the radius (XeGTAO's default 0.615)
+const FALLOFF_RANGE: f32 = 0.615;
+// the first sample's offset from the pixel (px)
+const MIN_OFFSET_PX: f32 = 1.3;
+// the apply's per-sample depth tolerance: relative, absolute (m)
+const SAME_SURFACE_REL: f32 = 0.03;
+const SAME_SURFACE_ABS: f32 = 0.05;
 
 @fragment
 fn fs_ao(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
@@ -63,8 +74,8 @@ fn fs_ao(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(1.0);
     }
     let radius = p.ao.x;
-    let rpx = min(radius * p.size.y * 0.5 / p.cam.y / z0, 48.0);
-    if rpx < 2.0 {
+    let rpx = min(radius * p.size.y * 0.5 / p.cam.y / z0, MAX_RADIUS_PX);
+    if rpx < MIN_RADIUS_PX {
         return vec4<f32>(1.0);
     }
     let c = vec2<f32>(px) + 0.5;
@@ -90,9 +101,9 @@ fn fs_ao(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let n_step = (f32(BAYER[(idx * 7u + 5u) & 15u]) + 0.5) / 16.0;
 
     // the falloff: samples between 38 % and 100 % of the radius count less and less
-    let fall_range = 0.615 * radius;
+    let fall_range = FALLOFF_RANGE * radius;
     let fall_mul = -1.0 / fall_range;
-    let fall_add = radius * (1.0 - 0.615) / fall_range + 1.0;
+    let fall_add = radius * (1.0 - FALLOFF_RANGE) / fall_range + 1.0;
 
     let slices = i32(p.n.x);
     let steps = i32(p.n.y);
@@ -121,7 +132,7 @@ fn fs_ao(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         for (var st = 0; st < steps; st++) {
             var s = (f32(st) + n_step) / f32(steps);
             s = s * s;
-            let off = 1.3 + s * (rpx - 1.3);
+            let off = MIN_OFFSET_PX + s * (rpx - MIN_OFFSET_PX);
             let s0 = at(c + omega * off) - P;
             let s1 = at(c - omega * off) - P;
             let l0 = length(s0);
@@ -181,16 +192,10 @@ fn fs_blur_v(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(blur_h(vec2<i32>(pos.xy), false), 0.0, 0.0, 1.0);
 }
 
-// the full-size occlusion: the four nearest half-size texels, each by its bilinear weight times how near its
-// depth is to this pixel's (so the occlusion of a far surface never bleeds over a silhouette)
-@fragment
-fn fs_up(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let px = vec2<i32>(pos.xy);
-    let d = raw_d(px);
-    if d >= SKY {
-        return vec4<f32>(1.0);
-    }
-    let zc = view_z(d);
+// the full-size occlusion at pixel `px` (view depth `zc`): the four nearest half-size texels, each by its bilinear weight times
+// how near its depth is to this pixel's (so the occlusion of a far surface never bleeds over a silhouette). Evaluated by the
+// apply passes themselves (PERF: no full-size occlusion image, no pass of its own; the value is no longer rounded to 8 bits).
+fn up_vis(px: vec2<i32>, zc: f32) -> f32 {
     let hp = (vec2<f32>(px) + 0.5) * 0.5 - 0.5;
     let base = vec2<i32>(floor(hp));
     let f = hp - floor(hp);
@@ -211,7 +216,7 @@ fn fs_up(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             near = a;
         }
     }
-    return vec4<f32>(select(near, sum / wsum, wsum > 0.001), 0.0, 0.0, 1.0);
+    return select(near, sum / wsum, wsum > 0.001);
 }
 
 // the multiplier for a surface at view depth `zs` whose full-size occlusion is `vis`
@@ -231,7 +236,8 @@ fn fs_apply_1(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if d >= SKY {
         return vec4<f32>(1.0);
     }
-    return multiplier(textureLoad(t_ao, px, 0).r, view_z(d));
+    let zc = view_z(d);
+    return multiplier(up_vis(px, zc), zc);
 }
 
 @fragment
@@ -243,9 +249,9 @@ fn fs_apply_ms(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let n = i32(textureNumSamples(t_ms));
     for (var k = 0; k < n; k++) {
         let ds = textureLoad(t_ms, px, k);
-        if ds >= SKY || abs(view_z(ds) - zc) > 0.03 * zc + 0.05 {
+        if ds >= SKY || abs(view_z(ds) - zc) > SAME_SURFACE_REL * zc + SAME_SURFACE_ABS {
             return vec4<f32>(1.0);
         }
     }
-    return multiplier(textureLoad(t_ao, px, 0).r, zc);
+    return multiplier(up_vis(px, zc), zc);
 }

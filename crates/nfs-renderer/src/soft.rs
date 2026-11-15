@@ -1,7 +1,7 @@
 //! ENHANCEMENT E12 — soft particles: the depth of the opaque part of a 3D pass, handed to the
 //! blended particle draws as a readable image (`soft.wgsl` converts it, `shader.wgsl` fades with it).
 
-use crate::gfx::{self, Fullscreen};
+use crate::gfx::{self, Fullscreen, Keyed};
 use crate::wgsl;
 
 pub(crate) const SOFT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
@@ -18,8 +18,12 @@ pub(crate) struct SoftDepth {
     pipe_ms: wgpu::RenderPipeline,
     layout_1: wgpu::BindGroupLayout,
     layout_ms: wgpu::BindGroupLayout,
-    images: std::collections::HashMap<(u32, u32), (wgpu::Texture, wgpu::TextureView)>,
+    /// per pass size: the image and the converter's bind group over the depth it last read
+    images: std::collections::HashMap<(u32, u32), (wgpu::TextureView, Keyed<(wgpu::TextureView, bool), wgpu::BindGroup>)>,
 }
+
+/// More pass sizes than this and the images are dropped (a window being dragged).
+const MAX_SIZES: usize = 6;
 
 impl SoftDepth {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
@@ -39,22 +43,13 @@ impl SoftDepth {
     /// Convert `depth` (the pass's depth, `multisampled` or not) into the image of `width × height`
     /// and return that image's view. Records one small full-screen pass into `encoder`.
     pub(crate) fn convert(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, multisampled: bool, width: u32, height: u32) -> wgpu::TextureView {
-        if self.images.len() > 6 && !self.images.contains_key(&(width, height)) {
+        if self.images.len() > MAX_SIZES && !self.images.contains_key(&(width, height)) {
             self.images.clear();
         }
-        let (_, view) = self.images.entry((width, height)).or_insert_with(|| {
-            let t = gfx::texture_2d(device, "soft depth", width, height, SOFT_FORMAT, gfx::RT_USAGE);
-            let v = t.create_view(&Default::default());
-            (t, v)
-        });
-        let view = view.clone();
+        let (view, bg) = self.images.entry((width, height)).or_insert_with(|| (gfx::texture_2d(device, "soft depth", width, height, SOFT_FORMAT, gfx::RT_USAGE).create_view(&Default::default()), Keyed::default()));
         let (pipe, layout, binding) = if multisampled { (&self.pipe_ms, &self.layout_ms, 0) } else { (&self.pipe_1, &self.layout_1, 1) };
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("soft depth"), layout, entries: &[wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(depth) }] });
-        let mut pass = gfx::color_pass(encoder, "soft depth pass", "soft depth convert", &view, wgpu::LoadOp::Clear(wgpu::Color::WHITE));
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.draw(0..3, 0..1);
-        drop(pass);
-        view
+        let bg = bg.get((depth.clone(), multisampled), || device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("soft depth"), layout, entries: &[wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(depth) }] }));
+        gfx::fullscreen_pass(encoder, "soft depth pass", "soft depth convert", view, wgpu::LoadOp::Clear(wgpu::Color::WHITE), pipe, &[bg]);
+        view.clone()
     }
 }

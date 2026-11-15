@@ -748,16 +748,39 @@ struct ReflectionEye {
     k: f32,
 }
 
+/// Which view a `App::dyn_items` pass draws the cars for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassKind {
+    /// the race's main view: the effect drive, the spots, the contact shadows, the sun cars, the windscreen run here only
+    Main,
+    /// the rear-view mirror's pass (0x468CA0): the camera's own car is not queued (0x4430EC)
+    Mirror,
+    /// ENHANCEMENT E49: an environment face's near cars, drawn as the mirror's pass draws them
+    EnvFace,
+}
+
+/// The lamp byte's bits (`car+0xD87`; the player's `lamp_bits`, `lamp_command`).
+pub(crate) mod lamp_bit {
+    /// bit 0: the headlights (slots 0 / 1; the night flag at `Car_init` 0x410C74, the lights key toggles it)
+    pub(crate) const HEADLIGHTS: u8 = 1;
+    /// bit 3: the left indicator (SIGNALLEFT)
+    pub(crate) const SIGNAL_LEFT: u8 = 8;
+    /// bit 4: the right indicator (SIGNALRIGHT)
+    pub(crate) const SIGNAL_RIGHT: u8 = 0x10;
+}
+
 /// One view pass's inputs for `App::dyn_items`: the frame's interpolation and the player's pose,
 /// whether it is the mirror's pass (with its frustum, `CullView`) and the view's screen for the LOD
-/// pick — the viewport's size and the render width the size is scaled by (0x43A2D7).
+/// pick — the viewport's size and the render width the size is scaled by (0x43A2D7) — and the frame's options
+/// (`opts`, read once by the main pass and handed on to the mirror's and the environment faces').
 #[derive(Clone, Copy)]
 pub(crate) struct DynPose {
+    pub(crate) opts: crate::app::render_scene::RenderOptions,
     pub(crate) alpha: f32,
     pub(crate) local_draw: Vec3,
     pub(crate) local_pos: Vec3,
     pub(crate) local_rot: Quat,
-    pub(crate) mirror_pass: bool,
+    pub(crate) pass: PassKind,
     pub(crate) cull: Option<nfs_game::world::CullView>,
     pub(crate) lod: (f32, f32),
     pub(crate) ref_width: f32,
@@ -773,13 +796,37 @@ pub(crate) struct PoolUse {
 }
 
 /// The dynamic meshes and materials the lamp draws are laid into: the headlight beams' (0x43D4F0:
-/// a strip of 18 vertices each, untextured and blended) and the road reflections' (0x451D60).
+/// a strip of 18 vertices each, untextured and blended) and the road reflections' (0x451D60). Also what each mesh of the skid
+/// strips' pool (`App::skid_pool`) was last written with (`skid_written`, `App::skid_items`).
 #[derive(Default)]
 pub(crate) struct LampPools {
     pub(crate) beam: Vec<nfs_renderer::MeshId>,
     pub(crate) beam_material: Option<nfs_renderer::MaterialId>,
     pub(crate) reflection: Vec<nfs_renderer::MeshId>,
     pub(crate) reflection_material: Option<nfs_renderer::MaterialId>,
+    pub(crate) skid_written: Vec<Option<SkidWritten>>,
+}
+
+/// A skid strip's mesh as last written: its vertices are a function of the strip's points and colours alone, so the same strip
+/// in the same mesh is not built and uploaded again (a strip changes per tick at most; the frames between draw it as it is).
+pub(crate) struct SkidWritten {
+    pub(crate) mesh: nfs_renderer::MeshId,
+    pub(crate) points: Vec<Vec3>,
+    pub(crate) colours: Vec<u32>,
+}
+
+impl SkidWritten {
+    pub(crate) fn holds(&self, mesh: nfs_renderer::MeshId, points: &[Vec3], colours: &[u32]) -> bool {
+        self.mesh == mesh && self.points.len() == points.len() && self.colours == colours && self.points.iter().zip(points).all(|(a, b)| a.to_array().map(f32::to_bits) == b.to_array().map(f32::to_bits))
+    }
+}
+
+/// A colour byte's full scale.
+const BYTE_MAX: f32 = 255.0;
+
+/// An `ARGB` dword as `[r, g, b, a]` in 0..1 (each byte over 255).
+pub(crate) fn argb_rgba(c: u32) -> [f32; 4] {
+    [((c >> 16) & 0xFF) as f32 / BYTE_MAX, ((c >> 8) & 0xFF) as f32 / BYTE_MAX, (c & 0xFF) as f32 / BYTE_MAX, (c >> 24) as f32 / BYTE_MAX]
 }
 
 pub(crate) fn lamp_command(bits: u8, code: u8) -> u8 {

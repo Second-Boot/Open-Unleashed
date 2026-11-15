@@ -5,11 +5,48 @@
 use crate::gfx;
 use super::*;
 
+/// State 0x2E's ceiling, `dx7z.dll` 0x600051EE…0x6000522E (`Core::set_gamma`).
+const GAMMA_MAX: f32 = 4.0;
+
+/// A scene sampler's place in the sampler tables (`Core::samplers` and the E2 / level-0 / point ones): the address modes (bit 0
+/// `CLAMP` u, bit 1 `CLAMP` v; what `GpuMaterial::sampler` holds) and, in `Core::samplers` only, bit 2: `POINT` between the levels
+/// (`[0x69DD1D]` clear, [`Core::set_trilinear`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SamplerKey {
+    pub clamp: [bool; 2],
+    pub point_mips: bool,
+}
+
+impl SamplerKey {
+    /// `WRAP` / `WRAP`, the mips filtered.
+    pub(super) const WRAP: Self = Self { clamp: [false; 2], point_mips: false };
+
+    /// The key of an address index (`GpuMaterial::sampler`).
+    pub(super) const fn of_address(a: usize) -> Self {
+        Self { clamp: [a & 1 != 0, a & 2 != 0], point_mips: false }
+    }
+
+    /// The key of a `Core::samplers` index.
+    pub(super) const fn of_index(i: usize) -> Self {
+        Self { clamp: [i & 1 != 0, i & 2 != 0], point_mips: i & 4 != 0 }
+    }
+
+    /// The index in the tables of the address modes alone.
+    pub(super) const fn address(self) -> usize {
+        self.clamp[0] as usize | (self.clamp[1] as usize) << 1
+    }
+
+    /// The index in `Core::samplers`.
+    pub(super) const fn index(self) -> usize {
+        self.address() | (self.point_mips as usize) << 2
+    }
+}
+
 impl Core {
     pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
         let texture = desc.texture.unwrap_or(self.white);
         let env = desc.env_texture.unwrap_or(self.white);
-        let sampler = desc.clamp[0] as usize | (desc.clamp[1] as usize) << 1;
+        let sampler = SamplerKey { clamp: desc.clamp, point_mips: false }.address();
         let bind_group = self.material_bind_group(texture, sampler, env);
         let bind_group_point = desc.false_sort.then(|| self.material_bind_group_point(texture, sampler, env));
         self.materials.push(GpuMaterial {
@@ -44,31 +81,10 @@ impl Core {
     /// synchronous blit 0x572B40).
     pub fn duplicate_material_texture(&mut self, id: MaterialId, texture: TextureId) -> MaterialId {
         let Some(m) = self.materials.get(id.0 as usize) else { return id };
-        let (sampler, env, false_sort, reflect) = (m.sampler, m.env, m.false_sort, m.reflect);
-        let (alpha_blend, blend_pair, device_states, lod_bias, cull_back, view_cull, depth_bias, depth_test, env_mix, env_variant, sky_map) =
-            (m.alpha_blend, m.blend_pair, m.device_states, m.lod_bias, m.cull_back, m.view_cull, m.depth_bias, m.depth_test, m.env_mix, m.env_variant, m.sky_map);
-        let bind_group = self.material_bind_group(texture, sampler, env);
-        let bind_group_point = false_sort.then(|| self.material_bind_group_point(texture, sampler, env));
-        self.materials.push(GpuMaterial {
-            bind_group,
-            bind_group_point,
-            alpha_blend,
-            blend_pair,
-            device_states,
-            sampler,
-            lod_bias,
-            cull_back,
-            view_cull,
-            depth_bias,
-            false_sort,
-            depth_test,
-            env_mix,
-            env_variant,
-            sky_map,
-            texture,
-            env,
-            reflect,
-        });
+        let bind_group = self.material_bind_group(texture, m.sampler, m.env);
+        let bind_group_point = m.false_sort.then(|| self.material_bind_group_point(texture, m.sampler, m.env));
+        let copy = GpuMaterial { bind_group, bind_group_point, texture, ..m.clone() };
+        self.materials.push(copy);
         MaterialId(self.materials.len() as u32 - 1)
     }
 
@@ -106,29 +122,21 @@ impl Core {
             Some(t) => &t.view,
             None => &self.proj_default_view,
         };
-        let (proj, head) = (pick(self.proj_tex), pick(self.head_tex));
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals"),
-            layout: &self.globals_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.globals_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.headlight_map_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(proj) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.proj_samplers[!self.trilinear as usize]) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(head) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(self.refl.as_ref().map_or(&self.refl_dummy_view, |c| &c.array_view)) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(self.csm.view()) },
-                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.csm.sampler) },
-                wgpu::BindGroupEntry { binding: 8, resource: self.csm.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(soft.unwrap_or(&self.soft_dummy_view)) },
-                wgpu::BindGroupEntry { binding: 16, resource: self.probe.as_ref().map_or(&self.probe_dummy, |p| &p.uniform).as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(self.spot.view()) },
-                wgpu::BindGroupEntry { binding: 11, resource: self.spot.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 20, resource: self.lamp.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(self.lamp.view()) },
-                wgpu::BindGroupEntry { binding: 24, resource: self.contact.uniform.as_entire_binding() },
-            ],
-        })
+        GlobalsSet {
+            globals: &self.globals_buf,
+            night_map: &self.headlight_map_buf,
+            proj: pick(self.proj_tex),
+            proj_sampler: &self.proj_samplers[!self.trilinear as usize],
+            head: pick(self.head_tex),
+            refl: self.refl.as_ref().map_or(&self.refl_dummy_view, |c| &c.array_view),
+            csm: &self.csm,
+            soft: soft.unwrap_or(&self.soft_dummy_view),
+            probe_sh: self.probe.as_ref().map_or(&self.probe_dummy, |p| &p.uniform),
+            spot: &self.spot,
+            lamp: &self.lamp,
+            contacts: &self.contact.buf,
+        }
+        .bind_group(&self.device, &self.globals_layout)
     }
 
     /// The view about to be drawn is the rear-view mirror's: `[0x6115CC]+0x190` is set from the
@@ -167,7 +175,7 @@ impl Core {
         } else if generated {
             &self.level0_samplers[sampler]
         } else {
-            &self.samplers[sampler | (!self.trilinear as usize) << 2]
+            &self.samplers[SamplerKey { point_mips: !self.trilinear, ..SamplerKey::of_address(sampler) }.index()]
         };
         self.material_bind_group_with(texture, sampler, env)
     }
@@ -190,8 +198,8 @@ impl Core {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.textures[texture.0 as usize].view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.textures[env.0 as usize].view) },
-                // `WRAP` / `WRAP` (index 0: no clamp); sampled at level 0, so the mip half is moot
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[0]) },
+                // `WRAP` / `WRAP`; sampled at level 0, so the mip half is moot
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[SamplerKey::WRAP.index()]) },
             ],
         })
     }
@@ -209,7 +217,10 @@ impl Core {
         let clamp = if self.aniso_supported { want } else { 1 };
         if clamp != self.aniso_clamp {
             self.aniso_clamp = clamp;
-            self.aniso_samplers = std::array::from_fn(|i| make_scene_sampler(&self.device, i & 1 != 0, i & 2 != 0, wgpu::MipmapFilterMode::Linear, clamp, None));
+            self.aniso_samplers = std::array::from_fn(|i| {
+                let k = SamplerKey::of_address(i);
+                make_scene_sampler(&self.device, k.clamp[0], k.clamp[1], wgpu::MipmapFilterMode::Linear, clamp, None)
+            });
         }
         tracing::info!(level, anisotropy = clamp, supported = self.aniso_supported, "ENHANCEMENT E2");
         self.rebuild_material_bind_groups(None);
@@ -253,8 +264,62 @@ impl Core {
     }
 
     /// State 0x2E's value as the game passes it; `dx7z.dll` 0x600051EE…0x6000522E: `≤ 0` → 0,
-    /// not `< 4` → 4.
+    /// not `< 4` → 4 ([`GAMMA_MAX`]).
     pub fn set_gamma(&mut self, g: f32) {
-        self.gamma = if g <= 0.0 { 0.0 } else if g < 4.0 { g } else { 4.0 };
+        self.gamma = if g <= 0.0 { 0.0 } else if g < GAMMA_MAX { g } else { GAMMA_MAX };
+    }
+}
+
+/// What the globals group binds (`classes::binding`): the one list of its entries, for `Core::new`'s first bind group and every
+/// rebuild ([`Core::make_globals_bg`]).
+pub(super) struct GlobalsSet<'a> {
+    pub globals: &'a wgpu::Buffer,
+    pub night_map: &'a wgpu::Buffer,
+    pub proj: &'a wgpu::TextureView,
+    pub proj_sampler: &'a wgpu::Sampler,
+    pub head: &'a wgpu::TextureView,
+    pub refl: &'a wgpu::TextureView,
+    pub csm: &'a csm::CsmState,
+    pub soft: &'a wgpu::TextureView,
+    pub probe_sh: &'a wgpu::Buffer,
+    pub spot: &'a spot::SpotState,
+    pub lamp: &'a lamps::LampState,
+    pub contacts: &'a wgpu::Buffer,
+}
+
+impl GlobalsSet<'_> {
+    pub(super) fn bind_group(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
+        use crate::classes::binding as b;
+        fn buf(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry { binding, resource: buf.as_entire_binding() }
+        }
+        fn view(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) }
+        }
+        fn sampler(binding: u32, s: &wgpu::Sampler) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::Sampler(s) }
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globals"),
+            layout,
+            entries: &[
+                buf(b::GLOBALS, self.globals),
+                buf(b::NIGHT_MAP, self.night_map),
+                view(b::PROJ_TEX, self.proj),
+                sampler(b::PROJ_SAMPLER, self.proj_sampler),
+                view(b::HEAD_TEX, self.head),
+                view(b::REFL, self.refl),
+                view(b::CSM_MAP, self.csm.view()),
+                sampler(b::CSM_SAMPLER, &self.csm.sampler),
+                buf(b::CSM, &self.csm.uniform.buf),
+                view(b::SOFT, self.soft),
+                buf(b::PROBE_SH, self.probe_sh),
+                view(b::SPOT_MAP, self.spot.view()),
+                buf(b::SPOTS, &self.spot.uniform.buf),
+                buf(b::LAMPS, &self.lamp.uniform.buf),
+                view(b::LAMP_SHADOW, self.lamp.view()),
+                buf(b::CONTACTS, self.contacts),
+            ],
+        })
     }
 }

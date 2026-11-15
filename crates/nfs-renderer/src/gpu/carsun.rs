@@ -31,17 +31,46 @@ pub(super) const EASE_TAU: f32 = 0.17;
 /// ENHANCEMENT E51 (CARSH-FADE): a car that moved farther than this (m) since the last frame (a reset, a teleport, a camera cut to
 /// another car's key) takes its new target at once.
 const JUMP: f32 = 20.0;
+/// ENHANCEMENT E51 (CARSH-FADE): the body's centre over the car's road point (m), and the margin (m) round the body's half
+/// diagonal within which a receiver's ray toward the sun passes the car (`Csm::carsh_cars`). APPROXIMATION.
+const BODY_CENTRE: f32 = 0.7;
+const BODY_MARGIN: f32 = 0.5;
+/// ENHANCEMENT E51 (CARSH-FADE): the sample points per car (one thread each, `carsun.wgsl`): `RING_POINTS` on each of the
+/// [`RINGS`], and a `BODY_GRID` x `BODY_GRID` grid inside the body.
+const RING_POINTS: usize = 16;
+const BODY_GRID: usize = 4;
+const SAMPLES: usize = RINGS.len() * RING_POINTS + BODY_GRID * BODY_GRID;
+/// ENHANCEMENT E51 (CARSH-FADE): a car's vec4s in [`Params::cars`].
+const CAR_VEC4S: usize = 4;
+const MAX_CASCADES: usize = super::csm::MAX_CASCADES;
+
+/// The compute shader: `carsun.wgsl` after the sizes it shares with this side.
+pub(crate) fn source() -> String {
+    let header = format!(
+        "const SUN_CAR_KEYS: u32 = {}u;\nconst MAX_CASCADES: i32 = {};\nconst CARS_VEC4S: u32 = {}u;\nconst SHARES: u32 = {}u;\n\
+         const RING_COUNT: u32 = {}u;\nconst RING_POINTS: u32 = {}u;\nconst BODY_GRID: u32 = {}u;\nconst SAMPLES: u32 = {}u;\n",
+        crate::SUN_CAR_KEYS,
+        MAX_CASCADES,
+        CAR_VEC4S * crate::MAX_CONTACTS,
+        crate::MAX_CONTACTS,
+        RINGS.len(),
+        RING_POINTS,
+        BODY_GRID,
+        SAMPLES
+    );
+    crate::wgsl::compose(&[&header, include_str!("carsun.wgsl")])
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
-    mats: [[[f32; 4]; 4]; 4],
-    info: [[f32; 4]; 4],
+    mats: [[[f32; 4]; 4]; MAX_CASCADES],
+    info: [[f32; 4]; MAX_CASCADES],
     misc: [f32; 4],
     consts: [f32; 4],
     fade: [f32; 4],
     rings: [f32; 4],
-    cars: [[f32; 4]; 4 * crate::MAX_CONTACTS],
+    cars: [[f32; 4]; CAR_VEC4S * crate::MAX_CONTACTS],
 }
 
 pub(super) struct CarSun {
@@ -50,8 +79,10 @@ pub(super) struct CarSun {
     params: wgpu::Buffer,
     state: wgpu::Buffer,
     pub(super) out: wgpu::Buffer,
-    /// the keys' road points of the last measured frame (`None` = not in it) and its draw clock (s, `SunCars::clock`)
+    /// the keys' road points of the last measured frame (`None` = not in it) and its draw clock (s, `SunCars::clock`); `seen`
+    /// this frame's, swapped with `prev` at the end (two kept tables, no allocation per frame)
     prev: Vec<Option<Vec3>>,
+    seen: Vec<Option<Vec3>>,
     prev_at: Option<f64>,
     /// PERF: the bind group, kept while the map's view is the same
     bg: gfx::Keyed<wgpu::TextureView, wgpu::BindGroup>,
@@ -59,7 +90,7 @@ pub(super) struct CarSun {
 
 impl CarSun {
     pub(super) fn new(device: &wgpu::Device) -> Self {
-        let module = gfx::wgsl_module(device, "car sun", include_str!("carsun.wgsl"));
+        let module = gfx::wgsl_module(device, "car sun", &source());
         let buf = |ty: wgpu::BufferBindingType| wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None };
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let layout = gfx::bgl(
@@ -83,6 +114,7 @@ impl CarSun {
             state: make("car sun state", (crate::SUN_CAR_KEYS * 4) as u64, wgpu::BufferUsages::STORAGE),
             out: make("car sun out", (crate::MAX_CONTACTS * 4) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             prev: vec![None; crate::SUN_CAR_KEYS],
+            seen: vec![None; crate::SUN_CAR_KEYS],
             prev_at: None,
             bg: Default::default(),
         }
@@ -90,16 +122,17 @@ impl CarSun {
 
 
     /// Write this frame's measure (the cascades; the cars, each one's cascade by its view depth, blended into the next over the
-    /// last eighth as the receiver's are; whether a car is new; the ease's share). Returns the cars' (centre, reach) for the track
-    /// receiver (`Csm::carsh_cars`); empty = no car (then nothing is to be recorded).
-    pub(super) fn prepare(&mut self, queue: &wgpu::Queue, cascades: &[Cascade], view: glam::Mat4, cars: &crate::SunCars, layers: (usize, usize)) -> Vec<[f32; 4]> {
+    /// last eighth as the receiver's are; whether a car is new; the ease's share), through the frame's belt (`up`). Writes the
+    /// cars' (centre, reach) for the track receiver into `centres` (`Csm::carsh_cars`) and returns their count; 0 = no car (then
+    /// nothing is to be recorded).
+    pub(super) fn prepare(&mut self, up: (&mut wgpu::util::StagingBelt, &mut wgpu::CommandEncoder), cascades: &[Cascade], view: glam::Mat4, cars: &crate::SunCars, layers: (usize, usize), centres: &mut [[f32; 4]]) -> usize {
         let (car_layers, car_base) = layers;
         let dt = self.prev_at.map_or(-1.0, |t| (cars.clock - t) as f32);
         self.prev_at = Some(cars.clock);
         // a new race (the clock went back) or a long gap: every car takes its target as it is
         let stale = !(0.0..=1.0).contains(&dt);
         let mut u = Params::zeroed();
-        for (i, c) in cascades.iter().take(4).enumerate() {
+        for (i, c) in cascades.iter().take(MAX_CASCADES).enumerate() {
             u.mats[i] = c.mat.to_cols_array_2d();
             u.info[i] = [c.texel, c.range, c.split, 0.0];
         }
@@ -108,13 +141,12 @@ impl CarSun {
         u.consts = [MIN_REACH, RING_HEIGHT, TAP_SPACING, 0.0];
         u.fade = FADE;
         u.rings = [RINGS[0], RINGS[1], RINGS[2], 0.0];
-        let count = cascades.len().min(4);
-        let mut seen = vec![None; crate::SUN_CAR_KEYS];
-        let mut centres = Vec::with_capacity(n);
+        let count = cascades.len().min(MAX_CASCADES);
+        self.seen.fill(None);
         for (i, sc) in cars.cars.iter().take(n).enumerate() {
             let c = &sc.pose;
             let key = usize::from(sc.key) % crate::SUN_CAR_KEYS;
-            let centre = c.origin + c.axes[1] * 0.7;
+            let centre = c.origin + c.axes[1] * BODY_CENTRE;
             let vd = -(view * centre.extend(1.0)).z;
             let mut ci = 0;
             for (k, cascade) in cascades.iter().enumerate().take(count.saturating_sub(1)) {
@@ -123,21 +155,22 @@ impl CarSun {
                 }
             }
             let end = cascades[ci].split;
-            let t = if ci + 1 < count { ((vd - end * 0.875) / (end * 0.125)).clamp(0.0, 1.0) } else { 0.0 };
+            let t = if ci + 1 < count { ((vd - end * crate::classes::CASCADE_BLEND_START) / (end * crate::classes::CASCADE_BLEND)).clamp(0.0, 1.0) } else { 0.0 };
             let fresh = stale || self.prev[key].is_none_or(|p| p.distance(c.origin) > JUMP);
-            seen[key] = Some(c.origin);
+            self.seen[key] = Some(c.origin);
             u.cars[4 * i] = [c.origin.x, c.origin.y, c.origin.z, key as f32];
             u.cars[4 * i + 1] = [c.axes[2].x, c.axes[2].y, c.axes[2].z, c.half[1]];
             u.cars[4 * i + 2] = [c.axes[0].x, c.axes[0].y, c.axes[0].z, c.half[0]];
             u.cars[4 * i + 3] = [ci as f32, t, if fresh { 1.0 } else { 0.0 }, 0.0];
-            let reach = (c.half[0] * c.half[0] + c.half[1] * c.half[1]).sqrt() + 0.5;
-            centres.push([centre.x, centre.y, centre.z, reach]);
+            let reach = (c.half[0] * c.half[0] + c.half[1] * c.half[1]).sqrt() + BODY_MARGIN;
+            centres[i] = [centre.x, centre.y, centre.z, reach];
         }
-        self.prev = seen;
-        if !centres.is_empty() {
-            queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&u));
+        std::mem::swap(&mut self.prev, &mut self.seen);
+        if n > 0 {
+            let size = wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64).expect("car sun params size");
+            up.0.write_buffer(up.1, &self.params, 0, size).copy_from_slice(bytemuck::bytes_of(&u));
         }
-        centres
+        n
     }
 
     /// Record the measure of `n` cars (after the shadow passes; `map` the shadow map's array view and comparison sampler) and copy

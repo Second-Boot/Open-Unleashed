@@ -808,7 +808,7 @@ impl App {
         let room_turn = if dealer_drawn || self.fe.room.is_empty() { Quat::IDENTITY } else { room_m.to_scale_rotation_translation().1 };
         let fx = self.fe_enh_prepare(car_at, room_turn, self.scene.ambient, self.scene.sun_direction);
         self.scene.ao = fx.ao;
-        self.scene.sun_shadow = fx.shadow;
+        self.scene.shadows.sun = fx.shadow;
         if views.is_empty() {
             return;
         }

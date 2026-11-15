@@ -56,7 +56,9 @@ impl App {
             let mut near: Vec<(f32, Vec3, [f32; 3], f32)> = self
                 .street_lamp_sites()
                 .iter()
-                .filter(|s| (s.air && cover > 0.01) || night)
+                // MONACO-TUNNEL: the painted tunnel bulbs have no glow in the air (the tube had none before them; 100 glows also cost
+                // the haze pass about 3 ms)
+                .filter(|s| !s.painted && ((s.air && cover > 0.01) || night))
                 .filter(|s| s.pos.distance(eye) < LAMP_REACH && cone.is_none_or(|c| c.sees(s.pos, LAMP_RADIUS)))
                 .map(|s| (s.pos.distance(eye), s.pos, s.color, s.height))
                 .collect();

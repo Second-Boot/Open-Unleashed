@@ -4,23 +4,34 @@
 use crate::gfx;
 use super::*;
 
+/// The cube's faces (`REFL_FACES`), and ENHANCEMENT E49's first own layer (the player's faces follow E8's six).
+const FACES: u32 = REFL_FACES.len() as u32;
+const OWN: u32 = crate::classes::NEAR_OWN_LAYER;
+/// TEST GLUE (`NFS_NEAR_DEBUG`): the shader's levels (`globals.near.w`, `classes.rs`)
+const NEAR_DEBUG_SHARP: u8 = crate::classes::NEAR_DEBUG_SHARP as u8;
+const NEAR_DEBUG_OVERLAY: u8 = crate::classes::NEAR_DEBUG_OVERLAY as u8;
+/// A face texel's top value in bytes (an 8-bit cube's upload), and a second in ms (`NFS_GPU_TIME`'s sums)
+const BYTE: f32 = 255.0;
+const MS_PER_S: f64 = 1000.0;
+
 impl Core {
     /// ENHANCEMENT E8: draw one face of the player's car's environment — `scene` seen through `camera`
     /// (the car's position, the face's direction, `REFL_TAN_HALF`) into a `size`² target, then copy it
     /// into layer `face` of the array. The array is made (or made again when `size` changes) here; the
-    /// map is used once all six faces have been drawn. A pass of its own, submitted in call order, so
+    /// map is used once all six faces have been drawn. Recorded into the frame's encoder in call order, so
     /// the main frame that follows samples the finished face. MSAA is not used (1 sample, `size`² is
     /// small and the faces are filtered when read).
     ///
     /// ENHANCEMENT E49 (`near` = the near cars' scene): the cube has twelve layers. The face's pass keeps its depth and is copied
     /// into layer `face` (every car's coat, E16's probe); then `near` is drawn over the same colour and depth (no clear) and the
-    /// result copied into layer `6 + face` (the player's own coat; with no car near it is the same face); the face's eye is kept
+    /// result copied into layer `OWN + face` (6 + face: the player's own coat; with no car near it is the same face); the face's eye is kept
     /// for the parallax-corrected lookup. `None` = E8's face exactly as before.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn render_refl_face(&mut self, scene: &Scene, camera: &Camera, face: u32, size: u32, clear: [f64; 4], depth_far: f32, near: Option<&Scene>) {
+    pub(crate) fn render_refl_face(&mut self, job: &crate::front::ReflFaceJob) {
+        let crate::front::ReflFaceJob { ref scene, ref camera, face, size, clear, depth_far, ref near } = *job;
+        let near = near.as_ref();
         let t0 = self.gpu_time_log.then(std::time::Instant::now);
         let size = size.clamp(16, 1024);
-        let face = face.min(5);
+        let face = face.min(FACES - 1);
         // ENHANCEMENT ENH-COAT: the faces are drawn in the float scene's format when the main view is float (the clear coat
         // reflects the sun above white); `cur_hdr` makes `encode_frame` build for it, like the mirror's pass
         let float = self.enh_hdr(scene);
@@ -35,7 +46,8 @@ impl Core {
         self.cur_hdr = float;
         self.refl_building = true;
         self.refl_near_pass = near.map(|_| NearPass::Keep);
-        self.encode_frame(scene, clear, false, camera, &view, &tex, false, &depth, 1.0, depth_far, None);
+        let face_frame = |scene| FrameDesc { scene, clear, with_sprites: false, camera, view: &view, target: &tex, can_copy: false, depth: &depth, aspect: 1.0, depth_far, ms: None };
+        self.encode_frame(face_frame(scene));
         let copy_into = |encoder: &mut wgpu::CommandEncoder, array: &wgpu::Texture, layer: u32| {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -50,14 +62,15 @@ impl Core {
             crate::prof::ctx(" [env face cars]");
             self.refl_near_pass = Some(NearPass::Over);
             self.refl_pre_copy = Some(face);
-            self.encode_frame(cars, clear, false, camera, &view, &tex, false, &depth, 1.0, depth_far, None);
+            self.encode_frame(face_frame(cars));
         }
         self.refl_near_pass = None;
         self.refl_building = false;
         self.cur_hdr = None;
         crate::prof::ctx("");
         self.no_reflections = was_mirror;
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("refl face copy") });
+        // the face's copies follow its passes in the frame's encoder
+        let mut encoder = self.frame_cmds.take(&self.device);
         // ENHANCEMENT E49 (NEAR-REFL2): the face's alpha marks what was drawn (1) and where the sky is (0), before its copies
         if near.is_some() {
             let format = self.refl.as_ref().expect("refl cube").format;
@@ -67,7 +80,7 @@ impl Core {
         if near.is_some() && !cars_drawn {
             copy_into(&mut encoder, &c.array, face);
         }
-        copy_into(&mut encoder, &c.array, if near.is_some() { 6 + face } else { face });
+        copy_into(&mut encoder, &c.array, if near.is_some() { OWN + face } else { face });
         if near.is_some() {
             c.faces_done_own |= 1 << face;
             c.stale_own |= 1 << face;
@@ -81,22 +94,15 @@ impl Core {
         }
         c.faces_done |= 1 << face;
         c.stale |= 1 << face;
-        // ENHANCEMENT E16: project the faces into the car ambient's SH (after every face update)
-        if self.enhancements.is_on(crate::E16) && self.enhancements.is_on(crate::E8) && self.compute_supported && c.faces_done == 0x3F {
-            let built = self.probe.is_some();
-            let p = self.probe.get_or_insert_with(|| crate::probe::Probe::new(&self.device));
-            let (array_view, size) = (c.base_view.clone(), c.size);
-            p.update(&self.device, &self.queue, &mut encoder, &array_view, size, 1.0 / REFL_TAN_HALF);
-            if !built {
-                self.rebuild_globals_bg();
-            }
-        }
-        crate::prof::resolve(&mut encoder);
-        crate::prof::submit(&self.device, &self.queue, Some(crate::prof::finish(encoder)));
-        // `NFS_GPU_TIME`: a face's cost is added to the main frame's average (steady state: one frame = main + its faces)
+        // ENHANCEMENT E16: the car ambient's SH is projected once a frame, after the frame's faces (`Self::refl_probe`)
+        c.probe_due |= c.faces_done == ALL_FACES;
+        self.frame_cmds.park(encoder);
+        // `NFS_GPU_TIME`: a face's cost is added to the main frame's average (steady state: one frame = main + its faces); the
+        // diagnostic submits the face on its own to time it
         if let Some(t0) = t0 {
+            self.submit_frame();
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-            self.gpu_time_acc.0 += t0.elapsed().as_secs_f64() * 1000.0;
+            self.gpu_time_acc.0 += t0.elapsed().as_secs_f64() * MS_PER_S;
         }
     }
 
@@ -129,7 +135,7 @@ impl Core {
         if self.refl.as_ref().is_none_or(|c| c.size != size || c.format != format || c.near != near) {
             let array = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("refl faces"),
-                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: if near { 12 } else { 6 } },
+                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: if near { 2 * FACES } else { FACES } },
                 mip_level_count: crate::coat::MIPS,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -142,7 +148,7 @@ impl Core {
             let base_view = array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), base_mip_level: 0, mip_level_count: Some(1), ..Default::default() });
             let tex = gfx::texture_2d(&self.device, "refl face", size, size, format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
             let face_view = tex.create_view(&Default::default());
-            self.refl = Some(ReflCube { size, format, array, array_view, base_view, stale: 0, face: tex, face_view, faces_done: 0, near, stale_own: 0, faces_done_own: 0, own_same: 0, eyes: [glam::Vec3::ZERO; 6], eye: glam::Vec3::ZERO });
+            self.refl = Some(ReflCube { size, format, array, array_view, base_view, stale: 0, face: tex, face_view, faces_done: 0, near, stale_own: 0, faces_done_own: 0, own_same: 0, eyes: [glam::Vec3::ZERO; 6], eye: glam::Vec3::ZERO, probe_due: false });
             if self.coat.is_none() {
                 self.coat = Some(crate::coat::CoatFilter::new(&self.device));
             }
@@ -153,24 +159,43 @@ impl Core {
         }
     }
 
-    /// ENHANCEMENT ENH-COAT: the prefiltered mips of the faces drawn since the last run, once all six are in (the filter of
-    /// one face reads its neighbours' mip 0). Its own submit, before the frame that reads the mips.
-    pub(super) fn refl_prefilter(&mut self) {
-        let (Some(c), Some(coat)) = (self.refl.as_mut(), self.coat.as_mut()) else { return };
-        // ENHANCEMENT E49: the player's layers 6..11 like the others, once all six of them are in
-        let own = c.near && c.stale_own != 0 && c.faces_done_own == 0x3F;
-        if (c.stale == 0 || c.faces_done != 0x3F) && !own {
+    /// ENHANCEMENT E16: project the cube's six faces into the car ambient's SH, once a frame when a face of the full cube was
+    /// drawn since the last projection (RENDER-AUDIT §8 item 2: it ran after every face, twice a frame; its blend per update is
+    /// the two updates' together, [`crate::probe::BLEND_FRAME`], so the ambient follows the surroundings as fast as before).
+    /// Recorded into `encoder` ahead of the frame that reads the uniform (with the coat prefilter, [`Self::refl_prefilter`]).
+    fn refl_probe(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(c) = self.refl.as_mut().filter(|c| c.probe_due) else { return };
+        c.probe_due = false;
+        if !(self.enhancements.is_on(crate::E16) && self.enhancements.is_on(crate::E8) && self.compute_supported) {
             return;
         }
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("coat prefilter") });
-        if c.stale != 0 && c.faces_done == 0x3F {
-            coat.record(&self.device, &self.queue, &mut encoder, &c.array, c.format, c.size, c.stale, 1.0 / REFL_TAN_HALF, 0);
+        let built = self.probe.is_some();
+        let p = self.probe.get_or_insert_with(|| crate::probe::Probe::new(&self.device));
+        p.update(&self.device, &mut self.belt, encoder, &c.base_view, c.size, crate::probe::BLEND_FRAME);
+        if !built {
+            self.rebuild_globals_bg();
+        }
+    }
+
+    /// ENHANCEMENT ENH-COAT: the prefiltered mips of the faces drawn since the last run, once all six are in (the filter of
+    /// one face reads its neighbours' mip 0). Recorded into `encoder` ahead of the frame that reads the mips; E16's probe of
+    /// the frame's faces first ([`Self::refl_probe`]).
+    pub(super) fn refl_prefilter(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.refl_probe(encoder);
+        let (Some(c), Some(coat)) = (self.refl.as_mut(), self.coat.as_mut()) else { return };
+        // ENHANCEMENT E49: the player's layers 6..11 like the others, once all six of them are in
+        let own = c.near && c.stale_own != 0 && c.faces_done_own == ALL_FACES;
+        if (c.stale == 0 || c.faces_done != ALL_FACES) && !own {
+            return;
+        }
+        if c.stale != 0 && c.faces_done == ALL_FACES {
+            coat.record(&self.device, &mut self.belt, encoder, &c.array, c.format, c.size, c.stale, 1.0 / REFL_TAN_HALF, 0);
             c.stale = 0;
         }
         if own {
             // a face with no car near is the same in both layers: its filtered mips are copied (after their filter above)
-            coat.record(&self.device, &self.queue, &mut encoder, &c.array, c.format, c.size, c.stale_own & !c.own_same, 1.0 / REFL_TAN_HALF, 6);
-            for f in 0..6u32 {
+            coat.record(&self.device, &mut self.belt, encoder, &c.array, c.format, c.size, c.stale_own & !c.own_same, 1.0 / REFL_TAN_HALF, OWN);
+            for f in 0..FACES {
                 if c.stale_own & c.own_same & (1 << f) == 0 {
                     continue;
                 }
@@ -178,27 +203,25 @@ impl Core {
                     let s = (c.size >> m).max(1);
                     encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo { texture: &c.array, mip_level: m, origin: wgpu::Origin3d { x: 0, y: 0, z: f }, aspect: wgpu::TextureAspect::All },
-                        wgpu::TexelCopyTextureInfo { texture: &c.array, mip_level: m, origin: wgpu::Origin3d { x: 0, y: 0, z: 6 + f }, aspect: wgpu::TextureAspect::All },
+                        wgpu::TexelCopyTextureInfo { texture: &c.array, mip_level: m, origin: wgpu::Origin3d { x: 0, y: 0, z: OWN + f }, aspect: wgpu::TextureAspect::All },
                         wgpu::Extent3d { width: s, height: s, depth_or_array_layers: 1 },
                     );
                 }
             }
             c.stale_own = 0;
         }
-        crate::prof::submit(&self.device, &self.queue, Some(crate::prof::finish(encoder)));
     }
 
     /// ENHANCEMENT E49: the near lookup's globals of `scene`'s frame (`fill::NearFrame`): the cube is the twelve-layer one with all its
     /// faces, E49 and E8 on, a view that takes the map (not the mirror, not a face being drawn); `None` = off (the globals' zeros).
     pub(super) fn near_frame(&self, scene: &Scene) -> Option<fill::NearFrame> {
         let c = self.refl.as_ref()?;
-        let on = self.enhancements.is_on(crate::E49) && self.enhancements.is_on(crate::E8) && c.near && c.faces_done == 0x3F && scene.refl > 0.0 && !self.no_reflections && !self.refl_building;
+        let on = self.enhancements.is_on(crate::E49) && self.enhancements.is_on(crate::E8) && c.near && c.faces_done == ALL_FACES && scene.refl > 0.0 && !self.no_reflections && !self.refl_building;
         // TEST GLUE: `NFS_NEAR_DEBUG=1` shows the reflection alone on the paint; `=2` also without the box (the plain lookup); `=3` / `=4`
         // the same as a mirror (mip 0); `=5` (NEAR-REFL2) the sphere-map overlay's geometry weights alone (the shader's `env_over`)
-        static DEBUG: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let debug = *DEBUG.get_or_init(|| std::env::var("NFS_NEAR_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let debug = crate::dbg::flags().near_debug;
         let proxy = if debug % 2 == 0 && debug > 0 { None } else { near_proxy(&scene.cover, c.eye) };
-        on.then(|| fill::NearFrame { own: c.faces_done_own == 0x3F, eyes: c.eyes, eye: c.eye, proxy, sky: scene.near_sky, debug: match debug { 5 => 3, d if d >= 3 => 2, d => u8::from(d > 0) } })
+        on.then(|| fill::NearFrame { own: c.faces_done_own == ALL_FACES, eyes: c.eyes, eye: c.eye, proxy, sky: scene.near_sky, debug: match debug { 5 => NEAR_DEBUG_OVERLAY, d if d >= 3 => NEAR_DEBUG_SHARP, d => u8::from(d > 0) } })
     }
 
     /// ENHANCEMENT ENH-FE3D: fill all six faces of the environment cube from the CPU — `faces` are six `size x size`
@@ -222,7 +245,7 @@ impl Core {
                     data.extend_from_slice(&f32_to_f16(*v).to_le_bytes());
                 }
             } else {
-                data.extend(px.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8));
+                data.extend(px.iter().map(|v| (v.clamp(0.0, 1.0) * BYTE + 0.5) as u8));
                 if bgra {
                     for t in data.chunks_exact_mut(4) {
                         t.swap(0, 2);
@@ -237,15 +260,15 @@ impl Core {
                 wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
             );
         }
-        c.faces_done = 0x3F;
-        c.stale = 0x3F;
+        c.faces_done = ALL_FACES;
+        c.stale = ALL_FACES;
         if self.enhancements.is_on(crate::E16) && self.enhancements.is_on(crate::E8) && self.compute_supported {
             let built = self.probe.is_some();
             let p = self.probe.get_or_insert_with(|| crate::probe::Probe::new(&self.device));
             let (array_view, size) = (c.base_view.clone(), c.size);
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("studio probe") });
-            p.update(&self.device, &self.queue, &mut encoder, &array_view, size, 1.0 / REFL_TAN_HALF);
-            crate::prof::submit(&self.device, &self.queue, Some(crate::prof::finish(encoder)));
+            let mut encoder = self.frame_cmds.take(&self.device);
+            p.update(&self.device, &mut self.belt, &mut encoder, &array_view, size, crate::probe::BLEND);
+            self.frame_cmds.park(encoder);
             if !built {
                 self.rebuild_globals_bg();
             }
@@ -257,7 +280,7 @@ impl Core {
     /// takes the environment map (`Scene::refl`).
     pub(super) fn probe_strength(&self, scene: &Scene) -> f32 {
         let ready = self.enhancements.is_on(crate::E16) && self.enhancements.is_on(crate::E8) && scene.refl > 0.0 && self.probe.as_ref().is_some_and(|p| p.ready());
-        if !ready { 0.0 } else if self.enhancements.level(crate::E16) >= 2 { crate::probe::STRENGTH_STRONG } else { crate::probe::STRENGTH }
+        if !ready { 0.0 } else if self.enhancements.level(crate::E16) >= crate::Enhancements::E16_STRONGER { crate::probe::STRENGTH_STRONG } else { crate::probe::STRENGTH }
     }
 }
 

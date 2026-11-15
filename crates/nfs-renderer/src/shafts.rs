@@ -8,7 +8,7 @@
 //! the sun lets none through. The pass is additive over the whole frame, sky included: the sky takes
 //! light only in proportion to what stands between it and the sun, so the beams show in the air.
 
-use crate::gfx::{self, Fullscreen, Keyed, OverScene};
+use crate::gfx::{self, Fullscreen, Keyed, OverScene, PostTarget, UniformBuf, Variants};
 use crate::wgsl::{self, DepthKind};
 
 /// The sun's screen position and strength for the pass (`Scene::shafts`).
@@ -83,7 +83,7 @@ const GAIN: f32 = 0.42;
 // pillars (closer than 1.5 m to the eye), which take no ray
 @fragment fn fs_comp(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let far = u.tint.w;
-    let z = u.near * far / max(far - depth_at(vec2<i32>(pos.xy)) * (far - u.near), 0.0001);
+    let z = linear_z(depth_at(vec2<i32>(pos.xy)), u.near, far);
     if z < 1.5 {
         return vec4<f32>(0.0);
     }
@@ -94,7 +94,7 @@ const GAIN: f32 = 0.42;
 
 /// The pass's shader for a depth `kind`.
 pub(crate) fn source(kind: DepthKind) -> String {
-    wgsl::compose(&[wgsl::FULLSCREEN_VS, wgsl::IGN, kind.wgsl(), WGSL])
+    wgsl::compose(&[wgsl::FULLSCREEN_VS, wgsl::IGN, kind.wgsl(), wgsl::LINEAR_Z, WGSL])
 }
 
 /// The rays' image format: the tinted light, half size (no blend, no alpha needed).
@@ -116,62 +116,53 @@ type ShaftsBgKey = ((DepthKind, u32), wgpu::TextureView, wgpu::TextureView);
 pub(crate) struct ShaftsPass {
     device: wgpu::Device,
     format: wgpu::TextureFormat,
-    ubuf: wgpu::Buffer,
+    ubuf: UniformBuf<Uniform>,
     sampler: wgpu::Sampler,
-    pipes: std::collections::HashMap<(DepthKind, u32), Pipes>,
+    pipes: Variants<(DepthKind, u32), Pipes>,
     /// the rays' and the composite's bind groups, kept while the pipelines, the depth and the rays image hold
     bgs: Keyed<ShaftsBgKey, (wgpu::BindGroup, wgpu::BindGroup)>,
     /// the half-size rays image of the last full size
-    image: Option<((u32, u32), wgpu::Texture, wgpu::TextureView)>,
+    image: Option<PostTarget>,
 }
 
 impl ShaftsPass {
     pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let ubuf = gfx::uniform_buf::<Uniform>(device, "shafts");
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() });
-        Self { device: device.clone(), format, ubuf, sampler, pipes: Default::default(), bgs: Keyed::default(), image: None }
+        let ubuf = UniformBuf::new(device, "shafts");
+        let sampler = gfx::linear_clamp_sampler(device, None);
+        Self { device: device.clone(), format, ubuf, sampler, pipes: Variants::default(), bgs: Keyed::default(), image: None }
     }
 
     /// `kind`: what the depth is ([`DepthKind`]); `samples`: the colour's sample count (1 when the scene is already resolved).
-    fn build(&self, kind: DepthKind, samples: u32) -> Pipes {
-        let module = gfx::wgsl_module(&self.device, "shafts", &source(kind));
+    fn build(device: &wgpu::Device, format: wgpu::TextureFormat, kind: DepthKind, samples: u32) -> Pipes {
+        let module = gfx::wgsl_module(device, "shafts", &source(kind));
         let depth = kind.layout_entry();
         let uniform = gfx::bgl_uniform(2, wgpu::ShaderStages::FRAGMENT);
         let rays_tex = gfx::bgl_tex(3, wgpu::TextureSampleType::Float { filterable: true }, false);
         let rays_samp = gfx::bgl_sampler(4, wgpu::SamplerBindingType::Filtering);
-        let layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| gfx::bgl(&self.device, label, entries);
+        let layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| gfx::bgl(device, label, entries);
         let rays_bgl = layout("shafts rays", &[depth, uniform]);
         let comp_bgl = layout("shafts composite", &[depth, uniform, rays_tex, rays_samp]);
-        let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let pipe = |label: &str, fs: &str, bgl: &wgpu::BindGroupLayout, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, samples: u32, mask: wgpu::ColorWrites| {
-            let pl = gfx::pipeline_layout(&self.device, label, &[bgl]);
-            Fullscreen::new(label, &pl, &module).fs(fs).samples(samples).build(&self.device, &[Some(wgpu::ColorTargetState { format, blend, write_mask: mask })])
+            let pl = gfx::pipeline_layout(device, label, &[bgl]);
+            Fullscreen::new(label, &pl, &module).fs(fs).samples(samples).build(device, &[Some(wgpu::ColorTargetState { format, blend, write_mask: mask })])
         };
         let rays = pipe("shafts rays", "fs", &rays_bgl, RAYS_FORMAT, None, 1, wgpu::ColorWrites::ALL);
-        let comp = pipe("shafts composite", "fs_comp", &comp_bgl, self.format, Some(wgpu::BlendState { color: add, alpha: add }), samples, wgpu::ColorWrites::COLOR);
+        let comp = pipe("shafts composite", "fs_comp", &comp_bgl, format, Some(gfx::blend::ADD), samples, wgpu::ColorWrites::COLOR);
         Pipes { rays, rays_bgl, comp, comp_bgl }
     }
 
     /// Record the pass into `encoder`: the rays at half size, then added over `at.colour` (loaded; `at.resolve` when it is
     /// multisampled; `at.keep` = store the multisampled samples for a later pass), reading `at.depth`.
-    pub(crate) fn draw(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, s: &Shafts, planes: [f32; 2], at: &OverScene) {
-        let OverScene { depth, kind, colour, resolve, samples, keep } = *at;
-        let samples = samples.max(1);
+    pub(crate) fn draw(&mut self, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, s: &Shafts, planes: [f32; 2], at: &OverScene) {
+        let OverScene { depth, kind, colour, resolve, .. } = *at;
+        let samples = at.samples.max(1);
         let key = (kind, samples);
-        if !self.pipes.contains_key(&key) {
-            let p = self.build(kind, samples);
-            self.pipes.insert(key, p);
-        }
-        let (w, h) = (depth.texture().width(), depth.texture().height());
-        if self.image.as_ref().is_none_or(|i| i.0 != (w, h)) {
-            let t = gfx::texture_2d(&self.device, "shafts rays", w.div_ceil(2).max(1), h.div_ceil(2).max(1), RAYS_FORMAT, gfx::RT_USAGE);
-            let v = t.create_view(&Default::default());
-            self.image = Some(((w, h), t, v));
-        }
-        let rays_view = &self.image.as_ref().expect("rays image").2;
-        let pipes = &self.pipes[&key];
-        queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&Uniform { sun: s.uv, strength: s.strength, near: planes[0], tint: [s.tint[0], s.tint[1], s.tint[2], planes[1]] }));
-        let (device, ubuf_res, sampler) = (&self.device, &self.ubuf, &self.sampler);
+        let (device, format) = (&self.device, self.format);
+        let pipes = self.pipes.get(key, || Self::build(device, format, kind, samples));
+        let size = (depth.texture().width(), depth.texture().height());
+        let rays_view = &PostTarget::ensure(&mut self.image, device, "shafts rays", size, PostTarget::HALF, RAYS_FORMAT).view;
+        self.ubuf.write(belt, encoder, &Uniform { sun: s.uv, strength: s.strength, near: planes[0], tint: [s.tint[0], s.tint[1], s.tint[2], planes[1]] });
+        let (ubuf_res, sampler) = (&self.ubuf.buf, &self.sampler);
         let (bg1, bg2) = self.bgs.get((key, depth.clone(), rays_view.clone()), || {
             let depth_entry = wgpu::BindGroupEntry { binding: kind.binding(), resource: wgpu::BindingResource::TextureView(depth) };
             let ubuf = wgpu::BindGroupEntry { binding: 2, resource: ubuf_res.as_entire_binding() };
@@ -183,15 +174,8 @@ impl ShaftsPass {
             });
             (bg1, bg2)
         });
-        {
-            let mut pass = gfx::color_pass(encoder, "light shafts (rays, half size)", "light shafts rays (half)", rays_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
-            pass.set_pipeline(&pipes.rays);
-            pass.set_bind_group(0, bg1, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        let mut pass = gfx::color_pass_resolve(encoder, "light shafts (composite)", "light shafts composite", colour, resolve, wgpu::LoadOp::Load, if samples > 1 && !keep { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store });
-        pass.set_pipeline(&pipes.comp);
-        pass.set_bind_group(0, bg2, &[]);
-        pass.draw(0..3, 0..1);
+        gfx::fullscreen_pass(encoder, "light shafts (rays, half size)", "light shafts rays (half)", rays_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &pipes.rays, &[bg1]);
+        let mut pass = gfx::color_pass_resolve(encoder, "light shafts (composite)", "light shafts composite", colour, resolve, wgpu::LoadOp::Load, at.store());
+        gfx::draw_fullscreen(&mut pass, &pipes.comp, &[bg2]);
     }
 }

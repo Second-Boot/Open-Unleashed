@@ -91,9 +91,9 @@ impl super::Upscaler for MetalFxSpatial {
     fn render_scale(&self, level: u8) -> f32 {
         // E34's levels 5..7 (the «simple» spatial ones, after the four temporal ones)
         match level {
-            5 => 0.67,
-            6 => 0.59,
-            _ => 0.5,
+            5 => super::preset_scale(0),
+            6 => super::preset_scale(1),
+            _ => super::preset_scale(2),
         }
     }
 

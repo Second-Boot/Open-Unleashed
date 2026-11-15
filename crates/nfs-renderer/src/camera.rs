@@ -10,9 +10,15 @@ pub struct Camera {
     pub far: f32,
 }
 
+/// [`Camera::default`]: a viewer's start (`tools/`), up and back from the origin, looking at it.
+const DEFAULT_POSITION: Vec3 = Vec3::new(0.0, 5.0, 12.0);
+const DEFAULT_FOV_Y_DEG: f32 = 60.0;
+const DEFAULT_NEAR: f32 = 0.1;
+const DEFAULT_FAR: f32 = 5000.0;
+
 impl Default for Camera {
     fn default() -> Self {
-        Self { position: Vec3::new(0.0, 5.0, 12.0), target: Vec3::ZERO, up: Vec3::Y, fov_y_radians: 60f32.to_radians(), near: 0.1, far: 5000.0 }
+        Self { position: DEFAULT_POSITION, target: Vec3::ZERO, up: Vec3::Y, fov_y_radians: DEFAULT_FOV_Y_DEG.to_radians(), near: DEFAULT_NEAR, far: DEFAULT_FAR }
     }
 }
 

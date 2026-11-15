@@ -23,11 +23,21 @@ mod fsr;
 /// ENHANCEMENT E37: `NFS_FSR_NAGA=1` keeps FSR's SPIR-V on naga's front end on Vulkan too (by default Vulkan takes it as it is, the
 /// shader-module passthrough: the SPD image's `Coherent` decoration is kept).
 pub(crate) fn fsr_naga_forced() -> bool {
-    std::env::var("NFS_FSR_NAGA").is_ok_and(|v| !v.is_empty() && v != "0")
+    crate::dbg::flags().fsr_naga
 }
 
 #[cfg(target_os = "macos")]
 mod metalfx;
+
+/// The internal size of the three upscaling presets, quality / balanced / performance: AMD FSR's ratios (1.5x, 1.7x, 2x), the one
+/// table of FSR (menu levels 2..4, `fsr.rs`) and of MetalFX (E34: temporal levels 2..4, spatial levels 5..7), 67 % / 59 % / 50 % in the menu.
+pub(crate) const RENDER_SCALES: [f32; 3] = [1.0 / 1.5, 1.0 / 1.7, 1.0 / 2.0];
+
+/// The internal size of preset `n` (0 = quality, 1 = balanced, anything else performance) of [`RENDER_SCALES`].
+pub(crate) fn preset_scale(n: usize) -> f32 {
+    RENDER_SCALES[n.min(RENDER_SCALES.len() - 1)]
+}
+
 #[cfg(target_os = "macos")]
 mod metalfx_temporal;
 
@@ -39,14 +49,12 @@ pub(crate) const TEMPORAL_MIP_EXTRA: f32 = -0.5;
 
 /// TEST GLUE `NFS_UPSCALE_MIP_EXTRA=<f>`: [`TEMPORAL_MIP_EXTRA`] replaced (for A/B stills; read once).
 fn temporal_mip_extra() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NFS_UPSCALE_MIP_EXTRA").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(TEMPORAL_MIP_EXTRA))
+    crate::dbg::flags().upscale_mip_extra.unwrap_or(TEMPORAL_MIP_EXTRA)
 }
 
 /// TEST GLUE `NFS_UPSCALE_MIP=0`: no upscaler LOD bias at all (the frame before UPSCALE-SOFT, for A/B stills; read once).
 fn mip_bias_off() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NFS_UPSCALE_MIP").is_ok_and(|v| v.trim() == "0"))
+    crate::dbg::flags().upscale_mip_off
 }
 
 /// ENHANCEMENT UPSCALE-SOFT: the texture LOD bias added to every material's own while the main view is drawn at `render_w` for a

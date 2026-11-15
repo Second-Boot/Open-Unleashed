@@ -28,14 +28,16 @@ impl Core {
         }
         let t0 = std::time::Instant::now();
         let _ = self.device.poll(wgpu::PollType::Poll);
-        let mut keep = Vec::new();
-        for p in std::mem::take(&mut self.lens_pending) {
-            match p.rx.try_recv() {
+        // (in place: the pending list keeps its storage)
+        let mut i = 0;
+        while i < self.lens_pending.len() {
+            match self.lens_pending[i].rx.try_recv() {
                 Ok(Ok(())) => {
+                    let p = self.lens_pending.remove(i);
                     let mut pixels = [0u32; 16];
                     {
                         let data = p.buf.slice(..).get_mapped_range().expect("mapped range");
-                        let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+                        let bgra = is_bgra(self.config.format);
                         for (row, chunk) in pixels.chunks_exact_mut(4).enumerate() {
                             for (i, px) in chunk.iter_mut().enumerate() {
                                 if p.half {
@@ -52,18 +54,22 @@ impl Core {
                         }
                     }
                     p.buf.unmap();
+                    if self.lens_free.len() < LENS_POOL {
+                        self.lens_free.push(p.buf);
+                    }
                     self.lens_done.push(LensRead { reference: p.reference, pixels, cost_ms: t0.elapsed().as_millis() as u32 });
                 }
-                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
-                Err(std::sync::mpsc::TryRecvError::Empty) => keep.push(p),
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.lens_pending.remove(i);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
             }
         }
         // a read-back that never completes does not pile up
-        let n = keep.len();
-        if n > 8 {
-            keep.drain(..n - 8);
+        let n = self.lens_pending.len();
+        if n > LENS_PENDING_MAX {
+            self.lens_pending.drain(..n - LENS_PENDING_MAX);
         }
-        self.lens_pending = keep;
     }
 
     /// The finished read-backs, taken.
@@ -82,14 +88,14 @@ impl Core {
         if w < 5 || h < 5 {
             return;
         }
-        let (px, py) = ((probe.x / 640.0 * w as f32).round_ties_even() as i32 - 2, (probe.y / 480.0 * h as f32).round_ties_even() as i32 - 2);
+        let (px, py) = ((probe.x / crate::LENS_SCREEN[0] * w as f32).round_ties_even() as i32 - 2, (probe.y / crate::LENS_SCREEN[1] * h as f32).round_ties_even() as i32 - 2);
         // 0x10003320: `max(v, 0)`, then `v + 4 >= size` → `size − 5`
         let clamp = |v: i32, size: i32| {
             let v = v.max(0);
             if v + 4 >= size { size - 5 } else { v }
         };
         let (x, y) = (clamp(px, w), clamp(py, h));
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("lens read-back"), size: LENS_ROW * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let buf = self.lens_free.pop().unwrap_or_else(|| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("lens read-back"), size: LENS_ROW * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false }));
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(LENS_ROW as u32), rows_per_image: Some(4) } },
@@ -111,8 +117,12 @@ impl Core {
     }
 
     /// The depth target for a pass of this size: one per size, kept (every pass clears it first,
-    /// so sharing it between offscreen passes is the same as a fresh texture each).
+    /// so sharing it between offscreen passes is the same as a fresh texture each); at most [`TARGET_CACHE_SIZES`] sizes are
+    /// kept (a window being dragged asks for a new size every frame).
     pub(super) fn depth_for(&mut self, width: u32, height: u32) -> wgpu::TextureView {
+        if self.depth_cache.len() > TARGET_CACHE_SIZES && !self.depth_cache.contains_key(&(width, height)) {
+            self.depth_cache.clear();
+        }
         let device = &self.device;
         self.depth_cache.entry((width, height)).or_insert_with(|| Self::make_depth_sized(device, width, height)).clone()
     }
@@ -156,24 +166,24 @@ impl Core {
         let clear = clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]);
         if let Some(mode) = hdr {
             let mut blit = match self.scale_blit_mirror.take() {
-                Some(b) if b.hdr == hdr => b,
-                _ => ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, Some(mode), false, None, false),
+                Some(b) if b.key == ToneKey::float(mode) => b,
+                _ => ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, ToneKey::float(mode), None, None),
             };
             let (rt_tex, rt_view) = blit.target(&self.device, &self.sprite_layout, &self.sprite_sampler, width, height);
             let ms = self.ms_targets(width, height, self.enh_samples(true), true);
             self.cur_hdr = hdr;
-            self.encode_frame(scene, clear, false, camera, &rt_view, &rt_tex, false, &depth, aspect, far, ms.as_ref());
+            self.encode_frame(FrameDesc { scene, clear, with_sprites: false, camera, view: &rt_view, target: &rt_tex, can_copy: false, depth: &depth, aspect, depth_far: far, ms: ms.as_ref() });
             self.cur_hdr = None;
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mirror tone map") });
-            blit.draw(&mut encoder, &view, None, None, None);
-            crate::prof::resolve(&mut encoder);
-        crate::prof::submit(&self.device, &self.queue, Some(crate::prof::finish(encoder)));
+            // the mirror's tone map follows its pass in the frame's encoder
+            let mut encoder = self.frame_cmds.take(&self.device);
+            blit.draw(&mut encoder, &view, &[], None, None);
+            self.frame_cmds.park(encoder);
             self.scale_blit_mirror = Some(blit);
             crate::prof::ctx("");
             return id;
         }
         let ms = self.ms_targets(width, height, self.enh_samples(false), false);
-        self.encode_frame(scene, clear, false, camera, &view, &target, false, &depth, aspect, far, ms.as_ref());
+        self.encode_frame(FrameDesc { scene, clear, with_sprites: false, camera, view: &view, target: &target, can_copy: false, depth: &depth, aspect, depth_far: far, ms: ms.as_ref() });
         crate::prof::ctx("");
         id
     }
@@ -184,9 +194,9 @@ impl Core {
         let depth = self.depth_for(width, height);
         // `NFS_GPU_TIME`: the same frame again 60 times, so a still has a timing (diagnostic only)
         for _ in 0..if self.gpu_time_log { 60 } else { 0 } {
-            self.encode_with_gamma(scene, camera, &view, &target, true, &depth, width, height, width as f32 / height as f32);
+            self.encode_with_gamma(scene, camera, FrameOut::of(&view, &target, &depth));
         }
-        self.encode_with_gamma(scene, camera, &view, &target, true, &depth, width, height, width as f32 / height as f32);
+        self.encode_with_gamma(scene, camera, FrameOut::of(&view, &target, &depth));
         // ENHANCEMENT E33 diagnostic (`NFS_EDR_PROBE=<path prefix>`): the same frame through the EDR chain, read back
         #[cfg(target_os = "macos")]
         if let Some(prefix) = crate::dbg::flags().edr_probe.as_deref() {
@@ -226,7 +236,7 @@ impl Core {
         }
         let (_, _, target, view) = self.bench_target.clone().expect("bench target");
         let depth = self.depth_for(width, height);
-        self.encode_with_gamma(scene, camera, &view, &target, true, &depth, width, height, width as f32 / height as f32);
+        self.encode_with_gamma(scene, camera, FrameOut::of(&view, &target, &depth));
     }
 
     /// TEST GLUE (`--perf-bench`): the throughput phase's frame end: no wait for this frame, only for the one `depth` frames
@@ -278,8 +288,8 @@ impl Core {
         let px = w as u64 * h as u64;
         if px > 32_000_000 {
             e.set_level(crate::E1, 0);
-        } else if px > 16_000_000 && e.level(crate::E1) > 1 {
-            e.set_level(crate::E1, 1);
+        } else if px > 16_000_000 && e.level(crate::E1) > crate::Enhancements::E1_2X {
+            e.set_level(crate::E1, crate::Enhancements::E1_2X);
         }
         self.enhancements = e;
         let r = self.render_to_image(scene, camera, w, h);
@@ -290,13 +300,27 @@ impl Core {
 
     /// Copies a `COPY_SRC` texture to the host as tightly packed RGBA8.
     pub(super) fn readback(&self, target: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<u8>> {
-        let bytes_per_row = (4 * width).div_ceil(256) * 256;
+        let mut px = self.read_texture(target, width, height, 4)?;
+        if is_bgra(self.config.format) {
+            for p in px.chunks_exact_mut(4) {
+                p.swap(0, 2);
+            }
+        }
+        Ok(px)
+    }
+
+    /// The `width x height` texels of a `COPY_SRC` texture of `bytes_per_px` bytes a texel, tightly packed rows (the device
+    /// waited for).
+    pub(super) fn read_texture(&self, target: &wgpu::Texture, width: u32, height: u32, bytes_per_px: u32) -> Result<Vec<u8>> {
+        debug_assert!(self.frame_cmds.is_empty(), "a read-back after the frame's submit");
+        let row = bytes_per_px * width;
+        let bytes_per_row = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (bytes_per_row * height) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            super::kit::level_copy(target, 0),
             wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(height) } },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            super::kit::extent(width, height),
         );
         self.queue.submit(Some(enc.finish()));
         let slice = buf.slice(..);
@@ -307,17 +331,9 @@ impl Core {
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         rx.recv()??;
         let data = slice.get_mapped_range().expect("mapped range");
-        let mut out = Vec::with_capacity((width * height * 4) as usize);
-        let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
-        for row in 0..height {
-            let r = &data[(row * bytes_per_row) as usize..(row * bytes_per_row + width * 4) as usize];
-            if bgra {
-                for px in r.chunks_exact(4) {
-                    out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-                }
-            } else {
-                out.extend_from_slice(r);
-            }
+        let mut out = Vec::with_capacity((row * height) as usize);
+        for r in data.chunks(bytes_per_row as usize).take(height as usize) {
+            out.extend_from_slice(&r[..row as usize]);
         }
         drop(data);
         buf.unmap();

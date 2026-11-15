@@ -6,6 +6,27 @@
 use crate::gfx;
 use super::*;
 
+/// The sRGB transfer function's constants (IEC 61966-2-1): the linear segment's knee (encoded / linear), its slope, the
+/// power segment's offset, scale and exponent.
+const SRGB_KNEE_ENC: f32 = 0.04045;
+const SRGB_KNEE_LIN: f32 = 0.003_130_8;
+const SRGB_SLOPE: f32 = 12.92;
+const SRGB_OFFSET: f32 = 0.055;
+const SRGB_SCALE: f32 = 1.055;
+const SRGB_GAMMA: f32 = 2.4;
+/// A surface value counts as above SDR white past this (half a 10-bit step of slack).
+const ABOVE_WHITE: f32 = 1.0005;
+/// The most a 2D pixel may differ from its byte's plain decode and still count as SDR.
+const HUD_TOLERANCE: f32 = 1.0 / 1024.0;
+/// `_edr.ppm`'s glow for values above white: green and blue from these at white to 255 at the cap.
+const GLOW_GREEN: f32 = 140.0;
+const GLOW_BLUE: f32 = 30.0;
+/// `_hdr.ppm`'s exposure, and the darkest SDR decode `_heat.ppm` divides by.
+const HDR_EXPOSURE: f32 = 0.5;
+const HEAT_FLOOR: f32 = 0.02;
+/// A channel's largest byte, as a float.
+const BYTE_MAX: f32 = 255.0;
+
 impl Core {
     /// ENHANCEMENT E33 diagnostic: draw `scene` through the EDR chain (frame image -> present pass) into an
     /// `Rgba16Float` image of its own, read the values back and log what they are: the brightest value, how many pixels
@@ -20,20 +41,24 @@ impl Core {
         self.gamma = 1.0;
         self.edr.pass = true;
         self.edr.gain_used = false;
-        self.encode_with_gamma(scene, camera, &view, &tex, true, &depth, w, h, w as f32 / h as f32);
+        self.encode_with_gamma(scene, camera, FrameOut::of(&view, &tex, &depth));
         self.edr.pass = false;
         self.gamma = gamma;
-        self.edr_probe_stats(&tex, &pre2d, w, h, gamma, was_on, prefix);
+        self.edr_probe_stats(&tex, &pre2d, gamma, was_on, prefix);
     }
 
     /// ENHANCEMENT E33 diagnostic, the second half of [`Self::edr_probe`]: the present pass of the frame already in
     /// `tex` (with `pre2d` its copy before the 2D) into an image of its own, read back and logged. Also called from
     /// the window path once (frame 20) under `NFS_EDR_PROBE`, so the MetalFX / SMAA paths can be measured too.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn edr_probe_stats(&mut self, tex: &wgpu::Texture, pre2d: &wgpu::Texture, w: u32, h: u32, gamma: f32, was_on: bool, prefix: &str) {
+    /// (`tex` and `pre2d` are the window frame's size.)
+    pub(super) fn edr_probe_stats(&mut self, tex: &wgpu::Texture, pre2d: &wgpu::Texture, gamma: f32, was_on: bool, prefix: &str) {
+        let (w, h) = (tex.width(), tex.height());
         let out = gfx::texture_2d(&self.device, "edr probe", w, h, HDR_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let out_view = out.create_view(&Default::default());
-        self.edr.present(&self.device, &self.queue, &out_view, gamma);
+        let mut encoder = self.frame_cmds.take(&self.device);
+        self.edr.present(&self.device, &mut self.belt, &mut encoder, &out_view, gamma);
+        self.frame_cmds.park(encoder);
+        self.submit_frame();
         let gain_used = self.edr.gain_used;
         let f = self.readback_f16(&out, w, h);
         let frame8 = self.readback(tex, w, h);
@@ -43,8 +68,8 @@ impl Core {
             return;
         };
         let dec = |b: u8| {
-            let v = b as f32 / 255.0;
-            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            let v = b as f32 / BYTE_MAX;
+            if v <= SRGB_KNEE_ENC { v / SRGB_SLOPE } else { ((v + SRGB_OFFSET) / SRGB_SCALE).powf(SRGB_GAMMA) }
         };
         let n = (w * h) as usize;
         let (mut max_v, mut above, mut sum_e, mut sum_s, mut hud, mut hud_bad, mut hud_max) = (0f32, 0usize, 0f64, 0f64, 0usize, 0usize, 0f32);
@@ -61,7 +86,7 @@ impl Core {
             let touched = frame8[i * 4..i * 4 + 3] != before[i * 4..i * 4 + 3];
             let em = e[0].max(e[1]).max(e[2]);
             max_v = max_v.max(em);
-            if em > 1.0005 {
+            if em > ABOVE_WHITE {
                 above += 1;
             }
             sum_e += (e[0] + e[1] + e[2]) as f64 / 3.0;
@@ -70,23 +95,23 @@ impl Core {
                 hud += 1;
                 let d = (0..3).map(|c| (e[c] - dec(m8[c])).abs()).fold(0f32, f32::max);
                 hud_max = hud_max.max(em);
-                if d > 1.0 / 1024.0 {
+                if d > HUD_TOLERANCE {
                     hud_bad += 1;
                 }
             }
             let enc = |v: f32| {
                 let v = v.clamp(0.0, 1.0);
-                (255.0 * if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }).round() as u8
+                (BYTE_MAX * if v <= SRGB_KNEE_LIN { v * SRGB_SLOPE } else { SRGB_SCALE * v.powf(1.0 / SRGB_GAMMA) - SRGB_OFFSET }).round() as u8
             };
-            if em > 1.0005 {
+            if em > ABOVE_WHITE {
                 let t = ((em - 1.0) / (crate::edr::CAP - 1.0)).clamp(0.0, 1.0);
-                img.extend_from_slice(&[255, (140.0 + 115.0 * t) as u8, (30.0 + 225.0 * t) as u8]);
+                img.extend_from_slice(&[255, (GLOW_GREEN + (BYTE_MAX - GLOW_GREEN) * t) as u8, (GLOW_BLUE + (BYTE_MAX - GLOW_BLUE) * t) as u8]);
             } else {
                 img.extend_from_slice(&[enc(e[0]), enc(e[1]), enc(e[2])]);
             }
             let sm = dec(m8[0]).max(dec(m8[1])).max(dec(m8[2]));
-            hdr.extend_from_slice(&[enc(e[0] * 0.5), enc(e[1] * 0.5), enc(e[2] * 0.5)]);
-            heat.extend_from_slice(&[(255.0 * (em / sm.max(0.02) - 1.0)).clamp(0.0, 255.0) as u8, (255.0 * em / 3.0).clamp(0.0, 255.0) as u8, 0]);
+            hdr.extend_from_slice(&[enc(e[0] * HDR_EXPOSURE), enc(e[1] * HDR_EXPOSURE), enc(e[2] * HDR_EXPOSURE)]);
+            heat.extend_from_slice(&[(BYTE_MAX * (em / sm.max(HEAT_FLOOR) - 1.0)).clamp(0.0, BYTE_MAX) as u8, (BYTE_MAX * em / 3.0).clamp(0.0, BYTE_MAX) as u8, 0]);
             let g = if touched { 255 } else { 0 };
             mask.extend_from_slice(&[g, g, g]);
         }
@@ -120,32 +145,6 @@ impl Core {
 
     /// An `Rgba16Float` image read back as f32 RGBA.
     pub(super) fn readback_f16(&self, target: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<f32>> {
-        let bytes_per_row = (8 * width).div_ceil(256) * 256;
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback f16"), size: (bytes_per_row * height) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(height) } },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        self.queue.submit(Some(enc.finish()));
-        let slice = buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device.poll(wgpu::PollType::wait_indefinitely())?;
-        rx.recv()??;
-        let data = slice.get_mapped_range().expect("mapped range");
-        let mut out = Vec::with_capacity((width * height * 4) as usize);
-        for row in 0..height {
-            let r = &data[(row * bytes_per_row) as usize..(row * bytes_per_row + width * 8) as usize];
-            for h in r.chunks_exact(2) {
-                out.push(f16_to_f32(u16::from_le_bytes([h[0], h[1]])));
-            }
-        }
-        drop(data);
-        buf.unmap();
-        Ok(out)
+        Ok(self.read_texture(target, width, height, 8)?.chunks_exact(2).map(|h| f16_to_f32(u16::from_le_bytes([h[0], h[1]]))).collect())
     }
 }

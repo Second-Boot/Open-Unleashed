@@ -1,5 +1,5 @@
 //! ENHANCEMENT E16 — the car's ambient from the surroundings: the faces of E8's environment map are
-//! projected to spherical harmonics on the GPU (`probe.wgsl`), after every face update, into a uniform
+//! projected to spherical harmonics on the GPU (`probe.wgsl`), once a frame after the frame's faces, into a uniform
 //! the shader's car lighting reads (`shader.wgsl` `sh_irradiance`). Needs E8 (its faces) and compute
 //! shaders (not on the GL fallback: then E16 does nothing).
 
@@ -10,8 +10,18 @@ use crate::gfx;
 pub const STRENGTH: f32 = 0.6;
 /// ENHANCEMENT E16 level 2 («сильнее»): a clearer sky-above / ground-below split and more surrounding colour.
 pub const STRENGTH_STRONG: f32 = 1.5;
-/// The share of a fresh projection taken per update (one per face drawn: ~6 updates a full map).
-const BLEND: f32 = 0.12;
+/// The share of a fresh projection taken per update of the front end's uploaded faces (`Core::upload_refl_faces`); it was
+/// the drawn faces' too while the probe ran after every face (two a frame: ~6 updates a full map).
+pub(crate) const BLEND: f32 = 0.12;
+/// The share taken per update of the drawn faces, now once a frame (`Core::refl_probe`): the two per-face updates of a
+/// frame together, `1 - (1 - BLEND)^2`, so the ambient follows the surroundings at the same rate per frame.
+pub(crate) const BLEND_FRAME: f32 = 1.0 - (1.0 - BLEND) * (1.0 - BLEND);
+/// Second-order SH: the coefficients of bands 0..2 (`probe.wgsl`, the car shader's `probe_sh`).
+pub(crate) const SH_COEFFS: usize = 9;
+/// The faces of the cube the probe projects (`gpu::REFL_FACES`).
+const FACES: usize = 6;
+/// One coefficient (rgb, 0) in the buffers.
+const VEC4: u64 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -38,9 +48,14 @@ pub(crate) struct Probe {
     bg: crate::gfx::Keyed<wgpu::TextureView, wgpu::BindGroup>,
 }
 
+/// The probe's compute shader: the mesh shader's SH / luma constants and face table (`classes.rs`), then `probe.wgsl`.
+pub(crate) fn source() -> String {
+    crate::wgsl::compose(&[crate::classes::SH_LUMA, &crate::classes::faces_wgsl(), include_str!("probe.wgsl")])
+}
+
 impl Probe {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
-        let module = gfx::wgsl_module(device, "probe", include_str!("probe.wgsl"));
+        let module = gfx::wgsl_module(device, "probe", &source());
         let buf = |ty: wgpu::BufferBindingType| wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None };
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let layout = gfx::bgl(
@@ -63,10 +78,11 @@ impl Probe {
             layout,
             pipe_partial,
             pipe_final,
-            partial: make("probe partial", 54 * 16, wgpu::BufferUsages::STORAGE),
-            state: make("probe state", 10 * 16, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
-            params: make("probe params", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
-            uniform: make("probe sh", 9 * 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
+            partial: make("probe partial", (FACES * SH_COEFFS) as u64 * VEC4, wgpu::BufferUsages::STORAGE),
+            // (and one more: the "initialised" flag)
+            state: make("probe state", (SH_COEFFS + 1) as u64 * VEC4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            params: make("probe params", std::mem::size_of::<Params>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
+            uniform: make("probe sh", SH_COEFFS as u64 * VEC4, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             reset: true,
             done: false,
             params_now: None,
@@ -84,15 +100,17 @@ impl Probe {
         self.reset = true;
     }
 
-    /// Record one update: project the six faces (`faces`, `size`², `tan_inv` = 1 / tan(half fov)) and
-    /// blend into the state, then copy the state into the uniform. The faces must all have been drawn.
-    pub(crate) fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, faces: &wgpu::TextureView, size: u32, tan_inv: f32) {
-        // PERF (picture identical): the 16 bytes are written only when they change (a queue write is carried out before the
-        // submit's command buffers and stays in the buffer, so an unchanged one wrote the same bytes again, through a staging
-        // allocation of its own each face): the reset flag's update, then its clear, are writes of their own
-        let p = [size as f32, tan_inv, BLEND, self.reset as u32 as f32];
+    /// Record one update: project the six faces (`faces`, `size`², seen through `REFL_TAN_HALF`) and
+    /// blend `blend` of it into the state ([`BLEND`] / [`BLEND_FRAME`]), then copy the state into the uniform. The faces must
+    /// all have been drawn.
+    pub(crate) fn update(&mut self, device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, faces: &wgpu::TextureView, size: u32, blend: f32) {
+        let tan_inv = 1.0 / crate::REFL_TAN_HALF;
+        // PERF (picture identical): the 16 bytes are written only when they change (a belt copy in the frame's encoder, in
+        // order with the faces' passes; the buffer keeps the last one): the reset flag's update, then its clear, are writes of
+        // their own
+        let p = [size as f32, tan_inv, blend, self.reset as u32 as f32];
         if self.params_now != Some(p) {
-            queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { p }));
+            gfx::belt_write(belt, encoder, &self.params, bytemuck::bytes_of(&Params { p }));
             self.params_now = Some(p);
         }
         self.reset = false;
@@ -114,10 +132,10 @@ impl Probe {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("probe"), timestamp_writes: crate::prof::cp("E16 probe SH compute") });
             pass.set_bind_group(0, bg, &[]);
             pass.set_pipeline(&self.pipe_partial);
-            pass.dispatch_workgroups(6, 1, 1);
+            pass.dispatch_workgroups(FACES as u32, 1, 1);
             pass.set_pipeline(&self.pipe_final);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&self.state, 0, &self.uniform, 0, 9 * 16);
+        encoder.copy_buffer_to_buffer(&self.state, 0, &self.uniform, 0, SH_COEFFS as u64 * VEC4);
     }
 }

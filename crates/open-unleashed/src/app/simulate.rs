@@ -1,6 +1,7 @@
 //! The race simulation tick (`simulate`): controller sampling, the vehicle, the opponents, the police and the traffic.
 
 use crate::*;
+use nfs_game::track_id::TrackId;
 use nfs_physics::vehicle::{ContactKind, RaceState};
 
 impl App {
@@ -1038,7 +1039,7 @@ impl App {
                 if let Controller::Ai(d) = &mut o.controller {
                     d.set_catchup(self.race_skill, player_progress, player_pace);
                     // 0x40BAF0…0x40BB13: `[0x606AE0]` (autobahn) and nothing overhead
-                    d.wet = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(o.vehicle.position) == 0;
+                    d.wet = self.track.name.eq_ignore_ascii_case(TrackId::Autobahn.name()) && w.overhead_flags(o.vehicle.position) == 0;
                 }
                 // the two entries after the car's own index `car+0x528` (0x40C2CC…0x40C2E7:
                 // `j = min(idx + 2, n − 1)` down to `idx + 1`), whatever their keys
@@ -1093,7 +1094,7 @@ impl App {
                         .collect::<Vec<_>>(),
                 );
                 // `LoadTransfer`'s wet test, 0x4A191D…0x4A194D: `[0x606AE0]` and nothing overhead
-                o.vehicle.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(o.vehicle.position) == 0;
+                o.vehicle.wet_track = self.track.name.eq_ignore_ascii_case(TrackId::Autobahn.name()) && w.overhead_flags(o.vehicle.position) == 0;
                 if net_seats.contains(&oi) {
                     // a stale remote car on the AI arm is a human car: its `Car_simulate` and
                     // `Car_ground` are both Sc32 entries
@@ -1632,7 +1633,7 @@ impl App {
         // before it where they have just moved to and the ones after it where the tick began
         // (`DraftFactor` reads them live, the misfire draw is the shared stream's next), and
         // every machine gets the same numbers. The seats with a lower index first…
-        let autobahn = self.track.name.eq_ignore_ascii_case("autobahn");
+        let autobahn = self.track.name.eq_ignore_ascii_case(TrackId::Autobahn.name());
         // **Sc32 priority 6, `+0xE0C` = 0x49AF70** for every human car, ahead of any priority-0x1E
         // step: `Tracker::update` 0x474440 re-finds `car+8` at the position the odd tick left, and
         // the progress 0x4169B0 (Sc64, after the Sc32 list) reads that slice (`RaceProgress::retrack`;
@@ -1675,7 +1676,7 @@ impl App {
             nfs_physics::vehicle::draft_factor(v.position, v.forward(), v.v_long(), &racers);
         // (the misfire draw is the car's own, in place in `Engine_update`, 0x49E496)
         // `LoadTransfer`'s wet test, 0x4A191D…0x4A194D: `[0x606AE0]` and nothing overhead
-        v.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0;
+        v.wet_track = self.track.name.eq_ignore_ascii_case(TrackId::Autobahn.name()) && w.overhead_flags(v.position) == 0;
         // 0x4123E0, the force-feedback driver: Sc32 priority 10, before the car's step (priority
         // 0x1E) — it reads what the last tick left
         super::force_feedback::ff_drive(&mut self.ff, &mut self.gamepads, super::force_feedback::FfTick { levels: self.ff_levels, replay: ff_replay, tick: self.tick }, &nfs_physics::force_feedback::FfCar::from_vehicle(v, &self.specs));
@@ -3482,7 +3483,7 @@ impl App {
         {
             // 0x40FBC8…0x40FC0D: `[0x606AE0]` (the track is `autobahn`, 0x414DFF…0x414E11) and
             // nothing overhead (0x473330 at `car+0x330`, the lowest patch more than 3.5 m up)
-            let autobahn = self.track.name.eq_ignore_ascii_case("autobahn");
+            let autobahn = self.track.name.eq_ignore_ascii_case(TrackId::Autobahn.name());
             let wet = |p: Vec3| autobahn && w.overhead_flags(p) == 0;
             let q = &mut self.snd.ai_sfx;
             // **Input exchange:** every human car's producer runs in registration order — the local car
@@ -3820,7 +3821,7 @@ impl App {
                 // `car+0x464` (0x40FC1B, 0x4100BB), the body's surface nibble
                 surface_nibble: v.surface_nibble(),
                 // `[0x606AE0]` && 0x473330 == 0 (0x40FBC8…0x40FC0D)
-                wet: self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0,
+                wet: self.track.name.eq_ignore_ascii_case(TrackId::Autobahn.name()) && w.overhead_flags(v.position) == 0,
                 human: true,
             };
             // (an exchange race, or its `--resim`, produced it above, in registration order)

@@ -14,13 +14,13 @@ use objc2_metal::{MTLDevice, MTLPixelFormat};
 use objc2_metal_fx::{MTLFXTemporalScaler, MTLFXTemporalScalerBase, MTLFXTemporalScalerDescriptor};
 
 /// The internal size per E34 level 1..4 (the temporal ones): 1 = native (temporal anti-aliasing), 2 = quality (67 %), 3 = balanced (59 %),
-/// 4 = performance (50 %).
+/// 4 = performance (50 %) (AMD's ratios, shared with FSR).
 pub fn render_scale_of(level: u8) -> f32 {
     match level {
         0 | 1 => 1.0,
-        2 => 0.67,
-        3 => 0.59,
-        _ => 0.5,
+        2 => super::preset_scale(0),
+        3 => super::preset_scale(1),
+        _ => super::preset_scale(2),
     }
 }
 
@@ -41,9 +41,6 @@ pub struct MetalFxTemporal {
     scaler: Option<((u32, u32, u32, u32), Scaler)>,
     cut: bool,
     warned: bool,
-    /// the jitter's signs, see [`JITTER_SIGN`]
-    jitter_sign: [f32; 2],
-    mask: bool,
 }
 
 // the Core (and with it this) moves to the render thread once, before any frame; the Metal objects are thread-safe
@@ -60,7 +57,7 @@ impl MetalFxTemporal {
         if !unsafe { MTLFXTemporalScalerDescriptor::supportsDevice(&raw) } {
             return Err("this GPU does not support the MetalFX temporal scaler".to_string());
         }
-        Ok(Self { device: raw, scaler: None, cut: false, warned: false, jitter_sign: JITTER_SIGN, mask: true })
+        Ok(Self { device: raw, scaler: None, cut: false, warned: false })
     }
 
     fn scaler_for(&mut self, key: (u32, u32, u32, u32)) -> Option<&Scaler> {
@@ -77,10 +74,8 @@ impl MetalFxTemporal {
                 desc.setOutputWidth(ow as usize);
                 desc.setOutputHeight(oh as usize);
                 // the foundation's reactive mask (R8Unorm: translucent effects write their coverage) is MetalFX's reactive mask
-                if self.mask {
-                    desc.setReactiveMaskTextureEnabled(true);
-                    desc.setReactiveMaskTextureFormat(MTLPixelFormat::R8Unorm);
-                }
+                desc.setReactiveMaskTextureEnabled(true);
+                desc.setReactiveMaskTextureFormat(MTLPixelFormat::R8Unorm);
                 // the scaler's pipelines are built before `new...` returns: with the default (asynchronous) start the first frames came out
                 // as nothing (a scripted still is frame 0)
                 desc.setRequiresSynchronousInitialization(true);
@@ -126,23 +121,22 @@ impl super::Upscaler for MetalFxTemporal {
         let (ow, oh) = (output.width(), output.height());
         let scaler = self.scaler_for((iw, ih, ow, oh))?.clone();
         let (color, depth, mv, out) = (raw_texture(&inputs.color)?, raw_texture(&inputs.depth)?, raw_texture(&inputs.motion_vectors)?, raw_texture(output)?);
-        let mask = if self.mask { Some(raw_texture(&inputs.reactive_mask)?) } else { None };
+        let mask = raw_texture(&inputs.reactive_mask)?;
         let reset = inputs.reset_history || std::mem::take(&mut self.cut);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("metalfx temporal") });
-        let sign = self.jitter_sign;
         let done = unsafe {
             encoder.as_hal_mut::<wgpu::hal::api::Metal, _, _>(|e| {
                 let cmd = e?.raw_command_buffer()?;
                 scaler.setColorTexture(Some(&color));
                 scaler.setDepthTexture(Some(&depth));
                 scaler.setMotionTexture(Some(&mv));
-                scaler.setReactiveMaskTexture(mask.as_deref());
+                scaler.setReactiveMaskTexture(Some(&mask));
                 scaler.setOutputTexture(Some(&out));
                 scaler.setInputContentWidth(iw as usize);
                 scaler.setInputContentHeight(ih as usize);
                 // the foundation's jitter is the image's shift in render px (x right, y down), in [-0.5, 0.5]
-                scaler.setJitterOffsetX(sign[0] * inputs.jitter_offset[0]);
-                scaler.setJitterOffsetY(sign[1] * inputs.jitter_offset[1]);
+                scaler.setJitterOffsetX(JITTER_SIGN[0] * inputs.jitter_offset[0]);
+                scaler.setJitterOffsetY(JITTER_SIGN[1] * inputs.jitter_offset[1]);
                 scaler.setMotionVectorScaleX(MV_SCALE[0]);
                 scaler.setMotionVectorScaleY(MV_SCALE[1]);
                 scaler.setPreExposure(inputs.pre_exposure);

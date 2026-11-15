@@ -222,6 +222,13 @@ pub(crate) struct OverScene<'a> {
     pub keep: bool,
 }
 
+impl OverScene<'_> {
+    /// The colour's store op: a multisampled colour no later pass reads (`!keep`) is discarded once resolved.
+    pub fn store(&self) -> wgpu::StoreOp {
+        if self.samples > 1 && !self.keep { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store }
+    }
+}
+
 /// The depth image a pass over the scene reads: the frame's, `multisampled` (ENHANCEMENT E1) or not.
 #[derive(Clone, Copy)]
 pub(crate) struct DepthSrc<'a> {
@@ -239,6 +246,8 @@ pub(crate) struct PostCtx<'a> {
     pub layout: &'a wgpu::BindGroupLayout,
     pub sampler: &'a wgpu::Sampler,
     pub encoder: &'a mut wgpu::CommandEncoder,
+    /// the frame's staging belt: the passes' uniforms go through it into `encoder` ([`belt_write`])
+    pub belt: &'a mut wgpu::util::StagingBelt,
     pub depth: DepthSrc<'a>,
     /// the post chain's size (`width`, `height`)
     pub size: (u32, u32),
@@ -266,6 +275,152 @@ impl<K: PartialEq, V> Keyed<K, V> {
             self.0 = Some((key, make()));
         }
         &self.0.as_ref().expect("keyed value").1
+    }
+
+    /// The value the last [`Self::get`] gave (none before the first).
+    pub fn value(&self) -> Option<&V> {
+        self.0.as_ref().map(|(_, v)| v)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The post-pass kit: what every full-screen pass of the post chain and of the passes over the scene repeated.
+
+/// The blend states the full-screen passes share.
+pub(crate) mod blend {
+    use wgpu::{BlendComponent, BlendFactor, BlendOperation, BlendState};
+
+    /// `src + dst`.
+    pub const ADD_COMPONENT: BlendComponent = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
+    /// The destination's own value: the target's alpha kept.
+    pub const KEEP: BlendComponent = BlendComponent { src_factor: BlendFactor::Zero, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
+    /// Additive colour, the target's alpha kept (the bloom's adds).
+    pub const ADD_KEEP_ALPHA: BlendState = BlendState { color: ADD_COMPONENT, alpha: KEEP };
+    /// Additive colour and alpha (the light shafts' and the haze's composites, which write the colour channels only).
+    pub const ADD: BlendState = BlendState { color: ADD_COMPONENT, alpha: ADD_COMPONENT };
+    /// Premultiplied "over" (`src + dst (1 - src alpha)`), the target's alpha kept: the original's `SRCALPHA` /
+    /// `INVSRCALPHA` with the colour already multiplied by its alpha (the lighthouse beam).
+    pub const OVER_KEEP_ALPHA: BlendState = BlendState { color: BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::OneMinusSrcAlpha, operation: BlendOperation::Add }, alpha: KEEP };
+    /// `src * dst`, the target's alpha kept (the corner shading's apply).
+    pub const MULTIPLY_KEEP_ALPHA: BlendState = BlendState { color: BlendComponent { src_factor: BlendFactor::Dst, dst_factor: BlendFactor::Zero, operation: BlendOperation::Add }, alpha: KEEP };
+}
+
+/// A bilinear sampler clamped to the edge (the passes' own samplers of an image of theirs).
+pub(crate) fn linear_clamp_sampler(device: &wgpu::Device, label: Option<&str>) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor { label, mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() })
+}
+
+/// `bytes` into `buf` from offset 0 through the frame's staging belt: a copy recorded in `encoder`, so it lands in order with
+/// the passes around it (a `Queue::write_buffer` lands before the whole submit: two of them in one frame's command buffer would
+/// leave the first pass reading the second value).
+pub(crate) fn belt_write(belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, buf: &wgpu::Buffer, bytes: &[u8]) {
+    let size = wgpu::BufferSize::new(bytes.len() as u64).expect("non-empty write");
+    belt.write_buffer(encoder, buf, 0, size).copy_from_slice(bytes);
+}
+
+/// A uniform buffer of one `T`, written only when the value changed (the buffer keeps the last one).
+pub(crate) struct UniformBuf<T> {
+    pub buf: wgpu::Buffer,
+    last: Option<T>,
+}
+
+impl<T: bytemuck::Pod> UniformBuf<T> {
+    pub fn new(device: &wgpu::Device, label: &str) -> Self {
+        Self { buf: uniform_buf::<T>(device, label), last: None }
+    }
+
+    /// `v` into the buffer through the frame's staging belt (a copy recorded in `encoder`, in order with the passes), skipped
+    /// when the buffer already holds these bytes.
+    pub fn write(&mut self, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, v: &T) {
+        if self.last.as_ref().is_some_and(|l| bytemuck::bytes_of(l) == bytemuck::bytes_of(v)) {
+            return;
+        }
+        belt_write(belt, encoder, &self.buf, bytemuck::bytes_of(v));
+        self.last = Some(*v);
+    }
+}
+
+/// Values built when a key is first asked for and kept from then on: a pass's pipelines per variant (depth kind,
+/// sample count, format, ...), so a variant that never runs is never compiled.
+pub(crate) struct Variants<K, V>(std::collections::HashMap<K, V>);
+
+impl<K, V> Default for Variants<K, V> {
+    fn default() -> Self {
+        Self(std::collections::HashMap::new())
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V> Variants<K, V> {
+    /// The value of `key`, `make()`'s at the first ask.
+    pub fn get(&mut self, key: K, make: impl FnOnce() -> V) -> &V {
+        self.0.entry(key).or_insert_with(make)
+    }
+}
+
+/// Record a full-screen draw: `pipeline`, `groups` as groups 0, 1, ..., one triangle.
+pub(crate) fn draw_fullscreen(pass: &mut wgpu::RenderPass, pipeline: &wgpu::RenderPipeline, groups: &[&wgpu::BindGroup]) {
+    pass.set_pipeline(pipeline);
+    for (i, g) in groups.iter().enumerate() {
+        pass.set_bind_group(i as u32, *g, &[]);
+    }
+    pass.draw(0..3, 0..1);
+}
+
+/// One full-screen pass into `view` ([`color_pass`], timed as `prof`) drawing `pipeline` with `groups`.
+pub(crate) fn fullscreen_pass(encoder: &mut wgpu::CommandEncoder, label: &str, prof: &'static str, view: &wgpu::TextureView, load: wgpu::LoadOp<wgpu::Color>, pipeline: &wgpu::RenderPipeline, groups: &[&wgpu::BindGroup]) {
+    let mut pass = color_pass(encoder, label, prof, view, load);
+    draw_fullscreen(&mut pass, pipeline, groups);
+}
+
+/// An image a pass renders into, `1 / div` of the size it is made for in each direction (rounded up, at least 1),
+/// remade only when that size changes.
+pub(crate) struct PostTarget {
+    /// the size it was made for (before the division)
+    pub size: (u32, u32),
+    /// (the view keeps its texture alive)
+    pub view: wgpu::TextureView,
+}
+
+impl PostTarget {
+    /// The scale of a half-size image (the light shafts' rays, the corner shading's occlusion).
+    pub const HALF: u32 = 2;
+    /// The scale of a quarter-size image (the haze's march, ENHANCEMENT E36).
+    pub const QUARTER: u32 = 4;
+
+    /// `slot`'s image for `size` (made when missing or of another size).
+    pub fn ensure<'s>(slot: &'s mut Option<PostTarget>, device: &wgpu::Device, label: &str, size: (u32, u32), div: u32, format: wgpu::TextureFormat) -> &'s PostTarget {
+        if slot.as_ref().is_none_or(|i| i.size != size) {
+            let view = texture_2d(device, label, size.0.div_ceil(div).max(1), size.1.div_ceil(div).max(1), format, RT_USAGE).create_view(&Default::default());
+            *slot = Some(PostTarget { size, view });
+        }
+        slot.as_ref().expect("post target")
+    }
+}
+
+/// The frame's depth bound as group 1, binding 0 (`wgsl::dtex`) of the post chain's passes (the motion blur, the depth of
+/// field, the windscreen drops): a layout per kind (plain / multisampled) and the bind group, kept while the depth holds.
+pub(crate) struct DepthBinding {
+    label: &'static str,
+    /// `[plain, multisampled]`
+    layouts: [wgpu::BindGroupLayout; 2],
+    bg: Keyed<(wgpu::TextureView, bool), wgpu::BindGroup>,
+}
+
+impl DepthBinding {
+    pub fn new(device: &wgpu::Device, label: &'static str) -> Self {
+        let layout = |multisampled: bool| bgl(device, label, &[bgl_tex(0, wgpu::TextureSampleType::Depth, multisampled)]);
+        Self { label, layouts: [layout(false), layout(true)], bg: Keyed::default() }
+    }
+
+    /// The layout of a plain or a `multisampled` depth.
+    pub fn layout(&self, multisampled: bool) -> &wgpu::BindGroupLayout {
+        &self.layouts[multisampled as usize]
+    }
+
+    /// The bind group of `depth`.
+    pub fn bind(&mut self, device: &wgpu::Device, depth: DepthSrc) -> &wgpu::BindGroup {
+        let (label, layout) = (self.label, &self.layouts[depth.multisampled as usize]);
+        self.bg.get((depth.view.clone(), depth.multisampled), || view_bg(device, label, layout, depth.view))
     }
 }
 

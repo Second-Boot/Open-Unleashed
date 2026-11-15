@@ -39,6 +39,10 @@ use wgpu::util::DeviceExt as _;
 const RUN: usize = 33;
 /// End patterns: bit 0 = a crossing edge on the - side (the row above / the column to the left), bit 1 = on the + side.
 const PATTERNS: usize = 16;
+/// The images' formats: the edges (left, top), the blend weights, the area table (the two coverages).
+const EDGES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
+const WEIGHTS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const AREA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
 
 /// The reconstructed edge line's height, relative to the aliased edge (positive = toward the + side
 /// of the pixel), at `x` along a run of length `d`, for the end patterns `pl` / `pr` (0 none, 1 the
@@ -115,7 +119,8 @@ pub(crate) fn area_table() -> Vec<u8> {
 /// The three passes, their images (kept while the window size holds) and the area table.
 /// The pass's shader: `smaa.wgsl` with the full-screen triangle (`wgsl.rs`).
 pub(crate) fn source() -> String {
-    wgsl::compose(&[wgsl::FULLSCREEN_VS, include_str!("smaa.wgsl")])
+    // the area table's run length is the Rust one (`RUN`), written as the line it was
+    wgsl::compose(&[wgsl::FULLSCREEN_VS, wgsl::LUMA_709, &include_str!("smaa.wgsl").replace("//AREA_RUN", &format!("const AREA_RUN: i32 = {RUN};"))])
 }
 
 pub(crate) struct Smaa {
@@ -159,8 +164,8 @@ impl Smaa {
             let pl = gfx::pipeline_layout(device, label, &[bgl]);
             Fullscreen::new(label, &pl, &module).fs(entry).build(device, &[gfx::target(target, None)])
         };
-        let edges_pipe = pipe("smaa edges", &edges_layout, "fs_edges", wgpu::TextureFormat::Rg8Unorm);
-        let weights_pipe = pipe("smaa weights", &weights_layout, "fs_weights", wgpu::TextureFormat::Rgba8Unorm);
+        let edges_pipe = pipe("smaa edges", &edges_layout, "fs_edges", EDGES_FORMAT);
+        let weights_pipe = pipe("smaa weights", &weights_layout, "fs_weights", WEIGHTS_FORMAT);
         let blend_pipe = pipe("smaa blend", &blend_layout, "fs_blend", format);
         let area = device.create_texture_with_data(
             queue,
@@ -170,37 +175,24 @@ impl Smaa {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rg8Unorm,
+                format: AREA_FORMAT,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
             &area_table(),
         );
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("smaa"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let sampler = gfx::linear_clamp_sampler(device, Some("smaa"));
         Self { edges_pipe, weights_pipe, blend_pipe, edges_layout, weights_layout, blend_layout, area_view: area.create_view(&Default::default()), sampler, format, images: None }
     }
 
     /// The `width x height` image the tone map writes into (the surface's format), made again when the size changes.
     pub(crate) fn ldr(&mut self, device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
         if !self.images.as_ref().is_some_and(|i| i.size == (width, height)) {
-            let make = |label: &str, format| {
-                device
-                    .create_texture(&wgpu::TextureDescriptor {
-                        label: Some(label),
-                        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    })
-                    .create_view(&Default::default())
-            };
+            let make = |label: &str, format| gfx::texture_2d(device, label, width, height, format, gfx::RT_USAGE).create_view(&Default::default());
             let ldr_view = make("smaa ldr", self.format);
-            let edges_view = make("smaa edges", wgpu::TextureFormat::Rg8Unorm);
-            let weights_view = make("smaa weights", wgpu::TextureFormat::Rgba8Unorm);
+            let edges_view = make("smaa edges", EDGES_FORMAT);
+            let weights_view = make("smaa weights", WEIGHTS_FORMAT);
             let bg = |label: &str, layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupEntry]| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries });
             let edges_bg = bg("smaa edges", &self.edges_layout, &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&ldr_view) }]);
             let weights_bg = bg(
@@ -226,10 +218,7 @@ impl Smaa {
     pub(crate) fn run(&self, encoder: &mut wgpu::CommandEncoder, dest: &wgpu::TextureView) {
         let Some(im) = self.images.as_ref() else { return };
         let pass = |encoder: &mut wgpu::CommandEncoder, label: &'static str, view: &wgpu::TextureView, pipe: &wgpu::RenderPipeline, bg: &wgpu::BindGroup| {
-            let mut p = gfx::color_pass(encoder, label, label, view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
-            p.set_pipeline(pipe);
-            p.set_bind_group(0, bg, &[]);
-            p.draw(0..3, 0..1);
+            gfx::fullscreen_pass(encoder, label, label, view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), pipe, &[bg]);
         };
         pass(encoder, "smaa edges", &im.edges_view, &self.edges_pipe, &im.edges_bg);
         pass(encoder, "smaa weights", &im.weights_view, &self.weights_pipe, &im.weights_bg);

@@ -13,7 +13,7 @@
 //! over a sharp background). The taps are clamped in brightness so a lit window or the sun gives a bokeh
 //! disc and not a sparkle; the float image keeps its highlights, so the discs are bright.
 
-use crate::gfx::{self, DepthSrc, Fullscreen, Keyed, PostCtx, RtImage};
+use crate::gfx::{self, DepthBinding, DepthSrc, Fullscreen, PostCtx, UniformBuf, Variants};
 use crate::wgsl;
 use crate::gpu::HDR_FORMAT;
 
@@ -61,7 +61,7 @@ struct U { a: vec4<f32>, b: vec4<f32> };
 @group(2) @binding(0) var<uniform> u: U;
 // the distance in front of the camera of a depth-buffer value (the projection's own inverse)
 fn lin(z: f32) -> f32 {
-    return u.b.x * u.b.y / (z + u.b.x);
+    return proj_dist(z, u.b.x, u.b.y);
 }
 fn coc_of(d: f32) -> f32 {
     return min(u.a.y * abs(1.0 - u.a.x / max(d, 0.01)), u.a.z);
@@ -75,12 +75,15 @@ fn coc_of(d: f32) -> f32 {
     let n = i32(u.a.w);
     var sum = min(c.rgb, vec3<f32>(24.0));
     var wsum = 1.0;
-    let rot = ign(in.pos.xy) * 6.2831853;
+    // the disc's turn of this pixel, applied to the table's unit directions (PERF: no per-tap cos / sin)
+    let rot = ign(in.pos.xy) * TAU;
+    let rc = cos(rot);
+    let rs = sin(rot);
     for (var i = 0; i < n; i = i + 1) {
         let fi = f32(i) + 0.5;
         let r = sqrt(fi / f32(n)) * reach;
-        let a = fi * 2.3999632 + rot;
-        let sp = in.pos.xy + vec2<f32>(cos(a), sin(a)) * r;
+        let v = VOGEL_DIR[i];
+        let sp = in.pos.xy + vec2<f32>(v.x * rc - v.y * rs, v.x * rs + v.y * rc) * r;
         let sc = clamp(vec2<i32>(sp), vec2<i32>(0), dims - vec2<i32>(1));
         let dt = lin(dload(sc, dims));
         var ct = coc_of(dt);
@@ -99,63 +102,64 @@ fn coc_of(d: f32) -> f32 {
 }
 "#;
 
+/// The most taps [`taps_for`] ever asks for: the size of the direction table.
+const MAX_TAPS: usize = 128;
+
+/// The WGSL table of the Vogel disc's unit directions, tap `i` at the angle `(i + 0.5)` golden angles (before the pixel's turn):
+/// `cos` / `sin` computed once here, in double precision, instead of per tap and pixel in the shader.
+fn vogel_table() -> String {
+    let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
+    let entries: Vec<String> = (0..MAX_TAPS)
+        .map(|i| {
+            let a = (i as f64 + 0.5) * golden;
+            format!("vec2<f32>({:?}, {:?})", a.cos() as f32, a.sin() as f32)
+        })
+        .collect();
+    format!("const VOGEL_DIR = array<vec2<f32>, {MAX_TAPS}>({});
+", entries.join(", "))
+}
+
 /// The pass's shader over a plain or a `multisampled` depth.
 pub(crate) fn source(multisampled: bool) -> String {
-    wgsl::compose(&[wgsl::FULLSCREEN_VS_UV, wgsl::dtex(multisampled), wgsl::DLOAD, wgsl::IGN, DOF_WGSL])
+    wgsl::compose(&[wgsl::FULLSCREEN_VS_UV, wgsl::dtex(multisampled), wgsl::DLOAD, wgsl::IGN, wgsl::ANGLES, &vogel_table(), wgsl::PROJ_DIST, DOF_WGSL])
 }
 
 pub(crate) struct DofPass {
-    pipe_1: wgpu::RenderPipeline,
-    pipe_ms: wgpu::RenderPipeline,
-    depth_layout_1: wgpu::BindGroupLayout,
-    depth_layout_ms: wgpu::BindGroupLayout,
-    u_buf: wgpu::Buffer,
+    /// the pipeline per depth kind (`true` = multisampled), built at its first use
+    pipes: Variants<bool, wgpu::RenderPipeline>,
+    image_layout: wgpu::BindGroupLayout,
+    depth: DepthBinding,
+    u_layout: wgpu::BindGroupLayout,
+    u_buf: UniformBuf<DofUniform>,
     u_bg: wgpu::BindGroup,
-    /// the blurred image, kept while the size holds
-    image: Option<RtImage>,
-    /// the depth's bind group, kept while the depth image holds
-    depth_bg: Keyed<(wgpu::TextureView, bool), wgpu::BindGroup>,
 }
 
 impl DofPass {
     pub fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Self {
-        let depth_layout = |multisampled: bool| gfx::bgl(device, "dof depth", &[gfx::bgl_tex(0, wgpu::TextureSampleType::Depth, multisampled)]);
-        let (depth_layout_1, depth_layout_ms) = (depth_layout(false), depth_layout(true));
         let u_layout = gfx::bgl(device, "dof", &[gfx::bgl_uniform(0, wgpu::ShaderStages::FRAGMENT)]);
-        let u_buf = gfx::uniform_buf::<DofUniform>(device, "dof");
-        let u_bg = gfx::buffer_bg(device, "dof", &u_layout, &u_buf);
-        let pipe = |multisampled: bool, dl: &wgpu::BindGroupLayout| {
-            let module = gfx::wgsl_module(device, "dof", &source(multisampled));
-            let pl = gfx::pipeline_layout(device, "dof", &[layout, dl, &u_layout]);
-            Fullscreen::new("dof", &pl, &module).build(device, &[gfx::target(HDR_FORMAT, None)])
-        };
-        let (pipe_1, pipe_ms) = (pipe(false, &depth_layout_1), pipe(true, &depth_layout_ms));
-        Self { pipe_1, pipe_ms, depth_layout_1, depth_layout_ms, u_buf, u_bg, image: None, depth_bg: Keyed::default() }
+        let u_buf = UniformBuf::new(device, "dof");
+        let u_bg = gfx::buffer_bg(device, "dof", &u_layout, &u_buf.buf);
+        Self { pipes: Variants::default(), image_layout: layout.clone(), depth: DepthBinding::new(device, "dof depth"), u_layout, u_buf, u_bg }
     }
 
-    /// Blur `src` (`cx.size`, its bind group `src_bg`) by the lens `dof`, reading `cx.depth`; returns the new image's bind
-    /// group and view.
-    pub fn run(&mut self, cx: &mut PostCtx, src_bg: &wgpu::BindGroup, dof: Dof) -> (&wgpu::BindGroup, &wgpu::TextureView) {
-        let PostCtx { device, queue, layout, sampler, depth: DepthSrc { view: depth, multisampled }, size: (width, height), camera: cam, .. } = *cx;
-        RtImage::ensure(&mut self.image, device, "dof image", layout, sampler, width, height, HDR_FORMAT, gfx::RT_USAGE);
+    /// Blur `src` (`cx.size`, its bind group `src_bg`) by the lens `dof`, reading `cx.depth`, into `out` (the chain's image of
+    /// `cx.size`).
+    pub fn run(&mut self, cx: &mut PostCtx, src_bg: &wgpu::BindGroup, dof: Dof, out: &wgpu::TextureView) {
+        let PostCtx { device, depth: DepthSrc { view: depth, multisampled }, size: (width, height), camera: cam, .. } = *cx;
         let h = height as f32;
         let u = DofUniform {
             a: [dof.focus.max(0.05), h * COC_PER_HEIGHT / dof.f_number.clamp(F_MIN, F_MAX), h * MAX_COC_PER_HEIGHT, taps_for(height) as f32],
             b: [cam.far / (cam.near - cam.far), cam.near, width as f32, h],
         };
-        queue.write_buffer(&self.u_buf, 0, bytemuck::bytes_of(&u));
-        let (pipe, dl) = if multisampled { (&self.pipe_ms, &self.depth_layout_ms) } else { (&self.pipe_1, &self.depth_layout_1) };
-        let depth_bg = self.depth_bg.get((depth.clone(), multisampled), || gfx::view_bg(device, "dof depth", dl, depth));
-        let RtImage { view, bg, .. } = self.image.as_ref().expect("dof image");
-        {
-            let mut pass = gfx::color_pass(cx.encoder, "dof", "depth of field", view, gfx::load_or_clear(false));
-            pass.set_pipeline(pipe);
-            pass.set_bind_group(0, src_bg, &[]);
-            pass.set_bind_group(1, depth_bg, &[]);
-            pass.set_bind_group(2, &self.u_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        (bg, view)
+        self.u_buf.write(cx.belt, cx.encoder, &u);
+        let (image_layout, depth_layout, u_layout) = (&self.image_layout, self.depth.layout(multisampled), &self.u_layout);
+        let pipe = self.pipes.get(multisampled, || {
+            let module = gfx::wgsl_module(device, "dof", &source(multisampled));
+            let pl = gfx::pipeline_layout(device, "dof", &[image_layout, depth_layout, u_layout]);
+            Fullscreen::new("dof", &pl, &module).build(device, &[gfx::target(HDR_FORMAT, None)])
+        });
+        let depth_bg = self.depth.bind(device, DepthSrc { view: depth, multisampled });
+        gfx::fullscreen_pass(cx.encoder, "dof", "depth of field", out, gfx::load_or_clear(false), pipe, &[src_bg, depth_bg, &self.u_bg]);
     }
 }
 
@@ -175,6 +179,12 @@ mod tests {
         assert!(coc_px(wide, 0.05, 1000.0) <= 1000.0 * MAX_COC_PER_HEIGHT + 1e-3);
         // a hi-res still has the same blur relative to its height
         assert!((coc_px(d, 50.0, 2400.0) / 2400.0 - coc_px(d, 50.0, 1200.0) / 1200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_direction_table_covers_every_tap_count() {
+        assert!(taps_for(u32::MAX) as usize <= MAX_TAPS);
+        assert_eq!(vogel_table().matches("vec2<f32>(").count(), MAX_TAPS);
     }
 
     #[test]

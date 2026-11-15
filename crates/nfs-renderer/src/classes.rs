@@ -49,6 +49,44 @@ pub(crate) const PART_LIT: f32 = crate::PARTICLE_LIT as f32;
 /// a lit particle per fragment ([`crate::PARTICLE_LIT_WORLD`]).
 pub(crate) const PART_LIT_WORLD: f32 = crate::PARTICLE_LIT_WORLD as f32;
 
+/// `Csm::misc.y` — ENHANCEMENT E9 (SHADOW-REFACTOR): the frame's shadow mode (`gpu/csm.rs` `ShadowMode`): the race's sun (the
+/// sky's, a sunless track's data sun, E51's cars-only frame). 0, so a zeroed uniform reads as no special mode.
+pub(crate) const SHADOW_SUN: f32 = 0.0;
+/// ENHANCEMENT E25: the overcast light (the wide 5 x 5 kernel, the eased "baked dark" gate)
+pub(crate) const SHADOW_OVERCAST: f32 = 1.0;
+/// ENHANCEMENT E50: the moon (its soft disc, the turned-round gate, the cars' cold term)
+pub(crate) const SHADOW_MOON: f32 = 2.0;
+/// ENHANCEMENT ENH-FE3D: a front-end car's focus shadow (the jittered disc, no "baked dark" gate, the `FESH` blob's own fade)
+pub(crate) const SHADOW_FOCUS: f32 = 3.0;
+
+/// SHADOW-REFACTOR: numbers both sides use (not classes, but the same reason to have them once). ENHANCEMENT E9 / E51: a cascade's
+/// view-depth range blends into the next one's over its last eighth (`shader.wgsl` `csm_split`, `gpu/carsun.rs` per car).
+pub(crate) const CASCADE_BLEND: f32 = 0.125;
+pub(crate) const CASCADE_BLEND_START: f32 = 0.875;
+/// ENHANCEMENT E23 / E47: a street lamp's downward cone, `smoothstep(start, end, l.y)` of the direction to the lamp (`shader.wgsl`
+/// `lamp_light`, `gpu/lamps.rs` `lamp_score`).
+pub(crate) const LAMP_CONE_START: f32 = 0.1;
+pub(crate) const LAMP_CONE_END: f32 = 0.55;
+
+/// `GlobalsUniform::near.x` — ENHANCEMENT E49: what the player's sphere-map overlay's sky parts show (`Scene::near_sky`, 0 = the
+/// near lookup off): the original's painted sky (NEAR-REFL2: only the geometry parts are live; the shader's other arm, not emitted).
+pub(crate) const NEAR_SKY_ORIGINAL: f32 = 1.0;
+/// NEAR-REFL3, a night track: the live sky, its strength scaled by its brightness
+pub(crate) const NEAR_SKY_NIGHT: f32 = 2.0;
+/// NEAR-REFL4, a day / dusk track: the live sky's hue at the painted texel's strength and luminance
+pub(crate) const NEAR_SKY_HUE: f32 = 3.0;
+/// `near.w` — TEST GLUE (`NFS_NEAR_DEBUG`): the paint shows the reflection alone (this level and [`NEAR_DEBUG_SHARP`]), read at
+/// mip 0 (from [`NEAR_DEBUG_SHARP`] on), the overlay's weights as a colour (from [`NEAR_DEBUG_OVERLAY`] on)
+pub(crate) const NEAR_DEBUG_REFL: f32 = 1.0;
+pub(crate) const NEAR_DEBUG_SHARP: f32 = 2.0;
+pub(crate) const NEAR_DEBUG_OVERLAY: f32 = 3.0;
+
+/// ENHANCEMENT E49: the player's own six faces (the near cars drawn in) follow E8's six in the cube's layers.
+pub(crate) const NEAR_OWN_LAYER: u32 = 6;
+
+/// ENHANCEMENT E23 / E47: the street lamps' shadow slots, one depth layer each (`gpu/lamps.rs`, `Lamps::smat` / `sinfo`).
+pub(crate) const LAMP_SHADOW_SLOTS: usize = 4;
+
 /// Every class constant by its WGSL name (the same as the Rust name).
 pub(crate) const WGSL: &[(&str, f32)] = &[
     ("REFL_NONE", REFL_NONE),
@@ -69,15 +107,176 @@ pub(crate) const WGSL: &[(&str, f32)] = &[
     ("SOFT_FADE_WHITE", SOFT_FADE_WHITE),
     ("PART_LIT", PART_LIT),
     ("PART_LIT_WORLD", PART_LIT_WORLD),
+    ("SHADOW_SUN", SHADOW_SUN),
+    ("SHADOW_OVERCAST", SHADOW_OVERCAST),
+    ("SHADOW_MOON", SHADOW_MOON),
+    ("SHADOW_FOCUS", SHADOW_FOCUS),
+    ("CASCADE_BLEND", CASCADE_BLEND),
+    ("CASCADE_BLEND_START", CASCADE_BLEND_START),
+    ("LAMP_CONE_START", LAMP_CONE_START),
+    ("LAMP_CONE_END", LAMP_CONE_END),
+    ("BAKED_SHADOW_MAX", crate::BAKED_SHADOW_MAX),
+    ("NEAR_SKY_NIGHT", NEAR_SKY_NIGHT),
+    ("NEAR_SKY_HUE", NEAR_SKY_HUE),
+    ("NEAR_DEBUG_REFL", NEAR_DEBUG_REFL),
+    ("NEAR_DEBUG_SHARP", NEAR_DEBUG_SHARP),
+    ("NEAR_DEBUG_OVERLAY", NEAR_DEBUG_OVERLAY),
+    // ENHANCEMENT ENH-COAT: the cube's last mip (`coat_lod`'s ceiling)
+    ("COAT_LAST_MIP", (crate::coat::MIPS - 1) as f32),
 ];
 
-/// [`WGSL`] as WGSL module-scope constants, one per line (`const REFL_WATER: f32 = 3.0;`).
+/// The array sizes and layer numbers both sides use, by their WGSL name (`u32` constants: the uniforms' arrays, the cube's layers).
+pub(crate) const WGSL_SIZES: &[(&str, usize)] = &[
+    // ENHANCEMENT E15: `Spots::pos` / `dir` (`gpu/spot.rs` `SpotUniform`)
+    ("MAX_SPOTS", crate::MAX_SPOTS),
+    // ENHANCEMENT E23 / E47: `Lamps::pos` / `col`, `smat` / `sinfo` (`gpu/lamps.rs` `LampUniform`)
+    ("MAX_LAMPS", crate::MAX_LAMPS),
+    ("LAMP_SHADOW_SLOTS", LAMP_SHADOW_SLOTS),
+    // ENHANCEMENT E43: `Contacts`' per-car arrays (and two tyre pairs a car, `wheels`) (`gpu/contact.rs` `ContactUniform`)
+    ("MAX_CONTACTS", crate::MAX_CONTACTS),
+    // ENHANCEMENT E16: the probe's SH coefficients (`probe_sh`, `probe.rs`)
+    ("SH_COEFFS", crate::probe::SH_COEFFS),
+    // ENHANCEMENT E49: the first of the player's six faces in the twelve-layer cube (`gpu/refl.rs`)
+    ("NEAR_OWN_LAYER", NEAR_OWN_LAYER as usize),
+];
+
+/// The `f32` tables both sides use: ENHANCEMENT ENH-COAT, the GGX alpha each mip of the cube holds and the widths between them
+/// (`coat_lod`: `coat.rs` `MIP_ALPHA` / `MIP_SPAN`).
+const WGSL_TABLES: &[(&str, &[f32])] = &[("COAT_MIP_ALPHA", &crate::coat::MIP_ALPHA), ("COAT_MIP_SPAN", &crate::coat::MIP_SPAN)];
+
+/// [`WGSL`], [`WGSL_SIZES`] and [`WGSL_TABLES`] as WGSL module-scope constants, one per line (`const REFL_WATER: f32 = 3.0;`,
+/// `const MAX_LAMPS: u32 = 32u;`, `const COAT_MIP_ALPHA: array<f32, 5> = array<f32, 5>(0.0, ...);`).
 pub(crate) fn wgsl_consts() -> String {
     let mut s = String::from("// the object classes, emitted from `classes.rs`\n");
     for (name, v) in WGSL {
         s += &format!("const {name}: f32 = {v:?};\n");
     }
+    for (name, n) in WGSL_SIZES {
+        s += &format!("const {name}: u32 = {n}u;\n");
+    }
+    for (name, n) in binding::NAMES {
+        s += &format!("const {name}: u32 = {n}u;\n");
+    }
+    for (name, t) in WGSL_TABLES {
+        let items: Vec<String> = t.iter().map(|v| format!("{v:?}")).collect();
+        s += &format!("const {name}: array<f32, {n}> = array<f32, {n}>({});\n", items.join(", "), n = t.len());
+    }
     s
+}
+
+/// The constants the mesh shader and the E16 probe share (`probe::source` puts it in front of `probe.wgsl`): the real
+/// spherical-harmonic basis of bands 0..2 (`Y00`; `Y1m`; `Y2-2`, `Y2-1`, `Y21`; `Y20` of `3 z^2 - 1`; `Y22` of `x^2 - y^2`) and the
+/// luma of a colour (Rec. 601, the weights the shader's gates were tuned with).
+pub(crate) const SH_LUMA: &str = "
+// the real SH basis constants (bands 0..2) and the luma of a colour (Rec. 601), `classes.rs` `SH_LUMA`
+const SH_Y00: f32 = 0.282095;
+const SH_Y1: f32 = 0.488603;
+const SH_Y2: f32 = 1.092548;
+const SH_Y20: f32 = 0.315392;
+const SH_Y22: f32 = 0.546274;
+const LUMA: vec3<f32> = vec3<f32>(0.299, 0.587, 0.114);
+";
+
+/// The items' uniforms as the mesh shader and the shadow pass read them (`gpu::ObjectUniform`, `wgsl_structs_match_the_rust_uniforms`):
+/// one text for both, put in front of each.
+pub(crate) const OBJECT_WGSL: &str = "
+struct Object {
+    model: mat4x4<f32>,
+    env_mix: vec4<f32>,
+    light: vec4<f32>,
+    lit_a: vec4<f32>,
+    // .w ENHANCEMENT E9: what the item does with the sun's shadow, RECV_NONE / RECV_CAR / RECV_TRACK / RECV_DECAL (the class
+    // constants are emitted in front of the mesh shader from `classes.rs`)
+    lit_d: vec4<f32>,
+    lit_dir: vec4<f32>,
+    shadow_u: vec4<f32>,
+    shadow_v: vec4<f32>,
+    shadow_on: vec4<f32>,
+    sky_u: vec4<f32>,
+    sky_v: vec4<f32>,
+    sky_on: vec4<f32>,
+    // ENHANCEMENT E8: .x the material's reflection class (REFL_NONE, REFL_PAINT, REFL_GLASS; E17 REFL_WATER, E26 REFL_WET_ROAD /
+    // REFL_SKID), .y its strength (not read), .z E16: 1 = the car ambient takes the probe, .w E26: the wetness / E49: 1 = the player's
+    // own faces
+    refl: vec4<f32>,
+    // ENHANCEMENT E12: .x the fade distance in metres (0 = none), .y SOFT_FADE_WHITE = the multiplying pair (fade toward white),
+    // SOFT_FADE_BLACK the colour toward black, SOFT_FADE_ALPHA alpha only; E15 / E23: .z RECV_*; ENH-TEMPORAL: .w ROLE_*
+    soft: vec4<f32>,
+    // ENHANCEMENT E11: .x the HDR boost of a flare layer (0 / 1 = none)
+    // ENHANCEMENT E18: .y a spark's gain above white (0 = none), .z the lit particle kind (PART_LIT centre-lit, PART_LIT_WORLD per
+    // fragment)
+    hdr: vec4<f32>,
+    // `view_proj · model`, multiplied out in f64 by the host (PORT-DEVIATION D37)
+    mvp: mat4x4<f32>,
+};
+";
+
+/// ENHANCEMENT E8: the environment cube's face table as WGSL, emitted from `gpu::REFL_FACES` (the layer order +X, -X, +Z, -Z,
+/// +Y, -Y): `face_fwd(f)` / `face_up(f)`, a face's view direction and up vector (screen right = `up x fwd`), and `face_of(d)`, the
+/// face a direction falls in (its major axis; a tie goes to x, then z). The mesh shader and the coat prefilter read the faces
+/// through it (and the E16 probe, `probe::source`).
+pub(crate) fn faces_wgsl() -> String {
+    let v = |a: [f32; 3]| format!("vec3<f32>({:?}, {:?}, {:?})", a[0], a[1], a[2]);
+    let mut s = String::from("\n// the environment faces (`gpu::REFL_FACES`, `classes.rs` `faces_wgsl`)\nfn face_fwd(f: i32) -> vec3<f32> {\n    switch f {\n");
+    let last = crate::REFL_FACES.len() - 1;
+    for (i, (fwd, _)) in crate::REFL_FACES.iter().enumerate() {
+        let case = if i == last { "default".to_string() } else { format!("case {i}") };
+        s += &format!("        {case}: {{ return {}; }}\n", v(*fwd));
+    }
+    s += "    }\n}\nfn face_up(f: i32) -> vec3<f32> {\n    switch f {\n";
+    let common = crate::REFL_FACES[0].1;
+    for (i, (_, up)) in crate::REFL_FACES.iter().enumerate() {
+        if *up != common {
+            s += &format!("        case {i}: {{ return {}; }}\n", v(*up));
+        }
+    }
+    s += &format!("        default: {{ return {}; }}\n    }}\n}}\n", v(common));
+    s += "fn face_of(d: vec3<f32>) -> i32 {\n    let a = abs(d);\n    if a.x >= a.y && a.x >= a.z {\n        return select(0, 1, d.x < 0.0);\n    }\n    if a.z >= a.y {\n        return select(2, 3, d.z < 0.0);\n    }\n    return select(4, 5, d.y < 0.0);\n}\n";
+    s
+}
+
+/// The mesh shader's globals group (group 0): each binding's number, for both sides. `shader.wgsl` declares its bindings with the
+/// `B_*` names ([`wgsl_consts`] emits them); `Core::make_globals_bg` and the passes' layout entries (`gpu/csm.rs`, `spot.rs`,
+/// `lamps.rs`, `contact.rs`) take the same constants.
+pub(crate) mod binding {
+    macro_rules! bindings {
+        ($($(#[$doc:meta])* $name:ident = $n:literal,)*) => {
+            $($(#[$doc])* pub const $name: u32 = $n;)*
+            /// The WGSL names (`B_` and the Rust name).
+            pub const NAMES: [(&str, u32); [$(stringify!($name)),*].len()] = [$((concat!("B_", stringify!($name)), $name)),*];
+        };
+    }
+
+    bindings! {
+        /// the frame's `Globals`
+        GLOBALS = 0,
+        /// `night.psh`'s `nght` map
+        NIGHT_MAP = 1,
+        /// the car shadow projector's texture and the projector / cube sampler
+        PROJ_TEX = 2,
+        PROJ_SAMPLER = 3,
+        /// `HEAD`, the headlight decal
+        HEAD_TEX = 4,
+        /// ENHANCEMENT E8: the environment cube
+        REFL = 5,
+        /// ENHANCEMENT E9: the cascades' map, comparison sampler and uniform
+        CSM_MAP = 6,
+        CSM_SAMPLER = 7,
+        CSM = 8,
+        /// ENHANCEMENT E12: the soft sprites' depth image
+        SOFT = 9,
+        /// ENHANCEMENT E15: the headlight pair's map and the spots
+        SPOT_MAP = 10,
+        SPOTS = 11,
+        /// ENHANCEMENT E16: the probe's SH
+        PROBE_SH = 16,
+        /// ENHANCEMENT E23: the street lamps
+        LAMPS = 20,
+        /// ENHANCEMENT E43: the contact shadows
+        CONTACTS = 24,
+        /// ENHANCEMENT E47: the lamps' shadow maps
+        LAMP_SHADOW = 25,
+    }
 }
 
 /// PERF (PERF-B): the mesh shader's optional parts, one bit each. A part is the code of one enhancement in `shader.wgsl`, between
@@ -86,60 +285,59 @@ pub(crate) fn wgsl_consts() -> String {
 /// uniform that is 0 while its switch is off (the fill, `gpu/fill.rs`, and the passes that clear their uniform), so cutting it
 /// changes nothing drawn; the kept parts' text is the same, line for line.
 pub(crate) mod feat {
-    /// ENHANCEMENT E9 (with E25, ENH-FE3D / ENH-GARAGE, ENH-DBLSH, SHADOW-REAL): the sun's shadow cascades (`csm.dir.w` 0 without)
-    pub const CSM: u32 = 1 << 0;
-    /// ENHANCEMENT E16: the car ambient probe (`globals.refl.z` 0 without)
-    pub const PROBE: u32 = 1 << 1;
-    /// ENHANCEMENT E43: the contact shadow (`contacts.params.x` 0 without)
-    pub const CONTACT: u32 = 1 << 2;
-    /// ENHANCEMENT E15: the headlight spots (`spots.params.x` 0 without)
-    pub const SPOT: u32 = 1 << 3;
-    /// ENHANCEMENT E23: the street lamps (`lamps.params.x` 0 without)
-    pub const LAMPS: u32 = 1 << 4;
-    /// ENHANCEMENT E47: the lamps' car shadows (`lamps.col[i].w` 0 without)
-    pub const LSHAD: u32 = 1 << 5;
-    /// ENHANCEMENT E8 / ENH-COAT: the paint's clear coat and the glass (`globals.refl.x` 0 without)
-    pub const COAT: u32 = 1 << 6;
-    /// ENHANCEMENT E17: water (`globals.water.x` 0 without)
-    pub const WATER: u32 = 1 << 7;
-    /// ENHANCEMENT E26: the wet road (`globals.rain.x` 0 without)
-    pub const RAIN: u32 = 1 << 8;
-    /// ENHANCEMENT E19: the fog's sun glow (`globals.fogsun.w` 0 without)
-    pub const FOGSUN: u32 = 1 << 9;
-    /// ENHANCEMENT E18: particles in HDR (`object.hdr.y` / `.z` 0 without)
-    pub const PFX: u32 = 1 << 10;
-    /// ENHANCEMENT E12: soft particles (`object.soft.x` 0 without)
-    pub const SOFT: u32 = 1 << 11;
-    /// ENHANCEMENT E11: the sun's HDR boost (`object.hdr.x` 0 without)
-    pub const HDRB: u32 = 1 << 12;
-    /// ENHANCEMENT E50: the moonlight through E9's cascades (`csm.moon.x` 0 without)
-    pub const MOON: u32 = 1 << 13;
-    /// ENHANCEMENT E51: the cars-only layers of E9's near cascades (`csm.carsh.x` 0 without)
-    pub const CARSH: u32 = 1 << 14;
-    /// ENHANCEMENT E49: the clear coat reads the near faces and the covered box (`globals.near.x` 0 without; inside COAT)
-    pub const NEAR: u32 = 1 << 15;
-    #[cfg(test)]
-    pub const ALL: u32 = (1 << 16) - 1;
-    /// The names `shader.wgsl` uses.
-    pub const NAMES: [(&str, u32); 16] = [
-        ("CSM", CSM),
-        ("PROBE", PROBE),
-        ("CONTACT", CONTACT),
-        ("SPOT", SPOT),
-        ("LAMPS", LAMPS),
-        ("LSHAD", LSHAD),
-        ("COAT", COAT),
-        ("WATER", WATER),
-        ("RAIN", RAIN),
-        ("FOGSUN", FOGSUN),
-        ("PFX", PFX),
-        ("SOFT", SOFT),
-        ("HDRB", HDRB),
-        ("MOON", MOON),
-        ("CARSH", CARSH),
-        ("NEAR", NEAR),
-    ];
-    /// The parts only an item with a reflection class runs (`object.refl.x`: `gpu/fill.rs` `item_variant`)
+    /// One list makes the parts: `NAME = bit` gives `pub const NAME: u32 = 1 << bit`, the [`NAMES`] table `shader.wgsl`'s markers
+    /// are looked up in, and (tests) [`ALL`].
+    macro_rules! parts {
+        ($($(#[$doc:meta])* $name:ident = $bit:literal,)*) => {
+            $($(#[$doc])* pub const $name: u32 = 1 << $bit;)*
+            /// The names `shader.wgsl` uses.
+            pub const NAMES: [(&str, u32); [$(stringify!($name)),*].len()] = [$((stringify!($name), $name)),*];
+            /// Every part.
+            #[cfg(test)]
+            pub const ALL: u32 = 0 $(| $name)*;
+        };
+    }
+
+    parts! {
+        /// ENHANCEMENT E9 (with E25, ENH-FE3D / ENH-GARAGE, ENH-DBLSH, SHADOW-REAL): the sun's shadow cascades (`csm.dir.w` 0 without)
+        CSM = 0,
+        /// ENHANCEMENT E16: the car ambient probe (`globals.refl.z` 0 without)
+        PROBE = 1,
+        /// ENHANCEMENT E43: the contact shadow (`contacts.params.x` 0 without)
+        CONTACT = 2,
+        /// ENHANCEMENT E15: the headlight spots (`spots.params.x` 0 without)
+        SPOT = 3,
+        /// ENHANCEMENT E23: the street lamps (`lamps.params.x` 0 without)
+        LAMPS = 4,
+        /// ENHANCEMENT E47: the lamps' car shadows (`lamps.col[i].w` 0 without)
+        LSHAD = 5,
+        /// ENHANCEMENT E8 / ENH-COAT: the paint's clear coat and the glass (`globals.refl.x` 0 without)
+        COAT = 6,
+        /// ENHANCEMENT E17: water (`globals.water.x` 0 without)
+        WATER = 7,
+        /// ENHANCEMENT E26: the wet road (`globals.rain.x` 0 without)
+        RAIN = 8,
+        /// ENHANCEMENT E19: the fog's sun glow (`globals.fogsun.w` 0 without)
+        FOGSUN = 9,
+        /// ENHANCEMENT E18: particles in HDR (`object.hdr.y` / `.z` 0 without)
+        PFX = 10,
+        /// ENHANCEMENT E12: soft particles (`object.soft.x` 0 without)
+        SOFT = 11,
+        /// ENHANCEMENT E11: the sun's HDR boost (`object.hdr.x` 0 without)
+        HDRB = 12,
+        /// ENHANCEMENT E50: the moonlight through E9's cascades (`csm.moon.x` 0 without)
+        MOON = 13,
+        /// ENHANCEMENT E51: the cars-only layers of E9's near cascades (`csm.carsh.x` 0 without)
+        CARSH = 14,
+        /// ENHANCEMENT E49: the clear coat reads the near faces and the covered box (`globals.near.x` 0 without; inside COAT)
+        NEAR = 15,
+        /// ENHANCEMENT ENH-FE3D / ENH-GARAGE (SHADOW-REFACTOR): the front-end car's focus shadow (`csm.misc.y` `SHADOW_FOCUS`; a race
+        /// frame never runs it)
+        FOCUS = 16,
+        /// ENHANCEMENT E25 (SHADOW-REFACTOR): the overcast light's wide kernel and eased gate (`csm.misc.y` `SHADOW_OVERCAST`)
+        OVERCAST = 17,
+    }
+    /// The parts only an item with a reflection class runs (`object.refl.x`: `gpu/fill.rs` `ItemVariant::of`)
     pub const SURFACE: u32 = COAT | WATER | RAIN | NEAR;
     /// The parts only a particle (E18's role), a soft sprite or an HDR-boosted flare runs (`object.hdr`, `.soft.x`)
     pub const EFFECT: u32 = PFX | SOFT | HDRB;
@@ -148,7 +346,7 @@ pub(crate) mod feat {
     pub const PER_ITEM: u32 = SURFACE | EFFECT;
     /// What the rear-view mirror's pass never runs (`Core::no_reflections`: no cascades, contact shadows, lamps or spots, and
     /// `globals.ambient.z` 1 skips the coat)
-    pub const NOT_IN_MIRROR: u32 = CSM | CONTACT | SPOT | LAMPS | LSHAD | COAT | MOON | CARSH | NEAR;
+    pub const NOT_IN_MIRROR: u32 = CSM | CONTACT | SPOT | LAMPS | LSHAD | COAT | MOON | CARSH | NEAR | FOCUS | OVERCAST;
 }
 
 /// PERF (PERF-B): the parts of the mesh shader a set of switches can run (see [`feat`]); the original's set has none.
@@ -171,6 +369,8 @@ pub(crate) fn mesh_features(e: &crate::Enhancements) -> u32 {
         (e.is_on(crate::E9) && e.is_on(crate::E50), feat::MOON),
         (e.is_on(crate::E9) && e.is_on(crate::E51), feat::CARSH),
         (e.is_on(crate::E49) && e.is_on(crate::E8), feat::NEAR),
+        (e.is_on(crate::E9), feat::FOCUS),
+        (e.is_on(crate::E9) && e.is_on(crate::E25), feat::OVERCAST),
     ] {
         if on {
             f |= bit;
@@ -211,11 +411,12 @@ pub(crate) fn mesh_shader_source(feats: u32) -> String {
         }
     }
     assert!(stack.is_empty(), "shader.wgsl: an //@if is not closed");
-    crate::wgsl::compose(&[&wgsl_consts(), &kept])
+    // (`ign`: the front-end focus shadow's per-pixel turn, ENH-FE3D; the turns: the Vogel discs, the water's ripple)
+    crate::wgsl::compose(&[&wgsl_consts(), crate::wgsl::IGN, crate::wgsl::ANGLES, crate::wgsl::NDC_UV, crate::wgsl::LINEAR_Z, SH_LUMA, &faces_wgsl(), OBJECT_WGSL, &kept])
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The emitted constants are the Rust values exactly (a float literal WGSL reads back to the same bits), each name once,
@@ -223,7 +424,9 @@ mod tests {
     #[test]
     fn the_emitted_constants_are_the_rust_values() {
         let src = wgsl_consts();
-        let shader = include_str!("shader.wgsl");
+        // (the shader with its `struct Object`, whose comments name classes)
+        let shader = format!("{}{OBJECT_WGSL}", include_str!("shader.wgsl"));
+        let shader = shader.as_str();
         for (name, v) in WGSL {
             let line = src.lines().find(|l| l.starts_with(&format!("const {name}:"))).unwrap_or_else(|| panic!("{name} not emitted"));
             let lit = line.rsplit("= ").next().unwrap().trim_end_matches(';');
@@ -252,7 +455,7 @@ mod tests {
                 unmarked.push_str(l);
             }
         }
-        assert!(mesh_shader_source(feat::ALL) == crate::wgsl::compose(&[&wgsl_consts(), &unmarked]), "the full shader is not shader.wgsl");
+        assert!(mesh_shader_source(feat::ALL) == crate::wgsl::compose(&[&wgsl_consts(), crate::wgsl::IGN, crate::wgsl::ANGLES, crate::wgsl::NDC_UV, crate::wgsl::LINEAR_Z, SH_LUMA, &faces_wgsl(), OBJECT_WGSL, &unmarked]), "the full shader is not shader.wgsl");
         let all = mesh_shader_source(feat::ALL);
         for (name, bit) in feat::NAMES {
             assert!(src.contains(&format!("//@if {name}")) || src.contains(&format!("|{name}")), "{name} not used by shader.wgsl");
@@ -265,6 +468,66 @@ mod tests {
         assert_eq!(mesh_features(&crate::Enhancements::ORIGINAL), 0);
     }
 
+    /// The size in bytes of the mesh shader's struct `name` (every part in: the layout naga gives it, the one the GPU reads).
+    pub(crate) fn mesh_struct_size(name: &str) -> u32 {
+        let src = mesh_shader_source(feat::ALL);
+        let module = naga::front::wgsl::parse_str(&src).expect("the mesh shader parses");
+        let (_, ty) = module.types.iter().find(|(_, t)| t.name.as_deref() == Some(name)).unwrap_or_else(|| panic!("no struct {name}"));
+        ty.inner.size(module.to_ctx())
+    }
+
+    /// The pieces `probe.wgsl` holds word for word (it is validated on its own, `wgsl.rs` `every_source`), so the probe, the coat
+    /// prefilter and the mesh shader read one face table and one SH basis.
+    #[test]
+    fn the_shared_pieces_are_one() {
+        let probe = crate::probe::source();
+        assert!(probe.contains(SH_LUMA) && probe.contains(&faces_wgsl()), "the probe is composed of the shader's pieces");
+        assert!(crate::coat::source().contains(&faces_wgsl()));
+        assert!(crate::gpu::shadow_source().contains(OBJECT_WGSL) && mesh_shader_source(0).contains(OBJECT_WGSL));
+    }
+
+    /// `face_of` picks face `i` for `REFL_FACES[i]`'s own direction (the table's order is the pick's), and the emitted table is it.
+    #[test]
+    fn the_face_table_is_refl_faces() {
+        let pick = |d: [f32; 3]| {
+            let a = d.map(f32::abs);
+            if a[0] >= a[1] && a[0] >= a[2] {
+                return if d[0] < 0.0 { 1 } else { 0 };
+            }
+            if a[2] >= a[1] {
+                return if d[2] < 0.0 { 3 } else { 2 };
+            }
+            if d[1] < 0.0 { 5 } else { 4 }
+        };
+        let src = faces_wgsl();
+        for (i, (fwd, up)) in crate::REFL_FACES.iter().enumerate() {
+            assert_eq!(pick(*fwd), i, "face {i}");
+            assert!(src.contains(&format!("vec3<f32>({:?}, {:?}, {:?})", fwd[0], fwd[1], fwd[2])), "face {i}'s direction");
+            assert!(src.contains(&format!("vec3<f32>({:?}, {:?}, {:?})", up[0], up[1], up[2])), "face {i}'s up");
+        }
+        assert_eq!(crate::REFL_FACES[4].0, [0.0, 1.0, 0.0], "`NEAR_UP_FACE` (shader.wgsl) is the +Y face");
+    }
+
+    /// The emitted sizes and tables are the Rust values (each name once), and the coat's spans are the differences of its alphas.
+    #[test]
+    fn the_emitted_sizes_and_tables() {
+        let src = wgsl_consts();
+        for (name, n) in WGSL_SIZES {
+            assert_eq!(src.matches(&format!("const {name}: u32 = {n}u;")).count(), 1, "{name}");
+        }
+        for m in 0..crate::coat::MIP_SPAN.len() {
+            let d = crate::coat::MIP_ALPHA[m + 1] - crate::coat::MIP_ALPHA[m];
+            assert!((d - crate::coat::MIP_SPAN[m]).abs() < 1e-6, "mip {m}: {d} vs {}", crate::coat::MIP_SPAN[m]);
+        }
+        assert!(src.contains("const COAT_MIP_ALPHA: array<f32, 5> = array<f32, 5>(0.0, 0.03, 0.08, 0.2, 0.45);"));
+        // every globals binding is declared by its name, once
+        let shader = include_str!("shader.wgsl");
+        for (name, n) in binding::NAMES {
+            assert_eq!(src.matches(&format!("const {name}: u32 = {n}u;")).count(), 1, "{name}");
+            assert_eq!(shader.matches(&format!("@group(0) @binding({name})")).count(), 1, "{name}");
+        }
+    }
+
     /// The values the uniform fills and the shader always used (pinned: a change here is a change of both sides).
     #[test]
     fn the_class_values_are_pinned() {
@@ -273,5 +536,8 @@ mod tests {
         assert_eq!([ROLE_OPAQUE, ROLE_EFFECT, ROLE_SKY], [0.0, 1.0, 2.0]);
         assert_eq!([SOFT_FADE_ALPHA, SOFT_FADE_BLACK, SOFT_FADE_WHITE], [0.0, 1.0, 2.0]);
         assert_eq!([PART_LIT, PART_LIT_WORLD], [2.0, 3.0]);
+        assert_eq!([SHADOW_SUN, SHADOW_OVERCAST, SHADOW_MOON, SHADOW_FOCUS], [0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(feat::ALL, (1 << 18) - 1, "the parts' bits are 0..17, each once");
+        assert_eq!(CASCADE_BLEND_START + CASCADE_BLEND, 1.0);
     }
 }

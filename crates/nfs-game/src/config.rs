@@ -69,6 +69,11 @@ switches! {
     nfs_ai_trace = "NFS_AI_TRACE",
     nfs_camera = "NFS_CAMERA",
     nfs_cam_at = "NFS_CAM_AT",
+    // TEST GLUE (ENHANCEMENTS E23 / E9 / E51, comparison stills only): the dusk-lamp tracks (`open-unleashed` `app/street_lamps.rs`),
+    // a hand-set data sun and the full frame's radii (`data_sun.rs`)
+    nfs_dusk_tracks = "NFS_DUSK_TRACKS",
+    nfs_data_sun = "NFS_DATA_SUN",
+    nfs_data_sun_full = "NFS_DATA_SUN_FULL",
     nfs_choice = "NFS_CHOICE",
     nfs_fe_clicks = "NFS_FE_CLICKS",
     nfs_fe_clock = "NFS_FE_CLOCK",

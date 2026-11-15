@@ -38,8 +38,6 @@ pub(crate) enum Cmd {
     Trilinear(bool),
     FakeSort(FakeSortMode),
     Gamma(f32),
-    /// ENHANCEMENT ENH-TEMPORAL: a temporal upscaler is active (`Core::temporal_flag`)
-    Temporal(bool),
     /// ENHANCEMENT E37: a camera cut the renderer cannot see (a view change, a replay jump, photo mode, a pause): the temporal
     /// history (FSR's, the vectors' previous frame) is dropped at the next frame
     TemporalCut,
@@ -67,6 +65,16 @@ pub(crate) enum Cmd {
     ReflFace(Box<ReflFaceJob>),
     /// ENHANCEMENT ENH-FE3D: the six faces from the CPU (a front-end studio): size, six RGBA8 images
     ReflUpload(u32, Vec<Vec<f32>>),
+}
+
+/// ENHANCEMENT E8: one environment face to draw ([`Renderer::render_refl_face`]): `face` (0..6, `gpu::REFL_FACES`), its `size`², the
+/// clear colour and `depth_far`, the far plane of the pass's screen z.
+#[derive(Clone, Copy, Debug)]
+pub struct EnvFace {
+    pub face: u32,
+    pub size: u32,
+    pub clear: [f64; 4],
+    pub depth_far: f32,
 }
 
 pub(crate) struct ReflFaceJob {
@@ -608,17 +616,6 @@ impl Renderer {
         }
     }
 
-    /// ENHANCEMENT ENH-TEMPORAL: raise the temporal flag a temporal upscaler (FSR 3.1, MetalFX temporal) needs: the race's main
-    /// view is then drawn jittered at one sample, with motion vectors, reactive / composition masks and depth
-    /// (`RE/notes/ENHANCEMENTS.md`, "Temporal foundation"). Default off, and nothing sets it yet: the debug env var
-    /// `NFS_TEMPORAL_DEBUG` is the other way in.
-    /// ENHANCEMENT E37: FSR 3.1 raises this flag by itself while its switch is on (the renderer knows the switch and
-    /// whether the backend came up, `gpu.rs::temporal_frame`); this call stays the explicit way for another backend.
-    #[allow(dead_code)]
-    pub fn set_temporal(&mut self, on: bool) {
-        self.rec(Cmd::Temporal(on));
-    }
-
     /// ENHANCEMENT E37: the camera cut at the next frame - the app calls it for what the renderer cannot see in the camera's
     /// numbers: a view change (chase to bumper), photo mode in / out, a replay jump, a new race, a pause. Without a temporal
     /// upscaler on it does nothing.
@@ -728,7 +725,8 @@ impl Renderer {
     /// player's car's environment map from `camera` into a `size`² image and put it in the map. Recorded
     /// like an offscreen pass; the main view uses the map once all six faces have been drawn and
     /// `Scene::refl` is set.
-    pub fn render_refl_face(&mut self, scene: &Scene, camera: &Camera, face: u32, size: u32, clear: [f64; 4], depth_far: f32) {
+    pub fn render_refl_face(&mut self, scene: &Scene, camera: &Camera, f: EnvFace) {
+        let EnvFace { face, size, clear, depth_far } = f;
         self.rec(Cmd::ReflFace(Box::new(ReflFaceJob { scene: scene.clone_without_sprites(), camera: *camera, face, size, clear, depth_far, near: None })));
         self.list.barrier = self.list.cmds.len();
     }
@@ -736,8 +734,8 @@ impl Renderer {
     /// ENHANCEMENT E49: [`Self::render_refl_face`] into the twelve-layer cube: `scene` (the surroundings) into layer `face` (every
     /// car's coat), then `cars` (the near cars) drawn over the same colour and depth into layer `6 + face` (the player's own coat).
     /// The face's eye is kept for the parallax-corrected lookup.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_refl_face_near(&mut self, scene: &Scene, cars: &Scene, camera: &Camera, face: u32, size: u32, clear: [f64; 4], depth_far: f32) {
+    pub fn render_refl_face_near(&mut self, scene: &Scene, cars: &Scene, camera: &Camera, f: EnvFace) {
+        let EnvFace { face, size, clear, depth_far } = f;
         self.rec(Cmd::ReflFace(Box::new(ReflFaceJob { scene: scene.clone_without_sprites(), camera: *camera, face, size, clear, depth_far, near: Some(cars.clone_without_sprites()) })));
         self.list.barrier = self.list.cmds.len();
     }

@@ -19,6 +19,7 @@
 //! `shadow.wgsl` vertex stage: the matrix is a perspective one, the vertex stage's `z` pancake
 //! only matters for a caster nearer than the lamp, which the near plane clips anyway.
 
+use super::shadowmap::{Caster, DepthArray, LightMats, UniformSlot};
 use crate::gfx;
 use super::*;
 use bytemuck::Zeroable;
@@ -38,6 +39,12 @@ const SHADOW_SIZE: u32 = 1024;
 const SELF_CLEAR: f32 = 2.8;
 /// A caster whose bounding sphere is larger than this (m) is left out (a hillside would fill the map).
 const MAX_CASTER_RADIUS: f32 = 40.0;
+/// A caster within [`SELF_CLEAR`] smaller than this (m) is the own car's part (or at the lamp): left out.
+const SELF_RADIUS: f32 = 4.0;
+/// The shadow frustum's far plane beyond the lamps' reach (m).
+const FAR_MARGIN: f32 = 10.0;
+/// A caster is left out beyond this many of the frustum's half angles off its axis (plus its own angular radius).
+const CONE_SLACK: f32 = 1.45;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -57,13 +64,13 @@ pub(super) struct SpotUniform {
 }
 
 pub(super) struct SpotState {
-    pub uniform: wgpu::Buffer,
-    light_buf: wgpu::Buffer,
-    light_bg: wgpu::BindGroup,
-    _dummy: wgpu::Texture,
+    pub uniform: UniformSlot<SpotUniform>,
+    light: LightMats,
     dummy_view: wgpu::TextureView,
-    map: Option<(wgpu::Texture, wgpu::TextureView)>,
-    active: bool,
+    /// the map: one layer, read through its 2-D layer view (the mesh shader's and E36's `t_spot: texture_depth_2d`)
+    map: Option<DepthArray>,
+    /// the frame's caster list, kept between frames
+    list: Vec<u32>,
 }
 
 pub(super) struct SpotFrame {
@@ -72,27 +79,28 @@ pub(super) struct SpotFrame {
     shadow: Option<(Mat4, Vec3, Vec3)>,
 }
 
+impl SpotFrame {
+    /// Whether the camera car's pair draws its shadow map this frame (level 2, a lit pair).
+    pub(super) fn casts(&self) -> bool {
+        self.shadow.is_some()
+    }
+}
+
 impl SpotState {
     pub(super) fn new(device: &wgpu::Device, light_layout: &wgpu::BindGroupLayout) -> Self {
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("spot uniform"), size: std::mem::size_of::<SpotUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: true });
-        // zeroed: lamp count 0, the shader's "off"
-        uniform.unmap();
-        let light_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("spot light vp"), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let light_bg = gfx::buffer_bg(device, "spot light", light_layout, &light_buf);
-        let dummy = gfx::texture_2d(device, "spot map placeholder", 1, 1, DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
-        let dummy_view = dummy.create_view(&Default::default());
-        Self { uniform, light_buf, light_bg, _dummy: dummy, dummy_view, map: None, active: false }
+        let dummy_view = DepthArray::placeholder_2d(device, "spot map placeholder");
+        Self { uniform: UniformSlot::new(device, "spot uniform"), light: LightMats::new(device, light_layout, "spot light vp", 1), dummy_view, map: None, list: Vec::new() }
     }
 
     pub(super) fn view(&self) -> &wgpu::TextureView {
-        self.map.as_ref().map_or(&self.dummy_view, |m| &m.1)
+        self.map.as_ref().map_or(&self.dummy_view, |m| &m.layer_views[0])
     }
 }
 
 pub(super) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
     [
-        gfx::bgl_tex(10, wgpu::TextureSampleType::Depth, false),
-        gfx::bgl_uniform(11, wgpu::ShaderStages::FRAGMENT),
+        gfx::bgl_tex(crate::classes::binding::SPOT_MAP, wgpu::TextureSampleType::Depth, false),
+        gfx::bgl_uniform(crate::classes::binding::SPOTS, wgpu::ShaderStages::FRAGMENT),
     ]
 }
 
@@ -131,7 +139,7 @@ impl Core {
             u.dir[i] = [d.x, d.y, d.z, 0.0];
         }
         u.params = [(s.n as usize).min(crate::MAX_SPOTS) as f32, CONE_OUTER_DEG.to_radians().cos(), CONE_INNER_DEG.to_radians().cos(), RANGE];
-        let far = RANGE + 10.0;
+        let far = RANGE + FAR_MARGIN;
         let mut shadow = None;
         if level >= 2 && s.shadowed > 0 {
             let (a, b) = (&s.lamps[0], if s.shadowed > 1 { &s.lamps[1] } else { &s.lamps[0] });
@@ -146,121 +154,64 @@ impl Core {
             }
         }
         if shadow.is_some() && self.spot.map.is_none() {
-            let texture = gfx::texture_2d(&self.device, "spot shadow map", SHADOW_SIZE, SHADOW_SIZE, DEPTH_FORMAT, gfx::RT_USAGE);
-            let view = texture.create_view(&Default::default());
-            tracing::info!(size = SHADOW_SIZE, "headlight shadow map (ENHANCEMENT E15)");
-            self.spot.map = Some((texture, view));
+            self.spot.map = Some(DepthArray::new(&self.device, "headlight shadow map (ENHANCEMENT E15)", SHADOW_SIZE, 1));
             self.rebuild_globals_bg();
         }
         Some(SpotFrame { uniform: u, shadow })
     }
 
-    /// What an item does with the spotlights (`ObjectUniform::soft.z`): the same roles as E9's
-    /// receivers, 1 a car, 2 a track item, 0 neither.
-    pub(super) fn spot_receive(&self, item: &crate::DrawItem) -> f32 {
-        self.csm_receive(item)
-    }
-
-    /// Write the frame's uniform and draw the shadow map of the camera's own car's pair. Without a
-    /// frame the uniform is zeroed once if it was on.
-    pub(super) fn spot_pass(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &Scene, n: usize, frame: Option<&SpotFrame>) {
-        let size = wgpu::BufferSize::new(std::mem::size_of::<SpotUniform>() as u64).expect("spot size");
+    /// Write the frame's uniform and draw the shadow map of the camera's own car's pair (`casters`: the frame's). Without a frame
+    /// the uniform is zeroed once if it was on.
+    pub(super) fn spot_pass(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &Scene, casters: &[Caster], frame: Option<&SpotFrame>) {
         let Some(frame) = frame else {
-            if self.spot.active {
-                self.spot.active = false;
-                self.belt.write_buffer(encoder, &self.spot.uniform, 0, size).copy_from_slice(bytemuck::bytes_of(&SpotUniform::zeroed()));
-            }
+            self.spot.uniform.clear(&mut self.belt, encoder);
             return;
         };
-        self.spot.active = true;
-        self.belt.write_buffer(encoder, &self.spot.uniform, 0, size).copy_from_slice(bytemuck::bytes_of(&frame.uniform));
+        self.spot.uniform.write(&mut self.belt, encoder, &frame.uniform);
         let Some((m, origin, dir)) = frame.shadow else { return };
-        let lsize = wgpu::BufferSize::new(64).expect("light size");
-        self.belt.write_buffer(encoder, &self.spot.light_buf, 0, lsize).copy_from_slice(bytemuck::bytes_of(&m.to_cols_array_2d()));
+        self.spot.light.write(&mut self.belt, encoder, 0, &m.to_cols_array_2d());
         let half = (FOV_DEG * 0.5).to_radians();
-        let mut casters: Vec<u32> = Vec::new();
-        for (i, item) in scene.items.iter().take(n).enumerate() {
-            if !self.csm_caster(item) {
-                continue;
-            }
-            let mesh = &self.meshes[item.mesh.0 as usize];
-            if mesh.index_count == 0 || mesh.bounds.1 <= 0.0 || mesh.flat {
-                continue;
-            }
-            let t = &item.transform;
-            let scale = t.x_axis.truncate().length().max(t.y_axis.truncate().length()).max(t.z_axis.truncate().length());
-            let (centre, radius) = (t.transform_point3(Vec3::from(mesh.bounds.0)), mesh.bounds.1 * scale);
-            if radius > MAX_CASTER_RADIUS {
-                continue;
-            }
-            let v = centre - origin;
-            let dist = v.length();
-            // the own car (and anything at the lamp) casts nothing; beyond the reach or out of the frustum too
-            if dist < SELF_CLEAR && radius < 4.0 || dist - radius > RANGE + 10.0 {
-                continue;
-            }
-            let along = v.dot(dir);
-            if along + radius < 0.0 {
-                continue;
-            }
-            if dist > radius {
-                let ang = (along / dist).clamp(-1.0, 1.0).acos();
-                if ang > half * 1.45 + (radius / dist).asin() {
-                    continue;
-                }
-            }
-            casters.push(i as u32);
-        }
-        let map = &self.spot.map.as_ref().expect("spot map made").1;
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("headlight shadow pass"),
-            color_attachments: &[],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: map,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: crate::prof::rp("headlight shadow"),
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_bind_group(0, &self.spot.light_bg, &[]);
-        self.draw_shadow_casters(&mut pass, scene, &casters);
-    }
-
-    /// Draw `casters` (indices into `scene.items`) into a depth-only shadow pass whose light group (0) is set: E9's opaque /
-    /// cut-out pipelines, the object buffer as group 1 (shared by E15's headlight map and ENHANCEMENT E47's lamp maps).
-    pub(super) fn draw_shadow_casters(&self, pass: &mut wgpu::RenderPass<'_>, scene: &Scene, casters: &[u32]) {
-        pass.set_bind_group(1, &self.object_bg, &[]);
-        let (mut cur_pipe, mut cur_mat, mut cur_mesh) = (u8::MAX, u32::MAX, u32::MAX);
-        for &idx in casters {
-            let item = &scene.items[idx as usize];
-            let mat = &self.materials[item.material.0 as usize];
-            let cut = mat.alpha_blend || mat.device_states || item.alpha_test;
-            if cur_pipe != cut as u8 {
-                pass.set_pipeline(if cut { &self.csm.pipe_cut } else { &self.csm.pipe_opaque });
-                cur_pipe = cut as u8;
-                cur_mat = u32::MAX;
-            }
-            if cut && cur_mat != item.material.0 {
-                pass.set_bind_group(2, &mat.bind_group, &[]);
-                cur_mat = item.material.0;
-            }
-            let mesh = &self.meshes[item.mesh.0 as usize];
-            if cur_mesh != item.mesh.0 {
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(mesh.vertex_offset..mesh.vertex_offset + mesh.vertex_len.max(4)));
-                pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
-                cur_mesh = item.mesh.0;
-            }
-            crate::prof::count_draw(u64::from(mesh.index_count / 3));
-            pass.draw_indexed(0..mesh.index_count, 0, idx..idx + 1);
-        }
+        let mut list = std::mem::take(&mut self.spot.list);
+        list.clear();
+        list.extend(
+            casters
+                .iter()
+                .filter(|c| {
+                    if c.flat || c.radius > MAX_CASTER_RADIUS {
+                        return false;
+                    }
+                    let v = c.centre - origin;
+                    let dist = v.length();
+                    // the own car (and anything at the lamp) casts nothing; beyond the reach or out of the frustum neither
+                    if dist < SELF_CLEAR && c.radius < SELF_RADIUS || dist - c.radius > RANGE + FAR_MARGIN {
+                        return false;
+                    }
+                    let along = v.dot(dir);
+                    if along + c.radius < 0.0 {
+                        return false;
+                    }
+                    dist <= c.radius || (along / dist).clamp(-1.0, 1.0).acos() <= half * CONE_SLACK + (c.radius / dist).asin()
+                })
+                .map(|c| c.idx),
+        );
+        let map = &self.spot.map.as_ref().expect("spot map made").layer_views[0];
+        let mut pass = super::shadowmap::depth_pass(encoder, "headlight shadow pass", "headlight shadow", map);
+        pass.set_bind_group(0, self.spot.light.bind_group(0), &[]);
+        self.draw_shadow_casters(&mut pass, scene, &list);
+        drop(pass);
+        self.spot.list = list;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mesh shader's `Spots` is this uniform, byte for byte in size (its arrays' lengths are emitted from the Rust ones).
+    #[test]
+    fn the_shader_reads_the_uniform() {
+        assert_eq!(crate::classes::tests::mesh_struct_size("Spots") as usize, std::mem::size_of::<SpotUniform>());
+    }
 
     #[test]
     fn shadow_matrix_maps_the_axis_to_the_centre_and_depth_to_0_1() {

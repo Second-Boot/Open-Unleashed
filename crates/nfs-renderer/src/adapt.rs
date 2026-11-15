@@ -13,7 +13,7 @@
 //!
 //! All plain wgpu / WGSL (a render pass into a 1 x 1 `Rgba32Float`, read with `textureLoad`).
 
-use crate::gfx::{self, Fullscreen, PostCtx};
+use crate::gfx::{self, Fullscreen, PostCtx, Variants};
 use crate::wgsl;
 use std::time::Instant;
 
@@ -25,6 +25,13 @@ const GAIN: f32 = 0.35;
 pub(crate) const CAP_EV: f32 = 0.5;
 /// The longest frame step the smoothing believes (a stall must not snap the adaptation).
 const MAX_DT: f32 = 0.25;
+
+/// The state's format: the quick and the slow average (x, y), one pixel.
+const STATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
+/// The parameters (`params` / `eye_params`, two vec4): the quick and the slow share of this frame, 1 on a fresh start, -; the
+/// gain, the cap.
+type Params = [f32; 8];
 
 /// The WGSL that the tone-map pass needs when the eye is on: the state and its parameters.
 pub(crate) const TONE_BINDINGS: &str = r#"
@@ -42,17 +49,24 @@ const MEASURE_WGSL: &str = r#"
 @group(0) @binding(1) var s: sampler;
 @group(1) @binding(0) var prev: texture_2d<f32>;
 @group(1) @binding(1) var<uniform> params: array<vec4<f32>, 2>;
+// the taps: a GRID x GRID lattice; a channel is capped at BRIGHT (a lamp or the sun does not swing the mean), a luminance
+// floored at DARK (log2 of black)
+const GRID: i32 = 16;
+const BRIGHT: f32 = 4.0;
+const DARK: f32 = 1.0 / 128.0;
 @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     var sum = 0.0;
-    for (var j = 0; j < 16; j = j + 1) {
-        for (var i = 0; i < 16; i = i + 1) {
-            let uv = (vec2<f32>(f32(i), f32(j)) + 0.5) / 16.0;
-            let c = min(textureSampleLevel(t, s, uv, 0.0).rgb, vec3<f32>(4.0));
-            let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-            sum = sum + log2(max(l, 1.0 / 128.0));
+    for (var j = 0; j < GRID; j = j + 1) {
+        for (var i = 0; i < GRID; i = i + 1) {
+            let uv = (vec2<f32>(f32(i), f32(j)) + 0.5) / f32(GRID);
+            var c = textureSampleLevel(t, s, uv, 0.0).rgb;
+            //BLOOM_MEASURE
+            c = min(c, vec3<f32>(BRIGHT));
+            let l = dot(c, LUMA_709);
+            sum = sum + log2(max(l, DARK));
         }
     }
-    let m = sum / 256.0;
+    let m = sum / f32(GRID * GRID);
     let old = textureLoad(prev, vec2<i32>(0, 0), 0);
     if params[0].z > 0.5 {
         return vec4<f32>(m, m, 0.0, 1.0);
@@ -61,13 +75,35 @@ const MEASURE_WGSL: &str = r#"
 }
 "#;
 
-/// The measure pass's shader.
-pub(crate) fn measure_source() -> String {
-    wgsl::compose(&[wgsl::FULLSCREEN_VS, MEASURE_WGSL])
+/// The measure pass's shader; `bloom`: ENHANCEMENT E10's last add is the tone map's, so the measure adds it to its taps itself
+/// (group [`BLOOM_GROUP`], `bloom::TONE_WGSL`'s `bloom_coarse`): the eye sees the scene the tone map shows, as when the add was
+/// a pass of its own before the measure.
+pub(crate) fn measure_source(bloom: bool) -> String {
+    if !bloom {
+        return wgsl::compose(&[wgsl::FULLSCREEN_VS, wgsl::LUMA_709, MEASURE_WGSL]);
+    }
+    let tone = crate::bloom::tone_source(BLOOM_GROUP);
+    wgsl::compose(&[wgsl::FULLSCREEN_VS, wgsl::LUMA_709, &tone, &MEASURE_WGSL.replace("//BLOOM_MEASURE", "c = c + bloom_coarse(uv);")])
+}
+
+/// ENHANCEMENT E10: the measure pass's group of the bloom's last add (after the image and the state).
+const BLOOM_GROUP: u32 = 2;
+
+/// ENHANCEMENT E10: the bloom chain the measure adds this frame: its group (and layout), the level and E28's dirt.
+#[derive(Clone, Copy)]
+pub(crate) struct Bloom<'a> {
+    pub layout: &'a wgpu::BindGroupLayout,
+    pub group: &'a wgpu::BindGroup,
+    pub level: u8,
+    pub dirt: bool,
 }
 
 pub(crate) struct EyePass {
+    /// the measure without the bloom
     pipeline: wgpu::RenderPipeline,
+    /// ENHANCEMENT E10: the measure with the bloom's add, per level and dirt (built at first use)
+    bloom_pipes: Variants<(u8, bool), wgpu::RenderPipeline>,
+    image_layout: wgpu::BindGroupLayout,
     /// group 1 of the tone-map pass and of the measure pass: the state texture + the parameters
     pub state_layout: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
@@ -84,12 +120,12 @@ pub(crate) struct EyePass {
 impl EyePass {
     pub fn new(device: &wgpu::Device, image_layout: &wgpu::BindGroupLayout) -> Self {
         let state_layout = gfx::bgl(device, "eye state", &[gfx::bgl_tex(0, wgpu::TextureSampleType::Float { filterable: false }, false), gfx::bgl_uniform(1, wgpu::ShaderStages::FRAGMENT)]);
-        let module = gfx::wgsl_module(device, "eye measure", &measure_source());
+        let module = gfx::wgsl_module(device, "eye measure", &measure_source(false));
         let pl = gfx::pipeline_layout(device, "eye measure", &[image_layout, &state_layout]);
-        let pipeline = Fullscreen::new("eye measure", &pl, &module).build(device, &[gfx::target(wgpu::TextureFormat::Rgba32Float, None)]);
-        let params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("eye params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let pipeline = Fullscreen::new("eye measure", &pl, &module).build(device, &[gfx::target(STATE_FORMAT, None)]);
+        let params = gfx::uniform_buf::<Params>(device, "eye params");
         let make = || {
-            let t = gfx::texture_2d(device, "eye state", 1, 1, wgpu::TextureFormat::Rgba32Float, gfx::RT_USAGE);
+            let t = gfx::texture_2d(device, "eye state", 1, 1, STATE_FORMAT, gfx::RT_USAGE);
             let v = t.create_view(&Default::default());
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("eye state"),
@@ -99,7 +135,7 @@ impl EyePass {
             (t, v, bg)
         };
         let states = [make(), make()];
-        Self { pipeline, state_layout, params, states, cur: 0, last: None, size: (0, 0), fixed_dt: std::env::var("NFS_EYE_DT").ok().and_then(|v| v.parse().ok()) }
+        Self { pipeline, bloom_pipes: Variants::default(), image_layout: image_layout.clone(), state_layout, params, states, cur: 0, last: None, size: (0, 0), fixed_dt: crate::dbg::flags().eye_dt }
     }
 
     /// The bind group (group 1) the tone-map pass reads the state the last `encode` wrote through.
@@ -107,11 +143,10 @@ impl EyePass {
         &self.states[self.cur].2
     }
 
-    /// Measure the float image (`image_bg`, `cx.size`) and step the adaptation: the new state is written to the other
-    /// texture and becomes the current one.
-    pub fn encode(&mut self, cx: &mut PostCtx, image_bg: &wgpu::BindGroup) {
-        let (queue, (width, height)) = (cx.queue, cx.size);
-        let encoder = &mut *cx.encoder;
+    /// Measure the float image (`image_bg`, `cx.size`; ENHANCEMENT E10: plus the `bloom` the tone map adds to it) and step the
+    /// adaptation: the new state is written to the other texture and becomes the current one.
+    pub fn encode(&mut self, cx: &mut PostCtx, image_bg: &wgpu::BindGroup, bloom: Option<Bloom>) {
+        let (width, height) = cx.size;
         let now = Instant::now();
         let dt = self.fixed_dt.unwrap_or_else(|| self.last.map_or(0.0, |t| now.duration_since(t).as_secs_f32())).min(MAX_DT);
         // a first frame or a new image size starts at rest (no jump from a size change)
@@ -119,15 +154,22 @@ impl EyePass {
         self.last = Some(now);
         self.size = (width, height);
         let (af, as_) = (alpha(dt, HALF_LIFE_FAST), alpha(dt, HALF_LIFE_SLOW));
-        let p: [f32; 8] = [af, as_, init as u32 as f32, 0.0, GAIN, CAP_EV, 0.0, 0.0];
-        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&p));
+        let p: Params = [af, as_, init as u32 as f32, 0.0, GAIN, CAP_EV, 0.0, 0.0];
+        gfx::belt_write(cx.belt, cx.encoder, &self.params, bytemuck::cast_slice(&p));
+        let encoder = &mut *cx.encoder;
         let (prev, next) = (self.cur, 1 - self.cur);
-        {
-            let mut pass = gfx::color_pass(encoder, "eye measure", "eye adaptation", &self.states[next].1, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, image_bg, &[]);
-            pass.set_bind_group(1, &self.states[prev].2, &[]);
-            pass.draw(0..3, 0..1);
+        let target = &self.states[next].1;
+        match bloom {
+            Some(b) => {
+                let (device, image_layout, state_layout) = (cx.device, &self.image_layout, &self.state_layout);
+                let pipeline = self.bloom_pipes.get((b.level, b.dirt), || {
+                    let module = gfx::wgsl_module(device, "eye measure (bloom)", &measure_source(true));
+                    let pl = gfx::pipeline_layout(device, "eye measure (bloom)", &[image_layout, state_layout, b.layout]);
+                    Fullscreen::new("eye measure (bloom)", &pl, &module).constants(&crate::bloom::tone_constants(b.level, b.dirt)).build(device, &[gfx::target(STATE_FORMAT, None)])
+                });
+                gfx::fullscreen_pass(encoder, "eye measure", "eye adaptation", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK), pipeline, &[image_bg, &self.states[prev].2, b.group]);
+            }
+            None => gfx::fullscreen_pass(encoder, "eye measure", "eye adaptation", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &self.pipeline, &[image_bg, &self.states[prev].2]),
         }
         self.cur = next;
     }

@@ -88,7 +88,7 @@ impl Switch {
 /// The captions of a plain on/off switch: levels `[off, on]`.
 pub const ON_OFF: &[[&str; 2]] = &[["off", "выкл"], ["on", "вкл"]];
 
-// To add one: append `Entry { token: "E45", .. }` here and `E45 = 44,` to `switches!` below (a mismatch does not compile).
+// To add one: append `Entry { token: "E45", .. }` here and `E45,` to `switches!` below (a token without an entry does not compile).
 // Menu order. Stage 1 closed the framework; ENH-VAL added the levels and registered E1..E6 — their
 // GPU side comes later, so for now no level changes anything on screen.
 /// Every enhancement of the branch, in menu order.
@@ -602,18 +602,27 @@ pub const REGISTRY: &[Entry] = &[
     },
 ];
 
-/// The [`Switch`] constants. `E7 = 6` declares `pub const E7: Switch = Switch(6)` and checks AT COMPILE TIME that `REGISTRY[6]` is
-/// the entry with the token `E7`; with the tokens unique and one constant per registry row (both checked at compile time too) a
-/// constant cannot point at another entry. Indices are stored positions: REGISTRY's order never changes, a new
-/// entry is appended there and here.
+/// The [`Switch`] constants. `E7,` declares `pub const E7: Switch = Switch(index_of("E7"))`: the index is the position of the
+/// entry with that token in [`REGISTRY`], found AT COMPILE TIME (a token with no entry does not compile). With the tokens unique
+/// and one constant per registry row (both checked at compile time too) a constant cannot point at another entry. REGISTRY's order
+/// never changes (the indices are the menu order and the `Enhancements` slots): a new entry is appended there, its constant here.
 macro_rules! switches {
-    ($($(#[$doc:meta])* $name:ident = $index:literal,)*) => {
-        $($(#[$doc])* pub const $name: Switch = Switch($index);)*
-        const _: () = {
-            $(assert!(str_eq(REGISTRY[$index].token, stringify!($name)), concat!("REGISTRY[", stringify!($index), "] is not ", stringify!($name)));)*
-            assert!([$($index),*].len() == REGISTRY.len(), "a REGISTRY entry has no switch constant");
-        };
+    ($($(#[$doc:meta])* $name:ident,)*) => {
+        $($(#[$doc])* pub const $name: Switch = Switch(index_of(stringify!($name)));)*
+        const _: () = assert!([$(stringify!($name)),*].len() == REGISTRY.len(), "a REGISTRY entry has no switch constant");
     };
+}
+
+/// The index of the [`REGISTRY`] entry whose token is `token`, in a const context; a compile error when there is none.
+const fn index_of(token: &str) -> u8 {
+    let mut i = 0;
+    while i < REGISTRY.len() {
+        if str_eq(REGISTRY[i].token, token) {
+            return i as u8;
+        }
+        i += 1;
+    }
+    panic!("no REGISTRY entry has this token")
 }
 
 /// `a == b` in a const context.
@@ -652,93 +661,93 @@ const _: () = assert!(tokens_unique(REGISTRY), "two REGISTRY entries share a tok
 const _: () = assert!(REGISTRY.len() <= MAX_SWITCHES, "REGISTRY has more entries than an Enhancements holds (MAX_SWITCHES)");
 
 switches! {
-    E1 = 0,
-    E2 = 1,
-    E3 = 2,
-    E4 = 3,
-    E5 = 4,
-    E6 = 5,
-    E7 = 6,
-    E8 = 7,
-    E9 = 8,
+    E1,
+    E2,
+    E3,
+    E4,
+    E5,
+    E6,
+    E7,
+    E8,
+    E9,
     /// ENHANCEMENT E12 soft particles
-    E12 = 9,
-    E10 = 10,
-    E11 = 11,
+    E12,
+    E10,
+    E11,
     /// ENHANCEMENT E16 car light from the surroundings (SH probe of E8's faces)
-    E16 = 12,
+    E16,
     /// ENHANCEMENT E15 headlight spots
-    E15 = 13,
-    E13 = 14,
+    E15,
+    E13,
     /// ENHANCEMENT E17 water
-    E17 = 15,
+    E17,
     /// ENHANCEMENT E14 corner shading (AO)
-    E14 = 16,
+    E14,
     /// ENHANCEMENT E18 particles in HDR
-    E18 = 17,
+    E18,
     /// ENHANCEMENT E19 fog sun in-scatter + output dither
-    E19 = 18,
+    E19,
     // index 19 was E20 (lightning lights the scene), removed 2026-11-13; the later switches moved down by one,
     // as when E30 left (an old file's "E20" key is ignored, an `NFS_ENH` "E20" is reported unknown)
     /// ENHANCEMENT E21 eye adaptation
-    E21 = 19,
+    E21,
     /// ENHANCEMENT E23 street lamps as lights
-    E23 = 20,
+    E23,
     /// ENHANCEMENT E24 headlights light up in tunnels (render side only)
-    E24 = 21,
+    E24,
     /// ENHANCEMENT E25 soft shadows on the sunless tracks
-    E25 = 22,
+    E25,
     /// ENHANCEMENT E22 frame rate limit
-    E22 = 23,
+    E22,
     /// ENHANCEMENT E27 motion blur
-    E27 = 24,
+    E27,
     /// ENHANCEMENT E28 lens dirt
-    E28 = 25,
+    E28,
     /// ENHANCEMENT E29 camera shake
-    E29 = 26,
+    E29,
     /// ENHANCEMENT E26 wet road and rain
-    E26 = 27,
+    E26,
     // index 29 was E30 (photo mode), removed 2026-10-27 (photo mode is always on now, PORT-DEVIATION D46 of master); the
     // later switches moved down by one. Nothing stores an index: `enhancements.json` and `NFS_ENH` name the tokens, which are
     // unchanged (an old file's "E30" key is ignored, an `NFS_ENH` "E30" is reported unknown)
     /// ENHANCEMENT E31 depth of field in replays
-    E31 = 28,
+    E31,
     /// ENHANCEMENT E32 baked bounce light (global illumination)
-    E32 = 29,
+    E32,
     /// ENHANCEMENT E35 SMAA 1x over the tone-mapped image
-    E35 = 30,
+    E35,
     /// ENHANCEMENT E36 tunnel haze and visible headlight beams in fog / rain / tunnels
-    E36 = 31,
+    E36,
     /// ENHANCEMENT E34 MetalFX upscaling (registered on every platform, after E36, so the other indices do not move; only macOS has the backend)
-    E34 = 32,
+    E34,
     /// ENHANCEMENT E33 HDR display / EDR output (registered on every platform, after E34; the backend is macOS only)
-    E33 = 33,
+    E33,
     /// ENHANCEMENT E37 FSR 3.1 temporal upscaling (registered last, on every platform; the backend is Windows / Linux, macOS only with `NFS_FSR_FORCE`)
-    E37 = 34,
+    E37,
     /// ENHANCEMENT ENH-UPSCALER: the upscaler choice (0 off, 1 MetalFX, 2 FSR 3.1; registered after E37, on every platform, level 1 is macOS only)
-    E38 = 35,
+    E38,
     /// ENHANCEMENT ENH-UPSCALER: the upscaler's RCAS sharpness (0 off, then 0.2 / 0.3 / 0.5 / 0.8; FSR's own, MetalFX's through `sharpen.rs`)
-    E39 = 36,
+    E39,
     /// ENHANCEMENT E40 raindrops on the windscreen of the driver view (registered last, after E39)
-    E40 = 37,
+    E40,
     /// ENHANCEMENT E41 the HD texture pack: 0 off, 1 on (registered last, after E40; read by the asset loaders, no GPU pass)
-    E41 = 38,
+    E41,
     /// ENHANCEMENT E42 rounded details of the cars: 0 off, 1 soft, 2 strong (registered last, after E41; read by the car loader, no GPU pass)
-    E42 = 39,
+    E42,
     /// ENHANCEMENT E43 the soft contact shadow under the cars: 0 off, 1 on (registered last, after E42)
-    E43 = 40,
+    E43,
     /// ENHANCEMENT E44 the lighthouse beam as soft volumetric light: 0 off, 1 on (registered last, after E43; needs E7)
-    E44 = 41,
+    E44,
     /// ENHANCEMENT E47 the cars' shadows from the street / tunnel lamps (E23): 0 off, 1 on (registered last, after E44; needs E23)
-    E47 = 42,
+    E47,
     /// ENHANCEMENT E48 the chase / heli cameras' steady slope lift: 0 off (the original), 1 on (registered last, after E47)
-    E48 = 43,
+    E48,
     /// ENHANCEMENT E49 reflections of nearby objects: 0 off, 1 on (registered after E48; needs E8)
-    E49 = 44,
+    E49,
     /// ENHANCEMENT E50 moonlight on the night tracks: 0 off, 1 weak, 2 normal (registered after E49; needs E9)
-    E50 = 45,
+    E50,
     /// ENHANCEMENT E51 the cars' own sun shadow on dimly baked roads: 0 off, 1 where the sun reaches the car, 2 always (registered after E50; needs E9)
-    E51 = 46,
+    E51,
 }
 
 /// ENHANCEMENT E34: its levels 1..=this are the temporal ones (MetalFX temporal scaler); the levels above are the spatial ('simple') ones
@@ -964,43 +973,44 @@ pub struct Dependency {
 /// Only RULES THE CODE ENFORCES are listed: a "needs" that the help texts mention but no gate checks is not here (E36's beams and
 /// E15 spotlights, E24 and E15, E19's fog glow which does not need HDR, E22's levels
 /// 5 / 6 with the frame output (a fallback, not a block), E17 / E8 (only at night, partial)).
+/// The tokens are the [`Switch`] constants' own (`E7.token()`), so a row cannot name an entry that does not exist.
 pub const DEPENDS: &[Dependency] = &[
-    Dependency { entry: "E41", cond: Cond::NoHdPack },
+    Dependency { entry: E41.token(), cond: Cond::NoHdPack },
     // the float scene (E7) is what the post effects work on: with E7 off `enh_hdr` gives None and every `hdr` / `cur_hdr` gate fails
-    Dependency { entry: "E10", cond: Cond::Needs("E7") },
-    Dependency { entry: "E11", cond: Cond::Needs("E7") },
-    Dependency { entry: "E13", cond: Cond::Needs("E7") },
-    Dependency { entry: "E18", cond: Cond::Needs("E7") },
-    Dependency { entry: "E21", cond: Cond::Needs("E7") },
-    Dependency { entry: "E27", cond: Cond::Needs("E7") },
-    Dependency { entry: "E31", cond: Cond::Needs("E7") },
-    Dependency { entry: "E33", cond: Cond::Needs("E7") },
-    Dependency { entry: "E40", cond: Cond::Needs("E7") },
-    Dependency { entry: "E36", cond: Cond::Needs("E7") },
-    Dependency { entry: "E44", cond: Cond::Needs("E7") },
+    Dependency { entry: E10.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E11.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E13.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E18.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E21.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E27.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E31.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E33.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E40.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E36.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E44.token(), cond: Cond::Needs(E7.token()) },
     // the lens dirt is added by the bloom pass (inside `if bloom_level > 0`), so it needs E10 and, through it, E7
-    Dependency { entry: "E28", cond: Cond::Needs("E7") },
-    Dependency { entry: "E28", cond: Cond::Needs("E10") },
+    Dependency { entry: E28.token(), cond: Cond::Needs(E7.token()) },
+    Dependency { entry: E28.token(), cond: Cond::Needs(E10.token()) },
     // the car-ambient probe samples E8's environment faces
-    Dependency { entry: "E16", cond: Cond::Needs("E8") },
+    Dependency { entry: E16.token(), cond: Cond::Needs(E8.token()) },
     // the overcast shadows are a second light of E9's cascades
-    Dependency { entry: "E25", cond: Cond::Needs("E9") },
+    Dependency { entry: E25.token(), cond: Cond::Needs(E9.token()) },
     // the lamp shadows shadow E23's lamps: without them there is no lamp light to shadow
-    Dependency { entry: "E47", cond: Cond::Needs("E23") },
+    Dependency { entry: E47.token(), cond: Cond::Needs(E23.token()) },
     // the moonlight is a third light of E9's cascades, and the cars' dim-road shadow a cars-only map of them
-    Dependency { entry: "E50", cond: Cond::Needs("E9") },
-    Dependency { entry: "E51", cond: Cond::Needs("E9") },
+    Dependency { entry: E50.token(), cond: Cond::Needs(E9.token()) },
+    Dependency { entry: E51.token(), cond: Cond::Needs(E9.token()) },
     // the reflections of nearby objects are drawn into E8's cube and read by its clear coat
-    Dependency { entry: "E49", cond: Cond::Needs("E8") },
+    Dependency { entry: E49.token(), cond: Cond::Needs(E8.token()) },
     // an upscaler draws the scene at its own internal size: E3's scale is not used; a temporal one also draws at 1 sample with
     // no SMAA pass (the spatial MetalFX mode keeps both)
-    Dependency { entry: "E3", cond: Cond::UpscalerOn },
-    Dependency { entry: "E1", cond: Cond::TemporalUpscaler },
-    Dependency { entry: "E35", cond: Cond::TemporalUpscaler },
+    Dependency { entry: E3.token(), cond: Cond::UpscalerOn },
+    Dependency { entry: E1.token(), cond: Cond::TemporalUpscaler },
+    Dependency { entry: E35.token(), cond: Cond::TemporalUpscaler },
     // UPSCALE-SOFT: a temporal upscaler runs only on the float scene: with E7 off the choice and its sharpness do nothing (the
     // spatial MetalFX mode is not blocked; the mode / scale rows stay editable, so the player can pick it)
-    Dependency { entry: "E38", cond: Cond::TemporalNeedsHdr },
-    Dependency { entry: "E39", cond: Cond::TemporalNeedsHdr },
+    Dependency { entry: E38.token(), cond: Cond::TemporalNeedsHdr },
+    Dependency { entry: E39.token(), cond: Cond::TemporalNeedsHdr },
 ];
 
 /// Why a row is inactive: the [`DEPENDS`] row, and for the upscaler conditions which backend (the E38 level, to name it).
@@ -1164,6 +1174,31 @@ impl Default for Enhancements {
     }
 }
 
+/// The levels whose meaning code tests by number (the captions of their [`REGISTRY`] rows), one name per meaning: what a gate
+/// compares a [`Enhancements::level`] with. Associated constants, so the crate's users reach them through the exported type.
+impl Enhancements {
+    /// E1, the MSAA: «2x»
+    pub const E1_2X: u8 = 1;
+    /// E6, the present mode: «mailbox (low lag)»
+    pub const E6_MAILBOX: u8 = 1;
+    /// E6: «immediate (no vsync)» (the front end is held to 120 frames a second then)
+    pub const E6_IMMEDIATE: u8 = 2;
+    /// E16, the car light from the surroundings: «stronger»
+    pub const E16_STRONGER: u8 = 2;
+    /// E17, the water: «stronger»
+    pub const E17_STRONGER: u8 = 2;
+    /// E22, the frame rate limit: levels 1..=4 cap at these frames a second
+    pub const E22_FPS: [f64; 4] = [30.0, 60.0, 120.0, 240.0];
+    /// E22: «display» (the display's refresh rate)
+    pub const E22_DISPLAY: u8 = 5;
+    /// E22: «auto (60 on battery)»
+    pub const E22_AUTO: u8 = 6;
+    /// E51, the cars' own sun shadow: «where the sun reaches» (the renderer measures each car's share of the sun)
+    pub const E51_WHERE_SUN: u8 = 1;
+    /// E51: «always»
+    pub const E51_ALWAYS: u8 = 2;
+}
+
 impl Enhancements {
     /// Every switch off: the original, `master` byte for byte.
     pub const ORIGINAL: Self = Self { levels: [0; MAX_SWITCHES] };
@@ -1195,7 +1230,8 @@ impl Enhancements {
         self.levels.iter().any(|&l| l > 0)
     }
 
-    /// The raw levels (tests, logs).
+    /// The raw levels (tests).
+    #[cfg(test)]
     pub fn levels(&self) -> &[u8; MAX_SWITCHES] {
         &self.levels
     }
@@ -1350,6 +1386,28 @@ mod tests {
     }
     const L4: &[[&str; 2]] = &[["off", "в"], ["a", "а"], ["b", "б"], ["c", "в"]];
     const TEST: &[Entry] = &[e("E1", ON_OFF, 1), e("E2", L4, 2), e("E3", L4, 3)];
+
+    /// The semantic level names point at the captions they are named after.
+    #[test]
+    fn the_level_names_match_the_captions() {
+        let cap = |s: Switch, l: u8| REGISTRY[s.0 as usize].levels[l as usize][0];
+        assert_eq!(cap(E1, Enhancements::E1_2X), "2x");
+        assert!(cap(E6, Enhancements::E6_MAILBOX).starts_with("mailbox"));
+        assert!(cap(E6, Enhancements::E6_IMMEDIATE).starts_with("immediate"));
+        assert_eq!(cap(E16, Enhancements::E16_STRONGER), "stronger");
+        assert_eq!(cap(E17, Enhancements::E17_STRONGER), "stronger");
+        for (k, fps) in Enhancements::E22_FPS.iter().enumerate() {
+            assert_eq!(cap(E22, k as u8 + 1), fps.to_string());
+        }
+        assert_eq!(cap(E22, Enhancements::E22_DISPLAY), "display");
+        assert!(cap(E22, Enhancements::E22_AUTO).starts_with("auto"));
+        assert_eq!(cap(E51, Enhancements::E51_WHERE_SUN), "where the sun reaches");
+        assert_eq!(cap(E51, Enhancements::E51_ALWAYS), "always");
+        // every switch constant is the entry of its own token
+        for (i, e) in REGISTRY.iter().enumerate() {
+            assert_eq!(index_of(e.token) as usize, i);
+        }
+    }
 
     fn lv(s: &Enhancements) -> (u8, u8, u8) {
         (s.level(Switch(0)), s.level(Switch(1)), s.level(Switch(2)))

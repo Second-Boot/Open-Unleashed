@@ -47,7 +47,7 @@ impl Core {
             })
         };
         let proj_samplers = [make_proj_sampler(wgpu::MipmapFilterMode::Linear), make_proj_sampler(wgpu::MipmapFilterMode::Nearest)];
-        let proj_default = gfx::texture_2d(&device, "projector default", 1, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let proj_default = gfx::texture_2d(&device, "projector default", 1, 1, TEXTURE_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &proj_default, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &[255, 255, 255, 0],
@@ -63,7 +63,7 @@ impl Core {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: TEXTURE_FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
@@ -72,28 +72,23 @@ impl Core {
         let soft_dummy_view = soft_dummy.create_view(&Default::default());
         // ENHANCEMENT E16: the probe's uniform while there is none (never read: `globals.refl.z` is 0 then)
         let probe_dummy = device.create_buffer(&wgpu::BufferDescriptor { label: Some("probe sh dummy"), size: 9 * 16, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false });
-        let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals"),
-            layout: &globals_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: headlight_map_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&proj_samplers[0]) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&refl_dummy_view) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(csm_state.view()) },
-                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&csm_state.sampler) },
-                wgpu::BindGroupEntry { binding: 8, resource: csm_state.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&soft_dummy_view) },
-                wgpu::BindGroupEntry { binding: 16, resource: probe_dummy.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(spot_state.view()) },
-                wgpu::BindGroupEntry { binding: 11, resource: spot_state.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 20, resource: lamp_state.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(lamp_state.view()) },
-                wgpu::BindGroupEntry { binding: 24, resource: contact_state.uniform.as_entire_binding() },
-            ],
-        });
+        // (the projector sampler is the trilinear one here: `trilinear` starts false and every rebuild takes its sampler,
+        // `make_globals_bg`; this first group is the one the frames before the first rebuild bind, as it always was)
+        let globals_bg = materials::GlobalsSet {
+            globals: &globals_buf,
+            night_map: &headlight_map_buf,
+            proj: &proj_default_view,
+            proj_sampler: &proj_samplers[0],
+            head: &proj_default_view,
+            refl: &refl_dummy_view,
+            csm: &csm_state,
+            soft: &soft_dummy_view,
+            probe_sh: &probe_dummy,
+            spot: &spot_state,
+            lamp: &lamp_state,
+            contacts: &contact_state.buf,
+        }
+        .bind_group(&device, &globals_layout);
         let object_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("objects"),
             size: std::mem::size_of::<ObjectUniform>() as u64 * MAX_OBJECTS,
@@ -113,7 +108,7 @@ impl Core {
             }],
         });
         let SceneSamplers { samplers, point_samplers, level0_samplers, point_level0_samplers, compute_supported, aniso_supported, aniso_samplers, sprite_sampler } = Self::create_samplers(&device, &adapter);
-        let SpriteSetup { sprite_layout, sprite_pipeline, sprite_depth_pipelines, belt, sprite_buf } = Self::create_sprite_setup(&device, format);
+        let SpriteSetup { sprite_layout, sprite_pipeline, sprite_flat_pipeline, sprite_depth_pipelines, belt, sprite_buf } = Self::create_sprite_setup(&device, format);
         let mut r = Self {
             surface,
             device,
@@ -121,6 +116,7 @@ impl Core {
             config,
             depth_view,
             pipelines: pipelines.clone(),
+            multisampled_set: false,
             globals_buf,
             globals_bg,
             globals_layout,
@@ -130,7 +126,6 @@ impl Core {
             headlight_map_buf,
             proj_tex: None,
             head_tex: None,
-            object_layout,
             material_layout,
             sky_layout,
             sky_bgs: Vec::new(),
@@ -146,6 +141,7 @@ impl Core {
             probe_dummy,
             compute_supported,
             soft: None,
+            soft_globals: None,
             ssao: None,
             shafts: None,
             haze: None,
@@ -180,7 +176,6 @@ impl Core {
             cur_hdr: None,
             scale_blit_mirror: None,
             temporal: crate::temporal::Config::from_env().map(crate::temporal::Temporal::new),
-            temporal_flag: false,
             temporal_gpu: None,
             cur_temporal: None,
             motion: Default::default(),
@@ -197,21 +192,7 @@ impl Core {
             mesh_layout: pipeline_layout,
             ms_cache: std::collections::HashMap::new(),
             scale_blit: None,
-            fsr: None,
-            fsr_state: 0,
-            fsr_kind: None,
-            #[cfg(target_os = "macos")]
-            mfxt_state: 0,
-            fsr_active: false,
-            fsr_out: None,
-            frame_no: 0,
-            fsr_last_frame: 0,
-            upscaler: None,
-            upscale_state: 0,
-            upscale_active: false,
-            upscale_images: None,
-            upscale_present: None,
-            sharpen: None,
+            up: Upscaling::default(),
             cur_lod_shift: 0.0,
             smaa: None,
             post: Default::default(),
@@ -235,11 +216,14 @@ impl Core {
             materials: Vec::new(),
             white: TextureId(0),
             sprite_pipeline,
+            sprite_flat_pipeline,
             sprite_depth_pipelines,
             offscreen: std::collections::HashMap::new(),
             sprite_layout,
             sprite_buf,
             belt,
+            frame_cmds: FrameCmds::default(),
+            frame_main: false,
             pending_writes: Vec::new(),
             pending_bytes: Vec::new(),
             pending_textures: Vec::new(),
@@ -251,7 +235,8 @@ impl Core {
             lens_pending: Vec::new(),
             lens_done: Vec::new(),
             lens_staged: Vec::new(),
-            gpu_time_log: std::env::var("NFS_GPU_TIME").is_ok(),
+            lens_free: Vec::new(),
+            gpu_time_log: crate::dbg::flags().gpu_time,
             gpu_time_acc: (0.0, 0),
             bench_target: None,
             csm: csm_state,
@@ -262,7 +247,6 @@ impl Core {
             frames_in_flight: std::collections::VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + 1),
             last_submit: None,
         };
-        let _ = &r.object_layout;
         r.white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
         Ok(r)
     }
@@ -359,7 +343,7 @@ impl Core {
             // feature to be reported); it changes nothing a draw does. ENHANCEMENT E41: `TEXTURE_COMPRESSION_BC` (Metal on Apple Silicon and
             // Intel Macs, Vulkan / Direct3D 12 on desktop GPUs report it) lets the HD pack's BC7 textures upload as they are; without it the
             // game decodes them on the CPU
-            required_features: if minimal_profile { wgpu::Features::empty() } else { (adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM | wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::CLEAR_TEXTURE)) | if adapter.get_info().backend == wgpu::Backend::Vulkan && !crate::upscale::fsr_naga_forced() && std::env::var_os("NFS_FSR_PASSTHROUGH").is_some() { adapter.features() & wgpu::Features::PASSTHROUGH_SHADERS } else { wgpu::Features::empty() } | if crate::prof::request_timestamps() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() } },
+            required_features: if minimal_profile { wgpu::Features::empty() } else { (adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM | wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::CLEAR_TEXTURE)) | if adapter.get_info().backend == wgpu::Backend::Vulkan && !crate::upscale::fsr_naga_forced() && crate::dbg::flags().fsr_passthrough { adapter.features() & wgpu::Features::PASSTHROUGH_SHADERS } else { wgpu::Features::empty() } | if crate::prof::request_timestamps() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() } },
             // ENHANCEMENT E37: FSR 3.1 also takes `TEXTURE_FORMAT_16BIT_NORM` (its Lanczos LUT is `R16Snorm`) and `FLOAT32_FILTERABLE`
             // (its `R32Float` / `Rg32Float` images are bound filterable) and `CLEAR_TEXTURE` (the history is cleared on a reset), asked for when the adapter has them: they change nothing a draw does.
             // Its SPD passes bind 8 storage images in one stage (wgpu's default is 4) and its
@@ -381,7 +365,7 @@ impl Core {
         device.on_uncaptured_error(Arc::new(gpu_error));
         device.set_device_lost_callback(|reason, msg| tracing::error!(?reason, "wgpu device lost: {msg}"));
         // TEST GLUE `NFS_TEST_GPU_ERROR=1`: one invalid resource, to see the handler log it (and, on the enhanced game, every enhancement fall back)
-        if std::env::var_os("NFS_TEST_GPU_ERROR").is_some() {
+        if crate::dbg::flags().test_gpu_error {
             let _ = device.create_texture(&wgpu::TextureDescriptor { label: Some("test glue: invalid"), size: wgpu::Extent3d { width: 0, height: 0, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
         }
         // ENHANCEMENT E41: the HD pack's BC7 textures upload as they are only where the device takes BC (see `Core::supports_bc7`)
@@ -407,8 +391,9 @@ impl Core {
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
-            // the byte pipeline's surface (`RENDERING.md` "Colour space"): no colour-space conversion
-            color_space: surface_color_space(),
+            // the byte pipeline's surface (`RENDERING.md` "Colour space"): no colour-space conversion (ENHANCEMENT E33's extended
+            // range is a surface of its own, `edr.rs`)
+            color_space: wgpu::SurfaceColorSpace::default(),
         };
         // ENHANCEMENT E33: does the surface / display do extended-range output (macOS only; elsewhere never)
         let edr = crate::edr::Edr::probe(&surface, &adapter, &caps);
@@ -451,20 +436,21 @@ impl Core {
         let shader = gfx::wgsl_module(device, "mesh shader", &crate::classes::mesh_shader_source(0));
         let csm_entries = csm::layout_entries();
         let spot_entries = spot::layout_entries();
+        use crate::classes::binding as b;
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
             entries: &[
-                gfx::bgl_uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                gfx::bgl_uniform(b::GLOBALS, wgpu::ShaderStages::VERTEX_FRAGMENT),
                 // the 128 × 128 `nght` bytes, four to a u32
-                gfx::bgl_uniform(1, wgpu::ShaderStages::VERTEX),
+                gfx::bgl_uniform(b::NIGHT_MAP, wgpu::ShaderStages::VERTEX),
                 // the car shadow projector's texture (`[0x6115CC]+0x18C`) and its sampler
-                gfx::bgl_tex(2, wgpu::TextureSampleType::Float { filterable: true }, false),
-                gfx::bgl_sampler(3, wgpu::SamplerBindingType::Filtering),
+                gfx::bgl_tex(b::PROJ_TEX, wgpu::TextureSampleType::Float { filterable: true }, false),
+                gfx::bgl_sampler(b::PROJ_SAMPLER, wgpu::SamplerBindingType::Filtering),
                 // `HEAD` of `Render/common.fsh`, the headlight decal `LayerUVLight` projects
-                gfx::bgl_tex(4, wgpu::TextureSampleType::Float { filterable: true }, false),
+                gfx::bgl_tex(b::HEAD_TEX, wgpu::TextureSampleType::Float { filterable: true }, false),
                 // ENHANCEMENT E8: the six environment faces of the player's car
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
+                    binding: b::REFL,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
                     count: None,
@@ -474,9 +460,9 @@ impl Core {
                 csm_entries[1],
                 csm_entries[2],
                 // ENHANCEMENT E12: the opaque part's raw depth (R32Float, read with textureLoad)
-                gfx::bgl_tex(9, wgpu::TextureSampleType::Float { filterable: false }, false),
+                gfx::bgl_tex(b::SOFT, wgpu::TextureSampleType::Float { filterable: false }, false),
                 // ENHANCEMENT E16: the car ambient probe's SH coefficients (9 x vec4)
-                gfx::bgl_uniform(16, wgpu::ShaderStages::FRAGMENT),
+                gfx::bgl_uniform(b::PROBE_SH, wgpu::ShaderStages::FRAGMENT),
                 // ENHANCEMENT E15: the headlight spots' shadow map (10) and the lamps (11)
                 spot_entries[0],
                 spot_entries[1],
@@ -517,7 +503,7 @@ impl Core {
         let csm_state = csm::CsmState::new(device, &object_layout, &material_layout);
         let spot_state = spot::SpotState::new(device, &csm_state.light_layout);
         let lamp_state = lamps::LampState::new(device, &csm_state.light_layout);
-        let contact_state = contact::ContactState::new(device);
+        let contact_state = contact::ContactState::new(device, "contact uniform");
         let pipeline_layout = gfx::pipeline_layout(device, "mesh pipeline layout", &[&globals_layout, &object_layout, &material_layout, &sky_layout]);
         let pipelines = build_mesh_pipelines(device, &shader, &pipeline_layout, format, 1, false);
         MeshSetup { shader, globals_layout, object_layout, material_layout, sky_layout, csm_state, spot_state, lamp_state, contact_state, pipeline_layout, pipelines }
@@ -533,49 +519,26 @@ impl Core {
         // anisotropy at 8, the port's own). The promotion to `LINEAR` is `[0x69DD1D]`, which
         // 0x44ED10 clears and sets again only at `SPECIALFX` 3 (0x44EDD1, 0x44EF04) and the front
         // end's 0x44F020 clears (0x44F080) — `set_trilinear`; below it the mip filter is `POINT`.
-        let make_sampler = |clamp_u: bool, clamp_v: bool, mag_min: wgpu::FilterMode, mip: wgpu::MipmapFilterMode| {
-            let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
-            device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("scene"),
-                address_mode_u: mode(clamp_u),
-                address_mode_v: mode(clamp_v),
-                address_mode_w: wgpu::AddressMode::Repeat,
-                mag_filter: mag_min,
-                min_filter: mag_min,
-                mipmap_filter: mip,
-                ..Default::default()
-            })
-        };
         // `nfs5.ini` `Filtering=0`: `POINT` magnification / minification (see the projector sampler)
         let mag_min_linear = if crate::point_filter() { wgpu::FilterMode::Nearest } else { wgpu::FilterMode::Linear };
+        use materials::SamplerKey;
         let samplers = std::array::from_fn(|i| {
-            let mip = if i & 4 == 0 { wgpu::MipmapFilterMode::Linear } else { wgpu::MipmapFilterMode::Nearest };
-            make_sampler(i & 1 != 0, i & 2 != 0, mag_min_linear, mip)
+            let k = SamplerKey::of_index(i);
+            let mip = if k.point_mips { wgpu::MipmapFilterMode::Nearest } else { wgpu::MipmapFilterMode::Linear };
+            SamplerSpec::of_key(k, mag_min_linear, mip).build(device, "scene")
         });
         // `LayerFalseSort1`/`2`'s other arm sets Thrash 7 ← 0 for the one draw (`MAG`/`MINFILTER`
         // `POINT`) and never touches state 0x0B, so the mip filter here follows the same `POINT`
         // default as every other sampler below `SPECIALFX` 3 (`trilinear` is false whenever
         // `fakesort_mode` can pick `Single`/`PerItem` — both are set from the same level, `main.rs`)
-        let point_samplers = std::array::from_fn(|i| make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest));
-        let level0_samplers = std::array::from_fn(|i| make_scene_sampler(device, i & 1 != 0, i & 2 != 0, wgpu::MipmapFilterMode::Nearest, 1, Some(0.0)));
-        let point_level0_samplers = std::array::from_fn(|i| {
-            let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
-            device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("scene point E2 level 0"),
-                address_mode_u: mode(i & 1 != 0),
-                address_mode_v: mode(i & 2 != 0),
-                address_mode_w: wgpu::AddressMode::Repeat,
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                lod_max_clamp: 0.0,
-                ..Default::default()
-            })
-        });
+        let point = |i| SamplerSpec::of_key(SamplerKey::of_address(i), wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest);
+        let point_samplers = std::array::from_fn(|i| point(i).build(device, "scene"));
+        let level0_samplers = std::array::from_fn(|i| SamplerSpec::of_key(SamplerKey::of_address(i), wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Nearest).level0().build(device, "scene E2"));
+        let point_level0_samplers = std::array::from_fn(|i| point(i).level0().build(device, "scene point E2 level 0"));
         let compute_supported = adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
         let aniso_supported = adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::ANISOTROPIC_FILTERING);
         tracing::info!(aniso_supported, "anisotropic filtering (ENHANCEMENT E2)");
-        let aniso_samplers = std::array::from_fn(|i| make_scene_sampler(device, i & 1 != 0, i & 2 != 0, wgpu::MipmapFilterMode::Linear, 1, None));
+        let aniso_samplers = std::array::from_fn(|i| SamplerSpec::of_key(SamplerKey::of_address(i), wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Linear).build(device, "scene E2"));
 
         // The 2D pass needs its own sampler. The 3D one once asked for `anisotropy_clamp: 8` and
         // `mipmap_filter: Linear`, which on a single-level texture — every sprite atlas is one —
@@ -616,31 +579,33 @@ impl Core {
         let sprite_layout = gfx::bgl(device, "sprite", &[gfx::bgl_tex(0, wgpu::TextureSampleType::Float { filterable: true }, false), gfx::bgl_sampler(1, wgpu::SamplerBindingType::Filtering)]);
         let sprite_pl = gfx::pipeline_layout(device, "sprite", &[&sprite_layout]);
         let sprite_vertex = [Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SpriteVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4, 3 => Float32] })];
-        let make_sprite_pipeline = |label: &str, fs: &str, depth: wgpu::DepthStencilState| {
+        let make_sprite_pipeline = |label: &str, fs: &str, depth: Option<wgpu::DepthStencilState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&sprite_pl),
                 vertex: wgpu::VertexState { module: &sprite_shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &sprite_vertex },
                 fragment: Some(wgpu::FragmentState { module: &sprite_shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-                depth_stencil: Some(depth),
+                depth_stencil: depth,
                 multisample: Default::default(),
                 multiview_mask: None,
                 cache: None,
             })
         };
-        let sprite_pipeline = make_sprite_pipeline("sprite", "fs_main", wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() });
+        let sprite_pipeline = make_sprite_pipeline("sprite", "fs_main", Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }));
+        // the same for a pass with no depth image: a frame with no depth-state sprite (the race's HUD) tests and writes no depth
+        let sprite_flat_pipeline = make_sprite_pipeline("sprite (no depth)", "fs_main", None);
         // A front-end sprite under the kit's depth state (`crate::SpriteDepth`): Thrash 0x39 ← 1
         // (0x4D30BE) and the compare Thrash 0x28 sets — 3 `LESSEQUAL` (0x4D30C9), 6 `GREATEREQUAL`
         // inside a mask (0x4DAAC0 → 0x537830) — with the device's alpha test in the shader.
-        let depth_state = |compare| wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(compare), stencil: Default::default(), bias: Default::default() };
+        let depth_state = |compare| Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(compare), stencil: Default::default(), bias: Default::default() });
         let sprite_depth_pipelines = [
             make_sprite_pipeline("sprite lessequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::LessEqual)),
             make_sprite_pipeline("sprite greaterequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::GreaterEqual)),
         ];
         let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
         let sprite_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("sprites"), size: MAX_SPRITES * 6 * std::mem::size_of::<SpriteVertex>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        SpriteSetup { sprite_layout, sprite_pipeline, sprite_depth_pipelines, belt, sprite_buf }
+        SpriteSetup { sprite_layout, sprite_pipeline, sprite_flat_pipeline, sprite_depth_pipelines, belt, sprite_buf }
     }
 
     pub(super) fn make_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
@@ -671,11 +636,12 @@ impl Core {
     /// textures and the depth target are untouched.
     // ENHANCEMENT E6
     pub(super) fn apply_present_mode(&mut self) {
+        use crate::Enhancements as E;
         let (mode, latency) = match self.enhancements.level(crate::E6) {
-            1 if self.present_modes.contains(&wgpu::PresentMode::Mailbox) => (wgpu::PresentMode::Mailbox, 1),
-            1 => (wgpu::PresentMode::AutoVsync, 2),
-            2 if self.present_modes.contains(&wgpu::PresentMode::Immediate) => (wgpu::PresentMode::Immediate, 2),
-            2 => (wgpu::PresentMode::AutoNoVsync, 2),
+            E::E6_MAILBOX if self.present_modes.contains(&wgpu::PresentMode::Mailbox) => (wgpu::PresentMode::Mailbox, 1),
+            E::E6_MAILBOX => (wgpu::PresentMode::AutoVsync, 2),
+            E::E6_IMMEDIATE if self.present_modes.contains(&wgpu::PresentMode::Immediate) => (wgpu::PresentMode::Immediate, 2),
+            E::E6_IMMEDIATE => (wgpu::PresentMode::AutoNoVsync, 2),
             _ => (wgpu::PresentMode::AutoVsync, 2),
         };
         if self.config.present_mode == mode && self.config.desired_maximum_frame_latency == latency {
@@ -693,7 +659,7 @@ impl Core {
         #[cfg(target_os = "macos")]
         if self.edr.on {
             let mut c = self.config.clone();
-            c.format = wgpu::TextureFormat::Rgba16Float;
+            c.format = HDR_FORMAT;
             c.color_space = wgpu::SurfaceColorSpace::ExtendedSrgbLinear;
             c.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
             self.surface.configure(&self.device, &c);
@@ -788,6 +754,7 @@ struct SceneSamplers {
 struct SpriteSetup {
     sprite_layout: wgpu::BindGroupLayout,
     sprite_pipeline: wgpu::RenderPipeline,
+    sprite_flat_pipeline: wgpu::RenderPipeline,
     sprite_depth_pipelines: [wgpu::RenderPipeline; 2],
     belt: wgpu::util::StagingBelt,
     sprite_buf: wgpu::Buffer,

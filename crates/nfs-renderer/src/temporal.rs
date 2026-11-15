@@ -67,7 +67,8 @@ pub(crate) struct Config {
 impl Config {
     /// `NFS_TEMPORAL_DEBUG` (and `NFS_TEMPORAL_NOOBJ`); `None` = the foundation is off.
     pub fn from_env() -> Option<Self> {
-        let v = std::env::var("NFS_TEMPORAL_DEBUG").ok()?;
+        let f = crate::dbg::flags();
+        let v = f.temporal_debug.as_deref()?;
         let view = match v.trim().to_ascii_lowercase().as_str() {
             "" | "0" | "off" => return None,
             "1" | "on" | "plain" => View::Plain,
@@ -81,8 +82,7 @@ impl Config {
                 View::Plain
             }
         };
-        let flag = |name| std::env::var(name).is_ok_and(|v| v != "0");
-        Some(Self { view, no_obj: flag("NFS_TEMPORAL_NOOBJ"), no_mv: flag("NFS_TEMPORAL_NOMV"), no_id: flag("NFS_TEMPORAL_NOID") })
+        Some(Self { view, no_obj: f.temporal_noobj, no_mv: f.temporal_nomv, no_id: f.temporal_noid })
     }
 }
 
@@ -473,7 +473,7 @@ struct PassUniform {
 
 /// The debug pass's shader.
 pub(crate) fn pass_source() -> String {
-    wgsl::compose(&[wgsl::FULLSCREEN_VS_UV, PASS_WGSL])
+    wgsl::compose(&[wgsl::FULLSCREEN_VS_UV, wgsl::ANGLES, PASS_WGSL])
 }
 
 struct Imgs {
@@ -517,6 +517,30 @@ struct P { size: vec4<f32>, a: vec4<f32>, j: vec4<f32> };
 @group(0) @binding(5) var t_re: texture_2d<f32>;
 @group(0) @binding(6) var t_tc: texture_2d<f32>;
 @group(0) @binding(7) var s: sampler;
+// TEST GLUE (the debug views; not the original's):
+// the Catmull-Rom weights' terms (`w1 = 1 + f^2 (-B + C f)`, `w2 = f (1/2 + f (2 - C f))`)
+const CR_B: f32 = 2.5;
+const CR_C: f32 = 1.5;
+// the hue's wheel (`hsv`): the channels' offsets, six sectors, three of them to the peak
+const HSV_K: vec3<f32> = vec3<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0);
+const HSV_SECTORS: f32 = 6.0;
+const HSV_HALF: f32 = 3.0;
+// the velocity view's full brightness (px)
+const MV_FULL_PX: f32 = 8.0;
+// the jitter view: the swatch cell (px), its cross's grey, the background, the dot's radius (px) and colour, the phase bar's top
+// (px) and colour
+const SWATCH_PX: f32 = 96.0;
+const SWATCH_BG: f32 = 0.08;
+const SWATCH_CROSS: f32 = 0.3;
+const DOT_R_PX: f32 = 4.0;
+const DOT_COLOUR: vec3<f32> = vec3<f32>(1.0, 0.9, 0.1);
+const BAR_TOP_PX: f32 = 90.0;
+const BAR_COLOUR: vec3<f32> = vec3<f32>(0.2, 0.9, 0.3);
+// the reprojection error view: off the history (blue), the error's gain
+const OFF_HISTORY: vec4<f32> = vec4<f32>(0.0, 0.0, 0.6, 1.0);
+const ERR_GAIN: f32 = 4.0;
+// the TAA's neighbourhood clamp, widened by this much
+const CLAMP_SLACK: f32 = 0.002;
 
 fn clamp_px(q: vec2<i32>) -> vec2<i32> {
     return clamp(q, vec2<i32>(0), vec2<i32>(p.size.xy) - vec2<i32>(1));
@@ -528,8 +552,8 @@ fn sample_hist(uv: vec2<f32>) -> vec3<f32> {
     let c = floor(pos - 0.5) + 0.5;
     let f = pos - c;
     let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-    let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-    let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    let w1 = 1.0 + f * f * (-CR_B + CR_C * f);
+    let w2 = f * (0.5 + f * (2.0 - CR_C * f));
     let w3 = f * f * (-0.5 + 0.5 * f);
     let w12 = w1 + w2;
     let o12 = w2 / w12;
@@ -545,8 +569,8 @@ fn sample_hist(uv: vec2<f32>) -> vec3<f32> {
 }
 
 fn hsv(h: f32, v: f32) -> vec3<f32> {
-    let k = vec3<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0);
-    let q = abs(fract(vec3<f32>(h) + k) * 6.0 - 3.0);
+    let k = HSV_K;
+    let q = abs(fract(vec3<f32>(h) + k) * HSV_SECTORS - HSV_HALF);
     return v * clamp(q - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
@@ -558,8 +582,8 @@ fn hsv(h: f32, v: f32) -> vec3<f32> {
         // velocity: hue = the direction of the motion (previous - current, y down), brightness = its length (8 px = full)
         let mv = textureLoad(t_mv, px, 0).rg;
         let len = length(mv);
-        let h = fract(atan2(mv.y, mv.x) / 6.2831853 + 1.0);
-        return vec4<f32>(hsv(h, clamp(sqrt(len / 8.0), 0.0, 1.0)), 1.0);
+        let h = fract(atan2(mv.y, mv.x) / TAU + 1.0);
+        return vec4<f32>(hsv(h, clamp(sqrt(len / MV_FULL_PX), 0.0, 1.0)), 1.0);
     }
     if MODE == 3u {
         // reactive (red), transparency and composition (green), the scene faintly under them
@@ -570,17 +594,17 @@ fn hsv(h: f32, v: f32) -> vec3<f32> {
     if MODE == 4u {
         // the frame and a swatch of the jitter: a dot at (0.5 + jx, 0.5 + jy) of a 96 px cell, the frame's phase as a bar
         let q = vec2<f32>(px);
-        if q.x < 96.0 && q.y < 96.0 {
-            let d = length(q - (vec2<f32>(0.5) + p.j.xy) * 96.0);
-            var c = vec3<f32>(0.08);
-            if abs(q.x - 48.0) < 0.5 || abs(q.y - 48.0) < 0.5 {
-                c = vec3<f32>(0.3);
+        if q.x < SWATCH_PX && q.y < SWATCH_PX {
+            let d = length(q - (vec2<f32>(0.5) + p.j.xy) * SWATCH_PX);
+            var c = vec3<f32>(SWATCH_BG);
+            if abs(q.x - 0.5 * SWATCH_PX) < 0.5 || abs(q.y - 0.5 * SWATCH_PX) < 0.5 {
+                c = vec3<f32>(SWATCH_CROSS);
             }
-            if d < 4.0 {
-                c = vec3<f32>(1.0, 0.9, 0.1);
+            if d < DOT_R_PX {
+                c = DOT_COLOUR;
             }
-            if q.y > 90.0 && q.x < 96.0 * (p.j.w + 1.0) / p.j.z {
-                c = vec3<f32>(0.2, 0.9, 0.3);
+            if q.y > BAR_TOP_PX && q.x < SWATCH_PX * (p.j.w + 1.0) / p.j.z {
+                c = BAR_COLOUR;
             }
             return vec4<f32>(c, 1.0);
         }
@@ -613,18 +637,18 @@ fn hsv(h: f32, v: f32) -> vec3<f32> {
     if MODE == 5u {
         // the reprojection error: the frame against the previous raw frame fetched through the vector, no blending
         if p.a.y > 0.5 || !inside {
-            return vec4<f32>(0.0, 0.0, 0.6, 1.0);
+            return OFF_HISTORY;
         }
         let h = textureSampleLevel(t_hist, s, huv, 0.0).rgb;
         let e = abs(cur.rgb - h);
-        return vec4<f32>(vec3<f32>(clamp(max(e.r, max(e.g, e.b)) * 4.0, 0.0, 1.0)), 1.0);
+        return vec4<f32>(vec3<f32>(clamp(max(e.r, max(e.g, e.b)) * ERR_GAIN, 0.0, 1.0)), 1.0);
     }
     // TAA: the history through the vector, clamped to the neighbourhood of the frame, blended
     var w = 1.0 - p.a.x;
     if p.a.y > 0.5 || !inside {
         return cur;
     }
-    let h = clamp(sample_hist(huv), mn - vec3<f32>(0.002), mx + vec3<f32>(0.002));
+    let h = clamp(sample_hist(huv), mn - vec3<f32>(CLAMP_SLACK), mx + vec3<f32>(CLAMP_SLACK));
     // a reactive pixel (a particle) takes the frame
     w = max(w, textureLoad(t_re, px, 0).r);
     return vec4<f32>(mix(h, cur.rgb, w), 1.0);
@@ -670,8 +694,7 @@ impl Pass {
     /// (`None` for [`View::Plain`], which leaves it alone).
     /// `depth`: the scene's (single-sample: a temporal main view renders at one sample).
     pub fn run(&mut self, cx: &mut PostCtx, t: &Cur, cur_tex: &wgpu::Texture, cur_view: &wgpu::TextureView, depth: &wgpu::TextureView) -> Option<(wgpu::BindGroup, wgpu::TextureView)> {
-        let PostCtx { device, queue, layout: image_layout, sampler, .. } = *cx;
-        let encoder = &mut *cx.encoder;
+        let PostCtx { device, layout: image_layout, sampler, .. } = *cx;
         if self.view == View::Plain {
             return None;
         }
@@ -696,7 +719,8 @@ impl Pass {
             a: [TAA_FEEDBACK, reset as u32 as f32, t.frame as f32, self.no_mv as u32 as f32],
             j: [t.jitter_px[0], t.jitter_px[1], t.phase_count as f32, (t.frame % t.phase_count.max(1) as u32) as f32],
         };
-        queue.write_buffer(&self.buf, 0, bytemuck::bytes_of(&u));
+        gfx::belt_write(cx.belt, cx.encoder, &self.buf, bytemuck::bytes_of(&u));
+        let encoder = &mut *cx.encoder;
         let dest = self.flip;
         let hist = match self.view {
             View::Taa => &imgs.view[1 - dest],
@@ -709,12 +733,7 @@ impl Pass {
             layout: &self.layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.buf.as_entire_binding() }, tv(1, cur_view), tv(2, hist), tv(3, &t.mv), tv(4, depth), tv(5, &t.reactive), tv(6, &t.tc), wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(sampler) }],
         });
-        {
-            let mut pass = gfx::color_pass(encoder, "temporal pass", "temporal pass", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
-            pass.set_pipeline(&self.pipe);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        gfx::fullscreen_pass(encoder, "temporal pass", "temporal pass", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &self.pipe, &[&bg]);
         let extent = wgpu::Extent3d { width: t.size.0, height: t.size.1, depth_or_array_layers: 1 };
         match self.view {
             View::Reproj => encoder.copy_texture_to_texture(cur_tex.as_image_copy(), imgs.raw.as_image_copy(), extent),

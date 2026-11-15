@@ -42,7 +42,7 @@ pub(super) struct GlobalsFrame<'a> {
     /// `Core::cur_hdr`
     pub hdr: Option<u32>,
     pub no_reflections: bool,
-    /// ENHANCEMENT E8: all six faces of the environment cube are drawn (`ReflCube::faces_done == 0x3F`)
+    /// ENHANCEMENT E8: all six faces of the environment cube are drawn (`ReflCube::faces_done == ALL_FACES`)
     pub refl_faces_done: bool,
     /// ENHANCEMENT E16: `Core::probe_strength` of the scene
     pub probe_strength: f32,
@@ -70,8 +70,8 @@ pub(super) fn globals_uniform(f: &GlobalsFrame) -> GlobalsUniform {
         view_proj: vp_j.to_cols_array_2d(),
         view: camera.view().to_cols_array_2d(),
         sun_dir: scene.sun_direction.extend(0.0).to_array(),
-        // .y the view's near plane: a depth-bias pull past it stops there (the original's
-        // screen z goes to 0 or below — in front of everything, `RE/notes/thrash.md` §6)
+        // .y the view's near plane (no longer read: the vertex stage holds a depth-bias pull at the clip's own near plane, the
+        // original's screen z going to 0 or below — in front of everything, `RE/notes/thrash.md` §6)
         // .z 1 in the rear-view mirror's view: no specular or sky-map pass (`[0x6115CC]+0x190`)
         // .w ENHANCEMENT E7: 1 = a float target that keeps values above 1 (the ACES tone map);
         // 0 = the fragment output is held to 0...1 as an 8-bit target does
@@ -91,22 +91,22 @@ pub(super) fn globals_uniform(f: &GlobalsFrame) -> GlobalsUniform {
         // ENHANCEMENT E12: the planes the stored depth is read through
         soft: [camera.near, camera.far, soft_split as u32 as f32, 0.0],
         // ENHANCEMENT E17: only with the switch on and the app's sky / sun for the water; 0 is master's value
-        water: water_env.map_or([0.0; 4], |w| [1.0, (w.sun != glam::Vec3::ZERO) as u32 as f32, w.use_env_map as u32 as f32, (enh.level(crate::E17) >= 2) as u32 as f32]),
+        water: water_env.map_or([0.0; 4], |w| [1.0, (w.sun != glam::Vec3::ZERO) as u32 as f32, w.use_env_map as u32 as f32, (enh.level(crate::E17) >= crate::Enhancements::E17_STRONGER) as u32 as f32]),
         water_zenith: water_env.map_or([0.0; 4], |w| [w.zenith[0], w.zenith[1], w.zenith[2], 0.0]),
         water_horizon: water_env.map_or([0.0; 4], |w| [w.horizon[0], w.horizon[1], w.horizon[2], 0.0]),
         water_sun: water_env.map_or([0.0; 4], |w| w.sun.extend(0.0).to_array()),
-        // ENHANCEMENT E18: the sun the cars and shadows use (`Scene::sun_shadow`, a day track's main view)
-        fx_sun: scene.sun_shadow.filter(|s| p_fx && s.focus.is_none()).map_or([0.0; 4], |s| (-s.direction).extend(1.0).to_array()),
-        // ENHANCEMENT E19: the fog's sun glow, only with the switch on and a sun (`Scene::sun_shadow`: none on a night /
+        // ENHANCEMENT E18: the sun the cars and shadows use (`ShadowLights::sun`, a day track's main view)
+        fx_sun: scene.shadows.sun.filter(|s| p_fx && s.focus.is_none()).map_or([0.0; 4], |s| (-s.direction).extend(1.0).to_array()),
+        // ENHANCEMENT E19: the fog's sun glow, only with the switch on and a sun (`ShadowLights::sun`: none on a night /
         // sunless track, and not in the environment faces); 0 is master's value
-        fogsun: scene.sun_shadow.filter(|s| enh.is_on(crate::E19) && s.focus.is_none()).map_or([0.0; 4], |s| (-s.direction).normalize_or_zero().extend(FOG_SUN_STRENGTH).to_array()),
+        fogsun: scene.shadows.sun.filter(|s| enh.is_on(crate::E19) && s.focus.is_none()).map_or([0.0; 4], |s| (-s.direction).normalize_or_zero().extend(FOG_SUN_STRENGTH).to_array()),
         // ENHANCEMENT E26: only with the switch on and a wet track; 0 is master's value
         rain: rain_env.map_or([0.0; 4], |r| [crate::rain_gain(enh.level(crate::E26)), r.time, r.n_lamps.min(crate::RAIN_LAMPS) as f32, r.n_edges.min(crate::RAIN_EDGES) as f32]),
         rain_zenith: rain_env.map_or([0.0; 4], |r| [r.zenith[0], r.zenith[1], r.zenith[2], 0.0]),
         rain_horizon: rain_env.map_or([0.0; 4], |r| [r.horizon[0], r.horizon[1], r.horizon[2], 0.0]),
         rain_lamp_pos: {
             let mut a = [[0.0; 4]; crate::RAIN_LAMPS];
-            // w (AUTOBAHN-LAMPS): the light's reach squared, 0 = the shader's default (`RAIN_LAMP_REACH`)
+            // w (AUTOBAHN-LAMPS): the light's reach squared, 0 = the shader's default (`RAIN_LAMP_REACH2`)
             for (d, (p, _, reach)) in a.iter_mut().zip(rain_env.iter().flat_map(|r| r.lamps[..r.n_lamps.min(crate::RAIN_LAMPS)].iter())) {
                 *d = [p.x, p.y, p.z, reach * reach];
             }
@@ -145,7 +145,7 @@ pub(super) fn globals_uniform(f: &GlobalsFrame) -> GlobalsUniform {
         // ENHANCEMENT E49: only with the switch on and the twelve-layer cube drawn; 0 is master's value
         // (.x 1 the original's sky in the overlay, 2 NEAR-REFL3's live sky (a night track), 3 NEAR-REFL4's live hue (a day / dusk
         // track); .w TEST GLUE `NFS_NEAR_DEBUG`: the paint shows the reflection alone)
-        near: near.map_or([0.0; 4], |n| [match n.sky { crate::NearSky::Original => 1.0, crate::NearSky::Night => 2.0, crate::NearSky::Hue => 3.0 }, n.own as u32 as f32, n.proxy.map_or(0.0, |p| p.1), n.debug as f32]),
+        near: near.map_or([0.0; 4], |n| [match n.sky { crate::NearSky::Original => classes::NEAR_SKY_ORIGINAL, crate::NearSky::Night => classes::NEAR_SKY_NIGHT, crate::NearSky::Hue => classes::NEAR_SKY_HUE }, n.own as u32 as f32, n.proxy.map_or(0.0, |p| p.1), n.debug as f32]),
         near_box: near.and_then(|n| n.proxy).map_or([[0.0; 4]; 4], |(b, _)| {
             [b.centre.extend(b.half_len).to_array(), b.forward.extend(b.half_wid).to_array(), b.lateral.extend(NEAR_BOX_FLOOR).to_array(), b.up.extend(b.ceil).to_array()]
         }),
@@ -221,11 +221,10 @@ pub(super) struct NearFrame {
     pub debug: u8,
 }
 
-/// The per-item receivers the fill asks only when their effect is on this frame (`Core::csm_receive`, `spot_receive`,
-/// `contact_receive`).
+/// The per-item receivers the fill asks only when their effect is on this frame (`Core::csm_receive`: E9's role, which E15 / E23
+/// take too, asked at most once an item; `contact_receive`).
 pub(super) struct Receivers<'a> {
     pub csm: &'a dyn Fn(&DrawItem) -> f32,
-    pub spot: &'a dyn Fn(&DrawItem) -> f32,
     pub contact: &'a dyn Fn(&DrawItem) -> bool,
 }
 
@@ -255,6 +254,9 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
     let a_game = depth_far / (depth_far - camera.near);
     let a_port = camera.far / (camera.far - camera.near);
     let pull = mat.map_or(0.0, |m| depth_bias_offset(m.depth_bias.saturating_add(item.depth_bias)) * (a_port / a_game));
+    // E9's receiver role, asked once for its two fields (`lit_d.w`, E15 / E23's `soft.z`)
+    let role = std::cell::OnceCell::new();
+    let receives = || *role.get_or_init(|| (rx.csm)(item));
     ObjectUniform {
         model: item.transform.to_cols_array_2d(),
         // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
@@ -270,7 +272,7 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], match &csm_frame {
             // ENHANCEMENT ENH-DBLSH: 3 = a track `sh80` decal under a caster (the shader fades it out with the shadow)
             Some(f) if item.csm & crate::CSM_DECAL != 0 && f.decal_fades => classes::RECV_DECAL,
-            Some(_) => (rx.csm)(item),
+            Some(_) => receives(),
             None => classes::RECV_NONE,
         }]),
         // .w the depth bias's pull, in view depth
@@ -293,7 +295,7 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         // ENHANCEMENT E12: the fade distance; the multiplying pair (3) fades toward white
         // ENHANCEMENT E15: .z the item's role for the headlight spots (1 car, 2 track, 0 none)
         // ENHANCEMENT ENH-TEMPORAL: .w the item's role for the masks (0 opaque-like, 1 a translucent effect, 2 a sky layer)
-        soft: [if soft_split && item.soft > 0.0 { item.soft } else { 0.0 }, if soft_split && item.soft > 0.0 && mat.is_some_and(|m| m.blend_pair == 3) { classes::SOFT_FADE_WHITE } else { classes::SOFT_FADE_ALPHA }, if spots { (rx.spot)(item) } else { classes::RECV_NONE }, roles.get(i).copied().unwrap_or(classes::ROLE_OPAQUE)],
+        soft: [if soft_split && item.soft > 0.0 { item.soft } else { 0.0 }, if soft_split && item.soft > 0.0 && mat.is_some_and(|m| m.blend_pair == 3) { classes::SOFT_FADE_WHITE } else { classes::SOFT_FADE_ALPHA }, if spots { receives() } else { classes::RECV_NONE }, roles.get(i).copied().unwrap_or(classes::ROLE_OPAQUE)],
         // ENHANCEMENT E11: only on the float scene with the switch on; 0 = none
         // ENHANCEMENT E18: .y a spark's gain, .z the lit particle kind
         // ENHANCEMENT ENH-TEMPORAL: .w the index of the item's reprojection matrix
@@ -307,11 +309,31 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
 /// bit 0 the surface parts (`classes::feat::SURFACE`) — a reflection class (`refl.x` > 0.5: E8's paint / glass, E17's water,
 /// E26's wet road / skid); bit 1 the effect parts (`classes::feat::EFFECT`) — a spark or a lit particle (`hdr.y` > 0, `hdr.z` >
 /// PART_LIT - 0.5, E18), a soft fade (`soft.x` > 0, E12), an HDR boost (`hdr.x` > 1, E11). Without a bit the item draws the
-/// same with a shader built without those parts.
-pub(super) fn item_variant(o: &ObjectUniform) -> u8 {
-    let surface = o.refl[0] > classes::REFL_NONE + 0.5;
-    let effect = o.hdr[1] > 0.0 || o.hdr[2] > classes::PART_LIT - 0.5 || o.soft[0] > 0.0 || o.hdr[0] > 1.0;
-    surface as u8 | (effect as u8) << 1
+/// same with a shader built without those parts. The value is the variant's bits (`as usize` indexes `Core::var_set`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum ItemVariant {
+    /// neither: the shader without the per-item parts draws it the same
+    Plain = 0,
+    /// a reflection class (`classes::feat::SURFACE`)
+    Surface = 1,
+    /// a spark / lit particle, a soft fade or an HDR boost (`classes::feat::EFFECT`)
+    Effect = 2,
+    Both = 3,
+}
+
+impl ItemVariant {
+    /// The parts an item's uniform can enter, by the shader's own tests of those parts.
+    pub(super) fn of(o: &ObjectUniform) -> Self {
+        let surface = o.refl[0] > classes::REFL_NONE + 0.5;
+        let effect = o.hdr[1] > 0.0 || o.hdr[2] > classes::PART_LIT - 0.5 || o.soft[0] > 0.0 || o.hdr[0] > 1.0;
+        match (surface, effect) {
+            (false, false) => Self::Plain,
+            (true, false) => Self::Surface,
+            (false, true) => Self::Effect,
+            (true, true) => Self::Both,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,7 +356,7 @@ mod tests {
             fog: Some(Fog { colour: [0.5, 0.6, 0.7], density: 0.01 }),
             sky_fog: Some(Fog { colour: [0.2, 0.3, 0.4], density: 0.02 }),
             refl: 0.8,
-            sun_shadow: Some(SunShadow { direction: Vec3::new(0.3, -0.9, 0.2), lit: true, focus: None }),
+            shadows: crate::ShadowLights { sun: Some(SunShadow { direction: Vec3::new(0.3, -0.9, 0.2), lit: true, focus: None }), ..crate::ShadowLights::NONE },
             water: Some(WaterEnv { zenith: [0.1, 0.2, 0.3], horizon: [0.4, 0.5, 0.6], sun: Vec3::new(0.0, 0.7, 0.7), use_env_map: true }),
             rain: Some(RainEnv { zenith: [0.3; 3], horizon: [0.4; 3], camera_wet: 1.0, time: 12.5, lamps, n_lamps: 1, edges, n_edges: 1 }),
             ..Scene::default()
@@ -421,7 +443,7 @@ mod tests {
 
     /// with [`Enhancements::ORIGINAL`] every item's first 12 fields are master's bytes and `soft` / `hdr` are 0;
     /// `refl` is the material's own class 0..2 and strength, read by the shader only under the globals' `refl.x` (0 above),
-    /// never the water / wet road / skid classes 3..5. The receivers would put 7 / 9 into the fields if they were asked.
+    /// never the water / wet road / skid classes 3..5. The receiver would put 7 into the fields if it were asked.
     #[test]
     fn original_objects_are_masters() {
         let scene = busy_scene();
@@ -429,9 +451,8 @@ mod tests {
         let enh = Enhancements::ORIGINAL;
         let env = FrameEnv::new(&scene, &enh, None);
         let csm = |_: &DrawItem| 7.0;
-        let spot = |_: &DrawItem| 9.0;
         let contact = |_: &DrawItem| true;
-        let rx = Receivers { csm: &csm, spot: &spot, contact: &contact };
+        let rx = Receivers { csm: &csm, contact: &contact };
         let mats = [
             None,
             Some(MatFill { env_mix: 0.3, lod_bias: -0.5, device_states: true, depth_bias: -4, blend_pair: 3, reflect: crate::Reflect { class: 1, strength: 0.6, interior: false } }),

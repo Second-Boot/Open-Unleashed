@@ -1,7 +1,7 @@
 //! ENHANCEMENT E8: the dynamic environment map of the player's car.
 //!
 //! The race's main scene is drawn without the player's car from the car's position into the six faces of an
-//! environment map, a few faces a frame in turn, and the paint and glass of every car in the main view take
+//! environment map, one face a frame in turn (all six at the start), and the paint and glass of every car in the main view take
 //! it through a Schlick-Fresnel clear coat (`shader.wgsl` `shade`, `Scene::refl`) on top of the original's
 //! sphere-map highlight, which stays. Nothing here feeds the simulation: it reads the world and draws.
 //!
@@ -28,12 +28,19 @@ const NEAR_DRAW: f32 = 100.0;
 /// ENHANCEMENT E49: the cars within this distance of the cube's eye are drawn into the player's faces (m). APPROXIMATION: by eye.
 const NEAR_CARS: f32 = 50.0;
 
+/// ENHANCEMENT ENH-COAT: the cube's face size at every level of E8 (px; the lacquer's roughness picks a mip of it).
+const FACE_SIZE: u32 = 256;
+/// ENHANCEMENT E8: the faces drawn a frame once the cube is complete: one (RENDER-AUDIT §8 item 2, owner-approved 2026-11-15:
+/// even frame pacing and half the faces' cost; the cube is renewed in 6 frames, the reflections lag up to 6 frames instead of
+/// 3 with the two a frame before).
+const FACES_PER_FRAME: u32 = 1;
+
 /// The levels of E8 (the clear coat's: 1 new, 2 normal, 3 worn; `ENHANCEMENTS.md`): the faces' size and how many are drawn per
-/// frame. ENHANCEMENT ENH-COAT: the cube is 256 px at every level (the lacquer's roughness picks a mip of it), two faces a frame.
+/// frame ([`FACE_SIZE`], [`FACES_PER_FRAME`] at every level).
 pub(super) fn level_params(level: u8) -> Option<(u32, u32)> {
     match level {
         0 => None,
-        _ => Some((256, 2)),
+        _ => Some((FACE_SIZE, FACES_PER_FRAME)),
     }
 }
 
@@ -89,10 +96,12 @@ impl App {
         let reach = self.enh_reach();
         let draw = if near.is_some() { NEAR_DRAW } else { (self.draw_distance * reach * 0.5).max(100.0) };
         let cull = nfs_game::world::CullView { eye, forward, right, up: right.cross(forward).normalize_or_zero(), tan_h: tan, tan_v: tan, near: cam.near, draw, reach };
+        // the frame's options as the main pass read them (`RenderOptions`)
+        let opts = self.dyn_pose.map_or_else(|| crate::app::render_scene::RenderOptions::read(self), |p| p.opts);
         let mut items = std::mem::take(&mut self.scratch.mirror_items);
         items.clear();
         // the sky first (no depth test), the track after it, as the main scene lays them out
-        if let Some(s) = self.sky.as_ref().filter(|_| !self.sky_off()) {
+        if let Some(s) = self.sky.as_ref().filter(|_| !opts.sky_off) {
             let view = nfs_game::sky::SkyView { eye, forward, up, main: true };
             let sun = self.sun_items(&cam, 1.0, SUN_VIEW_MAIN);
             items.extend(s.draw_items(&view, false));
@@ -136,11 +145,7 @@ impl App {
         // ENHANCEMENTS E27 / E29: nor motion blur or shake
         scene.motion = None;
         // ENHANCEMENT E9: the environment faces are drawn without sun shadows (a shadow pass per face would cost six)
-        scene.sun_shadow = None;
-        scene.overcast_shadow = None;
-        scene.moon_shadow = None;
-        scene.car_sun_shadow = None;
-        scene.car_sun_full = None;
+        scene.shadows = nfs_renderer::ShadowLights::NONE;
         // ENHANCEMENT E17: no water reflection inside the environment faces (it would reflect the previous map)
         scene.water = None;
         if near.is_some() {
@@ -166,12 +171,12 @@ impl App {
                 let cars = self.near_car_items(&cam, &cull, pose, size);
                 let cars = scene.clone_header(cars);
                 if let Some(r) = self.renderer.as_mut() {
-                    r.render_refl_face_near(&scene, &cars, &cam, face, size, clear, nfs_renderer::VIEW_FAR);
+                    r.render_refl_face_near(&scene, &cars, &cam, nfs_renderer::EnvFace { face, size, clear, depth_far: nfs_renderer::VIEW_FAR });
                 }
             }
             None => {
                 if let Some(r) = self.renderer.as_mut() {
-                    r.render_refl_face(&scene, &cam, face, size, clear, nfs_renderer::VIEW_FAR);
+                    r.render_refl_face(&scene, &cam, nfs_renderer::EnvFace { face, size, clear, depth_far: nfs_renderer::VIEW_FAR });
                 }
             }
         }
@@ -179,7 +184,7 @@ impl App {
     }
 
     /// ENHANCEMENT E49: the near cars of one environment face: the mirror pass's own draw of the cars (`dyn_items` with
-    /// `mirror_pass`: the player's car is not queued, no effect drive, no spots, no contact shadows), culled by the face's frustum to
+    /// `PassKind::EnvFace`: the player's car is not queued, no effect drive, no spots, no contact shadows), culled by the face's frustum to
     /// [`NEAR_CARS`] and picked for the face's size, farthest first. The cars' level-of-detail state the pick writes is put back
     /// (the main view's pick of the next frame starts from its own).
     fn near_car_items(&mut self, cam: &Camera, cull: &nfs_game::world::CullView, pose: crate::app::car_lights::DynPose, size: u32) -> Vec<nfs_renderer::DrawItem> {
@@ -193,7 +198,7 @@ impl App {
             return Vec::new();
         }
         let render_w = self.renderer.as_ref().map_or(640.0, |r| r.size().0.max(1) as f32);
-        let p = crate::app::car_lights::DynPose { mirror_pass: true, cull: Some(nfs_game::world::CullView { draw: NEAR_CARS, reach: 1.0, ..*cull }), lod: (size as f32, size as f32), ref_width: render_w, ..pose };
+        let p = crate::app::car_lights::DynPose { pass: crate::app::car_lights::PassKind::EnvFace, cull: Some(nfs_game::world::CullView { draw: NEAR_CARS, reach: 1.0, ..*cull }), lod: (size as f32, size as f32), ref_width: render_w, ..pose };
         let lods = (self.road.opponent_lods.clone(), self.road.traffic_lods.clone(), self.road.police_lods.clone());
         let saved_cam = std::mem::replace(&mut self.camera, *cam);
         let mut pools = self.pool_used;

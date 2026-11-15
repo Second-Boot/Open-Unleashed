@@ -32,6 +32,50 @@ fn ign(p: vec2<f32>) -> f32 {
 }
 "#;
 
+/// The Rec. 709 luma weights (linear-light luminance of an RGB colour).
+pub(crate) const LUMA_709: &str = r#"
+const LUMA_709: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+"#;
+
+/// A full turn in radians and the golden angle (`pi (3 - sqrt 5)`, the step of a Vogel disc), as the passes wrote them.
+pub(crate) const ANGLES: &str = r#"
+const TAU: f32 = 6.2831853;
+const GOLDEN_ANGLE: f32 = 2.3999632;
+"#;
+
+/// `linear_z(d, near, far)`: the distance in front of the camera of a depth-buffer value `d` of a projection with these planes
+/// (the scene-depth passes: light shafts, haze, lighthouse beam).
+pub(crate) const LINEAR_Z: &str = r#"
+fn linear_z(d: f32, near: f32, far: f32) -> f32 {
+    return near * far / max(far - d * (far - near), 0.0001);
+}
+"#;
+
+/// `ndc_uv(p)`: a clip-space xy (-1..1, y up) as the uv of a texture over the same view (0..1, y down): the shadow maps' lookups.
+pub(crate) const NDC_UV: &str = r#"
+fn ndc_uv(p: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+}
+"#;
+
+/// `proj_dist(z, r, near)`: the same distance from the projection's own terms, `r = far / (near - far)` (the post chain's
+/// passes: the motion blur, the depth of field, the windscreen drops).
+pub(crate) const PROJ_DIST: &str = r#"
+fn proj_dist(z: f32, r: f32, near: f32) -> f32 {
+    return r * near / (z + r);
+}
+"#;
+
+/// `view_dir(uv)`: the world direction of the view ray through `uv` (0..1, y down) of a pass whose uniform `u` holds the
+/// inverse view-projection `inv_vp` and the eye `cam.xyz` (haze, lighthouse beam).
+pub(crate) const VIEW_DIR: &str = r#"
+fn view_dir(uv: vec2<f32>) -> vec3<f32> {
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let pn = u.inv_vp * vec4<f32>(ndc, 0.0, 1.0);
+    return normalize(pn.xyz / pn.w - u.cam.xyz);
+}
+"#;
+
 /// The frame's depth as group 1, binding 0 (`dtex`) of the motion blur, the depth of field and the windscreen
 /// drops: a plain or a multisampled depth image.
 pub(crate) fn dtex(multisampled: bool) -> &'static str {
@@ -124,10 +168,11 @@ mod tests {
             ("mesh shader".into(), crate::classes::mesh_shader_source(crate::classes::feat::ALL)),
             ("mesh shader (all off)".into(), crate::classes::mesh_shader_source(0)),
             ("sprite".into(), include_str!("sprite.wgsl").into()),
-            ("shadow".into(), include_str!("gpu/shadow.wgsl").into()),
-            ("probe".into(), include_str!("probe.wgsl").into()),
-            ("carsun".into(), include_str!("gpu/carsun.wgsl").into()),
-            ("eye measure".into(), crate::adapt::measure_source()),
+            ("shadow".into(), crate::gpu::shadow_source()),
+            ("probe".into(), crate::probe::source()),
+            ("carsun".into(), crate::gpu::carsun_source()),
+            ("eye measure".into(), crate::adapt::measure_source(false)),
+            ("eye measure (bloom)".into(), crate::adapt::measure_source(true)),
             ("ao".into(), crate::ao::source()),
             ("bloom".into(), crate::bloom::source()),
             ("coat prefilter".into(), crate::coat::source()),
@@ -147,12 +192,14 @@ mod tests {
         }
         for eye in [false, true] {
             for edr in [false, true] {
-                v.push((format!("scale blit eye={eye} edr={edr}"), crate::gpu::blit_source(eye, edr)));
+                for bloom in [false, true] {
+                    v.push((format!("scale blit eye={eye} edr={edr} bloom={bloom}"), crate::gpu::blit_source(eye, edr, bloom)));
+                }
             }
         }
         for kind in DepthKind::ALL {
             v.push((format!("shafts {kind:?}"), crate::shafts::source(kind)));
-            for steps in [10, 14] {
+            for steps in [crate::haze::STEPS_SUBTLE, crate::haze::STEPS_STRONG] {
                 v.push((format!("haze {kind:?} steps={steps}"), crate::haze::source(kind, steps)));
             }
             for samples in [1, 4] {
@@ -179,6 +226,15 @@ mod tests {
     }
 
     #[test]
+    fn dump_sources_tmp() {
+        let Ok(dir) = std::env::var("WGSL_DUMP") else { return };
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, src) in every_source() {
+            std::fs::write(format!("{dir}/{}.wgsl", name.replace([' ', '/', '(', ')', ',', '='], "_")), src).unwrap();
+        }
+    }
+
+    #[test]
     fn every_shader_parses_and_validates() {
         let sources = every_source();
         let errors: Vec<String> = sources.iter().filter_map(|(name, src)| validate(name, src).err()).collect();
@@ -189,7 +245,7 @@ mod tests {
     #[test]
     fn each_piece_is_in_a_shader_once() {
         for (name, src) in every_source() {
-            for f in ["fn vs(", "fn ign(", "fn dload(", "fn depth_at(", "fn depth_dims("] {
+            for f in ["fn vs(", "fn ign(", "fn dload(", "fn depth_at(", "fn depth_dims(", "fn linear_z(", "fn proj_dist(", "fn view_dir(", "fn ndc_uv(", "const LUMA_709:", "const LUMA:", "const TAU:", "const GOLDEN_ANGLE:", "struct Object {", "fn face_of("] {
                 assert!(src.matches(f).count() <= 1, "{name}: `{f}` twice");
             }
         }

@@ -12,7 +12,7 @@ const LOCAL_CONTRAST: f32 = 2.0;
 const MAX_STEPS: i32 = 32;
 // SMAA_CORNER_ROUNDING 25 -> 0.25
 const CORNER: f32 = 0.25;
-const AREA_RUN: i32 = 33;
+//AREA_RUN
 
 // ---- pass 1: edges (luma) ----
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -20,7 +20,7 @@ const AREA_RUN: i32 = 33;
 fn luma_at(p: vec2<i32>) -> f32 {
     let d = vec2<i32>(textureDimensions(src));
     let c = textureLoad(src, clamp(p, vec2<i32>(0), d - vec2<i32>(1)), 0).rgb;
-    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return dot(c, LUMA_709);
 }
 
 @fragment fn fs_edges(@builtin(position) pos: vec4<f32>) -> @location(0) vec2<f32> {
