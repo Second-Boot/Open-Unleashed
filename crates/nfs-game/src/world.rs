@@ -68,6 +68,9 @@ pub struct TrackWorld {
     /// ENHANCEMENT E51 / E9 (CORSICA-SUN, SUN-ALL, SUN-FULL): on a day track whose sky has no sun (`sun_direction` straight down),
     /// the sun its data gives and the frame it drives ([`crate::data_sun`]); `None` elsewhere. Render only.
     pub data_sun: Option<crate::data_sun::DataSun>,
+    /// ENHANCEMENT E50 (SHADOW-OVERCAST): the sky's layers cover the sun (`SkyFile::blocks_the_sun`: Industrial); a night track so
+    /// covered has no moon. Render only.
+    pub sky_blocks_sun: bool,
     /// The race's smackables in `[WTrack+0x34]` order (0x4888B0): the mission scene's GEOM
     /// elements whose `animdefs.txt` definition says `kSmackable` (0x4772F0's `def+0x10 == 3`) —
     /// the skill test's cones — then the track's own placed `kSmackable` articles (signs,
@@ -2071,6 +2074,8 @@ impl TrackWorld {
         // ENHANCEMENT E51 / E9 (CORSICA-SUN, SUN-ALL, SUN-FULL): a track whose sky has no sun (the cars' light straight down): the
         // sun its data gives and the frame it drives (render only)
         let data_sun = crate::data_sun::measure(track, &geometry, &materials, sun_direction);
+        // ENHANCEMENT E50 (SHADOW-OVERCAST): whether the sky's layers cover the sun (render only)
+        let sky_blocks_sun = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).is_ok_and(|f| f.blocks_the_sun());
         let map_sections = MapSection::all(&track.map);
         Self::mark_lit_items(track, &materials, &mat_ids, &mut items, &mut track_lods);
         // materials whose render method builds `RCustomLayers::LayerUVAnimate` (0x8001) — water
@@ -2236,6 +2241,7 @@ impl TrackWorld {
             map_light,
             sun_direction,
             data_sun,
+            sky_blocks_sun,
             map_sections,
             env_by_id,
             smackables: smackables.into_iter().chain(track_smackables).take(MAX_SMACKABLES).collect(),

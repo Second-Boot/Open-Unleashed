@@ -114,10 +114,15 @@ impl App {
         // `Camera.1 … Camera.4` and `Camera.Current` (`FEPositionableAccessor`, 0x4BC460): the car's
         // camera list and the slot the Options screen has selected — `savegame.md` §9 had them
         // "deliberately not ported" until the list took effect in a race (§4.89a)
-        for (i, v) in self.fe.camera_list.iter().enumerate() {
-            out.push((format!("Camera.{}", i + 1), *v as u32));
-        }
-        out.push(("Camera.Current".into(), self.fe.camera_current as u32));
+        out.extend(camera_options(&self.fe.camera_list, self.fe.camera_current));
+        // three more the original's block carries and the port has the state of (ISS4-CAMSAVE's
+        // audit against `native_TEST.sav`): `Game.GameType` (`FEIntAccessor` 0x4BA310 at 0x4E55B0,
+        // range 0…12, default 0 — the index is the value), `Comms.GameMode` (`FEPositionableAccessor`,
+        // the counted list of 4 built at 0x50BBBE) and `Factory.ProfileNum` (the counted list of 6,
+        // 0x5196D0)
+        out.push(("Game.GameType".into(), u32::from(self.fe.game_type)));
+        out.push(("Comms.GameMode".into(), self.fe.comms_game_mode));
+        out.push(("Factory.ProfileNum".into(), self.fe.factory_profile as u32));
         out.extend(RANGE_ACCESSORS.iter().filter_map(|(n, ..)| self.range_value(n).map(|(v, lo, _)| (n.to_string(), (v - lo) as u32))));
         // the knockout table `Track1..7.*` (0x4F9790), each its list index: `Laps` 0…7 (the count
         // less one, 0x4FC1BC), `Direction` 0…3, `Traffic` 0…3 — `Track1.Laps` / `.Traffic` are
@@ -140,6 +145,9 @@ impl App {
             out.push(("Knockout.TrackNumber".into(), m.ko_sel as u32));
             // `Game.Difficutly`'s list index (0x4BC460, `[this+0x18]`)
             out.push(("Game.Difficutly".into(), u32::from(m.difficulty)));
+            // `Game.Damage` (`FEBoolAccessor`, registered at 0x4E55DD with 1): the quick race's
+            // damage switch — the original's fresh profile carries it (`native_TEST.sav`: 1)
+            out.push(("Game.Damage".into(), u32::from(m.damage)));
             out.push(("LoopedTrack.Track".into(), m.looped_idx as u32));
         }
         out
@@ -150,7 +158,11 @@ impl App {
     /// accessor through 0x4BC480 → `SetSelection` 0x4BC240 (the index clamped into the list), the
     /// race-screen counts, the CD player's list (0x4BE170) and the knockout block (0x4DDD60), which
     /// replaces whatever series was running. A profile without a `.sav` keeps everything.
-    pub(crate) fn apply_saved_profile(&mut self) {
+    ///
+    /// `modes`: also the front end's own mode accessors (`Game.GameType`, `Comms.GameMode`,
+    /// `Factory.ProfileNum`). False only for the port's diagnostic starts (`--fe=<screen>`, a
+    /// command-line race), which meet no `LoadInfo` in the original and set those themselves.
+    pub(crate) fn apply_saved_profile(&mut self, modes: bool) {
         self.apply_saved_controls();
         let Some(c) = self.career.as_ref() else { return };
         let Some(s) = std::fs::read(c.profile.path(&c.save_dir)).ok().and_then(|d| nfs_formats::sav::SaveFile::parse(&d).ok()) else { return };
@@ -172,14 +184,17 @@ impl App {
                 } else {
                     self.choices.insert(Self::choice_slot(name, key).to_string(), v);
                 }
-            } else if let Some(slot) = name.strip_prefix("Camera.").and_then(|n| n.parse::<usize>().ok()).filter(|n| (1..=4).contains(n)) {
-                // `Camera.1 … Camera.4` (`FEPositionableAccessor`, Save / Load 0x4BC460 / 0x4BC480): the
-                // car's camera list as the Options screen left it (`controls.md` §4.89a). The original
-                // loads the plain dword through `SetSelection`; nothing clamps a positionable accessor.
-                self.fe.camera_list[slot - 1] = *d as i32;
-            } else if name == "Camera.Current" {
-                // the slot `NFS5.CAMERASELECT` last chose; the port indexes its four slots with it
-                self.fe.camera_current = (*d as usize).min(3);
+            } else if apply_camera_option(name, *d, &mut self.fe.camera_list, &mut self.fe.camera_current) {
+                // `Camera.1 … Camera.4` / `Camera.Current`: the camera tab as it was saved (§4.89a)
+            } else if matches!(name, "Game.GameType" | "Comms.GameMode" | "Factory.ProfileNum") {
+                if modes {
+                    match name {
+                        // the range 0…12 (0x4BA310 at 0x4E55B0, 0x4E55A1 pushes the 12), clamped by 0x4BC240
+                        "Game.GameType" => self.fe.game_type = clamp_index(*d, 13) as u8,
+                        "Comms.GameMode" => self.fe.comms_game_mode = clamp_index(*d, 4),
+                        _ => self.fe.factory_profile = clamp_index(*d, 6) as usize,
+                    }
+                }
             } else if let Some((_, key, _, lo, hi)) = RANGE_ACCESSORS.iter().find(|(n, ..)| *n == name) {
                 let v = clamp_index(*d, (hi - lo + 1) as u32) as i32 + lo;
                 let a = &mut self.snd.audio_settings;
@@ -237,6 +252,9 @@ impl App {
                         m.set_ko_row(row, k);
                     } else if name == "Game.Difficutly" {
                         m.difficulty = clamp_index(*d, 3) as u8;
+                    } else if name == "Game.Damage" {
+                        // the two rows of `FEBoolAccessor` (0x4B8770: 1 = on)
+                        m.damage = clamp_index(*d, 2) == 1;
                     } else if name == "Knockout.TrackNumber" {
                         m.ko_sel = clamp_index(*d, 7) as usize;
                         m.fit_ko();
@@ -468,5 +486,79 @@ impl App {
         } else {
             "zMergedList.Car"
         }
+    }
+}
+
+/// `Camera.1 … Camera.4` and `Camera.Current` as the accessor block carries them
+/// (`FEPositionableAccessor`, Save 0x4BC460: the dword `[this+0x18]`): the car's camera list and
+/// the slot the camera tab has selected (`controls.md` §4.89a).
+pub(crate) fn camera_options(list: &[i32; 4], current: usize) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = list.iter().enumerate().map(|(i, v)| (format!("Camera.{}", i + 1), *v as u32)).collect();
+    out.push(("Camera.Current".into(), current as u32));
+    out
+}
+
+/// One accessor of the block onto the camera state, when it is one of [`camera_options`]' five
+/// (Load 0x4BC480 → `SetSelection`). Returns whether it was.
+pub(crate) fn apply_camera_option(name: &str, d: u32, list: &mut [i32; 4], current: &mut usize) -> bool {
+    if let Some(slot) = name.strip_prefix("Camera.").and_then(|n| n.parse::<usize>().ok()).filter(|n| (1..=4).contains(n)) {
+        // the plain dword through `SetSelection`; nothing clamps a positionable accessor
+        list[slot - 1] = d as i32;
+        true
+    } else if name == "Camera.Current" {
+        // the slot `NFS5.CAMERASELECT` last chose; the port indexes its four slots with it
+        *current = (d as usize).min(3);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::career_ui::CareerUi;
+
+    /// ISS4-CAMSAVE: the camera tab's list and slot survive the quit's save (0x4D52EA,
+    /// `App::fe_quit_save` -> `CareerUi::save`) and come back through the next start's `LoadInfo`
+    /// (0x4DE9B0 -> `apply_camera_option`); and with no profile loaded yet (the first entry's chooser
+    /// unanswered, `[0x691DC8]` empty) the save writes nothing (0x4DEDB9).
+    #[test]
+    fn the_quit_save_keeps_the_camera_tab_and_needs_a_loaded_name() {
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("nfs-camsave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ui = CareerUi::load(&paths).unwrap();
+        ui.save_dir = dir.clone();
+        assert!(ui.create_profile("Cam", 8));
+        let p = nfs_game::save::Profile::new("Cam", 8);
+        let file = p.path(&dir);
+        let created = std::fs::read(&file).unwrap();
+        // the first entry: the career blank, no name - a quit then writes nothing
+        ui.profile = p.clone();
+        ui.blank_before_chooser();
+        ui.side.settings.options = camera_options(&[3, 3, 3, 3], 3);
+        ui.save();
+        assert_eq!(std::fs::read(&file).unwrap(), created, "no save before the chooser is answered");
+        // the chooser answered; the camera tab: slot 3 selected, pictures 2 / 3 / 0 / 1 assigned
+        assert!(ui.switch_profile(&p));
+        let (list, current) = ([2, 3, 0, 1], 2);
+        ui.side.settings.options = camera_options(&list, current);
+        ui.side.settings.options.push(("Game.Damage".into(), 0));
+        ui.save();
+        // a fresh process: start-up, then the chooser's load
+        let mut fresh = CareerUi::load(&paths).unwrap();
+        fresh.save_dir = dir.clone();
+        assert!(fresh.switch_profile(&p));
+        let (mut got_list, mut got_current) = ([0, 1, 2, 3], 0);
+        for (n, d) in &fresh.side.settings.options {
+            apply_camera_option(n, *d, &mut got_list, &mut got_current);
+        }
+        assert_eq!((got_list, got_current), (list, current));
+        assert!(fresh.side.settings.options.iter().any(|(n, d)| n == "Game.Damage" && *d == 0), "the damage switch is saved too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

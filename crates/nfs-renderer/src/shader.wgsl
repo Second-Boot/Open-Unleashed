@@ -73,8 +73,8 @@ struct Csm {
     info: array<vec4<f32>, 4>,
     // xyz the way the light travels, w the cascade count
     dir: vec4<f32>,
-    // x the track's shadow strength, y the view depth where the last cascade fades out, z (E25) the soft kernel's
-    // spacing in texels, w the car's floor of the direct term
+    // x the track's shadow strength, y the view depth where the last cascade fades out, z 0 (unused), w the car's floor of the
+    // direct term
     params: vec4<f32>,
     // ENHANCEMENT E9 (SHADOWFIX): xyz the light the cars are lit with (the shadow's own is lifted to a higher sun), w the
     // cover gate (1 = open sky; the shadows fade out under cover)
@@ -627,9 +627,6 @@ const FOCUS_CORE_TAPS: i32 = 12;
 const FOCUS_CORE_TURN: f32 = 1.3;
 const FOCUS_NOISE_XZ: f32 = 211.0;
 const FOCUS_NOISE_Y: f32 = 97.0;
-// E25: the overcast kernel's half width (taps each side of the centre: a 5 x 5 grid)
-const OVERCAST_HALF: i32 = 2;
-const OVERCAST_TAPS: f32 = 25.0;
 // E15 / E47: the receiver's push along its normal in texels at its distance (1 + this x the turn from the light), the depth bias in
 // texels on top of the light's own metres, where the frustum's border starts fading to lit
 const PERSP_OFFSET_TURN: f32 = 2.0;
@@ -639,12 +636,11 @@ const SPOT_BIAS_M: f32 = 0.05;
 const LAMP_BIAS_M: f32 = 0.04;
 
 // E9's track receiver: how much a face turned from the light still takes (a floor, full from this `n.l`), the "already baked dark"
-// gate's luma ramp, E25's floor of that gate, E50's turned-round ramp (a lamp's pool is the lamp's light, not the moon's)
+// gate's luma ramp, E50's turned-round ramp (a lamp's pool is the lamp's light, not the moon's)
 const FACING_FLOOR: f32 = 0.35;
 const FACING_FULL: f32 = 0.25;
 const BAKED_DARK_LO: f32 = 0.3;
 const BAKED_DARK_HI: f32 = 0.7;
-const OVERCAST_BRIGHT_FLOOR: f32 = 0.6;
 const MOON_LIT_LO: f32 = 0.25;
 const MOON_LIT_HI: f32 = 0.6;
 // E9: the car's light is the sun's when its direction is within this cosine of the cascades' light (`csm.orig`)
@@ -755,7 +751,7 @@ fn csm_far_fade(vd: f32) -> f32 {
 }
 
 // ENHANCEMENT E9: how much of the sun reaches `world` through cascade `c` (0 shadowed .. 1 lit): `csm_coord`, then a 3 x 3 grid of
-// hardware-bilinear compares softens the edge over about four texels (the mode's own kernel for the moon, the front end, E25).
+// hardware-bilinear compares softens the edge over about four texels (the mode's own kernel for the moon, the front end).
 fn csm_tap(c: i32, world: vec3<f32>, n: vec3<f32>, ndl: f32) -> f32 {
     let q = csm_coord(c, world, n, ndl);
     if q.w < 0.5 {
@@ -788,19 +784,6 @@ fn csm_tap(c: i32, world: vec3<f32>, n: vec3<f32>, ndl: f32) -> f32 {
             soft = min(1.0 - (1.0 - soft) * csm.extra.z, core / f32(FOCUS_CORE_TAPS));
         }
         return soft;
-    }
-    //@endif
-    //@if OVERCAST
-    // ENHANCEMENT E25: the overcast light's wide soft edge, a 5 x 5 grid spaced `params.z` texels
-    if csm_mode_is(SHADOW_OVERCAST) {
-        let wide = step * csm.params.z;
-        var sum = 0.0;
-        for (var dy = -OVERCAST_HALF; dy <= OVERCAST_HALF; dy++) {
-            for (var dx = -OVERCAST_HALF; dx <= OVERCAST_HALF; dx++) {
-                sum += textureSampleCompareLevel(t_shadow, s_shadow, uv + vec2<f32>(f32(dx), f32(dy)) * wide, c, depth);
-            }
-        }
-        return sum / OVERCAST_TAPS;
     }
     //@endif
     // PERF: the four corner taps first; when they agree the other five would too
@@ -1737,13 +1720,6 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             bright = 1.0;
         }
         //@endif
-        //@if OVERCAST
-        // ENHANCEMENT E25: the sunless tracks' baked colours are dim (a forest floor, wet asphalt), so the gate would switch the
-        // shadow off nearly everywhere; here it only eases it a little
-        if csm_mode_is(SHADOW_OVERCAST) {
-            bright = mix(OVERCAST_BRIGHT_FLOOR, 1.0, bright);
-        }
-        //@endif
         //@if MOON
         // ENHANCEMENT E50: the moon's share of a night's baked colour is the dim part of it: a pool of lamp light (bright in the bake)
         // is the lamp's, not the moon's, so the gate turns round (full below a luma of 0.25, none above 0.6)
@@ -1773,11 +1749,10 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             }
             //@endif
             light = light * keep_sun;
-            // ENHANCEMENT E25 x E43 (LAMP-TUNE): under the overcast light both are the sky's occlusion by the same car (E25's soft
-            // shadow of the tilted overcast light, E43's of the underside): the point keeps the darker of the two, not their product
-            // (the product darkened the car's own shadow twice: 0.4 x 0.15 under the body, a heavy black patch on the sunless tracks).
-            // (The front end's focus light, as soft, takes the same rule; it has no contact shadows.)
-            let soft_key = csm_mode_is(SHADOW_OVERCAST) || csm_mode_is(SHADOW_FOCUS);
+            // ENHANCEMENT ENH-FE3D x E43 (LAMP-TUNE): under the front end's soft focus light both would be the sky's occlusion by the
+            // same car: the point keeps the darker of the two, not their product (it has no contact shadows; the rule was E25's overcast
+            // light's too, until E25 was removed 2026-11-16)
+            let soft_key = csm_mode_is(SHADOW_FOCUS);
             if ao < 1.0 && soft_key {
                 ao = min(ao, keep_sun) / max(keep_sun, MIN_DIV);
             }
@@ -1787,7 +1762,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             // sills; inside the car's own sun shadow (v 0) it is whole and deepens it under the body: one shadow, the car grounded.
             // `a` is E9's strength x facing x the share drawn here, without the "baked dark" gate (the map knows where the car
             // blocks the sun even where the bake is dim). Under cover, at night, beyond the cascades (a 0) it is the whole occlusion,
-            // as before. Not under E25's overcast light: its soft shadow is itself a sky occlusion (the min above).
+            // as before. Not under the focus light: its soft shadow is itself a sky occlusion (the min above).
             if ao < 1.0 && !soft_key {
                 var a = a0 * t.y;
                 //@if MOON
@@ -1979,7 +1954,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             // original's blob under the car gives way to it entirely (2026-10-03: two shadows under one car; was 30 %
             // left as a contact darkening); under cover (gate 0), at night and with E9 off the blob is the original's, whole
             var blob = sh.a;
-            // (only in the sun's mode: E25's overcast light and E50's moon cast car shadows too faint to stand in for the blob; the
+            // (only in the sun's mode: E50's moon casts car shadows too faint to stand in for the blob; the
             // garage's `FESH` blob: ENH-GARAGE fades it below, once the focus shadow has a contact core)
             // ENHANCEMENT E9 (SHADOW-REAL): by the point's own cover (`csm_share`), not by where the camera is
             //@if CSM
@@ -1993,7 +1968,7 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             }
             //@endif
             //@endif
-            // ENHANCEMENT E43: the same where a car's contact shadow stands in for it (under cover, at night, E9 off, E25's overcast:
+            // ENHANCEMENT E43: the same where a car's contact shadow stands in for it (under cover, at night, E9 off, a track without a sun:
             // where E9's own gate has not already taken it)
             //@if CONTACT
             if contacts.params.x > 0.5 && !csm_mode_is(SHADOW_FOCUS) {

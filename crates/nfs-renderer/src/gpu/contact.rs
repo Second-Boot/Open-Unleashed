@@ -1,8 +1,8 @@
 //! ENHANCEMENT E43: the soft contact shadow under the cars.
 //!
 //! The original has one shadow under a car, the `sh80` blob (a projector texture, 0x446130) and the car's `SHAD` ground patch
-//! (0x43B820). E9's sun shadow replaces them where it is drawn (a sun, in the open); under cover, at night, under E25's overcast
-//! light and with E9 off the blob stays, and at a tunnel mouth the soft shadow vanished and the old blob appeared. This is the
+//! (0x43B820). E9's sun shadow replaces them where it is drawn (a sun, in the open); under cover, at night, on a track without a sun
+//! and with E9 off the blob stays, and at a tunnel mouth the soft shadow vanished and the old blob appeared. This is the
 //! shadow for those places: an ambient-occlusion-like darkening of the road under and round each near car, evaluated analytically
 //! per fragment of the track (`shader.wgsl`, `contact_keep`), from the car's pose alone.
 //!

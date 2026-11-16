@@ -704,9 +704,8 @@ impl Core {
                 // ENHANCEMENT E50 / E51: the moon's part only in a moon frame, the cars-only layers' only in a frame that has them
                 | (if lights.csm.as_ref().is_some_and(|c| c.is_moon()) { 0 } else { feat::MOON })
                 | (if lights.csm.as_ref().is_some_and(|c| c.has_car_layers()) { 0 } else { feat::CARSH })
-                // (SHADOW-REFACTOR: the front end's focus shadow's and E25's kernels only in their own frames)
+                // (SHADOW-REFACTOR: the front end's focus shadow's kernel only in its own frames)
                 | (if lights.csm.as_ref().is_some_and(|c| c.is_focus()) { 0 } else { feat::FOCUS })
-                | (if lights.csm.as_ref().is_some_and(|c| c.is_overcast()) { 0 } else { feat::OVERCAST })
         };
         // PERF (PERF-D): a frame without a 3-D item (a loading screen, a 2-D front-end screen) draws no mesh: it needs no set (its
         // family, the 8-bit one of a sprite-only scene, was built in such a frame for nothing)

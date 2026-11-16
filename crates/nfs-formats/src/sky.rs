@@ -286,6 +286,16 @@ impl SkyFile {
         Ok(Self { blocks })
     }
 
+    /// Whether the sky's layers cover the sun: every block that builds a level and has the token says "Does this layer block the
+    /// sun" (not `no`: `basic` 0x45AEBC, `multi*` 0x45B6FE). The original uses the flag for the draw order only: a covering level
+    /// draws after the sun object, over it (flag 0x400 is the `no` case, drawn before it). `freecloud` has no such token (0x45BF80
+    /// reads none) and does not count; a file without a counted block is false. Shipped: only `Industrial.txt` (both blocks YES).
+    /// ENHANCEMENT E50 (SHADOW-OVERCAST) reads it: a night track whose sky covers the sun has no moon.
+    pub fn blocks_the_sun(&self) -> bool {
+        let mut authored = self.blocks.iter().filter(|b| b.kind.builds_a_level() && b.kind != SkyKind::FreeCloud).peekable();
+        authored.peek().is_some() && authored.all(|b| b.blocks_sun)
+    }
+
     /// The first usable block whose capability is exactly `capability` (a diagnostic's view; the
     /// game picks by [`SkyFile::for_level`]).
     ///
@@ -435,6 +445,10 @@ mod tests {
         let f = SkyFile::parse(&BASIC.replace("NO\n", "MAYBE\n")).unwrap();
         assert!(f.blocks[0].blocks_sun, "anything not starting `no` sets the flag");
         assert!(!SkyFile::parse(BASIC).unwrap().blocks[0].blocks_sun);
+        // SHADOW-OVERCAST: the file covers the sun when its counted blocks do; a freecloud block (no token) does not count
+        assert!(f.blocks_the_sun());
+        assert!(!SkyFile::parse(BASIC).unwrap().blocks_the_sun());
+        assert!(!SkyFile::parse(FREE).unwrap().blocks_the_sun());
         assert_eq!(name("NONEXISTENT"), None, "the compare is four characters, not the whole word");
         assert_eq!(name("non"), Some("non".to_string()));
     }

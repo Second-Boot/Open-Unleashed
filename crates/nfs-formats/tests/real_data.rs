@@ -517,6 +517,13 @@ fn sky_definitions() {
     assert_eq!(f.for_level(0).len(), 2);
     // its one `HIGH` block is `ADDITIVE`, which builds no level
     assert!(f.for_level(2).is_empty());
+    // SHADOW-OVERCAST: only Industrial's layers cover the sun ("Does this layer block the sun" YES in both blocks; every other file NO)
+    let covering: Vec<String> = files
+        .iter()
+        .filter(|p| nfs_formats::sky::SkyFile::parse(&String::from_utf8_lossy(&std::fs::read(p).unwrap())).unwrap().blocks_the_sun())
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    assert_eq!(covering, ["industrial.txt"]);
 }
 
 /// `BndP` gives every car the same body: a wheel-contact quad on the ground, two end boxes and a

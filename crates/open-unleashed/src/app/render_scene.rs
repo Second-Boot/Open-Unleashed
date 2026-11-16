@@ -3,14 +3,22 @@
 use crate::*;
 use nfs_physics::vehicle::RaceState;
 
-/// ENHANCEMENT E25: the overcast light's travel direction: a high diffuse sky, about 33 degrees off the vertical (the original's
-/// light on these tracks is exactly vertical, whose shadows hide under their casters).
-pub(crate) const OVERCAST_LIGHT: Vec3 = Vec3::new(0.55, -1.0, 0.4);
 /// ENHANCEMENT E50: the moon's travel direction on a night track whose sky has no moon of its own (the Monaco circuits: their sky
 /// `.bin` puts the sun object overhead and switches it off, `SkyBin::sun_active`), about 48 degrees over the horizon.
-/// APPROXIMATION (enhancement content, chosen by eye on the monaco1 stills: no original counterpart; on Industrial the sky's own
-/// moon is used instead).
+/// APPROXIMATION (enhancement content, chosen by eye on the monaco1 stills: no original counterpart; Industrial, whose sky's sun
+/// object is on at night, has no moon at all since SHADOW-OVERCAST: its sky layers cover it, `TrackWorld::sky_blocks_sun`).
 pub(crate) const MOON_LIGHT: Vec3 = Vec3::new(-0.55, -0.75, 0.35);
+/// ENHANCEMENT E50 (SHADOW-OVERCAST, 2026-11-16): E50's «слабо» level, the highest a capped track's moon is drawn at.
+const MOON_WEAK: u8 = 1;
+/// ENHANCEMENT E50 (SHADOW-OVERCAST, 2026-11-16): the highest E50 level per track (`ShadowLights::moon_level_cap`): the
+/// Monaco circuits' moon comes from `MOON_LIGHT`'s chosen direction (their data has none), so it stays faint («средне» draws as
+/// «слабо»). APPROXIMATION (a matter of taste, not the data).
+const MOON_LEVEL_CAPS: [(&str, u8); 5] = [("monaco1", MOON_WEAK), ("monaco2", MOON_WEAK), ("monaco3", MOON_WEAK), ("monaco4", MOON_WEAK), ("monaco5", MOON_WEAK)];
+/// ENHANCEMENT E9 / E51 (SHADOW-OVERCAST): how many slices either side of the camera's the sky data's precipitation is averaged
+/// over (about 120 m each way at the 6 m slices): the data's own snow steps (alps: 0 -> 1 over the four slices 644..648, the 0.3
+/// pulses that drop to 0 in one slice at 474 / 539 / 579 / 620) become a ramp of the shadows over ~240 m instead of a pop.
+/// APPROXIMATION (enhancement content, chosen for a smooth fade on the alps stills).
+const PRECIP_REACH: i32 = 20;
 /// ENHANCEMENT E9 (SHADOWFIX): the radius (m) round the camera inside which scenery casts a sun shadow whether or not the walk drew it.
 pub(crate) const SHADOW_CASTER_REACH: f32 = 600.0;
 
@@ -365,7 +373,17 @@ impl App {
     /// a zone's value changes, so this is cheap to call every frame. Every car with its own model
     /// takes it — the player (the car the camera follows) and each opponent; the traffic and the
     /// cops share one model per type and keep their pages clean (gap: the original's are per car).
-    pub(crate) fn update_damage_decals(&mut self) {
+    ///
+    /// It also runs slot 9's and slot 6's per-frame animations (0x438440, 0x43950E): the wing, the
+    /// pop-up lamps, the driver's gestures, the race channels and the siren. Their clocks are the
+    /// original's real-time ones — `GetTickCount` for the easers (0x438A50), `rdtsc` for the driver's
+    /// players (0x438B92), the 128 Hz `TIMER_getTicks` for the siren (0x53C2E0) — none stops for a
+    /// pause, a replay or the fly-in, so `anim_ms` is the frame's real time in whole ms with the
+    /// fraction carried (`fe_step_ms`, the front end's clock step). A scripted run, which draws no
+    /// frame, passes 16 per call (TEST GLUE, `NFS_SHOT_SETTLE`). *(Until 2026-11-16 every rendered
+    /// frame passed 16 ms: at 120 Hz the animations ran 1.9× too fast.)*
+    // PORT-DEVIATION D66 (RE/notes/PORT-DEVIATIONS.md): the step is capped at 250 ms a frame; the original's clocks are not
+    pub(crate) fn update_damage_decals(&mut self, anim_ms: u32) {
         let Some(damage) = self.vehicle.as_ref().map(|v| v.damage) else {
             return;
         };
@@ -405,13 +423,13 @@ impl App {
             lat_acc: v.lateral_filtered,
         });
         if let (Some(c), Some(r)) = (self.car_model.as_mut(), self.renderer.as_mut()) {
-            c.update_animation(r, 16, speed, night, tiny, reverse);
+            c.update_animation(r, anim_ms, speed, night, tiny, reverse);
             if let Some(d) = driver {
-                c.update_driver(r, 16, &d);
+                c.update_driver(r, anim_ms, &d);
             }
             // the shared traffic and police models take slot 9's clock channel (the siren)
             for m in self.road.police_models.iter_mut().chain(self.road.traffic_models.iter_mut()) {
-                m.update_clock_channels(16);
+                m.update_clock_channels(anim_ms);
             }
             // slot 9 runs for every car's model: the opponents' own too
             let k = if self.mirror { -1.0 } else { 1.0 };
@@ -422,10 +440,10 @@ impl App {
             for o in &self.road.opponents {
                 let Some(m) = self.road.opponent_models.get_mut(o.model) else { continue };
                 let v = &o.vehicle;
-                m.update_animation(r, 16, v.speed(), o.lamp_bits & lamp_bit::HEADLIGHTS != 0, o.tiny, v.gear == 0);
+                m.update_animation(r, anim_ms, v.speed(), o.lamp_bits & lamp_bit::HEADLIGHTS != 0, o.tiny, v.gear == 0);
                 m.update_driver(
                     r,
-                    16,
+                    anim_ms,
                     &nfs_game::world::DriverInputs {
                         detail,
                         wheel_turns: (v.wheels[0].steer + v.wheels[1].steer) / STEER_UNITS * k,
@@ -439,7 +457,7 @@ impl App {
                 );
                 let ws = wheel_steer(v);
                 m.update_race_channels(
-                    16,
+                    anim_ms,
                     [ws[0] / STEER_UNITS * k, ws[1] / STEER_UNITS * k],
                     [v.wheels[0].rotation, v.wheels[1].rotation, v.wheels[2].rotation, v.wheels[3].rotation],
                     [v.wheels[0].render_angle, v.wheels[1].render_angle, v.wheels[2].render_angle, v.wheels[3].render_angle],
@@ -450,7 +468,7 @@ impl App {
             if let Some(v) = self.vehicle.as_ref() {
                 let ws = wheel_steer(v);
                 c.update_race_channels(
-                    16,
+                    anim_ms,
                     [ws[0] / STEER_UNITS * k, ws[1] / STEER_UNITS * k],
                     [v.wheels[0].rotation, v.wheels[1].rotation, v.wheels[2].rotation, v.wheels[3].rotation],
                     [v.wheels[0].render_angle, v.wheels[1].render_angle, v.wheels[2].render_angle, v.wheels[3].render_angle],
@@ -476,35 +494,66 @@ impl App {
         SPOT_OPEN_DAY + SPOT_COVERED * self.spot_cover.borrow_mut().value_held(key, covered, now_ms)
     }
 
-    /// ENHANCEMENT E9 / E25 / E50 / E51: the lights the race's main view can draw its shadow cascades for (the renderer picks one by
+    /// ENHANCEMENT E9 / E50 / E51: the lights the race's main view can draw its shadow cascades for (the renderer picks one by
     /// its switches, `nfs_renderer::ShadowLights`). `lit`: the cover gate's fallback ([`nfs_renderer::SunShadow::lit`]); `moon_on`:
-    /// a night track with E50 on. None in the front end (no car).
+    /// a night track with a moon ([`Self::has_moon`]) and E50 on. None in the front end (no car).
     fn shadow_lights(&self, lit: bool, moon_on: bool) -> nfs_renderer::ShadowLights {
         let (Some(w), Some(_)) = (self.world.as_ref(), self.vehicle.as_ref()) else { return nfs_renderer::ShadowLights::NONE };
         let light = |direction: Vec3| nfs_renderer::SunShadow { direction, lit, focus: None };
         // the sky's sun object has a direction of its own (the port's straight-down fallback is a sky without one)
         let sky_sun = w.sun_direction.x.abs() + w.sun_direction.z.abs() > SUN_FLAT_EPS;
         if self.track.is_night() {
-            // ENHANCEMENT E50: a night track's moon. Where the sky's sun object is on at night (Industrial: `SkyBin::sun_active`, 40
-            // degrees up; its sky layer "blocks the sun", no disc shows) it stands for the moon: the cars are already lit from it
-            // (`TrackWorld::sun_direction`, 0x43AC8D); a sky without one (the Monaco circuits) takes `MOON_LIGHT`
+            // ENHANCEMENT E50: a night track's moon. Where the sky's sun object is on at night (`SkyBin::sun_active`) and the sky's
+            // layers do not cover it it stands for the moon: the cars are already lit from it (`TrackWorld::sun_direction`,
+            // 0x43AC8D); a sky without one (the Monaco circuits) takes `MOON_LIGHT`. SHADOW-OVERCAST: a sky that covers it
+            // (Industrial) has no moon at all (`has_moon`, `moon_on` false), and a track of `MOON_LEVEL_CAPS` is held to its level.
             let sky_moon = self.track.sky_bin.as_ref().is_some_and(|b| b.sun_active()) && sky_sun;
-            return nfs_renderer::ShadowLights { moon: moon_on.then(|| light(if sky_moon { w.sun_direction } else { MOON_LIGHT.normalize() })), ..nfs_renderer::ShadowLights::NONE };
+            let cap = MOON_LEVEL_CAPS.iter().find(|(t, _)| t.eq_ignore_ascii_case(&self.track.name)).map(|&(_, l)| l);
+            return nfs_renderer::ShadowLights {
+                moon: moon_on.then(|| light(if sky_moon { w.sun_direction } else { MOON_LIGHT.normalize() })),
+                moon_level_cap: cap,
+                ..nfs_renderer::ShadowLights::NONE
+            };
         }
+        // ENHANCEMENT E9 / E51 (SHADOW-OVERCAST): the sun's shadows fade with the sky data's snow / rain
+        let precipitation = self.shadow_precipitation();
         if sky_sun {
             // ENHANCEMENT E9: the sun the cars are lit with (`-SkyBin::sun_position`, 0x43AC8D; `TrackWorld::sun_direction`)
-            return nfs_renderer::ShadowLights { sun: Some(light(w.sun_direction)), ..nfs_renderer::ShadowLights::NONE };
+            return nfs_renderer::ShadowLights { sun: Some(light(w.sun_direction)), precipitation, ..nfs_renderer::ShadowLights::NONE };
         }
         nfs_renderer::ShadowLights {
-            // ENHANCEMENT E25: a day track with no sun disc (the sun overhead, the cars' light straight down: autobahn, canyon,
-            // foothills, forest) gets the overcast shadows with that same light
-            overcast: (w.sun_direction.length_squared() > 0.5).then(|| light(OVERCAST_LIGHT.normalize())),
             // ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL) / E9 (SUN-FULL): its data's sun (`nfs_game::data_sun`): the cars' own shadow
             // along it, or on the tracks so chosen E9's full frame (the scenery casts too: a vertex bake has no shade of the signs,
-            // posts, trees); the cars' shading stays the original's
+            // posts, trees); the cars' shading stays the original's. A track whose data gives no sun (foothills, autobahn since
+            // SHADOW-OVERCAST) has none: nothing else stands in for it
             data_sun: w.data_sun.map(|d| nfs_renderer::DataSun { light: light(d.direction), scenery_radius: d.scenery_radius }),
+            precipitation,
             ..nfs_renderer::ShadowLights::NONE
         }
+    }
+
+    /// ENHANCEMENT E50 (SHADOW-OVERCAST): whether this night track has a moon: not when its sky's layers cover the sun
+    /// (`TrackWorld::sky_blocks_sun`: Industrial's "Does this layer block the sun" YES). A data rule; of the six night tracks it
+    /// takes the moon from Industrial only (Monaco 1-5 say NO).
+    pub(crate) fn has_moon(&self) -> bool {
+        self.track.is_night() && !self.world.as_ref().is_some_and(|w| w.sky_blocks_sun)
+    }
+
+    /// ENHANCEMENT E9 / E51 (SHADOW-OVERCAST, "overcast during precipitation: no direct sun"; an enhancement judgement, nothing
+    /// of the original's): the sky data's precipitation round the camera, 0..1: the larger of the snow (track B field 7 `+0x20`,
+    /// 0x45CFD0 -> 0x45A940) and the rain (field 5 `+0x18`, 0x45D000 -> 0x45A8E0) - the two strengths the original's weather layer
+    /// 0x459020 hands its emitters at the camera's slice (`weather_strengths_at`) - averaged over `PRECIP_REACH` slices either side
+    /// (the data's own snow steps would pop the shadows). Shipped: alps' snowfall (slices 644..1343), autobahn's rain (no sun there).
+    fn shadow_precipitation(&self) -> f32 {
+        let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
+        let (Some(_), Some(cam), true) = (self.track.sky_bin.as_ref(), self.cam_slice, lap > 0) else { return 0.0 };
+        let sum: f32 = (-PRECIP_REACH..=PRECIP_REACH)
+            .map(|d| {
+                let (snow, rain) = self.weather_strengths_at((cam as i32 + d).rem_euclid(lap));
+                snow.max(rain).clamp(0.0, 1.0)
+            })
+            .sum();
+        sum / (2 * PRECIP_REACH + 1) as f32
     }
 
     /// ENHANCEMENT E43 / E51: `car` (standing at `origin`) onto a list sorted later by its squared distance from `eye`.
@@ -1305,14 +1354,14 @@ impl App {
         // casts the main race view's shadows; a night track has no sun to cast with, so none (the renderer
         // reads this only while E9 is on)
         // (a track whose sky configuration has no sun — the port's straight-down fallback, the overcast and
-        // rainy tracks: autobahn, canyon, foothills, forest — has none either)
+        // rainy tracks: autobahn, canyon, foothills, forest — has none either; canyon / forest have a data sun)
         // ENHANCEMENT E14: the corner shading is for the race's main view
         self.scene.ao = self.vehicle.is_some();
         // ENHANCEMENT E21: the eye adaptation is for the race's main view
         self.scene.eye = self.vehicle.is_some();
         // ENHANCEMENT E9 (ENH-TUNPOOL): the covered stretches, so the sun's shadow does not darken a tunnel's baked light by the camera's place
-        // (ENHANCEMENT E50: on a night track too while the moonlight is on)
-        let moon_on = self.track.is_night() && self.enh.is_on(nfs_renderer::E50);
+        // (ENHANCEMENT E50: on a night track too while the moonlight is on; SHADOW-OVERCAST: and the track has a moon)
+        let moon_on = self.has_moon() && self.enh.is_on(nfs_renderer::E50);
         self.scene.cover = if self.vehicle.is_some() && (!self.track.is_night() || moon_on) && self.enh.is_on(nfs_renderer::E9) { self.cover_boxes() } else { Default::default() };
         // ENHANCEMENT E9 (SHADOWFIX): under cover (the enclosure test the car's light uses, 0x473330 flags & 0xC000) the sun
         // does not reach: the camera or the player's car in a tunnel / gallery fades the shadows out

@@ -57,7 +57,7 @@ pub use drops::Drops;
 pub use haze::{HAZE_LAMPS, Haze, HazeLamp};
 pub use lbeam::{LBeam, LBeams, MAX_LBEAMS};
 pub use shafts::Shafts;
-pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E21, E23, E24, E25, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
+pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E21, E23, E24, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
 pub use front::{EnvFace, Renderer};
 pub use mipgen::MipAlpha;
 /// ENHANCEMENT E41: the E2 mip chain generator (levels 1.. of a base image), for the HD textures' own chains
@@ -736,7 +736,7 @@ pub struct Scene {
     pub sky_fog: Option<Fog>,
     /// The lens flare's frame read-backs for this frame ([`LensProbe`]), if any.
     pub lens_probe: Option<LensProbe>,
-    /// ENHANCEMENT E9 / E25 / E50 / E51: the lights this view's shadow cascades may be drawn for (none: the mirror, the environment
+    /// ENHANCEMENT E9 / E50 / E51: the lights this view's shadow cascades may be drawn for (none: the mirror, the environment
     /// faces, a front-end view without a car). The renderer draws one of them a frame ([`ShadowLights`]).
     pub shadows: ShadowLights,
     /// ENHANCEMENT E17: the sky the water items reflect and the sun that glints on them (the main race
@@ -1109,33 +1109,37 @@ pub struct SunShadow {
 
 /// ENHANCEMENT E9: the lights a view's sun-shadow cascades can be drawn for, one field per kind. The renderer draws ONE frame of
 /// cascades a frame, for the first kind in this order that is set and whose switch is on (`gpu/csm.rs`, `ShadowMode::pick`): the
-/// sky's sun (E9; or a front-end car's [`SunShadow::focus`]), the overcast light (E25), the data sun (E51 / SUN-FULL), the moon
+/// sky's sun (E9; or a front-end car's [`SunShadow::focus`]), the data sun (E51 / SUN-FULL), the moon
 /// (E50). Besides the cascades only [`Self::sun`] is read (the fog glow, the particles' and the water's sun).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ShadowLights {
     /// ENHANCEMENT E9: the sun the race's main view (or a front-end car) is lit with; `None` on a night or a sunless track. Read
     /// only with E9 on.
     pub sun: Option<SunShadow>,
-    /// ENHANCEMENT E25: on a track whose sky configuration has no sun disc (the sun is straight overhead, so the cars' light
-    /// travels straight down: autobahn, canyon, foothills, forest) the same shadow pass runs with that vertical light, softer and
-    /// weaker. Read only with E9 and E25 on.
-    pub overcast: Option<SunShadow>,
     /// ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL) / E9 (SUN-FULL): a sunless day track's sun from its data ([`DataSun`]). Read only
     /// with E9 on, and with E51 on unless it drives E9's full frame.
     pub data_sun: Option<DataSun>,
     /// ENHANCEMENT E50: on a night track the moon's light through the same cascades (a faint cold light, soft shadows, a weak cold
     /// term on the cars). Read only with E9 and E50 on.
     pub moon: Option<SunShadow>,
+    /// ENHANCEMENT E50 (SHADOW-OVERCAST): the highest E50 level this track's moon is drawn at (`None` = E50's own level): a level
+    /// above it draws at it (Monaco: «средне» draws as «слабо»).
+    pub moon_level_cap: Option<u8>,
+    /// ENHANCEMENT E9 / E51 (SHADOW-OVERCAST, "overcast during precipitation: no direct sun"): how much snow / rain the sky data
+    /// has round the camera, 0 (none) .. 1 (full). The sun's and the data sun's shadows are drawn at `1 - precipitation` of their
+    /// strength (the cover gate scaled by it: the track's darkening, the cars' direct-term shadow, the car's `SHAD` patch and the
+    /// `sh80` decals' give-way all follow); at 1 no frame is drawn. 0 (the `Default`) changes nothing.
+    pub precipitation: f32,
 }
 
 impl ShadowLights {
     /// No shadow light (the `Default`, usable in a `const`).
-    pub const NONE: Self = Self { sun: None, overcast: None, data_sun: None, moon: None };
+    pub const NONE: Self = Self { sun: None, data_sun: None, moon: None, moon_level_cap: None, precipitation: 0.0 };
 
     /// Whether a frame of these lights can draw the scenery's shadows (any light but the cars-only data sun): the race then adds
     /// the casters round the camera (`TrackWorld::shadow_casters`). By the lights set, not by the switches.
     pub fn casts_scenery(&self) -> bool {
-        self.sun.is_some() || self.overcast.is_some() || self.moon.is_some() || self.data_sun.is_some_and(|d| d.scenery_radius.is_some())
+        self.sun.is_some() || self.moon.is_some() || self.data_sun.is_some_and(|d| d.scenery_radius.is_some())
     }
 }
 
@@ -1172,7 +1176,7 @@ pub struct ShadowFocus {
 }
 
 impl SunShadow {
-    /// The race's sun / overcast light (the view-depth cascades).
+    /// The race's sun (the view-depth cascades).
     pub const fn race(direction: Vec3) -> Self {
         Self { direction, lit: true, focus: None }
     }

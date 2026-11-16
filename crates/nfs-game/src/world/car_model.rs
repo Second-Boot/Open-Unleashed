@@ -19,6 +19,14 @@ pub struct CarModel {
     /// back across the body's x, so under the mirrored view a car still reads the right way round
     /// (plates, the driver's side) — and slot 9 negates the steer channels 1 / 2 `.y` (0x438471).
     pub mirror: bool,
+    /// A front-end room model (`CarAssets::front_end_room`): its rotation channels are only the
+    /// ones its room writes (0x443F30). Slot 9 (0x438440) runs its race half — which, among
+    /// others, sets channel 5 from the steer and copies channels 1…4 into **18…21**
+    /// (0x438669…0x438726) — only while the front-end global `[0x65B928]` is clear (0x43845B
+    /// `jne 0x438751`), and the draw takes every channel from the model (0x43C98A…0x43C9B0,
+    /// 0x443F10(n)). So in a room channels 5 and 18…21 are read like any other, not from the
+    /// caller's steer / roll — the track room's `trackwall` turns `Panel1a` / `Panel2a` on 20 / 21.
+    pub front_end: bool,
     pub body: Vec<(MeshId, MaterialId, Mat4)>,
     /// Each material's `R3DLightLayer` parameters (`RE/notes/lighting.md` §6) — every shipped car
     /// material has them.
@@ -413,12 +421,75 @@ struct DriverAnim {
 
 /// One `{start, duration, from, to}` easer — the 16-byte record the original keeps per channel at
 /// `object+0x64 + 16n` (`car-model.md`), with the clock kept as elapsed rather than a start tick.
+///
+/// The original's clock here is **`GetTickCount`** (the thunk 0x53BFD0, called at 0x43894B, 0x438974,
+/// 0x4389ED, 0x438A0D, 0x438A50, 0x438A6E for the wing): `elapsed = GetTickCount() − start`, whole
+/// wall-clock milliseconds, no clamp, no pause — so `dt_ms` is the real time since the last frame in
+/// whole ms with the fraction carried (`open-unleashed` `fe_step_ms`), which sums to the same
+/// `elapsed` a millisecond counter read every frame gives.
 #[derive(Debug, Clone, Copy, Default)]
 struct ChannelEase {
     from: f32,
     to: f32,
     elapsed: u32,
     duration: u32,
+}
+
+impl ChannelEase {
+    /// Slot 9's wing easer (0x43892B…0x438AD1, `CarModel::update_animation`): advance, re-arm when
+    /// the speed gate holds and the travel is over, and answer animation 2's value.
+    fn wing_step(&mut self, dt_ms: u32, speed_mps: f32, len: f32) -> f32 {
+        let e = self;
+        if e.elapsed < e.duration {
+            e.elapsed = e.elapsed.saturating_add(dt_ms);
+        }
+        let want = if speed_mps > 22.222 {
+            Some(len)
+        } else if speed_mps < 13.889 {
+            Some(0.0)
+        } else {
+            None
+        };
+        if let Some(want) = want
+            && e.elapsed >= e.duration
+        {
+            // 0x438970…0x4389CC: the travel's current value becomes the new start
+            e.from = e.to;
+            e.to = want;
+            e.elapsed = 0;
+            e.duration = 2000;
+        }
+        if e.duration == 0 || e.elapsed >= e.duration {
+            e.to
+        } else {
+            e.from + (e.to - e.from) * (e.elapsed as f32 / e.duration as f32)
+        }
+    }
+
+    /// Slot 6's headlight easer (0x43950E…0x439620): a 1000 ms travel toward the lamp bit; the
+    /// ramp's value 0…1.
+    fn lamp_step(&mut self, dt_ms: u32, on: bool) -> f32 {
+        let e = self;
+        let want = if on { 1.0 } else { 0.0 };
+        if e.elapsed < e.duration {
+            e.elapsed = e.elapsed.saturating_add(dt_ms);
+        } else if e.to != want {
+            e.from = e.to;
+            e.to = want;
+            e.elapsed = 0;
+            e.duration = 1000;
+        }
+        let t = if e.duration == 0 { 1.0 } else { (e.elapsed as f32 / e.duration as f32).min(1.0) };
+        e.from + (e.to - e.from) * t
+    }
+}
+
+/// Channel 22 `.y`, the siren's glare (0x43872C…0x43874C): `TIMER_getTicks()` (0x53C2E0 → `[0x6B7C7C]`,
+/// the 128 Hz counter of the timer thread, `timing.md` §4 — it runs on through a pause) × `[0x5B273C]` =
+/// 1/128, a turn a second; `clock_ms` is the model's real-time clock in ms.
+fn siren_turn(clock_ms: u64) -> f32 {
+    let clock = (clock_ms * 128 / 1000) as u32;
+    (clock as f32 * 0.007_812_5).fract()
 }
 
 /// One float key out of a `.tpg` `[header]`, `default` when absent.
@@ -1585,6 +1656,7 @@ impl CarModel {
         Ok(Self {
             scale: 1.0,
             mirror: false,
+            front_end: car.front_end_room,
             body,
             body_channel,
             body_order,
@@ -2030,50 +2102,15 @@ impl CarModel {
     /// toggles it (`^= 3`, 0x49941D), so a day race's lamps rise when the player switches them on.
     pub fn update_animation(&mut self, r: &mut Renderer, dt_ms: u32, speed_mps: f32, headlights_on: bool, tiny: bool, reverse: bool) {
         // the wing's easer: advance, then (0x43892B) re-arm when the gate holds and it is done
-        let e = &mut self.spoiler;
-        if e.elapsed < e.duration {
-            e.elapsed = e.elapsed.saturating_add(dt_ms);
-        }
         let len = self.anim_length[2] as f32;
-        let want = if speed_mps > 22.222 {
-            Some(len)
-        } else if speed_mps < 13.889 {
-            Some(0.0)
-        } else {
-            None
-        };
-        if let Some(want) = want
-            && e.elapsed >= e.duration
-        {
-            // 0x438970…0x4389CC: the travel's current value becomes the new start
-            e.from = e.to;
-            e.to = want;
-            e.elapsed = 0;
-            e.duration = 2000;
-        }
-        let v = if e.duration == 0 || e.elapsed >= e.duration {
-            e.to
-        } else {
-            e.from + (e.to - e.from) * (e.elapsed as f32 / e.duration as f32)
-        };
+        let v = self.spoiler.wing_step(dt_ms, speed_mps, len);
         self.set_anim(r, 2, v);
         if tiny {
             let t = if reverse { 0.0 } else { (speed_mps * 0.067).min(1.0) };
             self.set_anim(r, 7, t);
         }
         if self.headlight_extent != 0.0 {
-            let e = &mut self.headlight;
-            let want = if headlights_on { 1.0 } else { 0.0 };
-            if e.elapsed < e.duration {
-                e.elapsed = e.elapsed.saturating_add(dt_ms);
-            } else if e.to != want {
-                e.from = e.to;
-                e.to = want;
-                e.elapsed = 0;
-                e.duration = 1000;
-            }
-            let t = if e.duration == 0 { 1.0 } else { (e.elapsed as f32 / e.duration as f32).min(1.0) };
-            let v = e.from + (e.to - e.from) * t;
+            let v = self.headlight.lamp_step(dt_ms, headlights_on);
             let x = self.headlight_extent;
             self.set_channel(17, v * x);
         }
@@ -2082,6 +2119,11 @@ impl CarModel {
     /// Slot 9's driver half (0x438B2C…0x439352, the race only): the right arm (animation 4), the
     /// left arm (5) and the body (6), `CarModel`'s eight keyframe players, and `R3DCar+0x564` /
     /// `+0x566`. `RE/notes/car-model.md` "Slot 9" has the whole of it.
+    ///
+    /// The players' clock is `rdtsc` (0x438B92, 0x438DC4, 0x438F13, 0x438FA9, 0x439172, 0x4391C6 under
+    /// `[0x5DEB24]`), the durations ms × the measured rate `[0x5CE908]` (nfs5.dll rescales the
+    /// constants, 0x438DE1 / 0x5B3684 / 0x5B3688, so the product stays ms): wall-clock time, running
+    /// through a pause. `dt_ms` is the frame's real time in whole ms (`car-model.md` "Slot 9's clock").
     pub fn update_driver(&mut self, r: &mut Renderer, dt_ms: u32, d: &DriverInputs) {
         // under detail 1 the driver is posed and nothing else runs (0x438B2C…0x438B5A)
         if d.detail < 1 {
@@ -2256,8 +2298,6 @@ impl CarModel {
     /// is `car+0xDB4`, `speed` `car+0xEC4`; `dt_ms` advances the clock 0x53C2E0 stands for.
     pub fn update_race_channels(&mut self, dt_ms: u32, steer: [f32; 2], spin: [f32; 4], roll: [f32; 4], rpm: f32, speed: f32) {
         self.clock_ms += dt_ms as u64;
-        // `TIMER_getTicks` (0x53C2E0 → `[0x6B7C7C]`) counts at 128 Hz (`timing.md`)
-        let clock = (self.clock_ms * 128 / 1000) as u32;
         let yz = &mut self.channel_yz;
         // 1, 2 `.y` = the fronts' steer; 1…4 `.x` = −the wheel's turn (`+0x88`); `.z` is the
         // wheel's `+0x70` (`Wheel::render_angle`, 0x4384F3…0x43852F), in turns
@@ -2282,7 +2322,7 @@ impl CarModel {
             self.channel_turns[18 + k] = 0.0;
         }
         // 22 `.y`: 0x53C2E0() · 1/128 — the cop's siren glare, a turn a second (0x43872C…0x43874C)
-        yz[22][0] = (clock as f32 * 0.007_812_5).fract();
+        yz[22][0] = siren_turn(self.clock_ms);
     }
 
     /// Channel 22 alone — the one slot 9 channel that reads no car state, only the clock — for the
@@ -2290,8 +2330,7 @@ impl CarModel {
     /// what the original's per-car copies do too.
     pub fn update_clock_channels(&mut self, dt_ms: u32) {
         self.clock_ms += dt_ms as u64;
-        let clock = (self.clock_ms * 128 / 1000) as u32;
-        self.channel_yz[22][0] = (clock as f32 * 0.007_812_5).fract();
+        self.channel_yz[22][0] = siren_turn(self.clock_ms);
     }
 
     /// The lids' two easers, 0x439A00 / 0x439AA0 (hood) and 0x439B30 / 0x439BD0 (engine lid):
@@ -2428,6 +2467,9 @@ impl CarModel {
                 let local = &(*local * lift(info.move_channel));
                 let m = match self.body_channel.get(i).copied().unwrap_or(0) {
                     0 => *local,
+                    // a front-end room: slot 9's race half does not run (0x43845B), so 5 and
+                    // 18…21 are the model's own channels like the rest (see `front_end`)
+                    n if self.front_end => *local * self.channel_matrix(n),
                     // 18…21 are channels 1…4 with `.x` cleared (0x438669…0x438726) — the wheel shadow
                     // and the parts that turn with the steer but do not spin. Taking them from the
                     // caller's `steer` instead of this model's own channels is what lets the traffic
@@ -2746,5 +2788,84 @@ impl CarModel {
             it.layer_light = self.material_light.get(&it.material).and_then(|l| block.layer_light(*l));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod anim_clock_tests {
+    use super::{ChannelEase, KeyPlayer, REVERSE_ON, siren_turn};
+
+    /// The frames' steps the app hands slot 9 (`open-unleashed` `fe_step_ms`): the real time of each
+    /// frame in whole ms, the fraction carried to the next — a millisecond clock read every frame.
+    fn steps(fps: f32, secs: f32) -> Vec<u32> {
+        let mut carry = 0.0f32;
+        (0..(fps * secs).round() as u32)
+            .map(|_| {
+                let want = 1000.0 / fps + carry;
+                let ms = want.floor().clamp(0.0, 250.0) as u32;
+                carry = (want - ms as f32).clamp(0.0, 1.0);
+                ms
+            })
+            .collect()
+    }
+
+    /// The state of the siren, the wing, the pop-up lamps and a driver gesture after `secs` of frames
+    /// at `fps`, each frame advanced by `step(fps)` ms.
+    fn state(fps: f32, secs: f32, fixed: Option<u32>) -> (u64, f32, f32, f32, (u32, u32, f32)) {
+        let (mut clock, mut wing, mut lamp, mut gesture) = (0u64, ChannelEase::default(), ChannelEase::default(), KeyPlayer::default());
+        let (mut w, mut l) = (0.0, 0.0);
+        // a gesture's table over a long travel (2400 ms), so it is still running at every sample
+        gesture.start(REVERSE_ON[2], 0, 2400);
+        let frames = steps(fps, secs);
+        for ms in frames.iter().map(|&ms| fixed.unwrap_or(ms)) {
+            clock += ms as u64;
+            // 30 m/s, over the 80 km/h gate: the wing rises toward animation 2's length 6 over 2000 ms
+            w = wing.wing_step(ms, 30.0, 6.0);
+            l = lamp.lamp_step(ms, true);
+            gesture.step(clock);
+        }
+        (clock, siren_turn(clock), w, l, (gesture.frame, gesture.next, gesture.frac))
+    }
+
+    /// The same real time gives the same animation state at any frame rate (the
+    /// original's clocks are `GetTickCount`, `rdtsc` and the 128 Hz timer, `car-model.md` "Slot 9's
+    /// clock"); the old fixed 16 ms a frame ran them at fps / 62.5.
+    #[test]
+    fn slot_9_clocks_are_frame_rate_independent() {
+        for secs in [1.0f32 / 3.0, 2.0 / 3.0, 1.0, 4.0 / 3.0] {
+            let (c0, s0, w0, l0, g0) = state(60.0, secs, None);
+            for fps in [30.0f32, 60.0, 75.0, 120.0, 144.0, 240.0] {
+                let (c, s, w, l, g) = state(fps, secs, None);
+                assert!(c.abs_diff((secs * 1000.0).round() as u64) <= 2, "{fps} fps {secs} s: clock {c}");
+                assert!(c.abs_diff(c0) <= 2, "{fps} fps {secs} s: clock {c} vs {c0}");
+                let ds = (s - s0).abs();
+                assert!(ds.min(1.0 - ds) <= 2.0 / 128.0 + 1e-6, "{fps} fps {secs} s: siren {s} vs {s0}");
+                // the easers start on the frame that re-arms them (`start = GetTickCount()` that frame,
+                // 0x438A50…0x438A55), so their travel trails the clock by one frame: within that frame and 2 ms
+                let lag = 1000.0 / fps.min(60.0) + 2.0;
+                assert!((w - w0).abs() <= 6.0 * lag / 2000.0 + 1e-4, "{fps} fps {secs} s: wing {w} vs {w0}");
+                assert!((l - l0).abs() <= lag / 1000.0 + 1e-4, "{fps} fps {secs} s: lamps {l} vs {l0}");
+                // the gesture: the same key pair, the fraction within 2 ms of travel (2 keys over 2400 ms)
+                assert!(g.0 == g0.0 && g.1 == g0.1 && (g.2 - g0.2).abs() <= 2.0 * 2.0 / 2400.0 + 1e-4, "{fps} fps {secs} s: gesture {g:?} vs {g0:?}");
+            }
+        }
+        // the defect it replaces: 16 ms a frame at 120 fps ran 1.92 s of animation in 1 s
+        assert_eq!(state(120.0, 1.0, Some(16)).0, 1920);
+    }
+
+    /// The numeric trace of the report (`cargo test -p nfs-game slot_9_trace -- --nocapture`): the
+    /// siren's phase, the wing and the lamps over the same real time, the old fixed step against the
+    /// real one, at 60 and 120 fps.
+    #[test]
+    fn slot_9_trace() {
+        eprintln!("  t s  | fps | step  | clock ms | siren turn | wing (0..6) | lamps (0..1)");
+        for secs in [0.25f32, 0.5, 1.0] {
+            for fps in [60.0f32, 120.0] {
+                for (name, fixed) in [("16 ms", Some(16)), ("real", None)] {
+                    let (c, s, w, l, _) = state(fps, secs, fixed);
+                    eprintln!("  {secs:4.2} | {fps:3} | {name:5} | {c:8} | {s:10.4} | {w:11.3} | {l:.3}");
+                }
+            }
+        }
     }
 }

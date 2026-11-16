@@ -42,7 +42,7 @@ impl App {
                 self.rebuild_track_lists();
                 if self.career.as_mut().is_some_and(|c| c.switch_profile(&p)) {
                     self.fe.user_sel = None;
-                    self.apply_saved_profile();
+                    self.apply_saved_profile(true);
                     // 0x4DE040 after the load (0x510701): a series the file carried is cancelled here —
                     // only the start-up and after-race loads (0x4D3B52) keep it running
                     if let Some(k) = self.knockout.as_mut() {
@@ -97,7 +97,7 @@ impl App {
                     // the start-up options — onto the live state, as every load does, then
                     // 0x4DE040 (the series cancelled). *(Until 2026-09-26 the options of the
                     // profile that was up stayed.)*
-                    self.apply_saved_profile();
+                    self.apply_saved_profile(true);
                     if let Some(k) = self.knockout.as_mut() {
                         k.state.active = false;
                     }

@@ -658,18 +658,19 @@ impl LayoutScreen {
             // 0x4D9AF0, which reads the same two fields for the quad's extent (0x4D9B04, 0x4D9B0E).
             // The only `SHAPE` parts that write a `size.value` are `CarSettingSlider.ctr`'s three
             // knobs, `6,11` — which is the art (`weeicons.fsh` 8, 34, 35 are 6×11).
-            // **`data.picoffy`** — `NFS5.BOTTOMBARBUTTON`'s own draw, 0x4C9B30, adds it to the
-            // `picture` part's y and nothing else: `[this+0x1D4]` (the bind at 0x4C9639) plus the
-            // part's own `pos.y` from `0x4E7060([this+0x178])` plus the widget's y, all three at
-            // 0x4C9BDE…0x4C9BED, with the x left alone (0x4C9BFD). Three of `bottombar.lay`'s four
-            // buttons — back, options and exit, the three with an icon — carry **6**; the other
-            // nineteen shipped bar buttons carry 0. §4.80.
-            let py = py
-                + if name == "picture" && e.class == "NFS5.BOTTOMBARBUTTON" {
-                    self.attr_num(e, "picoffy").unwrap_or(0.0)
-                } else {
-                    0.0
-                };
+            // **`data.picoffy` is counted once.** `NFS5.BOTTOMBARBUTTON`'s draw 0x4C9B30 places
+            // the `picture` part at the widget's y + the part's `pos.y` (`0x4E7060([this+0x178])`,
+            // `[part+0x5C]`) + `[this+0x1D4]` (`data.picoffy`, the INUSE activate 0x4C9639) —
+            // 0x4C9BDE…0x4C9BED — and `BottomBarButton.ctr` already writes that part's
+            // `pos.value=0,data.picoffy`, which the walk above has just evaluated. The port used
+            // to add the field on top (§4.80), so the three icons of `bottombar.lay` (back,
+            // options, exit; `picoffy=6`) sat at +12, six pixels below their captions and cut by
+            // the screen's bottom edge. The original's stills put them at **+6** — the icon art
+            // centred on the caption (`RE/reference/2026-09-28/cmp_p11_factorydriver.jpg`: the
+            // back arrow's red rows 2…17 of 20 at screen rows 461…474, the exit cross's 4…16 at
+            // 462…474, both a 458 top = 452 + 6). APPROXIMATION: the outcome is the original's,
+            // but which of the draw's two terms reads 0 there is not traced — read statically,
+            // both come out 6 (`controls.md` §4.80, "counted once"); the port keeps the template's.
             // `flip` is the part's own attribute — `Graphic Tab Button.ctr` writes
             // `flip.value=data.flipit`, so the widget's `flipit` mirrors the tab's art
             let flip = self

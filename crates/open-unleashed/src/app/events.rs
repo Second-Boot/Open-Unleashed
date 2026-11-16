@@ -262,6 +262,38 @@ impl App {
     }
 }
 
+impl App {
+    /// **The system pointer** (`controls.md` §4.152.1). The original never shows the Windows pointer over its
+    /// window and draws its own `Pointer.fsh` shapes instead (§4.152): the window's creation 0x53BB00 calls
+    /// `SetCursor(NULL)` (0x53BC58) and, full screen (`[win+0x461]`), `ShowCursor(FALSE)` (0x53BC6A); every
+    /// activation (`WM_ACTIVATEAPP`, 0x1C, handler 0x4B0EE0 registered at 0x4B0ED1) and every display-mode set
+    /// (0x468030) calls `ShowCursor(FALSE)` until the count is negative (0x4B0F0B…0x4B0F1F, 0x4680A5…0x4680BC);
+    /// a deactivation (`WM_ACTIVATE`, 6, 0x53B050) calls `ShowCursor(TRUE)` (0x53B113), and so does the abort
+    /// box (0x565426). So: hidden while the game is the active application, in the front end, the race and the
+    /// movies alike; shown when it is not.
+    ///
+    /// **PLATFORM GLUE**: winit's `set_cursor_visible(false)` hides the pointer only while it is over the
+    /// window (macOS: an invisible cursor rectangle over the view; Windows: the class cursor in the client area
+    /// while focused; X11 / Wayland: an invisible cursor on the window's surface), so a windowed game does not
+    /// take the pointer from the rest of the desktop. Focus lost shows it again (0x53B113), focus regained
+    /// hides it (0x4B0EE0); the process's end gives it back with the window. Port-only exceptions: the
+    /// developer text menu (`--debug-menu`), which draws no `Pointer.fsh`, keeps the pointer while it is on show,
+    /// and a scripted run (`NFS_NO_FOCUS`) never touches it.
+    pub(crate) fn sync_system_pointer(&mut self) {
+        if NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let text_menu = self.debug_menu && self.intro.is_none() && self.race.is_none() && self.fe.layout_preview.is_none();
+        let hidden = self.window_focused && !text_menu;
+        if self.pointer_hidden == Some(hidden) {
+            return;
+        }
+        let Some(w) = self.window.as_ref().or(self.intro.as_ref().map(|r| &r.window)) else { return };
+        w.set_cursor_visible(!hidden);
+        self.pointer_hidden = Some(hidden);
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let event_loop = &LoopCtl::real(el);
@@ -281,6 +313,12 @@ impl ApplicationHandler for App {
     /// The process ends inside a leave's wait: finish it here (the original's wait blocks, so nothing ends
     /// before it).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // PLATFORM GLUE: Cmd+Q, the Dock's Quit, a log-out — the host ends the program without a
+        // window event; on the front end that is the quit, which saves (0x4D52EA, `fe_quit_save`).
+        // A scripted run's own exits are tooling, not a quit: they save nothing.
+        if !NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) && self.autotest.is_none() {
+            self.host_quit_save();
+        }
         // PORT-DEVIATION D46: a photo-mode still still being written
         self.photo.finish_writers();
         while !self.net.leaving.is_empty() {
@@ -310,6 +348,10 @@ impl ApplicationHandler for App {
             }
             self.occluded = o;
         }
+        if let WindowEvent::Focused(f) = event {
+            self.window_focused = f;
+        }
+        self.sync_system_pointer();
         if self.intro.is_some() {
             self.intro_event(event_loop, event);
             return;
@@ -335,7 +377,12 @@ impl ApplicationHandler for App {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // PLATFORM GLUE: the window's close button is the host's quit; on the front end it
+                // saves as the original's only quit, `QUIT` → 0x4D56E0(0) → 0x4D52EA, does
+                self.host_quit_save();
+                event_loop.exit();
+            }
             // Focus lost = the original's WM_ACTIVATE deactivation (0x53B050, registered for message 6 at 0x53AD66):
             // LOWORD(wParam) == 0 or HIWORD != 0 -> ShowCursor(1) (0x53B113) and memset(0x5DE028, 0, 0x80)
             // (0x53B119..0x53B125) = the key-down table forgets every key. Focus regained: the original

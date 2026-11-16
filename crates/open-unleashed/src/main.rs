@@ -823,7 +823,7 @@ fn run() -> Result<()> {
     // (`fe_callbacks.rs`, both call `apply_saved_profile`). `--fe=<screen>`, `--layout`,
     // `--career`, `--mission` and every race start never meet the chooser and keep the profile.
     if !(app.fe.menu.is_some() && app.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(app::FE_ENTRY))) {
-        app.apply_saved_profile();
+        app.apply_saved_profile(false);
     }
     // a network race's replay file: its humans, their cars and the traffic (`replay.md` §18.15)
     app.apply_replay_net();

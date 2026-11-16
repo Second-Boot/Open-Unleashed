@@ -23,7 +23,7 @@
 //! camera turns or moves at 64 Hz or between ticks.
 //!
 //! SHADOW-REFACTOR: one frame of cascades has ONE [`ShadowMode`] (the sky's sun or a sunless track's full data sun, E51's
-//! cars-only data sun, E25's overcast light, E50's moon, a front-end car's focus) picked from [`crate::ShadowLights`] by
+//! cars-only data sun, E50's moon, a front-end car's focus) picked from [`crate::ShadowLights`] by
 //! [`ShadowMode::pick`], and ONE [`CarLayers`] (E51's cars-only layers); the shader reads the mode as a class constant
 //! (`misc.y`, `classes::SHADOW_*`) instead of decoding it from the kernel spacing and the strengths.
 
@@ -41,10 +41,6 @@ pub(super) const GROUND_STRENGTH: f32 = 0.6;
 /// The car's floor of its direct term in the sun's shadow: never fully black, a quarter of the direct term (the sky's own
 /// scatter). (Was the shader's default for a `params.w` of 0.)
 pub(super) const SUN_CAR_FLOOR: f32 = 0.25;
-/// ENHANCEMENT E25: the overcast variant's track strength, kernel spacing (texels, of a 5 x 5 grid) and car floor.
-pub(super) const OVERCAST_STRENGTH: f32 = 0.6;
-pub(super) const OVERCAST_SOFT: f32 = 4.0;
-pub(super) const OVERCAST_FLOOR: f32 = 0.45;
 /// ENHANCEMENT E50: the moonlight per level (index 1 weak, 2 normal): the share of the baked night colour a moon shadow takes at
 /// most (the track), and the cold term added to the cars' light (times `MOON_COLOUR`, `n.l` and the map's visibility).
 /// APPROXIMATION (enhancement content, by eye on monaco1 / industrial stills): no original counterpart.
@@ -116,21 +112,16 @@ pub(super) enum ShadowMode {
     /// ENHANCEMENT E51 (CORSICA-SUN): a sunless track's data sun with the cars alone: the near cascades only, the scenery casts
     /// nothing (its shade is baked / in the decals)
     CarsOnly,
-    /// ENHANCEMENT E25: the overcast light (weaker, softer)
-    Overcast,
-    /// ENHANCEMENT E50: the moon at its level (1 weak, 2 normal: faint like the overcast light, its own soft edge)
+    /// ENHANCEMENT E50: the moon at its level (1 weak, 2 normal: faint, its own soft edge)
     Moon { level: u8 },
 }
 
 impl ShadowMode {
     /// The light and the mode of a frame: the first light of `lights` that is set and whose switch is on, in
-    /// [`crate::ShadowLights`]' order (the sun, E25's overcast light, the data sun, E50's moon).
+    /// [`crate::ShadowLights`]' order (the sun, the data sun, E50's moon).
     fn pick(lights: &crate::ShadowLights, e: &crate::Enhancements) -> Option<(crate::SunShadow, Self)> {
         if let Some(s) = lights.sun {
             return Some((s, s.focus.map_or(Self::Sun { caster_radius: MAX_CASTER_RADIUS }, Self::Focus)));
-        }
-        if let Some(s) = lights.overcast.filter(|_| e.is_on(crate::E25)) {
-            return Some((s, Self::Overcast));
         }
         // ENHANCEMENT E51 (CORSICA-SUN): the cars-only frame with E51 on; E9 / E51 (SUN-FULL): the full frame with E9 alone, the
         // scenery casters held to the track's own radius
@@ -141,7 +132,8 @@ impl ShadowMode {
                 None => {}
             }
         }
-        let level = e.level(crate::E50);
+        // (SHADOW-OVERCAST: at most the track's cap, `ShadowLights::moon_level_cap`)
+        let level = e.level(crate::E50).min(lights.moon_level_cap.unwrap_or(MOON_MAX_LEVEL));
         lights.moon.filter(|_| level > 0).map(|s| (s, Self::Moon { level: level.min(MOON_MAX_LEVEL) }))
     }
 
@@ -149,19 +141,16 @@ impl ShadowMode {
     fn shader_class(&self) -> f32 {
         match self {
             Self::Sun { .. } | Self::CarsOnly => classes::SHADOW_SUN,
-            Self::Overcast => classes::SHADOW_OVERCAST,
             Self::Moon { .. } => classes::SHADOW_MOON,
             Self::Focus(_) => classes::SHADOW_FOCUS,
         }
     }
 
-    /// `params`: x the track's strength, y where the last cascade (ending at `last`) starts to fade out, z the overcast kernel's
-    /// spacing (texels; 0 = the race's 3 x 3), w the cars' floor of the direct term.
+    /// `params`: x the track's strength, y where the last cascade (ending at `last`) starts to fade out, z 0 (once E25's kernel
+    /// spacing; the race's kernel is 3 x 3), w the cars' floor of the direct term.
     fn params(&self, last: f32) -> [f32; 4] {
         match *self {
             Self::Sun { .. } | Self::CarsOnly => [GROUND_STRENGTH, last * FADE_START, 0.0, SUN_CAR_FLOOR],
-            // ENHANCEMENT E25: a lower strength, a wider kernel, a higher floor
-            Self::Overcast => [OVERCAST_STRENGTH, last * FADE_START, OVERCAST_SOFT, OVERCAST_FLOOR],
             Self::Moon { level } => [MOON_STRENGTH[usize::from(level)], last * FADE_START, 0.0, MOON_FLOOR],
             // ENHANCEMENT ENH-FE3D: the front-end car's own strength
             Self::Focus(f) => [f.strength, last * FOCUS_FADE_START, 0.0, SUN_CAR_FLOOR],
@@ -176,15 +165,21 @@ impl ShadowMode {
         }
     }
 
+    /// ENHANCEMENT E9 / E51 (SHADOW-OVERCAST): whether the sky data's precipitation weakens this mode's shadows
+    /// ([`crate::ShadowLights::precipitation`]): the race's sun and data sun, not the front end's focus or the moon
+    fn fades_with_precipitation(&self) -> bool {
+        matches!(self, Self::Sun { .. } | Self::CarsOnly)
+    }
+
     /// ENHANCEMENT ENH-DBLSH: whether a track's `sh80` decals give way to this frame's shadows: the sun's (not the front end's focus,
-    /// not E25's overcast light or E50's moon, whose shadows are too faint to stand in for them, not the cars-only frame: no
+    /// not E50's moon, whose shadows are too faint to stand in for them, not the cars-only frame: no
     /// scenery shadow stands in for the decals)
     fn decal_fades(&self) -> bool {
         matches!(self, Self::Sun { .. })
     }
 
     /// ENHANCEMENT E9: whether the car's `SHAD` patch gives way to the sun's car shadow in the open (the race's sun and the cars-only
-    /// frame; not the front end's focus, E25's overcast light or the moon, whose car shadow is too faint to stand in for it)
+    /// frame; not the front end's focus or the moon, whose car shadow is too faint to stand in for it)
     fn takes_car_patch(&self) -> bool {
         matches!(self, Self::Sun { .. } | Self::CarsOnly)
     }
@@ -408,11 +403,6 @@ impl CsmFrame {
         matches!(self.mode, ShadowMode::Focus(_))
     }
 
-    /// ENHANCEMENT E25: whether this is the overcast light's frame (the mesh shader's OVERCAST part runs)
-    pub(super) fn is_overcast(&self) -> bool {
-        self.mode == ShadowMode::Overcast
-    }
-
     /// ENHANCEMENT E51: whether this frame has the cars-only layers (the mesh shader's CARSH part runs)
     pub(super) fn has_car_layers(&self) -> bool {
         self.car_layers != CarLayers::None
@@ -534,6 +524,13 @@ impl Core {
         if self.csm.gate <= GATE_SHUT {
             return None;
         }
+        // ENHANCEMENT E9 / E51 (SHADOW-OVERCAST, "overcast during precipitation: no direct sun"): the sun's shadows are drawn at
+        // `1 - precipitation` of their share, through the gate every part of them reads (`csm_share`, the car's `SHAD` patch); fully
+        // overcast = no pass. The eased gate itself is not touched (the precipitation is smooth along the road already).
+        let gate = if mode.fades_with_precipitation() { self.csm.gate * (1.0 - scene.shadows.precipitation.clamp(0.0, 1.0)) } else { self.csm.gate };
+        if gate <= GATE_SHUT {
+            return None;
+        }
         // ENHANCEMENT E9 (SHADOWFIX): a low sun (coastal's is 3 degrees up) throws shadows hundreds of metres long: hills and
         // the tunnel's mass would blacken whole stretches with hard edges where the map ends. The shadow's own light is
         // lifted to at least `MIN_ELEVATION` over the horizon, keeping its azimuth; the cars' shading keeps the original's.
@@ -570,7 +567,7 @@ impl Core {
             self.csm.map = Some(DepthArray::new(&self.device, "sun shadow map (ENHANCEMENT E9)", size, layers));
             self.rebuild_globals_bg();
         }
-        Some(CsmFrame { cascades, dir: shadow_dir, orig, gate: self.csm.gate, mode, car_layers, car_cascades })
+        Some(CsmFrame { cascades, dir: shadow_dir, orig, gate, mode, car_layers, car_cascades })
     }
 
     /// An item the shadow passes draw: a car's opaque part (its own light's direction is the sun's),
@@ -791,26 +788,23 @@ mod tests {
         assert!(!flat);
     }
 
-    /// SHADOW-REFACTOR: the mode a set of lights and switches gives, in the lights' order (the sun, E25, the data sun, E50), as the
+    /// SHADOW-REFACTOR: the mode a set of lights and switches gives, in the lights' order (the sun, the data sun, E50), as the
     /// flags of before decided it.
     #[test]
     fn the_shadow_mode_follows_the_lights_and_switches() {
-        use crate::{DataSun, Enhancements, ShadowLights, SunShadow, E25, E50, E51};
+        use crate::{DataSun, Enhancements, ShadowLights, SunShadow, E50, E51};
         let s = SunShadow::race(Vec3::new(0.3, -0.8, 0.2));
         let mut e = Enhancements::ORIGINAL;
         let pick = |l: &ShadowLights, e: &Enhancements| ShadowMode::pick(l, e).map(|(_, m)| m);
-        let sun = ShadowLights { sun: Some(s), overcast: Some(s), ..ShadowLights::NONE };
+        let sun = ShadowLights { sun: Some(s), data_sun: Some(DataSun { light: s, scenery_radius: None }), ..ShadowLights::NONE };
         assert_eq!(pick(&sun, &e), Some(ShadowMode::Sun { caster_radius: MAX_CASTER_RADIUS }));
         let cars = DataSun { light: s, scenery_radius: None };
-        let sunless = ShadowLights { overcast: Some(s), data_sun: Some(cars), ..ShadowLights::NONE };
-        // E25 and E51 off: nothing; E51: the cars-only frame; E25 takes precedence
+        let sunless = ShadowLights { data_sun: Some(cars), ..ShadowLights::NONE };
+        // E51 off: nothing; E51: the cars-only frame
         assert_eq!(pick(&sunless, &e), None);
         e.set_level(E51, 1);
         assert_eq!(pick(&sunless, &e), Some(ShadowMode::CarsOnly));
-        e.set_level(E25, 1);
-        assert_eq!(pick(&sunless, &e), Some(ShadowMode::Overcast));
-        // SUN-FULL needs neither E25 off nor E51 on; its radius is held to E9's own limit
-        e.set_level(E25, 0);
+        // SUN-FULL does not need E51 on; its radius is held to E9's own limit
         e.set_level(E51, 0);
         let full = ShadowLights { data_sun: Some(DataSun { light: s, scenery_radius: Some(90.0) }), ..ShadowLights::NONE };
         assert_eq!(pick(&full, &e), Some(ShadowMode::Sun { caster_radius: MAX_CASTER_RADIUS }));
@@ -821,9 +815,20 @@ mod tests {
         assert_eq!(pick(&night, &e), None);
         e.set_level(E50, 2);
         assert_eq!(pick(&night, &e), Some(ShadowMode::Moon { level: 2 }));
+        // SHADOW-OVERCAST: a track's cap holds the level down, never up, and a cap of 0 is no moon
+        let capped = ShadowLights { moon_level_cap: Some(1), ..night };
+        assert_eq!(pick(&capped, &e), Some(ShadowMode::Moon { level: 1 }));
+        e.set_level(E50, 1);
+        assert_eq!(pick(&capped, &e), Some(ShadowMode::Moon { level: 1 }));
+        e.set_level(E50, 0);
+        assert_eq!(pick(&capped, &e), None);
+        e.set_level(E50, 2);
+        assert_eq!(pick(&ShadowLights { moon_level_cap: Some(0), ..night }, &e), None);
         // which modes fade the decals and take the car's patch
-        let modes = [ShadowMode::Sun { caster_radius: 1.0 }, ShadowMode::CarsOnly, ShadowMode::Overcast, ShadowMode::Moon { level: 1 }];
-        assert_eq!(modes.map(|m| m.decal_fades()), [true, false, false, false]);
-        assert_eq!(modes.map(|m| m.takes_car_patch()), [true, true, false, false]);
+        let modes = [ShadowMode::Sun { caster_radius: 1.0 }, ShadowMode::CarsOnly, ShadowMode::Moon { level: 1 }];
+        assert_eq!(modes.map(|m| m.decal_fades()), [true, false, false]);
+        assert_eq!(modes.map(|m| m.takes_car_patch()), [true, true, false]);
+        // SHADOW-OVERCAST: the precipitation weakens the sun's and the data sun's shadows, not the moon's
+        assert_eq!(modes.map(|m| m.fades_with_precipitation()), [true, true, false]);
     }
 }

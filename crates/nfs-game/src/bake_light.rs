@@ -78,11 +78,6 @@ impl BakeFit {
         (self.r2 >= MIN_R2 && self.r2 - self.r2_overhead >= MIN_GAIN).then_some(self.direction)
     }
 
-    /// The light taken: the accepted one, or with `weak_fit` (a track whose row of [`crate::data_sun::SUNLESS_DAY_TRACKS`] says so:
-    /// a chosen setting, APPROXIMATION) the best fit even below the thresholds.
-    pub fn taken(&self, weak_fit: bool) -> Option<Vec3> {
-        self.accepted().or_else(|| weak_fit.then_some(self.direction))
-    }
 }
 
 /// The light's travel direction for an azimuth / elevation in degrees.

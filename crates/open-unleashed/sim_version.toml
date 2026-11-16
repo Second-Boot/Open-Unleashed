@@ -11,4 +11,4 @@
 #     allowed only when the three race goldens AND net_loop_det.sh come out identical. When in doubt, bump.
 # Commit this file in the same commit as the change. Keep a --resim binary on the server for every released number.
 version = 1
-source_hash = "79d9be849e81331b"
+source_hash = "da85d5ac6c96533f"

@@ -487,7 +487,10 @@ impl App {
                 self.fe.cars[k].4.update_damage(r, &d, false, detail);
             }
         }
-        let dt = (self.frame_dt * 1000.0).round().clamp(0.0, 250.0) as u32;
+        // the lids' easers are slot 9's `GetTickCount` ones (0x439A00…0x439BD0): the frame's real ms with
+        // the fraction carried (`anim_ms`, `draw_frame`); it was the frame time rounded, which drifted at
+        // high frame rates (8.33 ms → 8 at 120 Hz)
+        let dt = self.anim_ms;
         for w in widgets {
             let doors = self.fe.layout_preview.as_ref().map(|l| l.car_doors(w)).unwrap_or((0.0, 0.0));
             let roof = self.fe.layout_preview.as_ref().map(|l| l.car_roof_state(w)).unwrap_or(0);

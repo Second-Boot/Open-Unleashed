@@ -758,7 +758,8 @@ impl App {
             tracing::warn!(error = %e, "records save failed");
         }
         self.rebuild_scene();
-        self.update_damage_decals();
+        // TEST GLUE: a scripted run draws no frame; one 16 ms frame's animation step, as before
+        self.update_damage_decals(16);
         // 0x501340 + `LoadInfo` (0x4D3B52), same as the interactive `end_finished_race` path
         self.reload_career_at_fe_entry();
         self.settle_mission();
@@ -866,7 +867,7 @@ impl App {
         // then the lamps' clock moved on by `ms` (after the rebuild above, so a ramp started by the keys runs)
         if let Some(ms) = nfs_game::config::cfg().nfs_shot_settle.as_str().and_then(|v| v.trim().parse::<u32>().ok()) {
             for _ in 0..ms.div_ceil(16) {
-                self.update_damage_decals();
+                self.update_damage_decals(16);
             }
             self.shot_settle_ms = ms as f64;
             self.rebuild_scene();

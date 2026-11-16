@@ -427,6 +427,48 @@ impl App {
         }
     }
 
+    /// **The quit saves the profile too** (`savegame.md` "ISS4-CAMSAVE"). The save of 0x4D52EA is
+    /// not the launch's own: it sits in `FEApplication::run` 0x4D3420's tail, after the front-end
+    /// loop 0x4D2DE0 (called at 0x4D5290) returns, and that loop ends for **every** hand-off
+    /// `0x4D56E0(flag)` makes (`[fe+0xD4]` slot 4, `[fe+0xF4] = flag ? 0 : 1`). Every entry
+    /// dispatch of 0x4D3420 jumps to 0x4D5207, and from there to 0x4D52EA the only branch is the
+    /// knockout start (0x4D52CB `Game.GameType == 2`, 0x4DDF00 not running → 0x4DDF30); nothing
+    /// tests `[fe+0xF4]` until the return (0x4D5594 … 0x4D55A0 `mov eax, [eax]`). Main (0x4B6C5B)
+    /// quits on 1 (0x4B6C72 `cmp ebp, 1; je 0x4B6F68`). So `QUIT`'s yes (0x50CC53 → 0x4D56E0(0)),
+    /// `REGISTERUSER` (0x51099F) and the update question's yes (0x4A596C) all write the profile —
+    /// every option screen's state with it — before the program ends. *(The notes had 0x4D52EA as
+    /// "the race launch" only, and the port's quit wrote nothing: an option changed and the game
+    /// quit without a race was lost.)* The empty name (the chooser not answered) writes nothing
+    /// (`CareerUi::name_loaded`, 0x4DEDB9). Only from the front end, once.
+    pub(crate) fn fe_quit_save(&mut self) {
+        if self.fe.quit_saved || self.vehicle.is_some() || self.fe.menu.is_none() {
+            return;
+        }
+        self.fe.quit_saved = true;
+        // 0x4D52CB…0x4D52D9: `Game.GameType` 2 with no series running starts one, quit or not
+        if self.fe.game_type == game_type::KNOCKOUT && !self.knockout.as_ref().is_some_and(|k| k.state.active) {
+            // the draw 0x4E3160 reads `Game.Difficutly`, as at the launch
+            if let Some(m) = self.fe.menu.as_ref() {
+                self.race_skill = m.difficulty.min(2);
+            }
+            self.knockout_start();
+        }
+        tracing::info!("front end: the quit saves the profile (0x4D52EA)");
+        self.launch_save();
+    }
+
+    /// **PLATFORM GLUE** — the host's quits the original did not have (its only way out was the
+    /// menu's `QUIT`, and the start-up movies came before the front end): the window's close
+    /// button, Cmd+Q, the system's termination. While a front-end screen is up they are that
+    /// quit and save as it does ([`Self::fe_quit_save`]); in a race, a replay or the start-up
+    /// movies nothing is written — the launch already saved what the front end had.
+    pub(crate) fn host_quit_save(&mut self) {
+        if self.intro.is_some() || self.fe.layout_preview.is_none() {
+            return;
+        }
+        self.fe_quit_save();
+    }
+
     /// **0x4EB470's `SKILL` (0x12) and `DAMAGE` (0x20)**, and the player car's camera list — what
     /// every launch writes afresh. The launch fills a new option buffer for every race (0x4ED5D0 →
     /// 0x4EB470 → 0x4ECDF0 → 0x4ECF00), so nothing of the last race's options survives in the

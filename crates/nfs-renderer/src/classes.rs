@@ -52,8 +52,7 @@ pub(crate) const PART_LIT_WORLD: f32 = crate::PARTICLE_LIT_WORLD as f32;
 /// `Csm::misc.y` — ENHANCEMENT E9 (SHADOW-REFACTOR): the frame's shadow mode (`gpu/csm.rs` `ShadowMode`): the race's sun (the
 /// sky's, a sunless track's data sun, E51's cars-only frame). 0, so a zeroed uniform reads as no special mode.
 pub(crate) const SHADOW_SUN: f32 = 0.0;
-/// ENHANCEMENT E25: the overcast light (the wide 5 x 5 kernel, the eased "baked dark" gate)
-pub(crate) const SHADOW_OVERCAST: f32 = 1.0;
+// 1.0 was E25's overcast light (removed 2026-11-16, SHADOW-OVERCAST); the other values keep theirs
 /// ENHANCEMENT E50: the moon (its soft disc, the turned-round gate, the cars' cold term)
 pub(crate) const SHADOW_MOON: f32 = 2.0;
 /// ENHANCEMENT ENH-FE3D: a front-end car's focus shadow (the jittered disc, no "baked dark" gate, the `FESH` blob's own fade)
@@ -108,7 +107,6 @@ pub(crate) const WGSL: &[(&str, f32)] = &[
     ("PART_LIT", PART_LIT),
     ("PART_LIT_WORLD", PART_LIT_WORLD),
     ("SHADOW_SUN", SHADOW_SUN),
-    ("SHADOW_OVERCAST", SHADOW_OVERCAST),
     ("SHADOW_MOON", SHADOW_MOON),
     ("SHADOW_FOCUS", SHADOW_FOCUS),
     ("CASCADE_BLEND", CASCADE_BLEND),
@@ -299,7 +297,7 @@ pub(crate) mod feat {
     }
 
     parts! {
-        /// ENHANCEMENT E9 (with E25, ENH-FE3D / ENH-GARAGE, ENH-DBLSH, SHADOW-REAL): the sun's shadow cascades (`csm.dir.w` 0 without)
+        /// ENHANCEMENT E9 (with ENH-FE3D / ENH-GARAGE, ENH-DBLSH, SHADOW-REAL): the sun's shadow cascades (`csm.dir.w` 0 without)
         CSM = 0,
         /// ENHANCEMENT E16: the car ambient probe (`globals.refl.z` 0 without)
         PROBE = 1,
@@ -334,8 +332,6 @@ pub(crate) mod feat {
         /// ENHANCEMENT ENH-FE3D / ENH-GARAGE (SHADOW-REFACTOR): the front-end car's focus shadow (`csm.misc.y` `SHADOW_FOCUS`; a race
         /// frame never runs it)
         FOCUS = 16,
-        /// ENHANCEMENT E25 (SHADOW-REFACTOR): the overcast light's wide kernel and eased gate (`csm.misc.y` `SHADOW_OVERCAST`)
-        OVERCAST = 17,
     }
     /// The parts only an item with a reflection class runs (`object.refl.x`: `gpu/fill.rs` `ItemVariant::of`)
     pub const SURFACE: u32 = COAT | WATER | RAIN | NEAR;
@@ -346,7 +342,7 @@ pub(crate) mod feat {
     pub const PER_ITEM: u32 = SURFACE | EFFECT;
     /// What the rear-view mirror's pass never runs (`Core::no_reflections`: no cascades, contact shadows, lamps or spots, and
     /// `globals.ambient.z` 1 skips the coat)
-    pub const NOT_IN_MIRROR: u32 = CSM | CONTACT | SPOT | LAMPS | LSHAD | COAT | MOON | CARSH | NEAR | FOCUS | OVERCAST;
+    pub const NOT_IN_MIRROR: u32 = CSM | CONTACT | SPOT | LAMPS | LSHAD | COAT | MOON | CARSH | NEAR | FOCUS;
 }
 
 /// PERF (PERF-B): the parts of the mesh shader a set of switches can run (see [`feat`]); the original's set has none.
@@ -370,7 +366,6 @@ pub(crate) fn mesh_features(e: &crate::Enhancements) -> u32 {
         (e.is_on(crate::E9) && e.is_on(crate::E51), feat::CARSH),
         (e.is_on(crate::E49) && e.is_on(crate::E8), feat::NEAR),
         (e.is_on(crate::E9), feat::FOCUS),
-        (e.is_on(crate::E9) && e.is_on(crate::E25), feat::OVERCAST),
     ] {
         if on {
             f |= bit;
@@ -536,8 +531,8 @@ pub(crate) mod tests {
         assert_eq!([ROLE_OPAQUE, ROLE_EFFECT, ROLE_SKY], [0.0, 1.0, 2.0]);
         assert_eq!([SOFT_FADE_ALPHA, SOFT_FADE_BLACK, SOFT_FADE_WHITE], [0.0, 1.0, 2.0]);
         assert_eq!([PART_LIT, PART_LIT_WORLD], [2.0, 3.0]);
-        assert_eq!([SHADOW_SUN, SHADOW_OVERCAST, SHADOW_MOON, SHADOW_FOCUS], [0.0, 1.0, 2.0, 3.0]);
-        assert_eq!(feat::ALL, (1 << 18) - 1, "the parts' bits are 0..17, each once");
+        assert_eq!([SHADOW_SUN, SHADOW_MOON, SHADOW_FOCUS], [0.0, 2.0, 3.0]);
+        assert_eq!(feat::ALL, (1 << 17) - 1, "the parts' bits are 0..16, each once");
         assert_eq!(CASCADE_BLEND_START + CASCADE_BLEND, 1.0);
     }
 }

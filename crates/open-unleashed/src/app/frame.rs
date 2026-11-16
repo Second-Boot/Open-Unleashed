@@ -32,9 +32,11 @@ impl App {
         let (dt_ms, carry) = fe_step_ms(self.frame_dt, self.fe_ms_carry);
         self.fe_ms_carry = carry;
         self.fe.ms += dt_ms as u64;
+        // the cars' real-time animation clocks take the same step (`update_damage_decals`)
+        self.anim_ms = dt_ms;
         self.fe_frame_tick(dt_ms);
         self.rebuild_scene();
-        self.update_damage_decals();
+        self.update_damage_decals(dt_ms);
         // the mip filter's promotion `[0x69DD1D]`: the race's 0x44ED10 sets it at `SPECIALFX` 3
         // only (0x44EDD1 clears, 0x44EF04 sets), the front end's 0x44F020 clears it (0x44F080)
         let fx_level = self.race.is_some().then(|| self.special_fx_level());

@@ -530,6 +530,8 @@ impl App {
                     #[cfg(not(any(target_os = "macos", windows)))]
                     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
                 }
+                // the run's tail after the loop: the profile save 0x4D52EA (`fe_quit_save`)
+                self.fe_quit_save();
                 event_loop.exit();
             }
         }

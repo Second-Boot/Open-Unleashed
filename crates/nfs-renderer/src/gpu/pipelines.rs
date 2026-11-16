@@ -233,16 +233,15 @@ const PREWARM_DEPTH: u32 = 1;
 
 /// PERF (PERF-D): the light parts a frame can leave out (`shut` of `ensure_pipelines`), as the groups that go together.
 /// (ENHANCEMENT E50 / E51: the moon's part and the cars-only layers' part are groups of their own: by day the first is off, at night the second)
-const LIGHT_GROUPS: [u32; 8] = [
+const LIGHT_GROUPS: [u32; 7] = [
     crate::classes::feat::CSM,
     crate::classes::feat::SPOT,
     crate::classes::feat::LAMPS | crate::classes::feat::LSHAD,
     crate::classes::feat::CONTACT,
     crate::classes::feat::MOON,
     crate::classes::feat::CARSH,
-    // (SHADOW-REFACTOR: the front end's focus kernel, E25's overcast kernel)
+    // (SHADOW-REFACTOR: the front end's focus kernel)
     crate::classes::feat::FOCUS,
-    crate::classes::feat::OVERCAST,
 ];
 
 /// PERF (PERF-D): a mesh pipeline set's build parameters (the key's low bits, the parts above them).
@@ -592,8 +591,8 @@ impl Core {
         }
         // (the main view meets the most light states; the others are prewarmed in their start state only)
         // (ENHANCEMENT E50: and no moon)
-        // (SHADOW-REFACTOR: nor the front end's focus or E25's overcast kernels)
-        let start = crate::classes::feat::LAMPS | crate::classes::feat::LSHAD | crate::classes::feat::MOON | crate::classes::feat::FOCUS | crate::classes::feat::OVERCAST;
+        // (SHADOW-REFACTOR: nor the front end's focus kernel)
+        let start = crate::classes::feat::LAMPS | crate::classes::feat::LSHAD | crate::classes::feat::MOON | crate::classes::feat::FOCUS;
         for (i, f) in fams.into_iter().enumerate() {
             self.prewarm_family(f, start, if i == 0 { PREWARM_DEPTH } else { 0 });
         }

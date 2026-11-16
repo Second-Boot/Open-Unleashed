@@ -5,8 +5,14 @@
 //! The four sunless day tracks (`canyon`, `forest`, `foothills`, `autobahn`) have the sky's sun object straight overhead and off,
 //! so the cars' light travels straight down (0x43AC8D, `TrackWorld::sun_direction` = -Y) and E9 has no sun. The sun comes from
 //! the data: the light its `sh80` ground-shadow decals were drawn for ([`crate::decal_sun`]: Corsica), else the light its baked
-//! vertex colours were lit with when that bake is clearly directional ([`crate::bake_light`]: Schwarzwald), or the bake's best
-//! fit on the chosen tracks ([`SunlessTrack::weak_fit`]). Render only: nothing reads it but the renderer's shadow frame.
+//! vertex colours were lit with when that bake is clearly directional ([`crate::bake_light`]: Schwarzwald). Nothing else: a track
+//! whose data gives no direction has no data sun. Render only: nothing reads it but the renderer's shadow frame.
+//!
+//! SHADOW-OVERCAST (2026-11-16): foothills (Pyrenees) and autobahn have NO data sun. Until then (SUN-ALL, 2026-11-14) they
+//! took the bake's best fit below the thresholds (a per-track `weak_fit` flag: foothills 144 / 63 deg, r2 0.49 vs 0.34 overhead;
+//! autobahn -135 / 78 deg, r2 0.48 vs 0.47), which drew a sharp car shadow beside the car 29-58 % dark under a twilight sky
+//! (foothills: the bake has no direction at all, every upright azimuth bin 0.442) and under rain (autobahn). Their shadows are
+//! E43's contact shadow, E14's AO and on autobahn E47's lamp shadows. With no track left on it the weak-fit mechanism is gone.
 
 use glam::Vec3;
 use nfs_assets::track::TrackGeometry;
@@ -22,17 +28,12 @@ pub struct DataSun {
     pub scenery_radius: Option<f32>,
 }
 
-/// One sunless day track's choices (2026-11-13 / 14; APPROXIMATION: enhancement content, nothing of the original's:
-/// it has no sun there).
+/// One sunless day track's choices (2026-11-13 / 14 / 16; APPROXIMATION: enhancement content, nothing of the
+/// original's: it has no sun there).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SunlessTrack {
     /// the track's name (`TrackAssets::name`)
     pub name: &'static str,
-    /// SUN-ALL: the bake's best fit is the sun although it is not clearly directional (r2 below `bake_light::MIN_R2`, hardly
-    /// better than the light overhead): foothills (Pyrénées, 144 / 63 deg, r2 0.49 vs 0.34) and autobahn (-135 / 78 deg, r2 0.48
-    /// vs 0.47), so that every day track has the cars' sun shadow; the light is nearly overhead, so the shadow is short.
-    /// APPROXIMATION: the direction is the fit's, not proven by the data.
-    pub weak_fit: bool,
     /// SUN-FULL (2026-11-14): `Some(r)`: the data sun drives E9's FULL frame (the scenery's shadows too: signs, posts, trees, fences
     /// and houses have no shade of their own in a vertex bake; E9's "baked dark" gate keeps the bake's own shade from being
     /// darkened twice, as on alps), the scenery casting up to a bounding radius of `r` m (E9's own limit is 60). Forest 15 m
@@ -48,12 +49,12 @@ pub struct SunlessTrack {
     pub dusk_lamps: bool,
 }
 
-/// The sunless day tracks and their choices (see [`SunlessTrack`]).
-pub const SUNLESS_DAY_TRACKS: [SunlessTrack; 4] = [
-    SunlessTrack { name: "canyon", weak_fit: false, scenery_radius: None, dusk_lamps: false },
-    SunlessTrack { name: "forest", weak_fit: false, scenery_radius: Some(15.0), dusk_lamps: false },
-    SunlessTrack { name: "foothills", weak_fit: true, scenery_radius: None, dusk_lamps: false },
-    SunlessTrack { name: "autobahn", weak_fit: true, scenery_radius: None, dusk_lamps: true },
+/// The sunless day tracks with a choice of their own (see [`SunlessTrack`]; foothills has none since SHADOW-OVERCAST, autobahn
+/// only its lamps).
+pub const SUNLESS_DAY_TRACKS: [SunlessTrack; 3] = [
+    SunlessTrack { name: "canyon", scenery_radius: None, dusk_lamps: false },
+    SunlessTrack { name: "forest", scenery_radius: Some(15.0), dusk_lamps: false },
+    SunlessTrack { name: "autobahn", scenery_radius: None, dusk_lamps: true },
 ];
 
 /// SUN-FULL's caster radius when a test glue list gives a track without one (m: E9's own limit).
@@ -69,7 +70,6 @@ pub fn measure(track: &nfs_assets::track::TrackAssets, geometry: &TrackGeometry,
     if sun_direction.x.abs() + sun_direction.z.abs() > 1e-3 {
         return None;
     }
-    let row = sunless_track(&track.name);
     let m = crate::decal_sun::measure(geometry, materials).0;
     tracing::info!(?m, "the decals' sun (ENHANCEMENT E51)");
     let direction = m
@@ -77,7 +77,7 @@ pub fn measure(track: &nfs_assets::track::TrackAssets, geometry: &TrackGeometry,
         .or_else(|| {
             let b = (!track.is_night()).then(|| crate::bake_light::fit(geometry, materials)).flatten();
             tracing::info!(?b, "the bake's light (ENHANCEMENT E51)");
-            b.and_then(|b| b.taken(row.is_some_and(|r| r.weak_fit)))
+            b.and_then(|b| b.accepted())
         })
         // TEST GLUE: `NFS_DATA_SUN=<azimuth>,<elevation>` (degrees, `bake_light::travel`) sets this sun by hand, for comparison stills
         .map_or_else(test_glue_data_sun, |d| Some(test_glue_data_sun().unwrap_or(d)))?;
@@ -117,9 +117,9 @@ mod tests {
             assert!(SUNLESS_DAY_TRACKS[..i].iter().all(|u| u.name != t.name), "{} twice", t.name);
             assert!(t.scenery_radius.is_none_or(|r| r > 0.0 && r <= TEST_GLUE_RADIUS), "{} {:?}", t.name, t.scenery_radius);
         }
-        // the choices as recorded (2026-11-13 / 14)
+        // the choices as recorded (2026-11-13 / 14 / 16; SHADOW-OVERCAST: foothills has no row, no data sun)
         let pick = |f: fn(&SunlessTrack) -> bool| SUNLESS_DAY_TRACKS.iter().filter(|t| f(t)).map(|t| t.name).collect::<Vec<_>>();
-        assert_eq!(pick(|t| t.weak_fit), ["foothills", "autobahn"]);
+        assert!(sunless_track("foothills").is_none());
         assert_eq!(pick(|t| t.scenery_radius.is_some()), ["forest"]);
         assert_eq!(pick(|t| t.dusk_lamps), ["autobahn"]);
         assert_eq!(sunless_track("FOREST").and_then(|t| t.scenery_radius), Some(15.0));

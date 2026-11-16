@@ -158,7 +158,10 @@ pub const REGISTRY: &[Entry] = &[
     Entry {
         token: "E9",
         name: ["sun shadows", "тени от солнца"],
-        help: ["cars and roadside objects cast shadows from the sun (cascaded shadow maps); the car's blob shadow stays", "машины и придорожные объекты отбрасывают тени от солнца; пятно под машиной остаётся"],
+        help: [
+            "cars and roadside objects cast shadows from the sun (cascaded shadow maps); the car's blob shadow stays. In snowfall and rain the shadows fade with the track's own snow / rain amount (an overcast sky has no direct sun); the tracks whose data gives no sun direction (Foothills, Autobahn) have none",
+            "машины и придорожные объекты отбрасывают тени от солнца; пятно под машиной остаётся. В снегопад и дождь тени слабеют по количеству снега / дождя из данных трассы (под сплошными тучами прямого солнца нет); на трассах, где данные не дают направления солнца (Предгорья, Автобан), их нет",
+        ],
         levels: &[["off", "выкл"], ["low (1024, 3 cascades)", "низко (1024, 3 каскада)"], ["high (2048, 4 cascades)", "высоко (2048, 4 каскада)"]],
         default_level: 1,
     },
@@ -291,16 +294,6 @@ pub const REGISTRY: &[Entry] = &[
         ],
         levels: ON_OFF,
         default_level: 1,
-    },
-    Entry {
-        token: "E25",
-        name: ["soft shadows when overcast", "рассеянные тени в пасмурную погоду"],
-        help: [
-            "on the tracks without a sun (Autobahn, Canyon, Foothills, Forest) the shadows of cars and roadside objects fall straight down, very soft and faint, as under a high overcast sky (the original has no shadows there). Needs the sun shadows (E9)",
-            "на трассах без солнца (Автобан, Каньон, Предгорья, Лес) тени от машин и придорожных объектов падают прямо вниз, очень мягкие и слабые, как при высокой облачности (в оригинале там теней нет). Нужны тени от солнца (E9)",
-        ],
-        levels: ON_OFF,
-        default_level: 0,
     },
     Entry {
         token: "E22",
@@ -571,15 +564,15 @@ pub const REGISTRY: &[Entry] = &[
         levels: ON_OFF,
         default_level: 1,
     },
-    // ENHANCEMENT E50: moonlight on the night tracks (registered after E49). A faint cold directional light through E9's cascades (the
-    // way E25's overcast light is a second light of them): soft shadows of the cars and the roadside objects on the baked night
+    // ENHANCEMENT E50: moonlight on the night tracks (registered after E49). A faint cold directional light through E9's cascades (a second
+    // light of them): soft shadows of the cars and the roadside objects on the baked night
     // colour, a weak cold direct term on the cars. Needs E9.
     Entry {
         token: "E50",
         name: ["moonlight", "лунный свет"],
         help: [
-            "on the night tracks (Industrial, Monaco) a faint cold moonlight: the cars, trees, posts and buildings cast soft moon shadows on the road and the cars take a weak cold light from the moon's side. The night stays as dark as before (the original's baked night light already holds the moon's glow; under the street lamps the moon shadow gives way to the lamp light). On Industrial the light comes from the sky's own moon, on Monaco (no moon in its sky) from a chosen direction. Needs the sun shadows (E9). Only the picture changes",
-            "на ночных трассах (Индастриал, Монако) слабый холодный лунный свет: машины, деревья, столбы и дома отбрасывают мягкие лунные тени на дорогу, а машины получают слабый холодный свет со стороны луны. Ночь остаётся такой же тёмной (запечённый ночной свет оригинала уже содержит свечение луны; под фонарями лунная тень уступает свету фонаря). На Индастриале свет идёт от луны на небе трассы, в Монако (на его небе луны нет) - с выбранной стороны. Нужны тени от солнца (E9). Меняется только картинка",
+            "on the Monaco night tracks a faint cold moonlight: the cars, trees, posts and buildings cast soft moon shadows on the road and the cars take a weak cold light from the moon's side. The night stays as dark as before (the original's baked night light already holds the moon's glow; under the street lamps the moon shadow gives way to the lamp light). Monaco's sky has no moon, so the light comes from a chosen direction and stays weak («normal» draws as «weak» there). Industrial has no moonlight: its sky's clouds cover the moon (the track's sky data says so). Needs the sun shadows (E9). Only the picture changes",
+            "на ночных трассах Монако слабый холодный лунный свет: машины, деревья, столбы и дома отбрасывают мягкие лунные тени на дорогу, а машины получают слабый холодный свет со стороны луны. Ночь остаётся такой же тёмной (запечённый ночной свет оригинала уже содержит свечение луны; под фонарями лунная тень уступает свету фонаря). На небе Монако луны нет, поэтому свет идёт с выбранной стороны и остаётся слабым («средне» там рисуется как «слабо»). На Индастриале лунного света нет: тучи на его небе закрывают луну (так сказано в данных неба трассы). Нужны тени от солнца (E9). Меняется только картинка",
         ],
         levels: &[["off", "выкл"], ["weak", "слабо"], ["normal", "средне"]],
         default_level: 2,
@@ -695,8 +688,8 @@ switches! {
     E23,
     /// ENHANCEMENT E24 headlights light up in tunnels (render side only)
     E24,
-    /// ENHANCEMENT E25 soft shadows on the sunless tracks
-    E25,
+    // index 22 was E25 (soft shadows when overcast), removed 2026-11-16 (SHADOW-OVERCAST); the later switches moved down by one,
+    // as when E20 / E30 left (an old file's "E25" key is ignored, an `NFS_ENH` "E25" is reported unknown)
     /// ENHANCEMENT E22 frame rate limit
     E22,
     /// ENHANCEMENT E27 motion blur
@@ -993,8 +986,6 @@ pub const DEPENDS: &[Dependency] = &[
     Dependency { entry: E28.token(), cond: Cond::Needs(E10.token()) },
     // the car-ambient probe samples E8's environment faces
     Dependency { entry: E16.token(), cond: Cond::Needs(E8.token()) },
-    // the overcast shadows are a second light of E9's cascades
-    Dependency { entry: E25.token(), cond: Cond::Needs(E9.token()) },
     // the lamp shadows shadow E23's lamps: without them there is no lamp light to shadow
     Dependency { entry: E47.token(), cond: Cond::Needs(E23.token()) },
     // the moonlight is a third light of E9's cascades, and the cars' dim-road shadow a cars-only map of them
@@ -1582,7 +1573,11 @@ mod tests {
         assert_eq!(REGISTRY[E23.0 as usize].default_level, 2); // street lamps: normal
         assert_eq!(REGISTRY[E24.0 as usize].token, "E24");
         assert_eq!(REGISTRY[E24.0 as usize].default_level, 1); // headlights in tunnels: on
-        assert_eq!(REGISTRY[E25.0 as usize].token, "E25");
+        // 2026-11-16: E25 (soft shadows when overcast) removed; an old "E25" is unknown
+        assert!(!REGISTRY.iter().any(|e| e.token == "E25"));
+        let mut unknown = Vec::new();
+        assert_eq!(Enhancements::parse_override("E25=1,E22=2", &mut unknown).map(|e| e.level(E22)), Some(2));
+        assert_eq!(unknown, vec!["E25=1".to_string()]);
         assert_eq!(REGISTRY[E22.0 as usize].token, "E22");
         assert_eq!(REGISTRY[E22.0 as usize].default_level, 6); // frame rate limit: auto (2026-10-04)
         assert_eq!(REGISTRY[E27.0 as usize].token, "E27");
@@ -1624,20 +1619,21 @@ mod tests {
         assert_eq!(REGISTRY[E37.0 as usize].levels.len(), 5);
         assert!(REGISTRY[E37.0 as usize].available());
         // ENHANCEMENT ENH-UPSCALER: E38 / E39 follow E37; E34 / E37 keep their levels (every index after 28 moved down by one when
-        // E30 left the registry 2026-10-27, every index after 18 when E20 left 2026-11-13: nothing stores an index)
-        assert_eq!((E34.0, E37.0, E38.0, E39.0), (32, 34, 35, 36));
+        // E30 left the registry 2026-10-27, every index after 18 when E20 left 2026-11-13, every index after 21 when E25 left
+        // 2026-11-16: nothing stores an index)
+        assert_eq!((E34.0, E37.0, E38.0, E39.0), (31, 33, 34, 35));
         assert_eq!(REGISTRY[E38.0 as usize].token, "E38");
         assert_eq!(REGISTRY[E39.0 as usize].token, "E39");
         assert_eq!(E51.0 as usize, REGISTRY.len() - 1); // ENHANCEMENT E51 is the last entry
-        assert_eq!((E39.0, E40.0, E41.0, E42.0, E43.0, E44.0, E47.0), (36, 37, 38, 39, 40, 41, 42));
+        assert_eq!((E39.0, E40.0, E41.0, E42.0, E43.0, E44.0, E47.0), (35, 36, 37, 38, 39, 40, 41));
         // ENHANCEMENT E48: the steady slope lift of the chase cameras, index 43, on by default, off / on
-        assert_eq!(E48.0, 43);
+        assert_eq!(E48.0, 42);
         assert_eq!(REGISTRY[E48.0 as usize].token, "E48");
         assert_eq!(REGISTRY[E48.0 as usize].default_level, 1);
         assert_eq!(REGISTRY[E48.0 as usize].levels.len(), 2);
-        assert_eq!((E50.0, E51.0), (45, 46));
+        assert_eq!((E50.0, E51.0), (44, 45));
         // ENHANCEMENT E49: reflections of nearby objects, index 44, on by default; needs E8 (its cube)
-        assert_eq!(E49.0, 44);
+        assert_eq!(E49.0, 43);
         assert_eq!(REGISTRY[E49.0 as usize].token, "E49");
         assert_eq!(REGISTRY[E49.0 as usize].default_level, 1);
         assert_eq!(REGISTRY[E49.0 as usize].levels.len(), 2);
@@ -1827,10 +1823,10 @@ mod tests {
         // the lens dirt needs the bloom
         s.set_level(E10, 0);
         assert_eq!(DEPENDS[s.blocked("E28").unwrap().dep].cond, Cond::Needs("E10"));
-        // the overcast shadows need the sun shadows, the car ambient the body reflections
+        // the car ambient needs the body reflections
         s.set_level(E9, 0);
         s.set_level(E8, 0);
-        assert!(s.blocked("E25").is_some() && s.blocked("E16").is_some());
+        assert!(s.blocked("E16").is_some());
         // ENHANCEMENT E50 / E51: the moonlight and the cars' dim-road shadow are lights / maps of E9's cascades
         assert!(s.blocked("E50").is_some() && s.blocked("E51").is_some());
         assert_eq!(DEPENDS[s.blocked("E50").unwrap().dep].cond, Cond::Needs("E9"));

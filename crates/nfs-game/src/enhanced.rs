@@ -18,7 +18,7 @@
 use nfs_assets::paths::GamePaths;
 use nfs_formats::locale::{Strings, typed_char};
 use nfs_renderer::{ENHANCEMENT_REGISTRY, EnhancementStored, EnhancementSwitch, Enhancements, MAX_ENHANCEMENT_LEVELS};
-use nfs_renderer::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E21, E22, E23, E24, E25, E26, E27, E28, E29, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51};
+use nfs_renderer::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E21, E22, E23, E24, E26, E27, E28, E29, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::PathBuf;
@@ -473,7 +473,7 @@ const INACTIVE_COLOR: &str = "0xff8a8a8a";
 /// A group stays on one page when it fits on one (`paginate`).
 pub const GROUPS: &[([&str; 2], &[EnhancementSwitch])] = &[
     (["image", "Изображение"], &[E6, E22, E1, E2, E3, E35, E4, E5, E38, E33]),
-    (["light and shadows", "Свет и тени"], &[E7, E9, E51, E43, E25, E50, E14, E32, E16, E15, E24, E23, E47]),
+    (["light and shadows", "Свет и тени"], &[E7, E9, E51, E43, E50, E14, E32, E16, E15, E24, E23, E47]),
     (["surfaces", "Поверхности"], &[E8, E49, E17, E26, E40, E41, E42]),
     (["atmosphere and effects", "Атмосфера и эффекты"], &[E10, E11, E13, E19, E36, E44, E21, E18, E12]),
     (["camera", "Камера"], &[E27, E28, E29, E48, E31]),
@@ -863,11 +863,11 @@ mod tests {
         assert_eq!((STR_NAME + 3, STR_HELP + 43), (900_103, 900_243));
         assert_eq!(level_ids(0), &[900_300, 900_301, 900_302, 900_303]);
         assert_eq!(level_ids(2), &[900_316, 900_317, 900_318, 900_319, 900_320, 900_321]);
-        // the per-row ids follow the registry index (no layout names them): E38 is 35 since E30 (2026-10-27; it was 37 with ids
-        // 900_596..) and E20 (2026-11-13; 36, ids 900_588..) left the registry
+        // the per-row ids follow the registry index (no layout names them): E38 is 34 since E30 (2026-10-27; it was 37 with ids
+        // 900_596..), E20 (2026-11-13; 36, ids 900_588..) and E25 (2026-11-16; 35, ids 900_580..) left the registry
         let e38 = nfs_renderer::E38.0 as usize;
-        assert_eq!(e38, 35);
-        let want: &[u32] = if cfg!(target_os = "macos") { &[900_580, 900_581, 900_582] } else { &[900_580, 900_582] };
+        assert_eq!(e38, 34);
+        let want: &[u32] = if cfg!(target_os = "macos") { &[900_572, 900_573, 900_574] } else { &[900_572, 900_574] };
         assert_eq!(level_ids(e38), want);
         assert_eq!((VRow::MfxMode.name_id(), VRow::FsrScale.help_id(), VRow::FsrScale.level_id(2)), (903_000, 903_012, 903_122));
         assert_eq!((STR_GROUP + 1, STR_REASON + 5 * 3 + 2), (903_301, 903_417));
@@ -899,6 +899,14 @@ mod tests {
             let new = parse_file(r#"{"version": 6, "levels": {"E19": 0, "E21": 0, "E23": 1, "E51": 0}}"#);
             assert_eq!(old, new);
             assert_eq!((old.level(nfs_renderer::E19), old.level(nfs_renderer::E21), old.level(nfs_renderer::E23), old.level(nfs_renderer::E51)), (0, 0, 1, 0));
+        }
+        // E25 (soft shadows when overcast, removed 2026-11-16): the same; the switches after it (E22 and on, one index down now)
+        // keep their stored levels
+        for e25 in [0, 1] {
+            let old = parse_file(&format!(r#"{{"version": 6, "levels": {{"E24": 0, "E25": {e25}, "E22": 2, "E27": 1, "E50": 1}}}}"#));
+            let new = parse_file(r#"{"version": 6, "levels": {"E24": 0, "E22": 2, "E27": 1, "E50": 1}}"#);
+            assert_eq!(old, new);
+            assert_eq!((old.level(nfs_renderer::E24), old.level(nfs_renderer::E22), old.level(nfs_renderer::E27), old.level(nfs_renderer::E50)), (0, 2, 1, 1));
         }
     }
 

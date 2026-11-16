@@ -655,7 +655,7 @@ impl App {
             if parked {
                 self.fe.menu = self.fe.menu_template.take();
             }
-            self.apply_saved_profile();
+            self.apply_saved_profile(true);
             if parked {
                 self.fe.menu_template = self.fe.menu.take();
             }

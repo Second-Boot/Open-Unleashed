@@ -20,8 +20,10 @@ impl App {
     /// end is leaving.
     pub(crate) fn fe_dialog_answer(&mut self, event_loop: &LoopCtl) -> bool {
         match self.fe.dialog_answer.take() {
-            // 0x50CC4F: "yes" to 811 is 0x4D56E0(0) — the front end is over
+            // 0x50CC4F: "yes" to 811 is 0x4D56E0(0) — the front end is over, and its tail saves
+            // the profile (0x4D52EA) before main quits
             Some((true, DialogFor::Quit)) => {
+                self.fe_quit_save();
                 event_loop.exit();
                 true
             }

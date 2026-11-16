@@ -199,6 +199,14 @@ pub struct CareerUi {
     /// `CDPlayer` modules and the settings screens' accessors (`savegame.md` §4.5, §4.6, §4.8,
     /// §6) — as the last load left it and the front end keeps it in step.
     pub side: nfs_game::save::SaveSide,
+    /// **`[0x691DC8]` holds a name** — the profile name `SaveInfo` 0x4DEDA0 writes under
+    /// (0x501270). The buffer is in `.data`'s zero tail (empty at start-up) and only `LoadInfo`
+    /// sets it (0x4DEC70 → 0x501280; `PlayerInfo`'s load 0x501816): so before the first entry's
+    /// chooser is answered every `SaveInfo` meets the empty name and writes nothing
+    /// (0x4DEDB9…0x4DEDF4) — the quit's save (0x4D52EA) included. False from
+    /// [`Self::blank_before_chooser`] until a load ([`Self::switch_profile`]) succeeds; the
+    /// starts that never meet the chooser keep the profile loaded at start-up.
+    pub name_loaded: bool,
 }
 
 impl CareerUi {
@@ -300,6 +308,7 @@ impl CareerUi {
             pending: None,
             race_flags: TournamentRaceFlags::default(),
             victory_room: false,
+            name_loaded: true,
         }
     }
 
@@ -933,6 +942,12 @@ impl CareerUi {
     }
 
     pub fn save(&mut self) {
+        // 0x4DEDB9…0x4DEDF4: no name in `[0x691DC8]` yet (the first entry's chooser not answered)
+        // — nothing is written
+        if !self.name_loaded {
+            tracing::info!("profile save skipped: no profile loaded yet (0x4DEDB9, the empty name)");
+            return;
+        }
         // `Tournament`'s front-end dwords (`save::TournamentFe`): the selected tournament
         // `[0x691E6C]` is the record's index in the table, and the running pair `[0x5DB768]` /
         // `[0x5DB76C]` is set only by the tournament launch 0x503940 (0x4D5B4A) — so a mission or a
@@ -996,6 +1011,7 @@ impl CareerUi {
         self.career.last_mission = last_mission;
         self.side = nfs_game::save::SaveSide::default();
         self.victory_room = false;
+        self.name_loaded = false;
     }
 
     /// `LoadInfo` 0x4DE9B0 with `autosave = 0` (`RE/notes/savegame.md` §2.4, §3): read
@@ -1019,6 +1035,8 @@ impl CareerUi {
         // the modules `LoadInfo` hands their own loaders — `Knockout` 0x4DDD60, `Personalities`
         // 0x4E2CA0, `CDPlayer` 0x4BE170 — and the accessor block 0x4B7FD0
         self.side = nfs_game::save::side_from_sav(&s);
+        // 0x4DEC70: `[0x691DC8]` = the loaded stem's name
+        self.name_loaded = true;
         if nfs_game::save::write_player_lst(&self.save_dir, &p.stem()).is_err() {
             return false;
         }

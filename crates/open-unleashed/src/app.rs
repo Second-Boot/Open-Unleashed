@@ -209,6 +209,10 @@ pub(crate) struct App {
     /// the free-running 128 Hz `TIMER_getTicks` (0x53C2E0), not a per-frame count, so the port's
     /// whole-millisecond step must not lose the fraction (120 fps rounds 8.33 ms to 8, 4 % slow).
     pub(crate) fe_ms_carry: f32,
+    /// the frame's step of the cars' real-time animation clocks, whole ms (`draw_frame`'s `fe_step_ms`;
+    /// `update_damage_decals`, the front end's lids). 17 until a frame is drawn — the rounded 1/60 s the
+    /// lids took before (a scripted still never draws a frame)
+    pub(crate) anim_ms: u32,
     pub(crate) paused: bool,
     /// 64 Hz ticks of wall time since the pause began. `[0x606AC8]` — the counter the HUD and the
     /// dialogs animate on — is advanced by one per pass of the frame driver's tick loop until it
@@ -797,6 +801,13 @@ pub(crate) struct App {
     pub(crate) frame_times: Vec<f32>,
     /// winit's last `Occluded` (the window is not on screen); see `idle.rs` `window_hidden`
     pub(crate) occluded: bool,
+    /// **PLATFORM GLUE** (`controls.md` §4.152.1, `App::sync_system_pointer`): the window has the focus — the
+    /// original's activation, `WM_ACTIVATEAPP` 0x4B0EE0 / `WM_ACTIVATE` 0x53B050; true from the window's creation
+    pub(crate) window_focused: bool,
+    /// the system pointer's visibility last handed to winit (`None` = never yet)
+    pub(crate) pointer_hidden: Option<bool>,
+    /// `--debug-menu`: the port's own text menu, which draws no `Pointer.fsh`, may be on show
+    pub(crate) debug_menu: bool,
     /// what the window last showed, for the front end's idle redraw (`idle.rs`)
     pub(crate) presented: Option<idle::Presented>,
     /// the image of the last front-end frame rendered, kept under `NFS_FE_IDLE_VERIFY`
@@ -1147,6 +1158,10 @@ pub(crate) struct FrontEnd {
     /// 0x4BF9EE): a release within `[0x5DEB48] / 2` (half a second) of the last is not one
     /// (0x4BF969…0x4BF984), and clears it (0x4BF99B)
     pub(crate) camera_pic_click: std::collections::HashMap<usize, Instant>,
+    /// The quit's profile save (`App::fe_quit_save`, 0x4D52EA on `FEApplication::run`'s quit arm)
+    /// has run: the host's own exits after it (the window's close, the app's termination) do not
+    /// write the profile a second time.
+    pub(crate) quit_saved: bool,
     /// `Game.GameType` of the race running when the layout front end started it — what 0x4D3420
     /// keys the screen stack it rebuilds on once the race is over (`fe_after_race`). `None` for a
     /// race from the text menu or the command line, which go back to the text menu.
