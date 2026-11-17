@@ -2401,10 +2401,10 @@ fn the_deadzone_bar_carries_a_marker_and_four_handles() {
     assert_eq!(deadzone_handles(300, [0, 0x80]).map(|(r, _)| r), [1, 3, 2, 4]);
 }
 
-/// `data.picoffy` shifts a `NFS5.BOTTOMBARBUTTON`'s picture down — once (the template's
-/// `pos.value=0,data.picoffy`; the original's stills show +6, not the +12 of adding 0x4C9BDE's
-/// `[this+0x1D4]` on top) — and only the three bottom-bar buttons that have an icon carry a
-/// non-zero one. `RE/notes/controls.md` §4.80.
+/// `data.picoffy` shifts a `NFS5.BOTTOMBARBUTTON`'s picture down — once: 0x4C9BDE's
+/// `[this+0x1D4]`, with the template's `pos.value=0,data.picoffy` reading 0 at runtime (live
+/// read; the stills show +6, not +12) — and only the three bottom-bar buttons that have an icon
+/// carry a non-zero one. `RE/notes/controls.md` §4.80.
 #[test]
 fn the_bottom_bar_icons_carry_a_y_offset() {
     let Ok(paths) = GamePaths::locate() else {

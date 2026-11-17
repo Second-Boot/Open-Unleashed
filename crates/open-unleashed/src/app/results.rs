@@ -108,8 +108,8 @@ impl App {
 
     /// The HUD toggles' bodies. `RaceFrame` reads the keys with the pause flag `[0x606A90]` clear
     /// (0x415982, the call site's `!self.paused`), and then **each toggle function tests the dialog
-    /// list itself** — 0x4273B0 (F5), 0x426740 ("2"), 0x427550 (F6), 0x427360 (F7), 0x427600 /
-    /// 0x427630, 0x4275D0 (F8) all begin `if [0x60C9C4] is not empty { return }` (read to the
+    /// list itself** — 0x4273B0 (F5), 0x426740 (Tab), 0x427550 (F6), 0x427360 (F7), 0x427600 /
+    /// 0x427630 (keypad − / +), 0x4275D0 (F8) all begin `if [0x60C9C4] is not empty { return }` (read to the
     /// instruction 2026-09-30, batch's lead) — so returning early while a dialog is up
     /// (`hud_dialog_up`: the pause menu, a notice, the save question, a result page) is the same
     /// behaviour, not a divergence from 0x415982.
@@ -178,6 +178,10 @@ impl App {
                 };
             }
             Action::HudTransparency => k.boxes = !k.boxes,
+            // 0x427600 / 0x427630: the step, then `HTrackMap`'s slot 2 (0x433080, its layout again —
+            // size, place, colours; the port lays the map out every frame)
+            Action::ZoomInMap => k.zoom_in_map(),
+            Action::ZoomOutMap => k.zoom_out_map(),
             _ => {}
         }
         tracing::info!(?a, keys = ?self.hud_keys, "HUD key");

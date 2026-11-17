@@ -34,7 +34,7 @@ An independent implementation written from scratch in Rust (winit + wgpu) that r
 
 On top of the faithful engine the game has render enhancements, on by default: better lighting, shadows, reflections,
 anti-aliasing, upscaling (AMD FidelityFX FSR 3), HD textures made from your own copy and more. Each has its own switch in
-the in-game enhancements screen, and **F12** shows the original's graphics at once. Gameplay, physics and the network
+the in-game enhancements screen, and the **0** key shows the original's graphics at once. Gameplay, physics and the network
 protocol are unchanged. Details: [docs/en/enhanced.md](docs/en/enhanced.md).
 
 ## Quick start

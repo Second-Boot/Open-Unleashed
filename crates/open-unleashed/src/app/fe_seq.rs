@@ -14,8 +14,8 @@ impl App {
     /// entries (moved out of `resume_inner` unchanged so `NFS_FE_SEQ_SCRIPT` can run the same).
     pub(crate) fn fe_scripted_key(&mut self, k: &str, event_loop: &LoopCtl) {
         match k {
-            // **TEST GLUE** `f12` — the window's F12 (ENHANCEMENT framework: every switch on <-> off), as the key handler runs it
-            "f12" => self.enh_toggle_all(),
+            // **TEST GLUE** `enh` — the enhancements' key `0` (ENHANCEMENT framework: every switch on <-> off), as the key handler runs it
+            "enh" => self.enh_toggle_all(),
             "b" => self.fe_key_code(0x62, event_loop),
             "esc" => self.fe_key_code(0x1B, event_loop),
             // **TEST GLUE** `save` — `SaveInfo` as the launch runs it (0x4D52EA): the live settings into

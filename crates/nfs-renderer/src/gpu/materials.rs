@@ -206,7 +206,7 @@ impl Core {
 
     /// ENHANCEMENT E2: the level changed (0 off, 1 / 2 / 3 = 4x / 8x / 16x): rebuild the
     /// anisotropic samplers for it and every material's bind groups. Once per change, in the menu
-    /// or on the F12 toggle — the texture data is untouched, so nothing is re-uploaded.
+    /// or on the A/B toggle — the texture data is untouched, so nothing is re-uploaded.
     pub(super) fn apply_e2(&mut self, level: u8) {
         let want = match level {
             0 => 1,

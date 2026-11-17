@@ -524,14 +524,23 @@ impl Crp {
     /// `frame·0x10 + ` the stream's own index (0x43E242…0x43E254, 0x43E2A4…0x43E2B4), everything
     /// else as frame 0. `None`-like failure when that frame's `vt` is missing.
     pub fn article_geometry_frame(&self, data: &[u8], art: &Article, frame: u16) -> Result<ArticleGeometry, FormatError> {
-        self.article_geometry_with(data, art, frame, false)
+        self.article_geometry_with(data, art, frame, false, None)
+    }
+
+    /// [`Self::article_geometry_frame`] of the primitives of one LOD only: the morph frames are
+    /// counted **per LOD**. The model loader probes each part's own `vt` index, `frame·0x10 + lod`,
+    /// up from frame 1 until one is missing (0x43C4FB…0x43C52A, `edi` = the part's index, `ebp` the
+    /// count), so a frame missing at one LOD does not end the other's: `356_1.crp`'s `DriverBody2`
+    /// has `vt` 0x11…0x81 at LOD 1 but no 0x22 at LOD 2 — 8 frames at LOD 1, 1 at LOD 2.
+    pub fn article_geometry_frame_lod(&self, data: &[u8], art: &Article, frame: u16, lod: u8) -> Result<ArticleGeometry, FormatError> {
+        self.article_geometry_with(data, art, frame, false, Some(lod))
     }
 
     /// The geometry with each primitive's `vt` stream taken from the **damage** part
     /// `vt#(0x8000 | lod)` (0x43E4A7…0x43E4C0): the per-vertex crush vectors, in the same windows
     /// and order as the plain geometry's positions. Fails when the article has none.
     pub fn article_geometry_damage(&self, data: &[u8], art: &Article) -> Result<ArticleGeometry, FormatError> {
-        self.article_geometry_with(data, art, 0, true)
+        self.article_geometry_with(data, art, 0, true, None)
     }
 
     /// The article's `dz#lod` part (0x59F2A0: `"dz"` + the LOD), if it has one.
@@ -542,7 +551,7 @@ impl Crp {
         }
     }
 
-    fn article_geometry_with(&self, data: &[u8], art: &Article, frame: u16, damage: bool) -> Result<ArticleGeometry, FormatError> {
+    fn article_geometry_with(&self, data: &[u8], art: &Article, frame: u16, damage: bool, only_lod: Option<u8>) -> Result<ArticleGeometry, FormatError> {
         self.check(data)?;
         let name = match art.level(tags::NAME) {
             Some(e) => self.entry_string(data, e)?,
@@ -565,7 +574,7 @@ impl Crp {
         }
         let transform = transforms.first().map(|t| t.1);
         let mut primitives = Vec::new();
-        for pr in art.parts.iter().filter(|p| p.is_part(tags::PR)) {
+        for pr in art.parts.iter().filter(|p| p.is_part(tags::PR) && only_lod.is_none_or(|l| p.lod() == l)) {
             let lod = pr.lod();
             let bytes = self.entry_data(data, pr)?;
             let rec = PrimitiveRecord::parse(bytes, pr.data_offset())?;

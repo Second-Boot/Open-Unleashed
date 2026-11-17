@@ -5,11 +5,10 @@
 
 use nfs_formats::locale::{Strings, typed_char};
 
-/// Whether F11 is a photo-mode key on this platform. On macOS F11 belongs to the system (Show Desktop / Stage
-/// Manager sweeps the game window away), so photo mode there is **K only**; Windows and Linux keep F11 and K.
-/// (The original's `I_VIEWDISTANCE` is `SC_F11` but names a key its key table does not have —
-/// `nfs_input::default_binding` — and K is bound to nothing, so neither key takes an original action.)
-pub const PHOTO_F11: bool = !cfg!(target_os = "macos");
+// Photo mode's key is **K** on every platform. *(Until 2026-11-17 Windows and Linux had F11 as well, on the
+// reading that the original's `I_VIEWDISTANCE` binds nothing; it is F11 — 0x411760's `[0x5E9924]` = 0x5703,
+// stored at every race start — so F11 is the view distance's now, `RE/notes/controls.md` §4.170.2. K is bound
+// to nothing in the original.)*
 
 /// The ids of [`PHOTO_STRINGS`], in its order.
 pub const S_TITLE: usize = 0;
@@ -39,15 +38,10 @@ pub const PHOTO_STRINGS: [[&str; 2]; 10] = [
     ["the still could not be saved", "снимок не удалось сохранить"],
 ];
 
-/// The photo mode's text with its key placeholders filled for this platform: `{KEY}` the keys that enter it,
-/// `{EXIT}` the keys that leave it (Esc, P, Backspace and the pad's B stay on every platform).
-pub fn photo_keys(s: &str, russian: bool) -> String {
-    let (key, exit) = match (PHOTO_F11, russian) {
-        (true, false) => ("F11 or K", "F11 / K / Esc"),
-        (true, true) => ("F11 или K", "F11 / K / Esc"),
-        (false, _) => ("K", "K / Esc"),
-    };
-    s.replace("{KEY}", key).replace("{EXIT}", exit)
+/// The photo mode's text with its key placeholders filled: `{KEY}` the key that enters it, `{EXIT}` the keys that
+/// leave it (Esc, P, Backspace and the pad's B as well).
+pub fn photo_keys(s: &str, _russian: bool) -> String {
+    s.replace("{KEY}", "K").replace("{EXIT}", "K / Esc")
 }
 
 /// Whether the install's text is Russian. The Russian release keeps its text in the **English** column of
@@ -79,13 +73,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_keys_follow_the_platform() {
+    fn the_keys_are_filled_in() {
         let t = photo_keys(PHOTO_STRINGS[S_ENTER][0], false);
-        if PHOTO_F11 {
-            assert_eq!(t, "F11 or K: photo mode");
-        } else {
-            assert_eq!(t, "K: photo mode");
-        }
+        assert_eq!(t, "K: photo mode");
         assert!(!photo_keys(PHOTO_STRINGS[S_KEYS_SHOT][1], true).contains('{'));
     }
 

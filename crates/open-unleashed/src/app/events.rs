@@ -172,13 +172,42 @@ impl App {
         k == N::Select && self.race_accept(event_loop)
     }
 
+    /// **The enhancements' A/B key** (ENHANCEMENT framework, PORT-DEVIATION D63): the physical **`0`** flips every
+    /// enhancement between the player's set and the original's look (`enh_toggle_all`), in a race and in the menus.
+    /// Not an original key: `0` (scan code 0x0B) is free in every table of the original — 0x411760's 25 race
+    /// bindings (Escape, Tab, F1…F12, `1`, keypad − / +, Alt+P, the arrows / Enter of `I_UP`…`I_SELECT`),
+    /// 0x51D1D0's nineteen default rows (arrows, Space, A, Z, H, L, R, C, P, W, E, T, Y, I, U, B; the AZERTY /
+    /// QWERTZ variants Q / W / Y / Z), the shipped `fe.txt` (Q, D, the `PSX_*` keys W S A D Space Enter End Del
+    /// PgDn Home LShift Ctrl, `2` — which 0x411760 overwrites), the direct key reads (Space 0x42A3D0, Tab 0x41194A,
+    /// Ctrl + Alt 0x48EEB5) and the front end's key codes (Esc, `b`, `=`, 0x4D2970) — and in the port (the race
+    /// panel's `` ` `` `[ ] , .`, photo mode's K). F1…F12 are all the original's now, so no function key is free.
+    /// `0` sits at the top row's right end, away from the arrows and the letters the car is driven with, and is on
+    /// every keyboard (a laptop has no Home / End / Pause). Since it types a digit, it is left to whatever takes
+    /// typed characters: a binding row waiting for a key, a front-end input box or dialog field, the replay-save
+    /// name (`typing_takes_keys`).
+    pub(crate) fn enh_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool, repeat: bool) {
+        if pressed && !repeat && code == ENH_KEY && !self.typing_takes_keys() {
+            self.enh_toggle_all();
+        }
+    }
+
+    /// Whether a typed character goes to a text field or a binding row now (the keys [`Self::enh_key`] leaves alone).
+    pub(crate) fn typing_takes_keys(&self) -> bool {
+        let layout = self.fe.layout_preview.as_ref();
+        layout.is_some_and(|l| l.focused_binding_row().is_some() || l.focused_input().is_some())
+            || self.fe.dialog.as_ref().is_some_and(|(d, _)| d.up && d.field.is_some())
+            || (self.replay_save.up && !self.replay_save.overwrite && !self.paused)
+    }
+
     /// The interface bits `RaceFrame` reads on the press (0x4138D0, the packer's ring `0x5E954C`):
-    /// the pause (bit 8), the pause orbit's steps, the HUD toggles, the sound and the music. Run on
-    /// every key event and, for a pad-bound control (PAD-HANG: Start on the pause row never reached
-    /// this code, which ran on key events only), once a race frame after `Gamepads::poll`.
+    /// the pause (bit 8), the pause orbit's steps, the screenshot, the HUD hide, the view distance,
+    /// the horizon, the HUD toggles and the map's zoom, the sound and the music — the keys 0x411760
+    /// binds (`nfs_input::bindings::RACE_FIXED`). Run on every key event and, for a pad-bound control
+    /// (PAD-HANG: Start on the pause row never reached this code, which ran on key events only), once
+    /// a race frame after `Gamepads::poll`.
     pub(crate) fn race_interface_keys(&mut self, event_loop: &LoopCtl) {
-        // `I_PAUSE` (P, or a pad's Start under D44's layout; Escape too, PORT-DEVIATION D10 ESC-PAUSE —
-        // the original reads no Escape in a race, `nfs_input::default_binding`): pause. The pause action (`0x4138D0(8, 1)`, 0x415170) opens the
+        // `I_PAUSE` (Escape, 0x411760's `[0x5E9908]` = 0x103; and a pad control on the pause row,
+        // PORT-DEVIATION D44 — the original has no pad pause): pause. The pause action (`0x4138D0(8, 1)`, 0x415170) opens the
         // pause menu (0x461740, 0x426800) only while the HUD's dialog queue is empty —
         // 0x41518C tests it with 0x426A60 first — and with a dialog up it goes to
         // 0x4151ED, which acts only in a network game (`[0x6573E8] == 3` → 0x41523A, the
@@ -221,15 +250,37 @@ impl App {
                 }
             }
         }
+        // `I_SCREENSHOT` (Alt+P, bit 0x0D): 0x4158A2 reads it on the press whatever the pause, before
+        // F1 (`race_shot.rs`)
+        if self.input.take_pressed(Action::Screenshot) && self.vehicle.is_some() {
+            self.race_screenshot();
+        }
         // `I_TOGGLEPAUSEMENU` (F1): 0x41596E reads bit 0x0E on the press whatever the pause,
         // and 0x425750 flips `[0x60CA00]` only with a dialog up
         if self.input.take_pressed(Action::TogglePauseMenu) && self.vehicle.is_some() && self.hud_dialog_up() {
             self.hud_hidden = !self.hud_hidden;
         }
-        // the HUD toggles, read on the press in this order while the pause is off
-        // (`[0x606A90]`, 0x415982): F5 0x18, "2" 0x1C, F6 0x1A, F7 0x1B, F8 0x1F
-        // (0x4159C9…0x415A8E)
-        for a in [Action::ToggleHud, Action::CycleMap, Action::ToggleRearView, Action::ToggleMap, Action::HudTransparency] {
+        // the rest are read while the pause is off (`[0x606A90]`, 0x415982), on the press:
+        // `I_VIEWDISTANCE` (F11, bit 0x0F) → 0x44F220, `ADJUSTABLEVIEWDISTANCE` `[0x657D70]` 0 → 1 → 2 →
+        // 3 → 0, which 0x44F1A0 turns into the draw distance's factor every frame (0x468A63)
+        if self.input.take_pressed(Action::ViewDistance) && self.vehicle.is_some() && !self.paused {
+            self.view_distance = (self.view_distance + 1) % 4;
+            self.detail = super::race_stages::VIEW_DISTANCE_SCALE[self.view_distance];
+            tracing::info!(view_distance = self.view_distance, factor = self.detail, "I_VIEWDISTANCE (0x44F220)");
+        }
+        // `I_HORIZON` (F12, bit 0x10) → 0x45DBB0 / 0x45DB90 on the sky manager (`Sky::toggle_horizon`)
+        if self.input.take_pressed(Action::Horizon)
+            && self.vehicle.is_some()
+            && !self.paused
+            && let Some(sky) = self.sky.as_mut()
+        {
+            sky.toggle_horizon();
+            tracing::info!(on = sky.horizon(), "I_HORIZON (0x45DBB0 / 0x45DB90)");
+        }
+        // the HUD toggles and the map's zoom, in `RaceFrame`'s order (0x4159C9…0x415A8E): F5 0x18,
+        // Tab 0x1C, keypad − 0x1D, (`1` 0x19: 0x427AC0 answers 0, nothing), F6 0x1A, F7 0x1B, keypad
+        // + 0x1E, F8 0x1F
+        for a in [Action::ToggleHud, Action::CycleMap, Action::ZoomInMap, Action::ToggleRearView, Action::ToggleMap, Action::ZoomOutMap, Action::HudTransparency] {
             if self.input.take_pressed(a) && self.vehicle.is_some() && !self.paused {
                 self.hud_key(a);
             }
@@ -404,13 +455,9 @@ impl ApplicationHandler for App {
                     return;
                 }
                 self.input.key_event(&event);
-                // ENHANCEMENT framework: F12 = every enhancement on <-> off, live (the original's
-                // F9 is `I_MUSIC`, so the debug key is F12, which it does not use)
-                if event.state == winit::event::ElementState::Pressed
-                    && !event.repeat
-                    && matches!(event.logical_key.as_ref(), winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12))
-                {
-                    self.enh_toggle_all();
+                // ENHANCEMENT framework: `0` = every enhancement on <-> off, live (`App::enh_key`)
+                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                    self.enh_key(code, event.state == winit::event::ElementState::Pressed, event.repeat);
                 }
                 // 0x4D2850: the callback list sees the key, then a screen or the background in
                 // transition, or a busy room, drops it (`fe_input_swallowed`)

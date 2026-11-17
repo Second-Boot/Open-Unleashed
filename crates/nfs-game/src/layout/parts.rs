@@ -650,6 +650,11 @@ impl LayoutScreen {
             };
             let at = |key: &str| self.part_attr(e, p, key).and_then(|v| self.ev_pair(e, v, 0));
             let (px, py) = at("pos").unwrap_or((0, 0));
+            // `NFS5.BOTTOMBARBUTTON`'s icon: template term 0, field term added (below)
+            let py = match e.class == "NFS5.BOTTOMBARBUTTON" && name == "picture" {
+                true => self.attr_num(e, "picoffy").unwrap_or(0.0) as i32,
+                false => py,
+            };
             let (px, py) = (px as f64, py as f64);
             // No size: a `SHAPE` part is always drawn at its **art's** size. `FEShapePart`'s load
             // (vtable 0x5B6E64 slot 8, **0x4E6AA0**) fetches the entry (0x4D7A10 at 0x4E6EBE) and
@@ -658,19 +663,20 @@ impl LayoutScreen {
             // 0x4D9AF0, which reads the same two fields for the quad's extent (0x4D9B04, 0x4D9B0E).
             // The only `SHAPE` parts that write a `size.value` are `CarSettingSlider.ctr`'s three
             // knobs, `6,11` — which is the art (`weeicons.fsh` 8, 34, 35 are 6×11).
-            // **`data.picoffy` is counted once.** `NFS5.BOTTOMBARBUTTON`'s draw 0x4C9B30 places
-            // the `picture` part at the widget's y + the part's `pos.y` (`0x4E7060([this+0x178])`,
-            // `[part+0x5C]`) + `[this+0x1D4]` (`data.picoffy`, the INUSE activate 0x4C9639) —
-            // 0x4C9BDE…0x4C9BED — and `BottomBarButton.ctr` already writes that part's
-            // `pos.value=0,data.picoffy`, which the walk above has just evaluated. The port used
-            // to add the field on top (§4.80), so the three icons of `bottombar.lay` (back,
-            // options, exit; `picoffy=6`) sat at +12, six pixels below their captions and cut by
-            // the screen's bottom edge. The original's stills put them at **+6** — the icon art
-            // centred on the caption (`RE/reference/2026-09-28/cmp_p11_factorydriver.jpg`: the
-            // back arrow's red rows 2…17 of 20 at screen rows 461…474, the exit cross's 4…16 at
-            // 462…474, both a 458 top = 452 + 6). APPROXIMATION: the outcome is the original's,
-            // but which of the draw's two terms reads 0 there is not traced — read statically,
-            // both come out 6 (`controls.md` §4.80, "counted once"); the port keeps the template's.
+            // **`data.picoffy` is counted once, and it is the field.** `NFS5.BOTTOMBARBUTTON`'s
+            // draw 0x4C9B30 places the `picture` part at the widget's y + the part's `pos.y`
+            // (`0x4E7060([this+0x178])` → `[part+0x5C]`, `ebp` at 0x4C9BB7) + `[this+0x1D4]`
+            // (`data.picoffy`, the INUSE activate 0x4C9639) — 0x4C9BDE…0x4C9BED. A live read at
+            // 0x4C9BDE in the original (`RE/notes/REFERENCE-2026-11-17-ISS4.md` row 9) gives, for
+            // all four `bottombar.lay` buttons, `ebp` = **0**, and `[esi+0x1D4]` = 6 on the three
+            // icon buttons (posy 452) and 0 on RACE (posy 456): the
+            // template's `pos.value=0,data.picoffy` reads 0 there and the field carries the
+            // offset. So the port takes the template term as 0 and adds the field — the icons
+            // at posy + 6, the original's stills (`RE/reference/2026-09-28/
+            // cmp_p11_factorydriver.jpg`: back arrow's red rows 2…17 at screen rows 461…474, a
+            // 458 top = 452 + 6). Why the template's expression is 0 at runtime is not traced
+            // (read statically, the dictionary holds the `.lay`'s 6: `controls.md` §4.80); the
+            // read settles the value for every shipped button — the other 19 carry `picoffy=0`.
             // `flip` is the part's own attribute — `Graphic Tab Button.ctr` writes
             // `flip.value=data.flipit`, so the widget's `flipit` mirrors the tab's art
             let flip = self
@@ -678,7 +684,8 @@ impl LayoutScreen {
                 .map(|v| self.ev(e, v, 0))
                 .filter(|n| *n >= 0)
                 .map(|n| n as i64)
-                .unwrap_or_else(|| e.int("flip").unwrap_or(0).max(0));
+                // the widget's own `flip`, as bits (0x4D9C79 / 0x4D9CA8 test `& 1` / `& 2`): −1 is both
+                .unwrap_or_else(|| e.int("flip").unwrap_or(0));
             out.push((px as f32, py as f32, file.to_string(), index, flip));
         }
         out

@@ -554,7 +554,7 @@ pub(crate) struct Core {
     pending_mesh: Vec<u32>,
     free_mesh: Vec<u32>,
     /// ENHANCEMENT ENH-LIVETEX (E41): a texture's HD twin, by the original's index; a material samples the twin while E41 is above 0
-    /// (`Self::shown_texture`), the original otherwise, so F12 / the menu flip between the two without a reload
+    /// (`Self::shown_texture`), the original otherwise, so the A/B key / the menu flip between the two without a reload
     tex_twin: Vec<Option<TextureId>>,
     /// ENHANCEMENT ENH-LIVETEX (E42): a mesh's refined twin (a car's rounded part), drawn in place of the original while E42 is above 0
     mesh_twin: Vec<Option<MeshId>>,

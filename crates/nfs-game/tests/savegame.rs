@@ -904,3 +904,43 @@ fn a_sav_car_without_a_stock_list_gets_its_stock_parts() {
     let want = t.car(car.car_id).unwrap().stock_parts.len();
     assert!(car.stock.len() == want && car.parts.len() >= want, "the stock parts are back: {:?}", car.parts);
 }
+
+/// ISS4-PRICE: the garage's «текущая цена» of the pristine profile's `'50 356` — 11,123 in the
+/// original (REFERENCE-2026-11-17-ISS4, REFERENCE-2026-10-22-PA-SRV2 O3), 11,000 in the port. Both are
+/// 0x4F8E50 on the same inputs except the stock list: year 1950 (curve 100 %, base 11,000), mileage
+/// 3000 (band 0 %), wins `car+0x69C` = 1 (+110), damage 0 (band −1 %, −110), and the parts term
+/// Σ 0x518220(`+0x758`) − Σ 0x518220(`+0x75C`) (0x4F8F24…0x4F8FCC). The file holds the stock list
+/// empty and the stock flywheel (part 54, 154, state 0) alone in `+0x758`: the original loads that
+/// as written (0x4EE6A0) and adds the flywheel's 80 % as if it were an upgrade, `154·80/100 = 123`.
+/// The port rebuilds the stock list on load (PORT-DEVIATION D40), so the flywheel cancels against
+/// its stock copy and the term is 0. A car the original itself constructs (0x4EE9A0) always
+/// carries its stock list: the port's 11,000 is what the original shows for the same car bought in
+/// the original. Test glue: needs the game data and the fixture.
+#[test]
+fn the_pristine_356_is_worth_11000_rebuilt_and_11123_as_written() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::Path::new(&home).join("fixtures/fe_save_pristine/8DRIVER.sav");
+    let Ok(data) = std::fs::read(&path) else {
+        eprintln!("skipping: no fixture");
+        return;
+    };
+    let s = SaveFile::parse(&data).unwrap();
+    let raw = &s.player.as_ref().unwrap().cars[0];
+    assert!(raw.removed.is_empty(), "the file's stock list +0x75C is empty");
+    assert_eq!(raw.installed.iter().map(|p| (p.id, p.state)).collect::<Vec<_>>(), [(54, 0.0)], "the stock flywheel alone in +0x758");
+    let c = career_from_sav(&s, &t);
+    let car = &c.garage[0];
+    assert_eq!((c.year, car.mileage, car.wins, car.purchase_price), (1950, 3000, 1, 11_000));
+    assert_eq!(c.value_of(&t, car), Some(11_000), "D40: the rebuilt stock list cancels the flywheel");
+    // the lists as the original holds them (0x4EE6A0 loads them as written)
+    let mut as_written = car.clone();
+    as_written.parts = vec![54];
+    as_written.part_state = vec![(54, 0.0)];
+    as_written.stock.clear();
+    as_written.damage_pct = nfs_game::career::car_damage_pct(&t, &as_written);
+    assert_eq!(c.value_of(&t, &as_written), Some(11_123), "the original's garage figure");
+}

@@ -129,7 +129,7 @@ impl App {
 
     /// Take a new set the player chose (the panel's rows and buttons): the renderer gets it through its command
     /// list (so the next frame, with the render thread too), and it is saved — unless this run is the hard
-    /// original (`NFS_ENH=off`), which keeps no state and ignores every change. A change made while the F12 A/B is
+    /// original (`NFS_ENH=off`), which keeps no state and ignores every change. A change made while the A/B view (the `0` key) is
     /// showing another set commits what the panel shows and ends the A/B.
     pub(crate) fn enh_apply(&mut self, e: Enhancements) {
         if self.enh_mode == Mode::HardOriginal {
@@ -165,7 +165,7 @@ impl App {
 
     /// ENHANCEMENT ENH-LIVETEX: make the loaded track, sky and cars carry what E41 (HD textures) and E42 (rounded parts) are at NOW. The
     /// originals are always resident; the HD textures and refined meshes sit next to them as twins and the renderer shows them while the
-    /// switch is on, so a flip (F12, a level to / from 0) needs nothing here. Only a level whose twins are not resident yet (first use after
+    /// switch is on, so a flip (the `0` key, a level to / from 0) needs nothing here. Only a level whose twins are not resident yet (first use after
     /// a load made with the switch off, x2 <-> x4, soft <-> strong) is loaded now: the track and the sky at once, the cars one model per
     /// step until `budget_ms` is used (`None`: all). With both switches at 0, or after the work is done, this is a flag test.
     pub(crate) fn enh_live_step(&mut self, budget_ms: Option<u64>) {

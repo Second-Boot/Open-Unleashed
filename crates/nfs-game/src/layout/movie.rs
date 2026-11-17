@@ -143,6 +143,11 @@ impl MoviePlayer {
         })
     }
 
+    /// **TEST GLUE**: the next chunk to decode (`LayoutScreen::anim_probe`).
+    pub(super) fn next_chunk(&self) -> usize {
+        self.next
+    }
+
     /// (Re)start the audio track from its own beginning — `FEMovie`'s constructor's own start
     /// (0x4E212C…0x4E2178) and, at a loop restart, 0x4E2380's `0x567690` (stop the old player)
     /// followed by a fresh 0x56CA20 (`mad.md` §14). No `looping` flag on the voice itself: the

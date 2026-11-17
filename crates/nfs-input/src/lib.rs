@@ -25,12 +25,16 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 ///   0 / 1 of byte 0 for the handbrake and the horn — levels;
 /// * **the commands** (0x41312F…0x41326B), a code in bits 3..7 of byte 0 on the press: 2 shift up,
 ///   3 shift down, 4 abort, 5 reset, 6 AI drive, 10 / 11 the turn signals, 12 the siren (the
-///   hazards), 13 the lights — edges;
+///   hazards), 13 the lights, 16 the music (stripped into bit 0x12 by 0x4136D9) — edges;
 /// * **the interface bits** (0x413744…0x4137A0), bit `id − 0x1EE` of the word the packer files in
 ///   the ring `0x5E954C`, read by `RaceFrame` through 0x4138D0 — on the press (edge) for 8 pause,
-///   0x0A…0x0C the pause orbit's step, 0x0E the HUD hide, 0x11 / 0x12 the sound and music, 0x17
-///   the camera, 0x18…0x1F the HUD toggles (0x415866…0x415ABE); held (level) for 0x13…0x16, the
-///   looks (0x415AFA…0x415B2C).
+///   0x0A…0x0C the pause orbit's step, 0x0D the screenshot, 0x0E the HUD hide, 0x0F the view
+///   distance, 0x10 the horizon, 0x11 / 0x12 the sound and music, 0x17 the camera, 0x18…0x1F the
+///   HUD toggles and the map's zoom (0x415866…0x415ABE); held (level) for 0x13…0x16, the looks
+///   (0x415AFA…0x415B2C).
+///
+/// A race reads 0x411760's bindings for the 25 ids it stores at every race start and the player's
+/// for the rest ([`InputState::binding_of`], `bindings::RACE_FIXED`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     SteerLeft,
@@ -90,8 +94,22 @@ pub enum Action {
     Sfx,
     /// `I_CYCLEHUD`, bit 0x19 — 0x427AC0, which answers 0 whatever the HUD: nothing happens
     CycleHud,
-    /// `I_CYCLEMAP`, bit 0x1C — 0x426740
+    /// `I_CYCLEMAP`, bit 0x1C — 0x426740 (Tab, 0x411760)
     CycleMap,
+    /// `I_VIEWDISTANCE`, bit 0x0F — 0x44F220, `ADJUSTABLEVIEWDISTANCE` `[0x657D70]` stepped 0 → 1 → 2 → 3 → 0
+    /// (F11, 0x411760)
+    ViewDistance,
+    /// `I_HORIZON`, bit 0x10 — 0x45DBB0 / 0x45DB90, the sky's `[+0x60]` flipped (F12, 0x411760)
+    Horizon,
+    /// `I_ZOOMINMAP`, bit 0x1D — 0x427600 → 0x41E620, MAPSCALE up (keypad −, 0x411760)
+    ZoomInMap,
+    /// `I_ZOOMOUTMAP`, bit 0x1E — 0x427630 → 0x41E5E0, MAPSCALE down (keypad +, 0x411760)
+    ZoomOutMap,
+    /// `I_SCREENSHOT`, bit 0x0D — 0x4158A2…0x415969, `Unleashed<nn>.tga` (Alt+P, 0x411760)
+    Screenshot,
+    /// `C1_SWITCHMUSIC`, command 16 — 0x4136D9 strips it from the packet and sets the interface bit
+    /// 0x12, `I_MUSIC`'s (F9, 0x411760)
+    SwitchMusic,
 }
 
 /// What the port keeps per action, one row each, **in the order of [`Action`]'s variants** (so
@@ -113,7 +131,7 @@ const fn def(action: Action, fe_name: &'static str, id: u16, default_key: KeyCod
     ActionDef { action, fe_name, id, default_key, key_code }
 }
 
-const ACTIONS: [ActionDef; 33] = {
+const ACTIONS: [ActionDef; 39] = {
     use bindings::id::*;
     [
         def(Action::SteerLeft, "C1_LEFT", C1_LEFT, KeyCode::ArrowLeft, Some(0x4B00)),
@@ -125,7 +143,9 @@ const ACTIONS: [ActionDef; 33] = {
         def(Action::ShiftDown, "C1_SHIFTDOWN", C1_SHIFTDOWN, KeyCode::KeyZ, Some(b'z' as u32)),
         def(Action::CameraNext, "I_CYCLECAMERA", I_CYCLECAMERA, KeyCode::KeyC, Some(b'c' as u32)),
         def(Action::RearView, "I_LOOKBEHIND", I_LOOKBEHIND, KeyCode::KeyB, Some(b'b' as u32)),
-        def(Action::Pause, "I_PAUSE", I_PAUSE, KeyCode::KeyP, Some(b'p' as u32)),
+        // the row's code stays 0x51D1D0's `p` (the setup screen shows it); the key a race reads is
+        // 0x411760's Escape (`bindings::RACE_FIXED`)
+        def(Action::Pause, "I_PAUSE", I_PAUSE, KeyCode::Escape, Some(b'p' as u32)),
         def(Action::Reset, "C1_RESET", C1_RESET, KeyCode::KeyR, Some(b'r' as u32)),
         def(Action::Horn, "C1_HORN", C1_HORN, KeyCode::KeyH, Some(b'h' as u32)),
         def(Action::Abort, "C1_ABORT", C1_ABORT, KeyCode::KeyQ, None),
@@ -148,15 +168,21 @@ const ACTIONS: [ActionDef; 33] = {
         def(Action::Music, "I_MUSIC", I_MUSIC, KeyCode::F9, None),
         def(Action::Sfx, "I_SFX", I_SFX, KeyCode::F10, None),
         def(Action::CycleHud, "I_CYCLEHUD", I_CYCLEHUD, KeyCode::Digit1, None),
-        def(Action::CycleMap, "I_CYCLEMAP", I_CYCLEMAP, KeyCode::Digit2, None),
+        def(Action::CycleMap, "I_CYCLEMAP", I_CYCLEMAP, KeyCode::Tab, None),
+        def(Action::ViewDistance, "I_VIEWDISTANCE", I_VIEWDISTANCE, KeyCode::F11, None),
+        def(Action::Horizon, "I_HORIZON", I_HORIZON, KeyCode::F12, None),
+        def(Action::ZoomInMap, "I_ZOOMINMAP", I_ZOOMINMAP, KeyCode::NumpadSubtract, None),
+        def(Action::ZoomOutMap, "I_ZOOMOUTMAP", I_ZOOMOUTMAP, KeyCode::NumpadAdd, None),
+        def(Action::Screenshot, "I_SCREENSHOT", I_SCREENSHOT, KeyCode::KeyP, None),
+        def(Action::SwitchMusic, "C1_SWITCHMUSIC", C1_SWITCHMUSIC, KeyCode::F9, None),
     ]
 };
 
 const _: () = assert!(ACTIONS.len() <= 64, "InputState keeps held / pressed in one u64 each");
 
 /// Every action, in the order of [`ACTIONS`].
-const ALL_ACTIONS: [Action; 33] = {
-    let mut out = [Action::SteerLeft; 33];
+const ALL_ACTIONS: [Action; 39] = {
+    let mut out = [Action::SteerLeft; 39];
     let mut i = 0;
     while i < out.len() {
         out[i] = ACTIONS[i].action;
@@ -166,15 +192,20 @@ const ALL_ACTIONS: [Action; 33] = {
 };
 
 /// The original's default key of each action, used only for an action with no binding at all
-/// ([`bindings`]; with the shipped `fe.txt` and 0x51D1D0's rows every action has one). The keys
-/// are 0x51D1D0's keyboard half (English, `lang` 0 — `bindings::default_key`) for its nineteen
-/// rows and the shipped `fe.txt` for the rest: `C1_ABORT = key,SC_Q`, `C1_AIDRIVE = key,SC_D`,
-/// `I_TOGGLEPAUSEMENU` … `I_SFX` = `SC_F1` … `SC_F10`, `I_CYCLEHUD = key,SC_1`, `I_CYCLEMAP =
-/// key,SC_2`. `I_VIEWDISTANCE`, `I_HORIZON` (`SC_F11`, `SC_F12`) and the map zoom (`SC_SUBTRACT`,
-/// `SC_ADD`) name keys the `SC_*` table 0x5D6588 does not have, so they bind nothing. Escape is
-/// no in-race key: no binding names `SC_ESC`, and nothing else reads its entry `[0x5DE029]` of
-/// the key-down table. *(Corrected 2026-09-26: this map also had Escape for pause and the
-/// port's own free-camera keys W / S / Q / E / PageUp / PageDown / Shift, which nothing read.)*
+/// ([`bindings`]; with the shipped `fe.txt`, 0x51D1D0's rows and 0x411760's table every action has
+/// one). The keys are 0x51D1D0's keyboard half (English, `lang` 0 — `bindings::default_key`) for
+/// its nineteen rows, the shipped `fe.txt` for `C1_ABORT = key,SC_Q`, `C1_AIDRIVE = key,SC_D`,
+/// `I_MUSIC = key,SC_F9` and the look / camera ids, and **0x411760** (`bindings::RACE_FIXED`, stored
+/// over both at every race start) for the pause (Escape), F1 … F8, F10, `I_CYCLEHUD` `1`,
+/// `I_CYCLEMAP` Tab, `I_VIEWDISTANCE` F11, `I_HORIZON` F12, the map zoom keypad − / +,
+/// `I_SCREENSHOT` Alt+P and `C1_SWITCHMUSIC` F9. (`fe.txt`'s own `SC_F11`, `SC_F12`,
+/// `SC_SUBTRACT`, `SC_ADD` are names the `SC_*` table 0x5D6588 does not have and bind nothing; it
+/// is 0x411760 that binds those keys, by scan code.)
+/// *(Corrected 2026-09-26: this map also had the port's own free-camera keys W / S / Q / E /
+/// PageUp / PageDown / Shift, which nothing read. Corrected 2026-11-17: the 2026-09-26 line
+/// "Escape is no in-race key — no binding names `SC_ESC`, nothing reads `[0x5DE029]`" was
+/// wrong; 0x411760 names it and 0x411C20 reads it by index. Corrected 2026-11-17, ISS4-KEYS: P
+/// paused and `2` cycled the map here, and F11 / F12 / keypad − / + / Alt+P bound nothing.)*
 pub fn default_binding(key: KeyCode) -> Option<Action> {
     ACTIONS.iter().find(|d| d.default_key == key).map(|d| d.action)
 }
@@ -190,7 +221,8 @@ pub fn key_code_for(action: Action) -> Option<u32> {
 }
 
 /// The DirectInput scancode of a physical key — the set `fe.txt`'s `SC_*` names and the key-down
-/// table `0x5DE028` index (`bindings::SC_NAMES`). Only the keys that table names.
+/// table `0x5DE028` index (`bindings::SC_NAMES`). Only the keys that table names, and F11 / F12 (0x57 / 0x58),
+/// which 0x411760 binds by scan code (`I_VIEWDISTANCE`, `I_HORIZON`).
 pub fn scancode(k: KeyCode) -> Option<u8> {
     use KeyCode::*;
     Some(match k {
@@ -207,7 +239,7 @@ pub fn scancode(k: KeyCode) -> Option<u8> {
         F4 => 0x3E, F5 => 0x3F, F6 => 0x40, F7 => 0x41, F8 => 0x42, F9 => 0x43, F10 => 0x44,
         NumLock => 0x45, ScrollLock => 0x46, Home => 0x47, ArrowUp => 0x48, PageUp => 0x49,
         NumpadSubtract => 0x4A, ArrowLeft => 0x4B, Numpad5 => 0x4C, ArrowRight => 0x4D, NumpadAdd => 0x4E,
-        End => 0x4F, ArrowDown => 0x50, PageDown => 0x51, Insert => 0x52, Delete => 0x53,
+        End => 0x4F, ArrowDown => 0x50, PageDown => 0x51, Insert => 0x52, Delete => 0x53, F11 => 0x57, F12 => 0x58,
         _ => return None,
     })
 }
@@ -215,11 +247,6 @@ pub fn scancode(k: KeyCode) -> Option<u8> {
 /// The binding id each action reads through (`bindings::id`).
 pub fn binding_id(a: Action) -> Option<u16> {
     Some(ACTIONS[a as usize].id)
-}
-
-/// The action whose binding has option id `id`.
-fn action_of_id(id: u16) -> Option<Action> {
-    ACTIONS.iter().find(|d| d.id == id).map(|d| d.action)
 }
 
 /// A front-end key from a standard pad (PORT-DEVIATION D10: the original's front end reads no
@@ -335,36 +362,38 @@ impl InputState {
         self.key_changed(code, ev.state);
     }
     /// A physical key going down or up (`key_event` minus the winit event, which tests cannot build).
-    fn key_changed(&mut self, code: KeyCode, state: ElementState) {
+    pub fn key_changed(&mut self, code: KeyCode, state: ElementState) {
         if let Some(sc) = scancode(code) {
             match state {
                 ElementState::Pressed => self.keys_down.insert(sc),
                 ElementState::Released => self.keys_down.remove(&sc),
             };
-            // an action bound in `fe.txt` is pressed by its binding's key and no other
-            let bound = self.bindings.by_id.iter().filter(|(_, b)| b.kind_class() == bindings::BindingKind::Key && b.index == sc as u32).map(|(&i, _)| i).collect::<Vec<_>>();
-            for i in bound {
-                if let Some(a) = action_of_id(i) {
+            // an action bound to a key is pressed by its binding's key and no other — the race's
+            // binding ([`Self::binding_of`]: 0x411760's table over the rows and `fe.txt`)
+            for &a in ALL_ACTIONS.iter() {
+                let Some(b) = self.binding_of(a) else { continue };
+                if b.kind_class() != bindings::BindingKind::Key {
+                    continue;
+                }
+                if b.index & 0xFF == u32::from(sc) {
                     match state {
                         ElementState::Pressed if self.read(a) > 0x40 => self.hold(a),
                         ElementState::Pressed => {}
                         ElementState::Released => self.unhold(a),
                     }
+                } else if b.index & 0x70000 != 0 && bindings::is_modifier(sc) {
+                    // a binding that asks for a modifier (0x411760's Alt+P) reads its key again when a
+                    // modifier goes down or up, as the packer's level read each tick does (0x411C20)
+                    if self.read(a) > 0x40 {
+                        self.hold(a);
+                    } else {
+                        self.unhold(a);
+                    }
                 }
             }
         }
-        // PORT-DEVIATION D10 (ESC-PAUSE): Escape is a second pause key beside P, unless a row is
-        // bound to Escape itself. The original reads no Escape in a race (no binding names
-        // `SC_ESC`, nothing reads `[0x5DE029]`), so the key was free.
-        if code == KeyCode::Escape && !self.key_bound(code) {
-            match state {
-                ElementState::Pressed => self.hold(Action::Pause),
-                ElementState::Released => self.unhold(Action::Pause),
-            }
-            return;
-        }
         let Some(action) = default_binding(code) else { return };
-        if let Some(b) = binding_id(action).and_then(|i| self.bindings.get(i)) {
+        if let Some(b) = self.binding_of(action) {
             // PORT-DEVIATION D44 (PAD-HANG): a row bound to a pad control still answers its
             // default key (0x51D1D0's keyboard half, `bindings::default_key`) unless a row is
             // bound to that key — the keyboard keeps working beside the pad. In the original a
@@ -378,12 +407,35 @@ impl InputState {
             ElementState::Released => self.unhold(action),
         }
     }
-    /// Whether a row is bound to physical key `code` (a key binding of its scancode).
+    /// The binding a race reads for action `a`: **0x411760**'s for the ids it stores
+    /// (`bindings::race_fixed`, written over the option stream at every race start, 0x4155EF), the
+    /// player's (`fe.txt`, then the `Controller.*` rows) for every other. The rows keep their own
+    /// bindings ([`bindings`](Self::bindings)) for the setup screens and the profile: in the
+    /// original too the `Controller.Pause` row still shows (and saves) P, which no race reads.
+    pub fn binding_of(&self, a: Action) -> Option<bindings::Binding> {
+        let id = ACTIONS[a as usize].id;
+        bindings::race_fixed(id).or_else(|| self.bindings.get(id).copied())
+    }
+    /// PORT-DEVIATION D44 (the pad's pause): the `Controller.Pause` row's own binding when it is a pad
+    /// control. The original has **no** pad pause: 0x411760 overwrites `I_PAUSE` with Escape after
+    /// the rows are applied, clears `I_PAUSEJOY` (`[0x5E990C]` = 0) whose bit 9 nothing reads (every
+    /// `0x4138D0` call site pushes 8 or 0x0A…0x1F), and the `PSX_START` word `[0x5E9548]` (0x4137ED)
+    /// has no reader. The port keeps the row's pad control pausing beside Escape, the only way to
+    /// pause with a pad.
+    fn pause_pad_row(&self) -> Option<&bindings::Binding> {
+        self.bindings.get(bindings::id::I_PAUSE).filter(|b| matches!(b.kind_class(), bindings::BindingKind::Axis | bindings::BindingKind::Button | bindings::BindingKind::Hat))
+    }
+    /// Whether a binding the race reads is a key of physical key `code` (its scancode).
     fn key_bound(&self, code: KeyCode) -> bool {
-        scancode(code).is_some_and(|sc| self.bindings.by_id.values().any(|b| b.kind_class() == bindings::BindingKind::Key && b.index == u32::from(sc)))
+        scancode(code).is_some_and(|sc| ALL_ACTIONS.iter().any(|&a| self.binding_of(a).is_some_and(|b| b.kind_class() == bindings::BindingKind::Key && b.index & 0xFF == u32::from(sc))))
     }
     pub fn press(&mut self, action: Action) {
         self.hold(action);
+    }
+    /// One press edge of `action` without holding it — an interface bit set for one sample, as
+    /// 0x4136D9 sets `I_MUSIC`'s bit 0x12 from command 16.
+    pub fn pulse(&mut self, action: Action) {
+        self.pressed |= bit(action);
     }
     pub fn release(&mut self, action: Action) {
         self.unhold(action);
@@ -403,7 +455,7 @@ impl InputState {
     /// [`held`](Self::held) without the pad read: a key or a `press` holding the action, gated
     /// by a modifier for a key binding (0x411C5F).
     fn held_by_press(&self, a: Action) -> bool {
-        let gated = binding_id(a).is_some_and(|i| self.bindings.get(i).is_some_and(|b| b.kind_class() == bindings::BindingKind::Key)) && self.modifier_down();
+        let gated = self.binding_of(a).is_some_and(|b| b.kind_class() == bindings::BindingKind::Key && bindings::modifier_mismatch(&b, self.modifiers()));
         self.held & bit(a) != 0 && !gated
     }
     /// New pad readings: an action bound to a pad control is pressed on the tick its read goes
@@ -445,26 +497,31 @@ impl InputState {
     pub fn keys_down_count(&self) -> usize {
         self.keys_down.len()
     }
-    fn modifier_down(&self) -> bool {
-        [bindings::SC_LSHIFT, bindings::SC_RSHIFT, bindings::SC_CTRL, bindings::SC_ALT].iter().any(|s| self.keys_down.contains(s))
+    /// The modifiers down, as 0x411C20 reads them.
+    fn modifiers(&self) -> bindings::Modifiers {
+        let down = |s: u8| self.keys_down.contains(&s);
+        bindings::Modifiers { shift: down(bindings::SC_LSHIFT) || down(bindings::SC_RSHIFT), ctrl: down(bindings::SC_CTRL), alt: down(bindings::SC_ALT) }
     }
     /// An action's 0…255 read through its binding by the kind's reader (the records at
     /// `0x5CC5C8 + 12·kind`): `Analog` 0x411B80, `Button` 0x411A50, `Key` 0x411C20, `Pov`
     /// 0x411AC0. 0 for an action with no binding, or a binding of kind 0.
     pub fn read(&self, a: Action) -> u8 {
-        let Some(b) = binding_id(a).and_then(|i| self.bindings.get(i)) else { return 0 };
+        let v = self.binding_of(a).map_or(0, |b| self.read_binding(&b));
+        // PORT-DEVIATION D44: the pause row's pad control beside 0x411760's Escape
+        if a == Action::Pause
+            && let Some(b) = self.pause_pad_row()
+        {
+            return v.max(self.read_binding(b));
+        }
+        v
+    }
+    /// One binding read by its kind's reader; 0 for kind 0 and for the interface reader 0x411C80
+    /// (kind 4), which only 0x411760's `I_UP` … `I_SELECT` use and no `RaceFrame` read reaches.
+    fn read_binding(&self, b: &bindings::Binding) -> u8 {
         match b.kind_class() {
             bindings::BindingKind::Axis => bindings::axis_read(b, &self.pads, &self.axis_bands),
             bindings::BindingKind::Button => bindings::button_read(b, &self.pads),
-            bindings::BindingKind::Key => {
-                let down = |s: u8| self.keys_down.contains(&s);
-                let m = bindings::Modifiers {
-                    shift: down(bindings::SC_LSHIFT) || down(bindings::SC_RSHIFT),
-                    ctrl: down(bindings::SC_CTRL),
-                    alt: down(bindings::SC_ALT),
-                };
-                bindings::key_read(b, down, m)
-            }
+            bindings::BindingKind::Key => bindings::key_read(b, |s: u8| self.keys_down.contains(&s), self.modifiers()),
             bindings::BindingKind::Hat => bindings::pov_read(b, &self.pads),
             _ => 0,
         }
@@ -472,7 +529,10 @@ impl InputState {
     /// Whether an action is bound to a pad control (kinds 1, 2, 5), which the packer then reads
     /// through its reader rather than through a held key.
     pub fn pad_bound(&self, a: Action) -> bool {
-        binding_id(a).and_then(|i| self.bindings.get(i)).is_some_and(|b| matches!(b.kind_class(), bindings::BindingKind::Axis | bindings::BindingKind::Button | bindings::BindingKind::Hat))
+        if a == Action::Pause {
+            return self.pause_pad_row().is_some();
+        }
+        self.binding_of(a).is_some_and(|b| matches!(b.kind_class(), bindings::BindingKind::Axis | bindings::BindingKind::Button | bindings::BindingKind::Hat))
     }
     /// `.RAMPS` / `.RAMPG` / `.RAMPB` — 0x51CC00 writes `kind != 1` for the `C1_RIGHT`, `C1_GAS`
     /// and `C1_BRAKE` bindings into option ids 0x222 / 0x223 / 0x224 (0x51CF54…0x51CFFC): every
@@ -481,7 +541,7 @@ impl InputState {
     /// PORT-DEVIATION D44 (PAD-HANG): while a key holds a side of an axis-bound control (its default
     /// key beside the pad, [`key_changed`](Self::key_changed)) that control is ramped as a key's is.
     pub fn ramps(&self) -> (bool, bool, bool) {
-        let digital = |a: Action| binding_id(a).and_then(|i| self.bindings.get(i)).is_none_or(|b| b.kind_class() != bindings::BindingKind::Axis);
+        let digital = |a: Action| self.binding_of(a).is_none_or(|b| b.kind_class() != bindings::BindingKind::Axis);
         let key = |a: Action| self.held_by_press(a);
         (
             digital(Action::SteerRight) || key(Action::SteerLeft) || key(Action::SteerRight),
@@ -611,8 +671,8 @@ mod tests {
         st.end_tick();
         assert!(!st.take_pressed(Action::SignalLeft), "end_tick drops the edge");
         assert!(st.held(Action::SignalLeft));
-        st.key_changed(KeyCode::Escape, ElementState::Pressed);
-        assert_eq!(st.keys_down_count(), 2, "Escape has a scancode but no action");
+        st.key_changed(KeyCode::Digit0, ElementState::Pressed);
+        assert_eq!(st.keys_down_count(), 2, "0 has a scancode but no action");
     }
 
     /// A bound action is pressed by its binding's key and no other: `C1_LEFT = key,SC_H` moves
@@ -838,14 +898,16 @@ mod tests {
         for (i, d) in ACTIONS.iter().enumerate() {
             assert_eq!(d.action as usize, i, "{:?}", d.action);
             assert_eq!(binding_id(d.action), Some(d.id));
-            assert_eq!(action_of_id(d.id), Some(d.action));
-            assert_eq!(default_binding(d.default_key), Some(d.action));
+            // `C1_SWITCHMUSIC` shares F9 with `I_MUSIC` (0x411760 and `fe.txt`), which comes first
+            if d.action != Action::SwitchMusic {
+                assert_eq!(default_binding(d.default_key), Some(d.action));
+            }
             assert!(d.fe_name.starts_with("C1_") || d.fe_name.starts_with("I_"), "{}", d.fe_name);
         }
         let names: std::collections::HashSet<_> = ACTIONS.iter().map(|d| d.fe_name).collect();
-        assert_eq!(names.len(), 33, "names are unique");
+        assert_eq!(names.len(), ACTIONS.len(), "names are unique");
         // the declaration order is the table's, so the last variant is the last row
-        assert_eq!(Action::CycleMap as usize, ACTIONS.len() - 1);
+        assert_eq!(Action::SwitchMusic as usize, ACTIONS.len() - 1);
     }
 
     /// the per-action tables as one text, pinned by hash (ids, default keys,
@@ -860,24 +922,27 @@ mod tests {
             s += &format!("{a:?}:{:?}:{:?}:{:?}\n", binding_id(*a), key_code_for(*a), key.map(|k| scancode(*k)));
         }
         let ids: std::collections::HashSet<_> = ALL_ACTIONS.iter().map(|a| binding_id(*a)).collect();
-        assert_eq!(ids.len(), 33, "ids are unique");
+        assert_eq!(ids.len(), ALL_ACTIONS.len(), "ids are unique");
         let h = s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
         eprintln!("TABLES {h:016x}\n{s}");
         assert_eq!(h, PINNED_TABLES);
     }
-    const PINNED_TABLES: u64 = 0x9e95fc809b4b2db8;
-    const KEY_PROBE: [KeyCode; 41] = [
+    // ISS4-KEYS: re-pinned for 0x411760 (the pause on Escape, the map on Tab, the six new rows)
+    const PINNED_TABLES: u64 = 0x0692c33f1f68d352;
+    const KEY_PROBE: [KeyCode; 43] = [
         KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown, KeyCode::Space,
         KeyCode::KeyA, KeyCode::KeyZ, KeyCode::KeyC, KeyCode::KeyR, KeyCode::KeyB, KeyCode::KeyH,
         KeyCode::KeyP, KeyCode::KeyL, KeyCode::KeyW, KeyCode::KeyE, KeyCode::KeyT, KeyCode::KeyY,
         KeyCode::KeyI, KeyCode::KeyU, KeyCode::KeyQ, KeyCode::KeyD, KeyCode::F1, KeyCode::F2,
         KeyCode::F3, KeyCode::F4, KeyCode::F5, KeyCode::F6, KeyCode::F7, KeyCode::F8, KeyCode::F9,
         KeyCode::F10, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Escape, KeyCode::KeyX, KeyCode::F11,
-        KeyCode::F12, KeyCode::NumpadAdd, KeyCode::Tab, KeyCode::Digit3, KeyCode::KeyS,
+        KeyCode::F12, KeyCode::NumpadAdd, KeyCode::Tab, KeyCode::Digit3, KeyCode::KeyS, KeyCode::NumpadSubtract,
+        KeyCode::Digit0,
     ];
 
-    /// The shipped `fe.txt`'s binding lines (lines 397…436) and 0x51D1D0's keyboard rows give
-    /// every action a key, and it is the one [`default_binding`] names.
+    /// The shipped `fe.txt`'s binding lines (lines 397…436), 0x51D1D0's keyboard rows and 0x411760's
+    /// table give every action the key a race reads ([`InputState::binding_of`]), and it is the one
+    /// [`default_binding`] names (`C1_SWITCHMUSIC`'s F9 is `I_MUSIC`'s too, so it names that one).
     #[test]
     fn every_action_has_its_default_key() {
         let fe = [
@@ -940,31 +1005,38 @@ mod tests {
         let codes = [
             KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown, KeyCode::Space,
             KeyCode::KeyA, KeyCode::KeyZ, KeyCode::KeyC, KeyCode::KeyR, KeyCode::KeyB, KeyCode::KeyH,
-            KeyCode::KeyP, KeyCode::KeyL, KeyCode::KeyW, KeyCode::KeyE, KeyCode::KeyT, KeyCode::KeyY,
+            KeyCode::Escape, KeyCode::KeyL, KeyCode::KeyW, KeyCode::KeyE, KeyCode::KeyT, KeyCode::KeyY,
             KeyCode::KeyI, KeyCode::KeyU, KeyCode::KeyQ, KeyCode::KeyD, KeyCode::F1, KeyCode::F2,
             KeyCode::F3, KeyCode::F4, KeyCode::F5, KeyCode::F6, KeyCode::F7, KeyCode::F8, KeyCode::F9,
-            KeyCode::F10, KeyCode::Digit1, KeyCode::Digit2,
+            KeyCode::F10, KeyCode::Digit1, KeyCode::Tab, KeyCode::F11, KeyCode::F12, KeyCode::NumpadSubtract,
+            KeyCode::NumpadAdd, KeyCode::KeyP,
         ];
-        assert_eq!(codes.len(), ALL_ACTIONS.len());
+        assert_eq!(codes.len() + 1, ALL_ACTIONS.len(), "every action but C1_SWITCHMUSIC (F9, as I_MUSIC)");
         for k in codes {
             let a = default_binding(k).unwrap();
-            let b = s.bindings.get(binding_id(a).unwrap()).copied().unwrap_or_else(|| panic!("{a:?} unbound"));
-            assert_eq!((b.kind, b.index), (3, scancode(k).unwrap() as u32), "{a:?}");
+            let b = s.binding_of(a).unwrap_or_else(|| panic!("{a:?} unbound"));
+            // `I_SCREENSHOT` is P with 0x411760's Alt bit (0x40000)
+            let want = if a == Action::Screenshot { 0x40000 | scancode(k).unwrap() as u32 } else { scancode(k).unwrap() as u32 };
+            assert_eq!((b.kind, b.index), (3, want), "{a:?}");
         }
-        assert_eq!(default_binding(KeyCode::Escape), None);
+        assert_eq!(s.binding_of(Action::SwitchMusic).map(|b| b.index), Some(u32::from(scancode(KeyCode::F9).unwrap())));
+        // the rows keep 0x51D1D0's P for the pause, which the setup screen shows and no race reads
+        assert_eq!(s.bindings.get(bindings::id::I_PAUSE).map(|b| b.index), Some(u32::from(scancode(KeyCode::KeyP).unwrap())));
     }
 
-    /// ESC-PAUSE (D10): Escape presses the pause beside P, also when the pause row is on a pad,
-    /// and not when a row is bound to Escape.
+    /// ISS4-KEYS: Escape presses the pause and P does not — the original's `I_PAUSE` is 0x411760's
+    /// `SC_ESC` (`[0x5E9908]` = 0x103), stored over the `Controller.Pause` row (P) at every race start;
+    /// a row bound to Escape fires beside it, as both read the same key; the pause row on a pad still
+    /// pauses (PORT-DEVIATION D44), and Escape with it.
     #[test]
-    fn escape_is_a_second_pause_key() {
+    fn escape_pauses_and_p_does_not() {
         let mut st = InputState::default();
         st.key_changed(KeyCode::Escape, ElementState::Pressed);
         assert!(st.take_pressed(Action::Pause));
         st.key_changed(KeyCode::Escape, ElementState::Released);
         assert!(!st.held(Action::Pause));
         st.key_changed(KeyCode::KeyP, ElementState::Pressed);
-        assert!(st.take_pressed(Action::Pause), "P still pauses");
+        assert!(!st.take_pressed(Action::Pause), "P does not pause");
         st.key_changed(KeyCode::KeyP, ElementState::Released);
 
         let mut pad = modern_pad_state(&gamepad::PadSnapshot::default());
@@ -975,11 +1047,103 @@ mod tests {
         let horn = binding_id(Action::Horn).unwrap();
         bound.bindings.by_id.insert(horn, bindings::Binding { kind: 3, index: u32::from(scancode(KeyCode::Escape).unwrap()), ..Default::default() });
         bound.key_changed(KeyCode::Escape, ElementState::Pressed);
-        assert!(!bound.take_pressed(Action::Pause), "a row bound to Escape keeps it");
-        assert!(bound.take_pressed(Action::Horn));
+        assert!(bound.take_pressed(Action::Pause), "0x411760's Escape whatever the rows");
+        assert!(bound.take_pressed(Action::Horn), "and the row bound to Escape beside it");
+
+        // the pause row remapped to K: K does not pause either (0x411760 overwrites the id)
+        let mut k = InputState::default();
+        k.bindings.by_id.insert(bindings::id::I_PAUSE, bindings::Binding { kind: 3, index: u32::from(scancode(KeyCode::KeyK).unwrap()), key: u32::from(b'k'), ..Default::default() });
+        k.key_changed(KeyCode::KeyK, ElementState::Pressed);
+        assert!(!k.take_pressed(Action::Pause));
     }
 
-    /// D44 item 9: the keyboard's factory rows are recognised as untouched; the pad's layout, or a
+    /// ISS4-KEYS: 0x411760's other keys — Tab cycles the map (`fe.txt`'s `2` is overwritten), F11 the
+    /// view distance, F12 the horizon, keypad − / + the map zoom, Alt+P (not P, not Shift+Alt+P) the
+    /// screenshot, F9 both `I_MUSIC` (`fe.txt`) and `C1_SWITCHMUSIC`; a row 0x411760 does not store
+    /// (`LookBehind`) follows the player's remapping.
+    #[test]
+    fn the_race_keys_are_0x411760s() {
+        const FE: [(&str, &str); 3] = [("I_CYCLEMAP", "key,SC_2"), ("I_MUSIC", "key,SC_F9"), ("I_LOOKBEHIND", "key,SC_K")];
+        let mut st = keyed(&FE);
+        let tap = |st: &mut InputState, k: KeyCode| {
+            st.key_changed(k, ElementState::Pressed);
+            st.key_changed(k, ElementState::Released);
+        };
+        tap(&mut st, KeyCode::Digit2);
+        assert!(!st.take_pressed(Action::CycleMap), "2 is no longer the map's");
+        tap(&mut st, KeyCode::Tab);
+        assert!(st.take_pressed(Action::CycleMap));
+        for (k, a) in [(KeyCode::F11, Action::ViewDistance), (KeyCode::F12, Action::Horizon), (KeyCode::NumpadSubtract, Action::ZoomInMap), (KeyCode::NumpadAdd, Action::ZoomOutMap)] {
+            tap(&mut st, k);
+            assert!(st.take_pressed(a), "{a:?}");
+        }
+        tap(&mut st, KeyCode::KeyP);
+        assert!(!st.take_pressed(Action::Screenshot), "P alone");
+        st.key_changed(KeyCode::AltLeft, ElementState::Pressed);
+        tap(&mut st, KeyCode::KeyP);
+        assert!(st.take_pressed(Action::Screenshot), "Alt+P");
+        st.key_changed(KeyCode::ShiftLeft, ElementState::Pressed);
+        tap(&mut st, KeyCode::KeyP);
+        assert!(!st.take_pressed(Action::Screenshot), "Shift+Alt+P: a bit left over (0x411C5F)");
+        st.key_changed(KeyCode::ShiftLeft, ElementState::Released);
+        st.key_changed(KeyCode::AltLeft, ElementState::Released);
+        // P held, then Alt: the level read sees Alt+P (0x411C20 each sample)
+        st.key_changed(KeyCode::KeyP, ElementState::Pressed);
+        st.key_changed(KeyCode::AltLeft, ElementState::Pressed);
+        assert!(st.take_pressed(Action::Screenshot));
+        st.key_changed(KeyCode::AltLeft, ElementState::Released);
+        st.key_changed(KeyCode::KeyP, ElementState::Released);
+        tap(&mut st, KeyCode::F9);
+        assert!(st.take_pressed(Action::Music) && st.take_pressed(Action::SwitchMusic));
+        tap(&mut st, KeyCode::KeyB);
+        assert!(!st.take_pressed(Action::RearView), "LookBehind is on K now");
+        tap(&mut st, KeyCode::KeyK);
+        assert!(st.take_pressed(Action::RearView));
+        tap(&mut st, KeyCode::Digit0);
+        assert_eq!(st.pressed, 0, "0 is no race key");
+    }
+
+    /// 0x411760 read back out of `nfs5.exe` (skipped without the game): its 25 stores, `mov dword
+    /// [0x5E9130 + id·4], imm32` (C7 05) or `mov [abs], eax` with `eax` = 0 (A3, after `xor eax, eax`),
+    /// then `ret`, are [`bindings::RACE_FIXED`] in order.
+    #[test]
+    fn the_race_bindings_match_the_image() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let Ok(img) = std::fs::read(std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/nfs5.exe")) else { return };
+        let u16at = |o: usize| u16::from_le_bytes([img[o], img[o + 1]]) as usize;
+        let u32at = |o: usize| u32::from_le_bytes([img[o], img[o + 1], img[o + 2], img[o + 3]]);
+        let pe = u32at(0x3C) as usize;
+        let table = pe + 24 + u16at(pe + 20);
+        let at = |va: u32| {
+            let rva = va - 0x40_0000;
+            (0..u16at(pe + 6))
+                .map(|i| table + i * 40)
+                .find(|&s| rva >= u32at(s + 12) && rva < u32at(s + 12) + u32at(s + 8))
+                .map(|s| (u32at(s + 20) + rva - u32at(s + 12)) as usize)
+                .expect("0x411760 is in a section")
+        };
+        let mut o = at(0x41_1760);
+        assert_eq!(&img[o..o + 2], &[0x33, 0xC0], "xor eax, eax");
+        o += 2;
+        let mut got = Vec::new();
+        loop {
+            match img[o] {
+                0xC7 if img[o + 1] == 0x05 => {
+                    got.push((u32at(o + 2), u32at(o + 6)));
+                    o += 10;
+                }
+                0xA3 => {
+                    got.push((u32at(o + 1), 0));
+                    o += 5;
+                }
+                0xC3 => break,
+                b => panic!("unexpected opcode {b:#x} at file offset {o:#x}"),
+            }
+        }
+        let want: Vec<(u32, u32)> = bindings::RACE_FIXED.iter().map(|&(id, v)| (0x5E_9130 + 4 * u32::from(id), v)).collect();
+        assert_eq!(got, want);
+    }
+
     /// changed row, is not.
     #[test]
     fn untouched_keyboard_rows_are_recognised() {
@@ -1032,7 +1196,7 @@ mod tests {
         assert!(st.take_pressed(Action::Pause), "the next push");
     }
 
-    /// PAD-HANG (D44): a row bound to a pad control still answers its default key — P pauses, the
+    /// PAD-HANG (D44): a row bound to a pad control still answers its default key — Escape pauses, the
     /// arrows steer, accelerate and brake beside the pad, the larger of key and pad wins, and a
     /// pedal a key holds is ramped as a key's is.
     #[test]
@@ -1040,9 +1204,9 @@ mod tests {
         let rest = gamepad::PadSnapshot::default();
         let mut st = modern_pad_state(&rest);
         assert!(st.pad_bound(Action::Pause) && st.pad_bound(Action::Throttle) && st.pad_bound(Action::SteerLeft));
-        st.key_changed(KeyCode::KeyP, ElementState::Pressed);
-        assert!(st.take_pressed(Action::Pause), "P pauses beside the pad's Start");
-        st.key_changed(KeyCode::KeyP, ElementState::Released);
+        st.key_changed(KeyCode::Escape, ElementState::Pressed);
+        assert!(st.take_pressed(Action::Pause), "Escape pauses beside the pad's Start");
+        st.key_changed(KeyCode::Escape, ElementState::Released);
         assert_eq!((st.throttle(), st.brake(), st.steer()), (0.0, 0.0, 0.0));
         assert_eq!(st.ramps(), (false, false, false), "axes are not ramped");
         st.key_changed(KeyCode::ArrowUp, ElementState::Pressed);

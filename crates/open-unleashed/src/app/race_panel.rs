@@ -1,11 +1,11 @@
-//! PORT-DEVIATION D63 (`RE/notes/PORT-DEVIATIONS.md`): the race panel and the F12 message. **Not the original's** - `nfs5.exe` has
+//! PORT-DEVIATION D63 (`RE/notes/PORT-DEVIATIONS.md`): the race panel and the message of the enhancements' key (`0`). **Not the original's** - `nfs5.exe` has
 //! neither. Render-side and UI only: nothing here is read by the simulation, a replay or the network.
 //!
 //! * **The panel** (`` ` `` opens and closes it in a race, a replay or photo mode): a compact box on the left edge with the frame
 //!   statistics and a graph of the last frames' times at the top and the switches of the enhanced game below (`nfs_renderer::ENHANCEMENT_REGISTRY`), `[` / `]` select a row and
 //!   `,` / `.` step its level through [`App::enh_step`] - the very path of the tab: the renderer takes it at once and
 //!   `enhancements.json` keeps it. Closed at every race start, its state is never saved.
-//! * **The message** (F12): for two seconds, in host time, near the top centre: whether the enhancements are on or off after the press.
+//! * **The message** (`0`, `App::enh_key`; it was F12 until F12 went to the original's `I_HORIZON`): for two seconds, in host time, near the top centre: whether the enhancements are on or off after the press.
 //!
 //! The keys are physical key codes (they work on any layout). They are read before the game's bindings: `` ` `` is taken even if the
 //! player bound it in the controls screen, the other four only while the panel is open (a binding on them works with it closed).
@@ -13,9 +13,9 @@
 //! timed or drawn while the panel is closed and no message is up (the renderer's draw counters and GPU timestamps are on only
 //! while it is open: `nfs_renderer::live_set`).
 //!
-//! **TEST GLUE** (not the original's): `NFS_RACE_PANEL=<tick>:<op>[,...]` (ops `open`, `close`, `row+`, `row-`, `lvl+`, `lvl-`, `f12`,
-//! `<token>:<delta>` to step a row by its token, e.g. `E1:+1`) runs the panel's actions at game ticks, and the `NFS_RACE_KEYS` tokens
-//! `bq`, `lb`, `rb`, `comma`, `period`, `f12` press its keys (`photo.rs`).
+//! **TEST GLUE** (not the original's): `NFS_RACE_PANEL=<tick>:<op>[,...]` (ops `open`, `close`, `row+`, `row-`, `lvl+`, `lvl-`, `enh`
+//! (the enhancements' key), `<token>:<delta>` to step a row by its token, e.g. `E1:+1`) runs the panel's actions at game ticks, and
+//! the `NFS_RACE_KEYS` tokens `bq`, `lb`, `rb`, `comma`, `period`, `0` press its keys (`photo.rs`).
 
 use crate::*;
 use nfs_game::enhanced;
@@ -23,7 +23,7 @@ use nfs_renderer::{ENHANCEMENT_REGISTRY as REGISTRY, EnhancementSwitch};
 use std::collections::VecDeque;
 use winit::keyboard::KeyCode;
 
-/// How long the F12 message stays up.
+/// How long the enhancements key's message stays up.
 const TOAST: Duration = Duration::from_secs(2);
 /// Frames kept for the statistics (about ten seconds at 60 fps).
 const RING: usize = 720;
@@ -69,7 +69,8 @@ enum Op {
     Close,
     Row(i32),
     Level(i32),
-    F12,
+    /// the enhancements' key (`enh_toggle_all`)
+    Enh,
     Token(&'static str, i32),
 }
 
@@ -298,7 +299,7 @@ impl App {
         let Some(e) = REGISTRY.get(self.panel.sel) else { return };
         self.panel_hitch_log();
         let t0 = Instant::now();
-        // a step during F12's view moves the player's own set, not the all-off one the view shows: the set is never lost to a stray key
+        // a step during the original-look view (the `0` key) moves the player's own set, not the all-off one the view shows: the set is never lost to a stray key
         if let Some(own) = self.enh_stash.take() {
             self.enh_set(own, false);
         }
@@ -322,7 +323,7 @@ impl App {
             .collect()
     }
 
-    /// The F12 message: what the press did.
+    /// The enhancements key's message: what the press did.
     pub(crate) fn panel_toast(&mut self, on: bool, nothing_to_compare: bool) {
         let t = match (on, nothing_to_compare) {
             (true, _) => self.panel_str("enhancements on", "улучшения вкл"),
@@ -498,7 +499,7 @@ impl App {
         stats.push((format!("{} {}   {} {}   {} {}", s("tick", "тик"), self.tick, speed.map_or("-".into(), |v| v.to_string()), s("km/h", "км/ч"), s("lap", "круг"), lap.unwrap_or_else(|| "-".into())), WHITE));
         stats.push((format!("{} {}   {} {}", s("track", "трасса"), self.track.name, s("car", "машина"), self.player_car_id.map_or("-".into(), |c| c.to_string())), WHITE));
         let keys = s("` close  [ ] row  , . change", "` закрыть  [ ] строка  , . изменить");
-        let view = self.enh_stash.is_some().then(|| s("F12 view: the original's look", "F12: вид оригинала"));
+        let view = self.enh_stash.is_some().then(|| s("0 view: the original's look", "0: вид оригинала"));
 
         // the box: at most a third of the window wide, the text shrinks to fit
         let pad = (size0 * 0.5).round();
@@ -620,7 +621,7 @@ impl App {
                     "row-" => Op::Row(-1),
                     "lvl+" => Op::Level(1),
                     "lvl-" => Op::Level(-1),
-                    "f12" => Op::F12,
+                    "enh" => Op::Enh,
                     other => {
                         let (tok, d) = other.split_once(':')?;
                         let tok = REGISTRY.iter().find(|e| e.token.eq_ignore_ascii_case(tok.trim()))?.token;
@@ -652,7 +653,7 @@ impl App {
                 Op::Close => self.panel_set_open(false),
                 Op::Row(d) => self.panel_move(d),
                 Op::Level(d) => self.panel_step(d),
-                Op::F12 => self.enh_toggle_all(),
+                Op::Enh => self.enh_toggle_all(),
                 Op::Token(tok, d) => {
                     self.enh_step(&format!("{}{tok}", enhanced::ACCESSOR_PREFIX), d);
                 }
@@ -678,7 +679,7 @@ mod tests {
     #[test]
     fn the_panel_takes_only_its_keys() {
         use KeyCode::*;
-        for k in [KeyA, ArrowUp, Space, F12, Escape, KeyK, F11, Digit1, Tab, Enter, Slash] {
+        for k in [KeyA, ArrowUp, Space, F12, Escape, KeyK, F11, Digit1, Digit0, Tab, Enter, Slash] {
             for (usable, open) in [(true, true), (true, false), (false, false)] {
                 assert_eq!(route(k, true, false, usable, open), Route::Pass, "{k:?}");
             }

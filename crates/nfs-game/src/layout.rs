@@ -2435,6 +2435,18 @@ impl LayoutScreen {
         self.car_parts.get(&index).map(|p| p.doors()).unwrap_or((0.0, 0.0))
     }
 
+    /// **TEST GLUE** (`NFS_FE_ANIM_LOG`, `app/frame.rs`): the next chunk of each movie on the screen and its
+    /// background, and the cursor's animation clock, for the per-frame phase log.
+    pub fn anim_probe(&self) -> (Vec<usize>, u32) {
+        let mut movies: Vec<(usize, usize)> = self.movies.iter().map(|(k, m)| (*k, m.next_chunk())).collect();
+        movies.sort_unstable();
+        let mut out: Vec<usize> = movies.into_iter().map(|(_, n)| n).collect();
+        if let Some(b) = self.background.as_ref() {
+            out.extend(b.anim_probe().0);
+        }
+        (out, self.cursor_ms)
+    }
+
     /// `TIMER_getTicks()` (0x53C2E0) — the 128 Hz count — from the screen's clock.
     pub fn ticks(&self) -> u32 {
         (self.clock_ms as u64 * 128 / 1000) as u32
@@ -3058,7 +3070,18 @@ impl LayoutScreen {
     /// Within a block the machine is `NFS5.AnimatingPicture`'s, and a `totalticks` of 0 is forced
     /// to **1** at 0x4C97DF, which with `start == end` is simply a still frame — which is what
     /// three of the four are at rest.
-    fn bar_button_frame(&self, e: &nfs_formats::lay::Element, hot: bool, down: bool) -> Option<usize> {
+    ///
+    /// **A disabled button does not run the machine.** The tick asks 0x4C7E40 (the disabled
+    /// bit, or the covered screen) at 0x4C9997 before anything else; when it holds,
+    /// 0x4C99A0…0x4C99AD hands the picture part (`[+0x17C]`) the plain block's **start**
+    /// (`[+0x18C]`, `data.startframe`) through 0x5271F0 and returns — a still of the first
+    /// frame. That is `racebutton.fsh` entry 0, the dim RACE of every screen whose
+    /// `canplaygame` disables it (the main menu, the garage); the port used to run the 0…29
+    /// pulse there (`RE/notes/REFERENCE-2026-11-17-ISS4.md`, "Other differences" 2).
+    fn bar_button_frame(&self, e: &nfs_formats::lay::Element, disabled: bool, hot: bool, down: bool) -> Option<usize> {
+        if disabled {
+            return Some(e.int("startframe").unwrap_or(0).max(0) as usize);
+        }
         let sep = self.attr_num(e, "seperatehovermousedown").unwrap_or(0.0) != 0.0;
         let p = match (hot, down && sep) {
             (_, true) => "hovermousedown",

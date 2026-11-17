@@ -137,6 +137,8 @@ switches! {
     nfs_race_panel = "NFS_RACE_PANEL",
     // TEST GLUE (PORT-DEVIATION D63): a windowed run draws each frame into an image instead of the surface (`app/frame.rs`)
     nfs_offscreen_frames = "NFS_OFFSCREEN_FRAMES",
+    // TEST GLUE: a windowed front end's per-frame animation phases and wall-time stills (`app/frame.rs` `fe_anim_log`)
+    nfs_fe_anim_log = "NFS_FE_ANIM_LOG",
     // TEST GLUE: a scripted still taken as if that many milliseconds of frames had followed its tick (`app/scripted.rs`)
     nfs_shot_settle = "NFS_SHOT_SETTLE",
     nfs_pa_input = "NFS_PA_INPUT",

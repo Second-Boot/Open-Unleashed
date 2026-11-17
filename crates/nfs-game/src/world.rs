@@ -1732,7 +1732,7 @@ pub(crate) fn hd_scale_wanted(r: &Renderer) -> Option<u32> {
 }
 
 /// ENHANCEMENT ENH-LIVETEX: make `new` the current set of `cur`: a base the old set had and the new one lacks goes back to its original,
-/// the replaced twins give their video memory back (the originals stay, so F12 flips without a reload).
+/// the replaced twins give their video memory back (the originals stay, so the A/B key flips without a reload).
 pub(crate) fn replace_hd_set(r: &mut Renderer, cur: &mut Option<HdSet>, new: HdSet) {
     if let Some(old) = cur.take() {
         let kept: std::collections::HashSet<nfs_renderer::TextureId> = new.bases.iter().copied().collect();
@@ -1835,7 +1835,7 @@ impl TrackWorld {
         hd_scale_wanted(r).is_some_and(|scale| self.hd.as_ref().is_none_or(|h| h.scale != scale)) && hd_pack_for(r, track).is_some()
     }
 
-    /// ENHANCEMENT ENH-LIVETEX: bring the HD twins in line with E41's level after a change (the F12 flip needs nothing: the renderer shows
+    /// ENHANCEMENT ENH-LIVETEX: bring the HD twins in line with E41's level after a change (the A/B flip needs nothing: the renderer shows
     /// the twins or the originals by the switch). Level 0: nothing (a resident set stays for the way back). A level whose scale is not the
     /// resident one (first use, x2 <-> x4): that pack is loaded now next to the originals and replaces the old twins (a short hitch).
     pub fn sync_hd(&mut self, r: &mut Renderer, track: &TrackAssets) {

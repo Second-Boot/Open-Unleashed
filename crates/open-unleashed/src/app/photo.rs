@@ -8,15 +8,14 @@
 //! * **Available** (`photo_entry`): a race (a front-end launch or a replay of one), not a network race — in a network
 //!   race the pause action does not stop the race (0x415110's game-type-3 branch at 0x4151ED: no pause menu, the
 //!   race runs on; `RE/notes/hud.md` §5), so photo mode is **not offered there**: no key, no pause-menu item (the
-//!   network race's replay included) — and either the pause menu up (its quit question not) or a replay playing. The key is **F11 or K** (**K only on macOS**, where F11 is the system's Show Desktop:
-//!   `nfs_game::photo::PHOTO_F11`): the original's `I_VIEWDISTANCE` is `SC_F11` but names a key its table does not
-//!   have (`nfs_input::default_binding`), K is unbound. The pause menu gets a fourth item, «photo mode»
+//!   network race's replay included) — and either the pause menu up (its quit question not) or a replay playing. The key is **K**, which the original binds to nothing
+//!   (until ISS4-KEYS also F11 off macOS, which is the original's `I_VIEWDISTANCE`, 0x411760). The pause menu gets a fourth item, «photo mode»
 //!   (`pause_items`). In a replay the key freezes it (the bar's pause) for as long as photo mode is up.
 //! * **Controls**: W A S D move, Q / E down / up, the arrow keys or the right mouse button look, Z / X roll, the
 //!   wheel or `-` / `=` zoom (the vertical angle of view), Shift faster, Ctrl slower; a pad's sticks move and look,
 //!   the triggers go down / up, the shoulders roll, the d-pad's up / down zoom. Enter / Space (pad A) save a still;
 //!   `6` cycles its size 1x / 2x / 4x of the window; H (pad Y) the game's HUD (hidden by default); Tab the hint;
-//!   R resets the camera; F11 / K / Esc / P / Backspace (pad B) leave. Every key goes to photo mode while it is up
+//!   R resets the camera; K / Esc / P / Backspace (pad B) leave. Every key goes to photo mode while it is up
 //!   (the mouse buttons and the pad's menu keys too: neither may reach the hidden pause menu).
 //! * **The still** is the frame the renderer draws, rendered again at `scale x` the window (`Renderer::render_still`,
 //!   scaled down only past the device's limits) and written as a PNG (RGB) to `<Pictures>/PorscheUnleashed/`
@@ -433,7 +432,7 @@ impl App {
     /// [`Self::photo_key_event`] after the winit decode (the scripted `NFS_RACE_KEYS` glue calls this one).
     pub(crate) fn photo_key_code(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> bool {
         if !self.photo.active {
-            return pressed && !repeat && (code == KeyCode::KeyK || (nfs_game::photo::PHOTO_F11 && code == KeyCode::F11)) && self.photo_enter();
+            return pressed && !repeat && code == KeyCode::KeyK && self.photo_enter();
         }
         if pressed {
             self.photo.keys.insert(code);
@@ -447,9 +446,11 @@ impl App {
     }
 
     /// **TEST GLUE** (`NFS_RACE_KEYS=<tok;tok;...>`, a `--screenshot` race run): key presses in the window
-    /// handler's own order, photo mode's hook first and then the pause menu's keys. Tokens: `pause` (the menu
-    /// up, as Esc does), `k`, `f11`, `esc`, `enter`, `up`, `down`, and `lights` (the lights key's command 13 on the
-    /// player's lamp byte, `car+0xD87 ^= 3`, 0x49941D, as `simulate` applies it). Logs the state after each. `true` when it ran.
+    /// handler's own order — the race panel, photo mode's hook, the pause menu's keys, then the input and the
+    /// interface reads (`race_interface_keys`) and the enhancements' key — each pressed and released. Tokens:
+    /// `pause` (the menu up directly), `k`, `esc`, `p`, `enter`, `up`, `down`, `tab`, `f11`, `f12`, `kp-`, `kp+`,
+    /// `0`, `altp` (Alt held over P), and `lights` (the lights key's command 13 on the player's lamp byte,
+    /// `car+0xD87 ^= 3`, 0x49941D, as `simulate` applies it). Logs the state after each. `true` when it ran.
     pub(crate) fn race_keys_script(&mut self, event_loop: &LoopCtl) -> bool {
         let Some(spec) = nfs_game::config::cfg().nfs_race_keys.as_str().filter(|s| !s.trim().is_empty()) else { return false };
         for tok in spec.split(';').map(str::trim).filter(|t| !t.is_empty()) {
@@ -486,17 +487,23 @@ impl App {
                     None
                 }
                 "k" => Some(KeyCode::KeyK),
-                // PORT-DEVIATION D63: the race panel's keys, and F12's view
+                // PORT-DEVIATION D63: the race panel's keys (the A/B key `0` below)
                 "bq" => Some(KeyCode::Backquote),
                 "lb" => Some(KeyCode::BracketLeft),
                 "rb" => Some(KeyCode::BracketRight),
                 "comma" => Some(KeyCode::Comma),
                 "period" => Some(KeyCode::Period),
-                "f12" => {
-                    self.enh_toggle_all();
-                    None
-                }
                 "f11" => Some(KeyCode::F11),
+                "f12" => Some(KeyCode::F12),
+                "tab" => Some(KeyCode::Tab),
+                "kp-" => Some(KeyCode::NumpadSubtract),
+                "kp+" => Some(KeyCode::NumpadAdd),
+                "0" => Some(KeyCode::Digit0),
+                "p" => Some(KeyCode::KeyP),
+                "altp" => {
+                    self.input.key_changed(KeyCode::AltLeft, ElementState::Pressed);
+                    Some(KeyCode::KeyP)
+                }
                 "esc" => Some(KeyCode::Escape),
                 "enter" => Some(KeyCode::Enter),
                 "up" => Some(KeyCode::ArrowUp),
@@ -507,22 +514,43 @@ impl App {
                 }
             };
             if let Some(code) = code {
+                let menu = match code {
+                    KeyCode::ArrowUp => Some(MenuKey::Up),
+                    KeyCode::ArrowDown => Some(MenuKey::Down),
+                    KeyCode::Enter => Some(MenuKey::Enter),
+                    _ => None,
+                };
                 if self.panel_key_code(code, true, false) {
                     // the panel took it
-                } else if !self.photo_key_code(code, true, false) && self.paused {
-                    let key = match code {
-                        KeyCode::ArrowUp => Some(MenuKey::Up),
-                        KeyCode::ArrowDown => Some(MenuKey::Down),
-                        KeyCode::Enter => Some(MenuKey::Enter),
-                        _ => None,
-                    };
-                    if let Some(k) = key {
-                        self.pause_menu_key(k, event_loop);
-                    }
+                } else if self.photo_key_code(code, true, false) {
+                    // photo mode took it
+                } else if let (true, Some(k)) = (self.paused, menu) {
+                    self.pause_menu_key(k, event_loop);
+                } else {
+                    // the window handler's tail: the input, the enhancements' key, the interface reads
+                    self.input.key_changed(code, ElementState::Pressed);
+                    self.enh_key(code, true, false);
+                    self.race_interface_keys(event_loop);
+                    self.input.key_changed(code, ElementState::Released);
                 }
                 self.photo_key_code(code, false, false);
+                if tok == "altp" {
+                    self.input.key_changed(KeyCode::AltLeft, ElementState::Released);
+                }
             }
-            tracing::info!(tok, photo = self.photo.active, paused = self.paused, items = self.pause_items(), sel = self.pause_sel, "NFS_RACE_KEYS");
+            tracing::info!(
+                tok,
+                photo = self.photo.active,
+                paused = self.paused,
+                items = self.pause_items(),
+                sel = self.pause_sel,
+                map = self.hud_keys.map,
+                mapscale = self.hud_keys.mapscale,
+                view_distance = self.view_distance,
+                horizon = self.sky.as_ref().map(|s| s.horizon()),
+                enh_view = self.enh_stash.is_some(),
+                "NFS_RACE_KEYS"
+            );
         }
         true
     }
@@ -531,7 +559,6 @@ impl App {
     pub(crate) fn photo_edge(&mut self, code: KeyCode) {
         match code {
             KeyCode::KeyK | KeyCode::Escape | KeyCode::KeyP | KeyCode::Backspace => self.photo_exit(),
-            KeyCode::F11 if nfs_game::photo::PHOTO_F11 => self.photo_exit(),
             KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => self.photo.pending_still = true,
             KeyCode::KeyH => self.photo.hud = !self.photo.hud,
             KeyCode::Tab => self.photo.hint = !self.photo.hint,

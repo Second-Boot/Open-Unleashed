@@ -1200,7 +1200,8 @@ impl App {
         if nfs_game::config::cfg().nfs_detail.as_str().is_none()
             && let Some((i, _)) = self.choice_index(choice::GRAPHICS_VIEW_DISTANCE)
         {
-            self.detail = [0.5f32, 0.67, 0.83, 1.0][i.min(3)];
+            self.view_distance = i.min(3);
+            self.detail = super::race_stages::VIEW_DISTANCE_SCALE[self.view_distance];
         }
         renderer.set_lens_probe(self.lens.enabled);
         if let Some(images) = common.as_ref() {
@@ -1369,3 +1370,6 @@ fn upload_sprite_texture(renderer: &mut Renderer, img: &nfs_assets::texture::Tex
         renderer.upload_texture_mips(img.width, img.height, mips)
     }
 }
+
+/// `0x5CE90C`: the `.key` draw distance factor 0x44F1A0 takes for each `ADJUSTABLEVIEWDISTANCE` `[0x657D70]` (0…3).
+pub(crate) const VIEW_DISTANCE_SCALE: [f32; 4] = [0.5, 0.67, 0.83, 1.0];

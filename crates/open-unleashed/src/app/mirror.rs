@@ -212,7 +212,9 @@ impl App {
         let mirror_slice = self.mirror_slice(cam.position);
         let mut clear = [0x77 as f64 / 255.0, 0xBB as f64 / 255.0, 1.0, 1.0];
         if let Some(bin) = self.track.sky_bin.as_ref() {
-            if let Some(c) = bin.background_at(opts.sky_level, 1, main_slice, lap) {
+            // the record `[0x627E1C]` holds (0x468DDC), as the main view's (`Sky::colour_level`)
+            let level = self.sky.as_ref().map_or(opts.sky_level, |s| s.colour_level(opts.sky_level));
+            if let Some(c) = bin.background_at(level, 1, main_slice, lap) {
                 clear = [c[0] as f64, c[1] as f64, c[2] as f64, 1.0];
             }
             let fog = |sky: bool| bin.fog_at(sky, mirror_slice, lap).filter(|_| self.ini.fog).map(|(colour, density)| nfs_renderer::Fog { colour, density });

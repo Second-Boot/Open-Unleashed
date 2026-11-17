@@ -72,15 +72,36 @@ pub mod id {
     pub const C1_SIGNALRIGHT: u16 = 0x172;
     pub const C1_SIREN: u16 = 0x173;
     pub const C1_LIGHTSON: u16 = 0x174;
+    /// the plain command 16, which 0x4136D9 strips from the packet's byte 0 and turns into the
+    /// interface bit 0x12 (`I_MUSIC`'s); 0x411760 binds it to F9 at every race start
+    pub const C1_SWITCHMUSIC: u16 = 0x177;
+    /// `MAINEXIT`, bit 0 — read by 0x413940 (0x415C7F); 0x411760 clears it
+    pub const MAINEXIT: u16 = 0x1EE;
+    /// `I_UP` / `I_DOWN` / `I_LEFT` / `I_RIGHT` / `I_SELECT`, bits 1…5 — no `RaceFrame` read
+    /// (every `0x4138D0` call site pushes 8 or 0x0A…0x1F); 0x411760 binds them to the interface
+    /// reader 0x411C80
+    pub const I_UP: u16 = 0x1EF;
+    pub const I_DOWN: u16 = 0x1F0;
+    pub const I_LEFT: u16 = 0x1F1;
+    pub const I_RIGHT: u16 = 0x1F2;
+    pub const I_SELECT: u16 = 0x1F3;
     /// The interface keys, 0x1EE…0x20D: the packer files bit `id − 0x1EE` (0x413755…0x4137A0).
     /// `Controller.Pause` is built with `I_PAUSE` (0x51E259), `LookBehind` with `I_LOOKBEHIND`
     /// (0x51E1A9), `LookLeft` / `LookRight` / `LookForward` with 0x202 / 0x203 / 0x204
     /// (0x51E309, 0x51E335, 0x51E361), `CameraView` with `I_CYCLECAMERA` (0x51E22D).
     pub const I_PAUSE: u16 = 0x1F6;
+    /// `I_PAUSEJOY`, bit 9 — nothing reads it (no `0x4138D0(9, …)` in the image); 0x411760 clears it
+    pub const I_PAUSEJOY: u16 = 0x1F7;
     pub const I_ROTCAMCCLOCK: u16 = 0x1F8;
     pub const I_ROTCAMSTOP: u16 = 0x1F9;
     pub const I_ROTCAMCLOCK: u16 = 0x1FA;
+    /// `I_SCREENSHOT`, bit 0x0D — 0x4158A2…0x415969
+    pub const I_SCREENSHOT: u16 = 0x1FB;
     pub const I_TOGGLEPAUSEMENU: u16 = 0x1FC;
+    /// `I_VIEWDISTANCE`, bit 0x0F — 0x44F220
+    pub const I_VIEWDISTANCE: u16 = 0x1FD;
+    /// `I_HORIZON`, bit 0x10 — 0x45DBB0 / 0x45DB90
+    pub const I_HORIZON: u16 = 0x1FE;
     pub const I_SFX: u16 = 0x1FF;
     pub const I_MUSIC: u16 = 0x200;
     pub const I_LOOKBEHIND: u16 = 0x201;
@@ -93,7 +114,62 @@ pub mod id {
     pub const I_TOGGLEREARVIEW: u16 = 0x208;
     pub const I_TOGGLEMAP: u16 = 0x209;
     pub const I_CYCLEMAP: u16 = 0x20A;
+    /// `I_ZOOMINMAP`, bit 0x1D — 0x427600 → 0x41E620
+    pub const I_ZOOMINMAP: u16 = 0x20B;
+    /// `I_ZOOMOUTMAP`, bit 0x1E — 0x427630 → 0x41E5E0
+    pub const I_ZOOMOUTMAP: u16 = 0x20C;
     pub const I_HUDTRANSPARENCY: u16 = 0x20D;
+}
+
+/// **0x411760**, the race's fixed bindings: `(option id, binding)` for each of its 25 stores into
+/// `[0x5E9130 + id·4]`, in its order (0x411762…0x41184D), as the race keeps a binding —
+/// `kind | payload << 8`, the kind's reader from the table 0x5CC5CC (3 a key, 0x411C20; 4 the
+/// interface reader 0x411C80; 0 none). The race start 0x4152E0 applies the front end's option
+/// stream (0x4155D9…0x4155ED) and **then** calls it (0x4155EF); the option loader 0x4B4DA0 calls it
+/// too (0x4B51CA). So whatever the `Controller.*` rows or `fe.txt` gave these ids, a race reads
+/// these, and only the ids **not** listed here follow the player's remapping
+/// (`RE/notes/controls.md` §4.170.2). A key payload's bits 0x10000 / 0x20000 / 0x40000 ask for
+/// Shift / Ctrl / Alt ([`key_read`]): `I_SCREENSHOT` is Alt+P. Test
+/// `the_race_bindings_match_the_image` reads the instructions back out of `nfs5.exe`.
+pub const RACE_FIXED: [(u16, u32); 25] = {
+    use id::*;
+    [
+        (I_PAUSE, 0x103),               // [0x5E9908]: SC_ESC
+        (I_PAUSEJOY, 0),                // [0x5E990C]: none
+        (I_UP, 0xC804),                 // [0x5E98EC]: interface, up (0xC8)
+        (I_DOWN, 0xD004),               // [0x5E98F0]: down (0xD0)
+        (I_LEFT, 0xCB04),               // [0x5E98F4]: left (0xCB)
+        (I_RIGHT, 0xCD04),              // [0x5E98F8]: right (0xCD)
+        (I_SELECT, 0x1C04),             // [0x5E98FC]: Enter (0x1C)
+        (I_TOGGLEPAUSEMENU, 0x3B03),    // [0x5E9920]: F1
+        (I_ROTCAMCLOCK, 0x3C03),        // [0x5E9918]: F2
+        (I_ROTCAMSTOP, 0x3D03),         // [0x5E9914]: F3
+        (I_ROTCAMCCLOCK, 0x3E03),       // [0x5E9910]: F4
+        (I_TOGGLEHUD, 0x3F03),          // [0x5E9948]: F5
+        (I_CYCLEHUD, 0x203),            // [0x5E994C]: 1
+        (I_TOGGLEREARVIEW, 0x4003),     // [0x5E9950]: F6
+        (I_TOGGLEMAP, 0x4103),          // [0x5E9954]: F7
+        (I_HUDTRANSPARENCY, 0x4203),    // [0x5E9964]: F8
+        (C1_SWITCHMUSIC, 0x4303),       // [0x5E970C]: F9
+        (I_SFX, 0x4403),                // [0x5E992C]: F10
+        (I_VIEWDISTANCE, 0x5703),       // [0x5E9924]: F11
+        (I_HORIZON, 0x5803),            // [0x5E9928]: F12
+        (I_ZOOMINMAP, 0x4A03),          // [0x5E995C]: keypad -
+        (I_ZOOMOUTMAP, 0x4E03),         // [0x5E9960]: keypad +
+        (I_CYCLEMAP, 0xF03),            // [0x5E9958]: Tab
+        (I_SCREENSHOT, 0x400_1903),     // [0x5E991C]: Alt+P
+        (MAINEXIT, 0),                  // [0x5E98E8]: none
+    ]
+};
+
+/// The binding 0x411760 stores for option id `id` ([`RACE_FIXED`]) in the port's six-field shape: a
+/// key keeps its whole payload — scan code and modifier bits — in `index`; kind 4 (the interface
+/// reader 0x411C80, which the port does not read) and 0 stay as they are.
+pub fn race_fixed(id: u16) -> Option<Binding> {
+    let &(_, v) = RACE_FIXED.iter().find(|(i, _)| *i == id)?;
+    let (kind, payload) = (v & 0xFF, v >> 8);
+    let key = if kind == BindingKind::Key.as_u32() { display_code((payload & 0xFF) as u8) } else { 0 };
+    Some(Binding { kind, device: 0, index: payload, dir: 0, pov: 0, key })
 }
 
 /// A binding's kind, `[binding+0x14]` (0x51D010 / 0x51CB7C): which reader looks at it. A value
@@ -218,6 +294,11 @@ pub fn parse(value: &str) -> Option<Binding> {
     Some(Binding { kind: BindingKind::Key.as_u32(), device: 0, index: sc as u32, dir: 0, pov: 0, key: display_code(sc) })
 }
 
+/// Whether scancode `sc` is one of the modifiers 0x411C20 folds into a key read.
+pub fn is_modifier(sc: u8) -> bool {
+    matches!(sc, SC_CTRL | SC_LSHIFT | SC_RSHIFT | SC_ALT)
+}
+
 /// The modifier state 0x411C20 folds into a key read: Shift (0x2A or 0x36, `[0x5DE052]` /
 /// `[0x5DE05E]`), Ctrl (0x1D, `[0x5DE045]`), Alt (0x38, `[0x5DE060]`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -227,14 +308,33 @@ pub struct Modifiers {
     pub alt: bool,
 }
 
-/// `Key`'s reader **0x411C20**: 255 while the key is down, else 0 — and 0 whenever Shift, Ctrl or
-/// Alt is held, since the reader XORs their bits into a binding that carries none and answers 0
-/// on any bit left set (0x411C5F).
+/// `Key`'s reader **0x411C20**: 255 while the key is down, else 0. It XORs 0x10000 into the
+/// payload for Shift (`[0x5DE052]` or `[0x5DE05E]`), 0x20000 for Ctrl (`[0x5DE045]`) and 0x40000 for
+/// Alt (`[0x5DE060]`) and answers 0 on any of the three bits left set (0x411C5F): a binding that
+/// carries none reads 0 while a modifier is held, and one that carries a bit — 0x411760's Alt+P,
+/// `[0x5E991C]` = 0x4001903 — reads only with exactly that modifier down. The scan code is the
+/// payload's low byte (0x411C69).
 pub fn key_read(b: &Binding, down: impl Fn(u8) -> bool, m: Modifiers) -> u8 {
-    if b.kind_class() != BindingKind::Key || m.shift || m.ctrl || m.alt {
+    if b.kind_class() != BindingKind::Key || modifier_mismatch(b, m) {
         return 0;
     }
     if down((b.index & 0xFF) as u8) { 255 } else { 0 }
+}
+
+/// 0x411C20's modifier test alone (0x411C20…0x411C64): whether the held modifiers differ from the
+/// ones key binding `b` asks for.
+pub fn modifier_mismatch(b: &Binding, m: Modifiers) -> bool {
+    let mut v = b.index;
+    if m.shift {
+        v ^= 0x10000;
+    }
+    if m.ctrl {
+        v ^= 0x20000;
+    }
+    if m.alt {
+        v ^= 0x40000;
+    }
+    v & 0x70000 != 0
 }
 
 /// One pad's reading in the shape of the original's 0x104-byte device record (0x532E10(i, 6)):

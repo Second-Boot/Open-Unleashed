@@ -504,7 +504,7 @@ pub(crate) struct TraySlide {
 }
 
 /// The race HUD's state the in-race toggle keys change (`controls.md` §4.170, read 2026-09-27):
-/// the "HUD is live" flag and the runtime copies of three `nfs5-2.hud` options.
+/// the "HUD is live" flag and the runtime copies of four `nfs5-2.hud` options.
 ///
 /// `HUD_init` 0x41E170 loads the `nfs5-1.hud` / `nfs5-2.hud` records (the profile copies the
 /// Display screen writes through 0x4CB860 → 0x41EA50) and sets `[0x60C970] = 1` (0x41E1CB) only
@@ -522,6 +522,9 @@ pub(crate) struct HudKeys {
     pub(crate) live: bool,
     /// cfg2`+0x40` MAP: 0 off, 1 rotating, 2 static, 3 radar.
     pub(crate) map: usize,
+    /// cfg2`+0x44` MAPSCALE, 0…4: the map's zoom (0x41E9C0); keypad − (`I_ZOOMINMAP`, 0x41E620) and + (`I_ZOOMOUTMAP`,
+    /// 0x41E5E0) step it ([`Self::zoom_in_map`] / [`Self::zoom_out_map`]).
+    pub(crate) mapscale: usize,
     /// `[0x60C821]` / `[0x60C824]`: F7's (or F5's) suspend 0x41E6E0 keeps the MAP it zeroed; the
     /// restore 0x41E690 puts it back, or 1 when nothing was kept (0x41E6CB). `HUD_init` clears
     /// the flag (0x41E29A).
@@ -541,8 +544,18 @@ pub(crate) struct HudKeys {
 }
 
 impl HudKeys {
-    pub(crate) fn new(map: usize, rearview: bool, boxes: bool) -> Self {
-        Self { live: true, map, map_kept: None, rearview, map_at_hide: false, mirror_at_hide: false, boxes }
+    pub(crate) fn new(map: usize, mapscale: usize, rearview: bool, boxes: bool) -> Self {
+        Self { live: true, map, mapscale, map_kept: None, rearview, map_at_hide: false, mirror_at_hide: false, boxes }
+    }
+
+    /// **0x41E620** (`I_ZOOMINMAP`, keypad −, through 0x427600): MAPSCALE 0 → 2, otherwise one up, at most 4.
+    pub(crate) fn zoom_in_map(&mut self) {
+        self.mapscale = if self.mapscale == 0 { 2 } else { (self.mapscale + 1).min(4) };
+    }
+
+    /// **0x41E5E0** (`I_ZOOMOUTMAP`, keypad +, through 0x427630): MAPSCALE one down, at least 1.
+    pub(crate) fn zoom_out_map(&mut self) {
+        self.mapscale = self.mapscale.saturating_sub(1).max(1);
     }
 
     /// 0x41E6E0: MAP kept and zeroed.

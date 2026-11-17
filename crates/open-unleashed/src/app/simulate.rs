@@ -47,6 +47,35 @@ impl App {
                 input.release(Action::Brake);
             }
         }
+        // the plain group's codes (below); code 16 `C1_SWITCHMUSIC` (F9, 0x411760's `[0x5E970C]`) is the
+        // highest of them when pressed, and **0x4136D9** strips it: byte 0 keeps only its handbrake / horn bits
+        // (`and al, 7`, so no command goes to the car this sample — a shift pressed in the same sample is lost)
+        // and the interface word gets bit 0x40000, `I_MUSIC`'s 0x12 (0x41370D…0x413715). F9 is also
+        // `fe.txt`'s `I_MUSIC`, and both set the same bit of one sample, so the music switches once: the bit is
+        // given here only when `I_MUSIC` is on another key.
+        let command = [
+            (Action::ShiftUp, 2u8),
+            (Action::ShiftDown, 3),
+            (Action::Abort, 4),
+            (Action::Reset, 5),
+            (Action::AiDrive, 6),
+            (Action::SignalLeft, 10),
+            (Action::SignalRight, 11),
+            (Action::Hazards, 12),
+            (Action::Lights, 13),
+            (Action::SwitchMusic, 16),
+        ]
+        .into_iter()
+        .fold(0, |code, (a, c)| if input.take_pressed(a) { c } else { code });
+        let command = if command == 16 {
+            let key = |a: Action| input.binding_of(a).filter(|b| b.kind == 3).map(|b| b.index);
+            if key(Action::Music) != key(Action::SwitchMusic) {
+                input.pulse(Action::Music);
+            }
+            0
+        } else {
+            command
+        };
         let mut throttle = input.throttle();
         if follow_road {
             // autotest: ease off above 130 km/h and when steering hard
@@ -71,19 +100,7 @@ impl App {
             // (0x499336) and 0x40F7EB reads it back from there; the recorder (0x4143F0) and the
             // positional block's `+0x03` (0x499216) take the whole byte. The reset request
             // (`tick_player_reset`) reads this sample's command, not the key.
-            command: [
-                (Action::ShiftUp, 2u8),
-                (Action::ShiftDown, 3),
-                (Action::Abort, 4),
-                (Action::Reset, 5),
-                (Action::AiDrive, 6),
-                (Action::SignalLeft, 10),
-                (Action::SignalRight, 11),
-                (Action::Hazards, 12),
-                (Action::Lights, 13),
-            ]
-            .into_iter()
-            .fold(0, |code, (a, c)| if input.take_pressed(a) { c } else { code }),
+            command,
         }
     }
 

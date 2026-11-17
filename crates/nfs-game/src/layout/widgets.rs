@@ -100,6 +100,17 @@ impl LayoutScreen {
     }
 }
 
+/// How much of `FeComboBox`'s draw (0x4C5810) follows the value: see [`LayoutScreen::combo_value`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComboTail {
+    /// nothing (the port has no font for the value)
+    Stop,
+    /// the glass / raised bevel only — the `nolabel == 4` arm (0x4C5DBC…0x4C5E6F)
+    Glass,
+    /// the common tail 0x4C623F: glass / bevel, then the outline (0x4C637F…0x4C64F6)
+    Full,
+}
+
 impl LayoutScreen {
     // `NFS5.CheckBox` keeps **two** entries of its pack, `onIndex` and `offIndex`,
     // and `CheckBox.ctr`'s one SHAPE part is written `shapeIndex.value=data.onIndex`
@@ -220,22 +231,6 @@ impl LayoutScreen {
     pub(super) fn draw_combo(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, overlay: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, h, aspect, selected, hovered, .. } = d;
         self.glinty_box(d, out, tint);
-        // The combo's own bevel, 0x4C69DF — the last call site of 0x521050 whose
-        // arguments were not all read (§4.58, §4.68). Its gate is four tests at
-        // 0x4C6947…0x4C698D: not a list box (`[+0x1DD]`), hovered (0x4C7C90), a
-        // **button held** (0x5299C0) and not disabled (0x4C7E40) — a pressed
-        // decoration. Its rect is `x` from the `selectionbox`'s left (0x4C6961), `y`
-        // from the widget's box's **bottom** — `[0x4C8670()+0xC]`, copied at
-        // 0x4C58D2 and the only write to that slot — `w` the `backrect`'s width
-        // (0x4C69BE) and `h` the two rects' heights together (0x4C6998, 0x4C69A5),
-        // which is `data.height` plus the selection box's height — the rows' height slot 1 sets
-        // every tick (0x4C57D5 → 0x4E2C20), **0 while the combo holds no focus** (0x4C53C4) and
-        // the clamped rows' height while its list is open (`drop_down_rect`). (history: `game-history.md` §22.1)
-        // Thickness **3**.
-        if self.pressed_on(i, hovered) {
-            let open_h = if self.open_combo == Some(i) { self.drop_down_rect(e, i, x, y).map_or(0.0, |r| r.3) } else { 0.0 };
-            self.bevel(out, aspect, FeRect::new(x, y + h, w, h + open_h), 3.0);
-        }
         let state = self.state_for(e, i, selected, hovered);
         if self.open_combo == Some(i) {
             // a colour box's list is an ordinary drop-down of swatches (§4.171); the
@@ -252,9 +247,27 @@ impl LayoutScreen {
         // the two text colours take alpha 0x30 (0x4C59D0 `neg al / sbb / and al, 0x31 / add 0xFF`
         // = 0x30 disabled, 0xFF otherwise, into 0x4D87E0 / 0x4D87D0, 0x4C59E0 / 0x4C5A09). The
         // template's `[state.disabled]` lists the same parts as `normal`, so this is all code.
+        //
+        // **The bar's colour is the code's, not the template's** (ISS4-COMBO, read 2026-11-17): the
+        // draw's prologue keeps one fill colour in a local — `[L+0x24]`, `L` the `esp` after
+        // 0x4C5829's `push ebp` — written `0x4D87F0(0xFFBC0000, fade)` at 0x4C591F, then
+        // overwritten with the disabled red above (0x4C59CA from 0x4C59A9) or with **amber**,
+        // 0x4D87C0(fade), when the widget is **hovered** (0x4C7C90, `[+0x10C] & 4`) **or focused**
+        // (0x4C7DD0, flag 0x40 — a combo holds focus exactly while its list is open, §4.43)
+        // (0x4C59AD…0x4C59CA). The `nolabel != 4` arm fills the `backrect` with that local
+        // (0x4C5ED3 `mov edx, [esp+0x24]` at `esp = L` → 0x4D9280 at 0x4C5F10), the `nolabel == 4`
+        // arm its stencil with it (0x4C5C3E, below). The template's `backrect` `color`
+        // (0xFFBC0000) is only the editor's preview: 0x4C5810 never reads the part's colour.
         let dim = state == "disabled";
-        for (px, py, pw, ph, col) in self.state_rects(e, state) {
-            let col = if dim { [0xff, 0, 0, 0x30] } else { col };
+        let lit = hovered == Some(i) || self.open_combo == Some(i);
+        for (px, py, pw, ph, _) in self.state_rects(e, state) {
+            let col = if dim {
+                [0xff, 0, 0, 0x30]
+            } else if lit {
+                [0xff, 0xbb, 0, 0xff]
+            } else {
+                [0xbc, 0, 0, 0xff]
+            };
             out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
         }
         // `data.dropshadow == 2` replaces the `backrect`'s plain fill with §4.22's red
@@ -268,8 +281,9 @@ impl LayoutScreen {
             let (x0, y0, x1, y1) = (x + 1.0, y + 1.0, x + w - 1.0, y + h - 1.0);
             self.gouraud(out, aspect, [[x0, y0], [x1, y0], [x0, y1], [x1, y1]], [l, r, l, r]);
         }
-        // PORT-DEVIATION D54: the original has no hover look on a closed combo (a mouse has its cursor), so
-        // the box the pad stands on takes the buttons' amber over its caption strip, or over the box without one
+        // PORT-DEVIATION D54: the box the pad stands on takes the buttons' amber over its caption strip, or
+        // over the box without one. It was made on the reading that a closed combo has no hover look; it has
+        // (the amber fill above, 0x4C59AD), so this now paints amber over the same amber (§4.180)
         if self.pad_mark && hovered == Some(i) && self.open_combo != Some(i) && !dim && self.attr_num(e, "nolabel") != Some(4.0) {
             let strip = self.combo_strip(e);
             let bw = if strip > 0.0 { strip } else { w };
@@ -365,9 +379,18 @@ impl LayoutScreen {
         // `0x4D87E0(fade)` through 0x4D9200 (0x4C618B); then 0x4C6193 jumps past the value
         // draw to the arrow (0x4C623F). `nolabel == 1` is tested first (0x4C6062) and keeps
         // the left-aligned value — no shipped colour box has it (all eleven carry 0). §4.171.4.
-        if self.combo_value(d, state, out, arrow_at) {
+        let tail = self.combo_value(d, state, out, arrow_at);
+        if tail == ComboTail::Stop {
             return;
         }
+        self.combo_tail(d, tail, out);
+        self.combo_bevel_or_shadow(d, out);
+    }
+
+    /// The glass / raised bevel and the outline that close `FeComboBox`'s draw (0x4C5DBC…0x4C5E6F
+    /// on the `nolabel == 4` arm, 0x4C62C2…0x4C64F6 on the other), see [`Self::draw_combo`].
+    fn combo_tail(&self, d: WidgetDraw<'_>, tail: ComboTail, out: &mut Vec<Sprite>) {
+        let WidgetDraw { i, e, x, y, w, h, aspect, hovered, .. } = d;
         // and last of all, over everything it has just drawn — the label included —
         // the inset highlight 0x521810 (0x4C5E6A in the closed arm, 0x4C636D in the
         // other), over the **`backrect`** part: `0x4E2B90([this+0x17C])` is
@@ -383,12 +406,78 @@ impl LayoutScreen {
         // (0x4C505A…0x4C5088). Three of the 86 sliders carry 2; `ListBox.ctr` has no
         // `dropshadow` at all and `ColorBox.ctr`'s is 1, so both leave the byte 0 and
         // take this. §4.76.
-        if !self.pressed_on(i, hovered) {
-            if self.attr_num(e, "dropshadow") == Some(2.0) {
+        let pressed = self.pressed_on(i, hovered);
+        let raised = self.attr_num(e, "dropshadow") == Some(2.0);
+        if !pressed {
+            if raised {
                 self.bevel_up(out, aspect, FeRect::new(x, y, w, h), 3.0);
             } else {
                 self.glass(out, aspect, FeRect::new(x, y, w, h), &tint);
             }
+        }
+        // **Then the box's one-pixel outline, black** (ISS4-COMBO, read 2026-11-17), pressed or
+        // not (0x4C6377 joins at 0x4C637F): 0x4D9200(x, y, backrect.width + [+0x1DC],
+        // backrect.height, 0x4D87E0(fade)) at 0x4C639F…0x4C63E8 — `x` / `y` the floats at
+        // `[L+0x14]` / `[L+0x10]` (0x4C5E74…0x4C5E88), the width one more while the list scrolls,
+        // which a closed combo never does. Gate 0x4C637F…0x4C639D: always when
+        // `data.dropshadow != 2` (`[+0x209]` 0); a `dropshadow == 2` box takes it unless it is
+        // hovered (0x4C7C90) and not pressed (0x4C7CB0) — and exactly then it gets a **white**
+        // outline instead, 0x4D9200(…, 0x4D87D0(fade)) at 0x4C649C…0x4C64F6, at the plain width.
+        // This black frame is what the original's every combo shows around the red bar; without
+        // it the bar's own red rim (the glass is inset one pixel) read as a red outline.
+        // The `nolabel == 4` arm has its own glass (0x4C5DBC…0x4C5E6A, the same two gates) and
+        // then jumps past this outline (0x4C5E6F `jmp 0x4C64FB`): its frame came earlier, 0x4C5C31.
+        if tail == ComboTail::Glass {
+            return;
+        }
+        let hover_raised = raised && hovered == Some(i) && !pressed;
+        let outline = if hover_raised { [0xff, 0xff, 0xff, 0xff] } else { [0, 0, 0, 0xff] };
+        self.outline(out, aspect, FeRect::new(x, y, w, h), tint(outline));
+    }
+
+    /// The last block of `FeComboBox`'s draw, 0x4C6947…0x4C6A51, over everything the draw put down
+    /// (both arms reach it through 0x4C64FE; a list box leaves at 0x4C6950 on `[+0x1DD]`).
+    ///
+    /// **Pressed** — hovered (0x4C7C90), a button held (0x5299C0) and not disabled (0x4C7E40) — it
+    /// is the sunken bevel 0x521050 with thickness **3** (0x4C69DF) and the draw returns; **otherwise**,
+    /// when `data.dropshadow == 1` (`[+0x208]`, 0x4C69F0; 81 of the 86 sliders and every colour
+    /// box), the **drop shadow 0x520F00 at (4, 4)** (0x4C6A4C) — the same shadow a
+    /// `NFS5.GOTOBUTTON` has (0x4C9235), and the dark rim right of and under every closed combo in
+    /// the original's stills (ISS4-COMBO, 2026-11-17).
+    ///
+    /// Both take one rect. `w` is the `backrect`'s width (0x4C69BE / 0x4C6A2B); `h` the `backrect`'s
+    /// height plus the `selectionbox`'s (0x4C6998 + 0x4C69A5 / 0x4C6A05 + 0x4C6A12), the latter the
+    /// rows' height slot 1 sets every tick (0x4C57D5 → 0x4E2C20), **0 while the combo holds no
+    /// focus** (0x4C53C4) and the clamped rows' height while its list is open (`drop_down_rect`).
+    /// `x` is `0x4E2B20(selectionbox, &box)` — its `pos.x` 0 plus the 0x4C8670 box's left —
+    /// plus the scroll-drag `dx` `[L+0x3C]` (0x4C6961…0x4C696E, into the argument slot `[E+4]`).
+    ///
+    /// **`y` is the widget's own top**, `[E−0x14]` (0x4C69CF / 0x4C6A3C), `E` the entry `esp`.
+    /// With `L = E − 0x5C` (`sub esp, 0x4C`, three pushes, 0x4C5829's `push ebp`) that slot is
+    /// `[L+0x48]`, written at 0x4C5846 (0x525310's `y`, at `esp = L − 4`) and 0x4C5898 (`y` plus
+    /// the parent offset of the draw's argument, at `esp = L`) — 0x525310, 0x4C8760, 0x4C8670
+    /// and 0x4E2B20 all end in `ret 4`, so their pushed argument is gone when they return.
+    /// *(§4.58 had `y` as the box's **bottom**, `[0x4C8670()+0xC]` stored at 0x4C58D2: that store is
+    /// `[L+0x58]` = `[E−4]`, a different slot; the trace that put it at `[E−0x14]` left the four
+    /// callee-popped arguments on the stack. The port drew the pressed bevel one box lower
+    /// until 2026-11-17.)*
+    fn combo_bevel_or_shadow(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
+        let WidgetDraw { i, e, x, y, w, h, aspect, hovered, .. } = d;
+        let open_h = if self.open_combo == Some(i) { self.drop_down_rect(e, i, x, y).map_or(0.0, |r| r.3) } else { 0.0 };
+        let rect = FeRect::new(x, y, w, h + open_h);
+        if self.pressed_on(i, hovered) {
+            self.bevel(out, aspect, rect, 3.0);
+        } else if self.attr_num(e, "dropshadow") == Some(1.0) {
+            self.drop_shadow(out, aspect, rect, 4.0, 4.0);
+        }
+    }
+
+    /// 0x4D9200: a one-pixel frame, four calls to the bar primitive 0x4D9280 —
+    /// `(x, y, w, 1)`, `(x, y + h − 1, w, 1)`, `(x, y, 1, h)`, `(x + w − 1, y, 1, h)`.
+    fn outline(&self, out: &mut Vec<Sprite>, aspect: f32, r: FeRect, col: [f32; 4]) {
+        let FeRect { x, y, w, h } = r;
+        for (bx, by, bw, bh) in [(x, y, w, 1.0), (x, y + h - 1.0, w, 1.0), (x, y, 1.0, h), (x + w - 1.0, y, 1.0, h)] {
+            out.push(self.quad(aspect, bx, by, bw, bh, col));
         }
     }
 
@@ -461,11 +550,12 @@ impl LayoutScreen {
         }
     }
 
-    /// The combo's value (or a colour box's swatch, see [`Self::draw_combo`]). Returns `true`
-    /// where the original's draw ends there (no value font, the `nolabel == 1` and `== 4` arms),
-    /// so the inset highlight is not drawn.
-    fn combo_value(&self, d: WidgetDraw<'_>, state: &str, out: &mut Vec<Sprite>, arrow_at: usize) -> bool {
-        let WidgetDraw { i, e, x, y, w, aspect, strings, selected, hovered, accessor, .. } = d;
+    /// The combo's value (or a colour box's swatch, see [`Self::draw_combo`]). Returns how much of
+    /// the draw's tail follows: the `nolabel == 4` arm has its own glass and skips the outline
+    /// (0x4C5E6F), every other arm reaches the common tail 0x4C623F (`nolabel == 1` too, through
+    /// 0x4C60B7 → 0x4C6236); [`ComboTail::Stop`] only when the port has no font for the value.
+    fn combo_value(&self, d: WidgetDraw<'_>, state: &str, out: &mut Vec<Sprite>, arrow_at: usize) -> ComboTail {
+        let WidgetDraw { i, e, x, y, w, aspect, strings, hovered, accessor, .. } = d;
         if self.classes[i] == WidgetClass::ColorBox && self.attr_num(e, "nolabel") != Some(1.0) {
             if let Some(c) = self.swatches.get(&i) {
                 let (sx, sy, sw, sh) = (x + w - 40.0, y + 4.0, 20.0, 10.0);
@@ -486,7 +576,7 @@ impl LayoutScreen {
                 .or_else(|| self.attr_num(e, "usesmallfont").is_some_and(|v| v != 0.0).then(|| SMALL_FONT.to_string()))
                 .and_then(|f| self.fonts.get(&f))
                 .or_else(|| self.font_for(e));
-            let Some(f) = f else { return true };
+            let Some(f) = f else { return ComboTail::Stop };
             // **`nolabel == 4`** is a second box, and eleven of the shipped sliders
             // ask for it — all on `advgraphics.lay`, `graphicsettings.lay` and
             // `audioreal.lay`, the same eleven that carry a non-zero
@@ -509,9 +599,19 @@ impl LayoutScreen {
             // (§4.65, §4.112). That arm was unreachable until §4.113 gave this port a
             // disabled flag; it is drawn now. §4.125.
             let gscw = self.attr_num(e, "GraphicsSpecialCaseWidth").unwrap_or(0.0) as f32;
-            let colour = if selected == Some(i) { [1.0, 0.85, 0.2, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
-            // a disabled combo's text is alpha 0x30 (0x4C59D0, see `draw_combo`)
-            let colour = if state == "disabled" { [colour[0], colour[1], colour[2], 0x30 as f32 / 255.0] } else { colour };
+            // **The two text colours are the prologue's** (ISS4-COMBO, read 2026-11-17), at `L` =
+            // the `esp` after 0x4C5829's `push ebp`: `[L+0x28]` = 0x4D87F0(0x4D87E0(fade), a)
+            // — **black** — stored at 0x4C59F5 (after 0x4C59F0's `add esp, 8`), and `[L+0x18]` =
+            // 0x4D87F0(0x4D87D0(fade), a) — **white** — stored at 0x4C5A19 (`esp = L − 8`), `a`
+            // 0x30 disabled / 0xFF otherwise (0x4C59D0, 0x4C59F9). The caption reads
+            // `[esp+0x20]` at `esp = L − 8` (0x4C6027) = white; the `nolabel == 1` value the same
+            // (0x4C608B); **the ordinary value `[esp+0x30]` at `esp = L − 8` (0x4C61C1) — and the
+            // disabled "Н/Д" `[esp+0x34]` at `L − 12` (0x4C61FB) — the black one**. So the value
+            // is black on the red bar, in every state; the port drew it white (amber when
+            // selected), which nothing in 0x4C5810 does. The template's `label` `foreColor`
+            // `0x00000000` is the same black with alpha 0, the editor's preview.
+            let a = if state == "disabled" { 0x30 as f32 / 255.0 } else { 1.0 };
+            let (white, black) = ([1.0, 1.0, 1.0, a], [0.0, 0.0, 0.0, a]);
             // **`nolabel == 1`** — all fourteen of them on `display.lay`, and all
             // fourteen with `stringID=0`, so they have no caption of their own — puts
             // the **value** where the caption would go instead: 0x4C6080 takes the
@@ -533,8 +633,8 @@ impl LayoutScreen {
                 // shipped `nolabel=1` sliders are ever disabled in this port yet, so this had
                 // no live case to miss until the ordinary arm's own gap (below) was found.
                 let shown = if state == "disabled" { strings.get(299).unwrap_or_default() } else { v.as_str() };
-                self.text(out, aspect, cf, shown, x + 5.0, y + 2.0, 0.0, 0, colour);
-                return true;
+                self.text(out, aspect, cf, shown, x + 5.0, y + 2.0, 0.0, 0, white);
+                return ComboTail::Full;
             }
             if self.attr_num(e, "nolabel") == Some(4.0) && gscw >= 1.0 {
                 let bw = self.attr_num(e, "width").unwrap_or(0.0) as f32;
@@ -562,6 +662,10 @@ impl LayoutScreen {
                 // the shipped values is. Read and not added: the box's own black outline just
                 // before, 0x4D9200 at 0x4C5C31 — the port paints this family's box from the
                 // template's parts, which the original's 0x4C5810 never reaches (§4.35).
+                // ISS4-COMBO: that outline is drawn now — 0x4D9200(x, y, backrect.width +
+                // [+0x1DC], backrect.height, 0x4D87E0(fade)) at 0x4C5BE0…0x4C5C31, black at the
+                // full fade (no disabled alpha here), the same frame the other arm's tail draws.
+                self.outline(out, aspect, FeRect::new(x, y, bw, bh), tint([0, 0, 0, 0xff]));
                 let mask = super::fe_depth::mask_begin();
                 let disabled = state == "disabled";
                 let fill = if disabled {
@@ -581,7 +685,7 @@ impl LayoutScreen {
                 // above, so the mask's draws go in under it
                 let masked: Vec<Sprite> = out.drain(stencil..).collect();
                 out.splice(arrow_at..arrow_at, masked);
-                return true;
+                return ComboTail::Glass;
             }
             // **`nolabel == 2` draws no value at all**: past the caption, 0x4C6198
             // `cmp eax, 2` / `je 0x4C623F` jumps over the value's 0x4DA350 straight to
@@ -600,10 +704,10 @@ impl LayoutScreen {
             // (history: `game-history.md` §22.5)
             if self.attr_num(e, "nolabel") != Some(2.0) {
                 let shown = if state == "disabled" { strings.get(299).unwrap_or_default() } else { v.as_str() };
-                self.text(out, aspect, f, shown, x + w - 12.0, y, 0.0, 2, colour);
+                self.text(out, aspect, f, shown, x + w - 12.0, y, 0.0, 2, black);
             }
         }
-        false
+        ComboTail::Full
     }
 
     // A `NFS5.GOTOBUTTON` is a **dark-red pill with white text**, not red text on
@@ -735,7 +839,7 @@ impl LayoutScreen {
     pub(super) fn draw_bar_or_graphic_tab(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, aspect, strings, selected, hovered, .. } = d;
         let state = self.state_for(e, i, selected, hovered);
-        let frame = (self.classes[i] == WidgetClass::BottomBarButton).then(|| self.bar_button_frame(e, hovered == Some(i), self.pressed_on(i, hovered))).flatten();
+        let frame = (self.classes[i] == WidgetClass::BottomBarButton).then(|| self.bar_button_frame(e, self.widget_disabled(i), hovered == Some(i), self.pressed_on(i, hovered))).flatten();
         let first = out.len();
         self.template_widget_at(out, aspect, TemplateSpot { e, state, x, y }, strings, frame);
         if e.class != "NFS5.BOTTOMBARBUTTON" {
@@ -770,6 +874,18 @@ impl LayoutScreen {
         let shapes = self.shape_parts_at(e, state, frame).into_iter().filter(|(_, _, f, n, _)| self.shapes.contains_key(&(f.clone(), *n))).count();
         let mask = super::fe_depth::mask_begin();
         let caption = (first + rects + shapes).min(out.len());
+        // **A disabled button's icon is drawn at half alpha.** The colour 0x4C9C1A hands
+        // 0x4D9AF0 is 0x4D87F0(0x4D87D0(fade), k) — white at the fade's alpha, scaled by
+        // `k / 255` — where 0x4C9BBA…0x4C9BC9 make `k` **0x80** when 0x4C7E40 (disabled, or the
+        // screen covered) holds and 0xFF otherwise (`neg al; sbb eax, eax; and al, 0x81;
+        // add eax, 0xFF`). Over the bar's black that is the dim RACE and the dark back arrow of
+        // the main menu and the garage, both `canplaygame` 0 / no history to go back to.
+        if self.widget_disabled(i) {
+            let icons = (first + rects).min(caption);
+            for s in &mut out[icons..caption] {
+                s.color[3] = s.color[3] * 128.0 / 255.0;
+            }
+        }
         super::fe_depth::apply(&mut out[caption..], mask.stencil);
         if hovered == Some(i) && state != "disabled" && self.widget_progress() * 255 / TRANS_FULL == 0 {
             let glint = out.len();
@@ -1503,6 +1619,14 @@ impl LayoutScreen {
                 let (pos, size) = self.place(aspect, x + fx, y + fy, pw * kx, ph * ky);
                 out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
             }
+        }
+        // **`NFS5.MINIBADGE` is the card alone.** Its draw 0x4CF610 has one blit, the eight-argument
+        // 0x4D9B30 at 0x4CF6A8 with the box's own size, and returns at 0x4CF6B7: no shadow, no name,
+        // no rank — those are `NFS5.BADGE`'s own draw 0x4CF3E0 (0x4CF468…0x4CF5F9). The port drew
+        // all three for both classes, so `factorydriver.lay`'s mini card (560,8 73×40) carried the
+        // player's name at x+122 — past the 640 frame's right edge — and the shadow beside it.
+        if self.classes[i] == WidgetClass::MiniBadge {
+            return;
         }
         let Some((name, rank, colour)) = self.badges.get(&i) else { return };
         // the shadow: entry 0 at x+244 and entry 1 at y+131 (0x4CF499, 0x4CF4C4). The
@@ -2669,11 +2793,16 @@ impl LayoutScreen {
             // `pos` (`CnstLyr.fsh` entry 4 is at (−131, −120), its widget at 131,120).
             // HIGH, from the data.
             let (pos, size) = self.place(aspect, x, y, aw, ah);
-            // `flip` mirrors the art: 1 in x, 2 in y, 3 in both. HIGH — the attribute is
-            // an int on the picture widget (0x52AA4E) whose consumer was not traced, but
-            // it is what makes the oval frames of the background screens close up: the
-            // four corners of `screenempty` are the same `.fsh` entry with flip 0/1/2/3.
-            let flip = e.int("flip").unwrap_or(0).max(0);
+            // `flip` mirrors the art: bit 0 in x, bit 1 in y. The attribute is the `SHAPE`
+            // part's int property (`[part+0x12C]`, built at 0x52AA4E over the whole signed
+            // range 0x80000000…0x7FFFFFFF); the part's draw 0x4E6F60 hands `[part+0x164]` to
+            // 0x4D9AF0 → 0x4D9B30, which tests `flip & 1` (0x4D9C79) for the u pair and
+            // `flip & 2` (0x4D9CA8) for the v pair — bits, not a 0…3 value, so the three
+            // `flip=-1` corners (`firstlicense`, `levelbadge`, `teamprofile`, `FDmaps.fsh` at
+            // 470,275) mirror in both, like the `flip=3` corners elsewhere. *(Until 2026-11-17
+            // the port clamped −1 to 0 and drew that corner unmirrored, a grey block right of
+            // the oval.)*
+            let flip = e.int("flip").unwrap_or(0);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });

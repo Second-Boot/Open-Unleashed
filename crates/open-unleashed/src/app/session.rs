@@ -371,11 +371,11 @@ impl App {
                 }
                 // **TEST GLUE** (PORT-DEVIATION D47, not the original's): `NFS_DISPLAY_LIVE=<token>:<delta>[,…]` steps display options
                 // (`E1:1` MSAA, `E3:-1` render scale) as a click on their rows of the enhancements panel would (`enh_step`: renderer,
-                // `enhancements.json`, the combos' text), so a scripted run can check the live path without a pointer; the token `f12`
-                // is the window's F12
+                // `enhancements.json`, the combos' text), so a scripted run can check the live path without a pointer; the token `enh`
+                // is the enhancements' key (`0`, `App::enh_key`)
                 if let Some(v) = std::env::var("NFS_DISPLAY_LIVE").ok().filter(|v| !v.is_empty()) {
                     for part in v.split(',') {
-                        if part.trim().eq_ignore_ascii_case("f12") {
+                        if part.trim().eq_ignore_ascii_case("enh") {
                             self.enh_toggle_all();
                         } else if let Some((tok, d)) = part.split_once(':').and_then(|(t, d)| Some((t.trim(), d.trim().parse::<i32>().ok()?))) {
                             self.enh_step(&format!("{}{tok}", nfs_game::enhanced::ACCESSOR_PREFIX), d);

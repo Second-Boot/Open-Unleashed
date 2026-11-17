@@ -7,7 +7,7 @@ The keyboard defaults are the original's. Keys and gamepad controls can be chang
 bindings. On a standard pad (Xbox, PlayStation, Switch Pro) a profile whose controls were never changed gets
 the pad's layout by itself when the pad is connected; otherwise pick the pad in the device list and press
 "Default". The pad's layout is a modern one — left stick steers, RT throttle and LT brake (both analogue), A handbrake,
-B look back, X reset the car, Y camera, RB / LB shift up / down, Start pause, L3 horn, d-pad up lights,
+B look back, X reset the car, Y camera, RB / LB shift up / down, Start pause (the original has no pause on a pad; this one is the port's), L3 horn, d-pad up lights,
 d-pad left / right turn signals, d-pad down hazards, right stick looks left / right. Wheels and other
 devices get the original's layout. In the menus the pad works on its own (see below). Force feedback
 is used where the system and the pad support it. The keyboard keeps working beside a pad: an action bound to the
@@ -71,17 +71,26 @@ is up (never while driving): d-pad / left stick picks, A answers, B goes back.
 | F6 | rear-view mirror on / off |
 | F7 | map on / off |
 | F8 | HUD transparency |
-| 1 / 2 | cycle the HUD / the map |
+| Tab | the map's kind: rotating, radar, fixed |
+| keypad − / + | the map's zoom out / in |
+| 1 | cycle the HUD (does nothing, as in the original) |
 | F9 / F10 | music / sound effects |
-| P, Esc | pause; in the pause menu the arrows pick and Enter answers (continue, race again, quit, photo mode) |
+| F11 | view distance (the next of the four steps; the race only) |
+| F12 | the sky's cloud layers on / off (the race only) |
+| Alt+P | screenshot: `Unleashed00.tga` … `Unleashed98.tga` in the saves folder |
+| Esc | pause; in the pause menu the arrows pick and Enter answers (continue, race again, quit, photo mode) |
 | F1 | hide / show the pause menu or a result page, to look at the scene behind it |
+
+These keys are fixed, as in the original, which sets them at every race start: the controls screen's Pause row (P) is not read
+in a race (Esc pauses), and the map is on Tab, not on 2. The other rows of the controls screen can be changed. On macOS the
+system may keep F11 / F12 for itself (Show Desktop and the like): hold fn, or turn on "Use F1, F2, etc. keys as standard function keys".
 
 At the end of a race **Space** closes the result pages one by one and leaves the last one.
 
 ## Photo mode
 
 A free camera for a paused race or a replay (not in network races, where the pause does not stop the race). Enter it
-from the pause menu's **photo mode** item (on a pad: d-pad to it, A), or with **K** (also **F11** on Windows and Linux)
+from the pause menu's **photo mode** item (on a pad: d-pad to it, A), or with **K**
 in the pause menu or a replay. The race or the replay stands still while it is up. It is not in the original game.
 
 | Keyboard / mouse | Pad | Action |
@@ -118,8 +127,8 @@ the driving keys keep working. The panel is closed at the start of every race an
 
 The keys are the physical ones, so they work on any keyboard layout. While the panel is open, `[ ] , .` belong to it; closed, only the backquote is
 taken (also if a control of the game is bound to it). A value the card cannot give shows a dash (for instance the GPU time on a card without timestamp
-queries). A row that needs another one (the car light needs the body clear coat) is greyed and starred while the other is off. A press of **F12**
+queries). A row that needs another one (the car light needs the body clear coat) is greyed and starred while the other is off. A press of **0**
 while the panel is open shows the original's look as everywhere (the panel then shows that look; changing a row ends it).
 
-Every **F12** press, in a race and in the menus, shows for two seconds *enhancements on* or *enhancements off* near the top of the window: what
+Every press of **0** (the digit key above the letters), in a race and in the menus, shows for two seconds *enhancements on* or *enhancements off* near the top of the window: what
 the press did. If every row is already at the original's setting there is nothing to compare, and the message says so.

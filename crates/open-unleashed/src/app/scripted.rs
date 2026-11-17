@@ -556,6 +556,8 @@ impl App {
             (std::io::BufWriter::new(std::fs::File::create(path).expect("NFS_CAM_LOG")), fps, 0u64, 0.0f64)
         });
         let mut cam_log = cam_log;
+        // the game tick of the last drawn frame's animation step (TEST GLUE, below)
+        let mut anim_tick = self.tick;
         for t in 0..ticks {
             self.net_race_notice();
             // **TEST GLUE** `NFS_NET_LOCKSTEP=<D>`: the remote cars' blocks arrive at fixed receiver ticks (`NetPlay::lockstep_wait`)
@@ -633,6 +635,17 @@ impl App {
                 // the windowed frame's billboard key first, as `RedrawRequested` takes it
                 self.billboard_key_frame();
                 self.rebuild_scene();
+                // and, after it, the cars' real-time animations of the frame, as `draw_frame` steps them
+                // (`update_damage_decals`: the driver's arms off the steering, the wing, the lids, the pop-up
+                // lamps, slot 9's clocks) — by the game time since the last such frame, whole ms of the 64 Hz
+                // tick (`n · 1000 / 64`, the fraction carried), so an `NFS_SHOT_TICKS` still shows the pose a
+                // windowed frame at that tick shows. *(Until ISS4-ARMS these frames never stepped them: the
+                // driver kept the model's frame-0 pose — full left lock, a hand right of the head — in every
+                // still, read as "the arms do not follow the steering" in REFERENCE-2026-11-17-ISS4 row 6.)*
+                let ms = |k: u64| k * 1000 / 64;
+                let dt = if self.tick >= anim_tick { (ms(self.tick) - ms(anim_tick)) as u32 } else { 16 };
+                anim_tick = self.tick;
+                self.update_damage_decals(dt);
                 if live {
                     self.refl_live_frame();
                 }
@@ -1086,8 +1099,8 @@ impl App {
         // **TEST GLUE** (ENH-SAVE) `NFS_ENH_LIVE=<tick>:<E-token>:<delta>,…`: right after that tick's still, the same step the
         // panel's combo makes (`enh_step`, which saves like the panel does), then the same tick again as
         // `<prefix>.t<tick>.live.png` — a live change inside one run, the same frame before and after
-        // ENH-LIVETEX: the token `F12` is the A/B key (`enh_toggle_all`, a view that is never saved; the delta is ignored); every matching item gets its
-        // own still, `.live.png`, `.live2.png`, ... (so `250:F12:0,250:F12:0` shows the flip and the flip back, `250:E41:1,250:E41:1` x4 -> orig -> x2)
+        // ENH-LIVETEX: the token `ENH` is the A/B key (`0`, `enh_toggle_all`, a view that is never saved; the delta is ignored); every matching item gets its
+        // own still, `.live.png`, `.live2.png`, ... (so `250:ENH:0,250:ENH:0` shows the flip and the flip back, `250:E41:1,250:E41:1` x4 -> orig -> x2)
         if let Ok(live) = std::env::var("NFS_ENH_LIVE") {
             let mut n = 0;
             for item in live.split(',') {
@@ -1096,7 +1109,7 @@ impl App {
                 if t != self.tick {
                     continue;
                 }
-                let stepped = if tok.eq_ignore_ascii_case("f12") {
+                let stepped = if tok.eq_ignore_ascii_case("enh") {
                     self.enh_toggle_all();
                     true
                 } else {

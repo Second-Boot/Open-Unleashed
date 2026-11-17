@@ -63,6 +63,10 @@ mod quickfix;
 mod init;
 mod photo;
 mod race_panel;
+mod race_shot;
+
+/// The enhancements' A/B key, the physical `0` (`App::enh_key`; PORT-DEVIATION D63).
+pub(crate) const ENH_KEY: winit::keyboard::KeyCode = winit::keyboard::KeyCode::Digit0;
 pub(crate) use quickfix::*;
 pub(crate) use init::AppInit;
 pub(crate) use scripted::*;
@@ -342,6 +346,11 @@ pub(crate) struct App {
     pub(crate) stuck_ticks: u32,
     /// detail level (`[0x657D70]` → 0.5 / 0.67 / 0.83 / 1.0) scaling the `.key` draw distance
     pub(crate) detail: f32,
+    /// `ADJUSTABLEVIEWDISTANCE` `[0x657D70]`, 0…3: the launch's `Graphics.ViewDistance` selection, stepped by
+    /// `I_VIEWDISTANCE` (F11, 0x44F220) during the race; `detail` follows it
+    pub(crate) view_distance: usize,
+    /// `[0x606ADC]`: the number of the next `I_SCREENSHOT` file, 0…98 (`race_shot.rs`)
+    pub(crate) shot_counter: u32,
     /// `SPLITTIMES` (`[0x657DD8]`): 1 record lap, 2 best lap, 3 last lap — circuits only; the
     /// record time is always shown on point-to-point tracks (`HRecordTime` 0x42A200, hud.md §6.3).
     pub(crate) records_path: std::path::PathBuf,
@@ -690,7 +699,7 @@ pub(crate) struct App {
     /// The enhanced game's switches and how they were chosen (`nfs_game::enhanced`); pushed to the renderer by [`App::enh_apply`].
     pub(crate) enh: nfs_renderer::Enhancements,
     pub(crate) enh_mode: nfs_game::enhanced::Mode,
-    /// ENH-SAVE: the player's set while the F12 A/B shows another (`enhanced::ab_toggle`); the A/B is never stored.
+    /// ENH-SAVE: the player's set while the A/B key (`0`) shows another (`enhanced::ab_toggle`); the A/B is never stored.
     pub(crate) enh_stash: Option<nfs_renderer::Enhancements>,
     /// ENHANCEMENT ENH-UPSCALER: the options panel's lines changed with the set; rebuilt next frame (`enh_panel_refresh`)
     pub(crate) enh_panel_dirty: bool,
@@ -788,7 +797,7 @@ pub(crate) struct App {
     /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a command-line race, `Game.Difficutly` (`FeCatalogues::difficulty`) for a layout launch (0x4EB470), the event's in career
     pub(crate) race_skill: u8,
     pub(crate) last_frame: Instant,
-    /// PORT-DEVIATION D63: the race panel and the F12 message (`app/race_panel.rs`); render-side, closed at every race start
+    /// PORT-DEVIATION D63: the race panel and the A/B key's message (`app/race_panel.rs`); render-side, closed at every race start
     pub(crate) panel: race_panel::RacePanel,
     /// ENHANCEMENT E22 / D4: the frame pacer's next deadline, and the display refresh rate it last
     /// read (Hz, when it was read), see `idle.rs`

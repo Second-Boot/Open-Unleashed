@@ -261,7 +261,7 @@ impl App {
             shot_settle_ms: 0.0,
             hud_clock_base: 0.0,
             hud_scale: std::cell::Cell::new(1.0),
-            hud_keys: HudKeys::new(1, false, true),
+            hud_keys: HudKeys::new(1, 4, false, true),
             replay_bar: nfs_game::replay::BarState::new(),
             bar_press: None,
             hud_key_script: std::env::var("NFS_HUD_KEYS_1").or_else(|_| std::env::var("NFS_HUD_KEYS")).map(|s| parse_hud_keys(&s).into()).unwrap_or_default(),
@@ -353,6 +353,8 @@ impl App {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0),
+            view_distance: 3,
+            shot_counter: 0,
             records_path,
             car_id: catalog
                 .iter()

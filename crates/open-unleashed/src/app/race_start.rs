@@ -829,10 +829,11 @@ impl App {
         // a new session's timer starts `[0x5E99B8]`, and so `[0x606AC8]`, at 0 (0x4A4752)
         if !race_pass {
             // the session's HUD (0x4B6878 → 0x424460 → `HUD_init` 0x41E170): live, the options'
-            // MAP / REARVIEWMIRRROR, TRANSLUCENCY's box (0x425298), the map's suspend cleared;
-            // a pass keeps them (`HudKeys`)
+            // MAP / MAPSCALE / REARVIEWMIRRROR, TRANSLUCENCY's box (0x425298), the map's suspend
+            // cleared; a pass keeps them (`HudKeys`)
             self.hud_keys = HudKeys::new(
                 self.choice_index(choice::DISPLAY_MAP).map_or(1, |(i, _)| i),
+                self.choice_index(choice::DISPLAY_MAP_SCALE).map_or(4, |(i, _)| i.min(4)),
                 self.choice_index(choice::DISPLAY_REAR_VIEW).is_some_and(|(i, _)| i != 0),
                 self.choice_index(choice::DISPLAY_TRANSLUCENCY).is_none_or(|(i, _)| i == 0),
             );

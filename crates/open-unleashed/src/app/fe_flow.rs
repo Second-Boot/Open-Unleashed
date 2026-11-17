@@ -304,12 +304,13 @@ impl App {
         let account = self.fe.game_type == game_type::TOURNAMENT && !slot_ac(&list);
         let layered = self.fe.nav.bottom_covered();
         let Some(b) = self.fe.layout_bottom.as_mut() else { return };
-        // 0x4D1E70 after the open: the bar is covered while more than one layer is open
-        // (0x4D1F4C), which disables every button whose template has the state (0x4C7E62);
-        // uncovering is left to the dialog step, which also covers it for a dialog
-        if layered {
-            b.set_covered(true);
-        }
+        // 0x4D1E70 after the open: the bar is covered while more than one layer is open and
+        // **uncovered** otherwise (0x4D1F4C: 0x4E08C0 / 0x4E08A0 on the layer count), which
+        // disables every button whose template has the state (0x4C7E62); a dialog covers it
+        // again on the dialog step. The port used to leave the uncovering to that step, so a
+        // still taken right after a layer closed (`NFS_FE_KEYS` on the main menu's player
+        // dialog) showed `опции...` / `выход` covered — grey, and their icons dim.
+        b.set_covered(layered);
         for (index, which) in b.widgets_named(&NAMES) {
             match which {
                 0 => b.set_disabled_flag(index, !back),

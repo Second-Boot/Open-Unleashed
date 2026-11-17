@@ -1322,7 +1322,8 @@ impl App {
         // (0x459983…0x45998E). The port read level 0 whatever the option said.
         // the frame's options, read once (`RenderOptions`)
         let opts = RenderOptions::read(self);
-        let sky_level = opts.sky_level;
+        // `[0x627E1C]`, the record 0x459950 / `I_HORIZON` (0x4599E0 / 0x459A20) left (`Sky::colour_level`)
+        let sky_level = self.sky.as_ref().map_or(opts.sky_level, |s| s.colour_level(opts.sky_level));
         // 0x459A70 at the race pass's start (0x468C63): the record's gradient flag sends the
         // colour to the sky manager's track B at the camera's slice, else track A blends the
         // record's top and bottom (`SkyBin::background_at`), group A — the main view
@@ -1435,7 +1436,7 @@ impl App {
         }
         // PORT-DEVIATION D46: photo mode's hint, and the pointer to it on the pause menu / in a replay
         self.photo_hint();
-        // PORT-DEVIATION D63: the race panel and the F12 message, after the hint (a photo-mode still cuts the sprites off there)
+        // PORT-DEVIATION D63: the race panel and the A/B key's (`0`) message, after the hint (a photo-mode still cuts the sprites off there)
         self.panel_overlay();
         // `+0x100` for the next release, and sound 9 when the pointer crosses into a button
         // (0x41B3BA…0x41B3C6)
@@ -1606,7 +1607,7 @@ impl App {
     }
 
     /// The front end's scene: its room and the screens' sprites over a black clear (the loading / start-up stills in place of
-    /// them), the F12 message last.
+    /// them), the A/B key's message last.
     fn fe_scene(&mut self) {
         self.scene.clear_color = [0.0, 0.0, 0.0, 1.0];
         self.load_fe_room();
@@ -1642,7 +1643,7 @@ impl App {
             self.scene.sprites = self.fe.race_loading.as_ref().map(|l| l.sprites(lw as f32, lh as f32)).unwrap_or_default();
             self.renderer = Some(r);
         }
-        // PORT-DEVIATION D63: the F12 message, over every screen of the front end (the panel is a race's)
+        // PORT-DEVIATION D63: the A/B key's message, over every screen of the front end (the panel is a race's)
         self.panel_overlay();
     }
 

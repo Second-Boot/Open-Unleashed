@@ -62,18 +62,28 @@ impl App {
         // window's surface (a window that nothing shows - a scripted run's, a locked screen's - gives no drawable and the loop would draw nothing),
         // so a windowed run times real frames; the image is read back, which adds to the frame time
         let offscreen = nfs_game::config::cfg().nfs_offscreen_frames.is_set();
+        let anim_log = nfs_game::config::cfg().nfs_fe_anim_log.as_str().map(str::to_string);
+        let mut frame_px: Option<(u32, u32, Vec<u8>)> = None;
         if !idle
             && let Some(r) = self.renderer.as_mut()
         {
             let drawn = if offscreen {
                 let (w, h) = r.size();
-                r.render_to_image(&self.scene, &render_cam, w, h).map(|_| ())
+                r.render_to_image(&self.scene, &render_cam, w, h).map(|px| {
+                    if anim_log.is_some() {
+                        frame_px = Some((w, h, px));
+                    }
+                })
             } else {
                 r.render(&self.scene, &render_cam)
             };
             if let Err(e) = drawn {
                 tracing::error!(error = %e, "render failed");
             }
+        }
+        // **TEST GLUE** `NFS_FE_ANIM_LOG=<dir>[:<ms>[:<every ms>]]`: this frame's animation phases, and the stills at wall-time marks
+        if let Some(spec) = anim_log.as_deref() {
+            self.fe_anim_log(spec, idle, frame_px);
         }
         // PORT-DEVIATION D46: a photo-mode still asked for this frame, taken from the scene just drawn
         self.photo_after_frame();
@@ -374,6 +384,84 @@ impl App {
             self.bind_checks();
             }
         }
+    }
+}
+
+/// **TEST GLUE** state of `NFS_FE_ANIM_LOG` (one windowed run, one thread).
+struct FeAnimLog {
+    start: Instant,
+    csv: std::io::BufWriter<std::fs::File>,
+    next_mark: u64,
+    stills: Vec<(u64, u32, u32, Vec<u8>)>,
+}
+
+thread_local! {
+    static FE_ANIM_LOG: std::cell::RefCell<Option<FeAnimLog>> = const { std::cell::RefCell::new(None) };
+}
+
+impl App {
+    /// **TEST GLUE** (not the original's): the front end's animation phases of every frame against the wall clock,
+    /// `<dir>/phases.csv`, and with `NFS_OFFSCREEN_FRAMES=1` the first drawn frame after each `<every>` ms of wall time
+    /// (`<dir>/w<ms>.png`, kept in memory and written at the end so the run's pacing is not disturbed). The log starts
+    /// on the first frame with a screen on show and ends the process after `<ms>` (default 10 000, every 250). For the
+    /// 60 / 120 fps comparison of the front end's clocks (`NFS_FPS_CAP`, `RE/notes/timing.md`).
+    fn fe_anim_log(&mut self, spec: &str, idle: bool, px: Option<(u32, u32, Vec<u8>)>) {
+        use std::io::Write;
+        let mut it = spec.split(':');
+        let dir = it.next().unwrap_or(".").to_string();
+        let total: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(10_000);
+        let every: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(250).max(1);
+        if self.fe.layout_preview.is_none() {
+            return;
+        }
+        let row = {
+            let l = self.fe.layout_preview.as_ref().expect("screen");
+            let (movies, cursor_ms) = l.anim_probe();
+            let spin = self.fe_room_of().map_or(0.0, |r| r.spin_turns(self.fe.ms));
+            let tr = self.fe.track_room.as_ref().map_or(String::from(","), |t| format!("{:.5},{}", t.yrot, t.frame));
+            let dealer = self.fe.dealer_row.as_ref().map_or(0.0, |d| d.progress);
+            let movies = movies.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("/");
+            (
+                self.frame_dt * 1000.0,
+                self.fe.ms,
+                l.ticks(),
+                self.fe.layout_name.clone().unwrap_or_default(),
+                movies,
+                cursor_ms,
+                spin,
+                l.transition().progress(),
+                tr,
+                dealer,
+            )
+        };
+        FE_ANIM_LOG.with(|cell| {
+            let mut g = cell.borrow_mut();
+            if g.is_none() {
+                let _ = std::fs::create_dir_all(&dir);
+                let Ok(f) = std::fs::File::create(format!("{dir}/phases.csv")) else { return };
+                let mut csv = std::io::BufWriter::new(f);
+                let _ = writeln!(csv, "wall_ms,frame_dt_ms,fe_ms,screen_ticks,screen,movie_chunks,cursor_ms,spin_turns,transition,track_yrot,track_frame,dealer_progress,idle");
+                *g = Some(FeAnimLog { start: Instant::now(), csv, next_mark: 0, stills: Vec::new() });
+            }
+            let s = g.as_mut().expect("log");
+            let wall = s.start.elapsed().as_secs_f64() * 1000.0;
+            let (dt, fe_ms, ticks, screen, movies, cursor_ms, spin, trans, tr, dealer) = row;
+            let _ = writeln!(s.csv, "{wall:.2},{dt:.3},{fe_ms},{ticks},{screen},{movies},{cursor_ms},{spin:.5},{trans},{tr},{dealer:.4},{}", idle as u8);
+            if wall as u64 >= s.next_mark
+                && let Some((w, h, px)) = px
+            {
+                s.stills.push((s.next_mark, w, h, px));
+                s.next_mark += every;
+            }
+            if wall as u64 >= total {
+                let _ = s.csv.flush();
+                for (mark, w, h, px) in s.stills.drain(..) {
+                    let _ = image::save_buffer(format!("{dir}/w{mark:05}.png"), &px, w, h, image::ColorType::Rgba8);
+                }
+                tracing::info!(dir, "NFS_FE_ANIM_LOG written");
+                std::process::exit(0);
+            }
+        });
     }
 }
 

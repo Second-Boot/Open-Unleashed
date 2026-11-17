@@ -11,7 +11,7 @@
 //!
 //! **Hard original.** `NFS_ENH=off` is the test mode "this is the original": every switch off
 //! *and* none of this module's front-end additions present (no third graphics sub-tab,
-//! no extra strings, no F12, nothing saved) — what the FE goldens compare against `master`'s. The
+//! no extra strings, no A/B key, nothing saved) — what the FE goldens compare against `master`'s. The
 //! menu's «как в оригинале» action turns every switch off but leaves the tab, so the player can
 //! come back.
 
@@ -304,7 +304,7 @@ pub fn save_to(path: &std::path::Path, e: &Enhancements) -> std::io::Result<()> 
     std::fs::write(path, file_text(e))
 }
 
-/// The debug A/B key (F12): the player's set <-> every switch off (or, with the player's own set already all
+/// The A/B key (`0`, the window handler's `App::enh_key`): the player's set <-> every switch off (or, with the player's own set already all
 /// off, every default). Returns the set to show and the player's set to bring back by the next press (`None`
 /// = this press is the way back). **The A/B is a view, never stored**: before ENH-SAVE the key saved whatever
 /// it showed, so two presses (off, then "all") overwrote the player's levels with the registry defaults —
@@ -944,7 +944,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ENH-SAVE: F12 is a view — off, then back to the player's own levels, not to the defaults; and from an all-off
+    /// ENH-SAVE: the A/B key is a view — off, then back to the player's own levels, not to the defaults; and from an all-off
     /// player set it shows the defaults and returns to off.
     #[test]
     fn the_ab_key_returns_the_players_set() {

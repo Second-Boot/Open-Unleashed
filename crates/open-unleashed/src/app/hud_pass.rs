@@ -601,9 +601,10 @@ impl App {
                     .map(|sl| (sl.forward.x, sl.forward.z)),
                 _ => None,
             };
-            // the zoom 0x41E9C0: base 0 / 0 / 33 / 66 / 100 by MAPSCALE, then `· 4.15 + 185`, or
-            // `· 0.15 + 5` in radar mode; 600 (= 0x41EA40) is the whole-track view
-            let base = [0.0f32, 0.0, 33.0, 66.0, 100.0][self.choice_index(choice::DISPLAY_MAP_SCALE).map_or(4, |(i, _)| i.min(4))];
+            // the zoom 0x41E9C0: base 0 / 0 / 33 / 66 / 100 by MAPSCALE (the session's, which the
+            // keypad's − / + step, `HudKeys::mapscale`), then `· 4.15 + 185`, or `· 0.15 + 5` in radar
+            // mode; 600 (= 0x41EA40) is the whole-track view
+            let base = [0.0f32, 0.0, 33.0, 66.0, 100.0][self.hud_keys.mapscale.min(4)];
             let zoom = if map_mode == 3 { base * 0.15 + 5.0 } else { base * 4.15 + 185.0 };
             let follow = (zoom != 600.0).then_some((v.position.x, v.position.z, zoom));
             if let Some(r) = self.renderer.as_mut() {

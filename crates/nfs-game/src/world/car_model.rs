@@ -1277,7 +1277,7 @@ struct ArticleCtx<'a> {
     ty: u8,
     is_wheel: bool,
     anim: usize,
-    frame_geometry: Vec<nfs_formats::crp::ArticleGeometry>,
+    animated: bool,
     damage_geometry: Option<nfs_formats::crp::ArticleGeometry>,
 }
 
@@ -1316,15 +1316,9 @@ impl CarAccum {
             return Ok(());
         }
         let is_wheel = matches!(ty, 0x0D | 0x0E);
-        // an animated article's morph frames: each frame's geometry — 0x43C4FB probes `vt`
-        // part `frame·0x10 + index` until one is missing, and the count is the animation's
-        // length when it is the largest (0x43C54B…0x43C56F)
+        // an animated article's morph frames, read per LOD (`add_article_lod`)
         let anim = g.base.as_ref().map(|b| b.anim as usize).filter(|&n| n > 0 && n < ANIMS).unwrap_or(0);
-        let frame_geometry: Vec<nfs_formats::crp::ArticleGeometry> = if !is_wheel && anim != 0 {
-            (1u16..).map_while(|f| car.crp.article_geometry_frame(&car.crp_data, a, f).ok()).collect()
-        } else {
-            Vec::new()
-        };
+        let animated = !is_wheel && anim != 0;
         // 0x43E390 crushes the parts whose `Base+78` has bit 3 (0x43E3D8) from their
         // `vt#(0x8000|lod)` vectors by their `dz#lod` zones, into the buffer `*(part+0x40)`
         // points at. *(Settled 2026-09-27: a part that also morphs (the convertibles' roof,
@@ -1344,7 +1338,7 @@ impl CarAccum {
         // Every LOD the article has primitives in: the car draw 0x444E00 takes each pass from
         // its own LOD object (`CarPass`). (history: `game-history.md` §10.7)
         let lods: std::collections::BTreeSet<u8> = g.primitives.iter().map(|p| p.lod).filter(|l| (1..=7).contains(l)).collect();
-        let ctx = ArticleCtx { ai, a, g, ty, is_wheel, anim, frame_geometry, damage_geometry };
+        let ctx = ArticleCtx { ai, a, g, ty, is_wheel, anim, animated, damage_geometry };
         for l in lods {
             self.add_article_lod(r, mats, car, lod, &ctx, l);
         }
@@ -1354,8 +1348,8 @@ impl CarAccum {
     /// One LOD of one article: its meshes uploaded, the morph / crush data, and the part filed as a
     /// wheel or a body part.
     fn add_article_lod(&mut self, r: &mut Renderer, mats: &mut MaterialCache, car: &CarAssets, lod: u8, c: &ArticleCtx, l: u8) {
-        let ArticleCtx { ai, a, g, ty, is_wheel, anim, frame_geometry, damage_geometry } = c;
-        let (ai, ty, is_wheel, anim) = (*ai, *ty, *is_wheel, *anim);
+        let ArticleCtx { ai, a, g, ty, is_wheel, anim, animated, damage_geometry } = c;
+        let (ai, ty, is_wheel, anim, animated) = (*ai, *ty, *is_wheel, *anim, *animated);
         let Self { lists, skipped, min, max, morph, anim_length, wheel_radius, half_track, deform, e42, round_static, round_deform, round_stats, twins_only, placeholder_n, .. } = self;
         let (e42, twins_only) = (*e42, *twins_only);
 
@@ -1375,13 +1369,24 @@ impl CarAccum {
             move_channel: if tr.is_some() { g.base.as_ref().map_or(-1, |b| b.move_channel) } else { -1 },
         };
         let rot_channel = if tr.is_some() { g.base.as_ref().map_or(0, |b| b.rot_channel) } else { 0 };
-        let roof_frames: Vec<Vec<MeshData>> = frame_geometry
-            .iter()
-            .map(|gf| {
-                let mut sk = 0;
-                article_meshes(gf, l, &mut sk).into_iter().map(|m| m.mesh).collect()
-            })
-            .collect();
+        // the morph frames of this LOD: 0x43C4FB probes the LOD part's own `vt` index, `frame·0x10 +
+        // lod`, from frame 1 until one is missing (0x43C502 `add edi, 0x10`, 0x43C517 / 0x43C523 the
+        // lookup, 0x43C52A the loop), and the count is the animation's length when it is the largest
+        // (0x43C54B…0x43C56F). Per LOD: a frame missing at one LOD does not end another's — `356_1`'s
+        // `DriverBody2` has no `vt` 0x22, so 8 frames at LOD 1 and 1 at LOD 2. *(Until ISS4-ARMS the
+        // frames were read for every LOD at once and stopped at the first gap anywhere: that body's lean
+        // and look-back, animation 6, had 1 frame of 8 at LOD 1 too.)*
+        let roof_frames: Vec<Vec<MeshData>> = if animated {
+            (1u16..)
+                .map_while(|f| car.crp.article_geometry_frame_lod(&car.crp_data, a, f, l).ok())
+                .map(|gf| {
+                    let mut sk = 0;
+                    article_meshes(&gf, l, &mut sk).into_iter().map(|m| m.mesh).collect()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !roof_frames.is_empty() {
             anim_length[anim] = anim_length[anim].max(roof_frames.len() as u32 + 1);
         }
@@ -1843,7 +1848,7 @@ impl CarModel {
 
     /// ENHANCEMENT ENH-LIVETEX: bring this model's twins to the levels E41 / E42 are at now (see [`Self::live_pending`]). The first model of
     /// a load builds them by loading the car again (`CarSource`) with only the missing kinds asked for and adopts the result; the others of
-    /// the load (traffic / police instances) copy from it through `cache`. A short hitch, once per change of level, never per F12 flip.
+    /// the load (traffic / police instances) copy from it through `cache`. A short hitch, once per change of level, never per A/B flip.
     pub fn sync_live(&mut self, r: &mut Renderer, paths: &nfs_assets::GamePaths, cache: &mut LiveCache) {
         if !self.live_pending(r) {
             return;

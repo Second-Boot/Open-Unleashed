@@ -66,6 +66,8 @@ pub struct Sky {
     hd: Option<crate::world::HdSet>,
     /// `[this+0x38…+0x40]`: the last pass's eye (0x45D562…0x45D579)
     eye: Vec3,
+    /// `[this+0x60]`: 1 from the constructor (0x45D827), flipped by `I_HORIZON` ([`Self::toggle_horizon`])
+    horizon: bool,
 }
 
 /// 0x45A9E0(slice) over the `+0x655C` track (0x45A970): the byte of the key pair `b`, `b + 1` with
@@ -983,7 +985,7 @@ impl Sky {
         if parts.is_empty() {
             return None;
         }
-        let mut sky = Self { parts, grids, blend, last_tick: None, jitter, lightning, ring_turn, track_c, slice: 0, eye: Vec3::ZERO, hd_bases: bases.into_inner(), hd: None };
+        let mut sky = Self { parts, grids, blend, last_tick: None, jitter, lightning, ring_turn, track_c, slice: 0, eye: Vec3::ZERO, hd_bases: bases.into_inner(), hd: None, horizon: true };
         sky.sync_hd(r, track);
         Some(sky)
     }
@@ -1085,6 +1087,28 @@ impl Sky {
         self.lightning.as_mut().and_then(|l| l.thunder.take())
     }
 
+    /// **`I_HORIZON`** (F12; `RaceFrame` 0x4159A2…0x4159C4, with the pause off, `[0x606A90]` == 0): on the
+    /// sky manager 0x45DD80 returns, `[+0x60]` set → **0x45DBB0**: cleared, and `[0x627E1C]` — the colour
+    /// record the race views clear to (0x468C5A / 0x468DDC → 0x459A70) — set by **0x4599E0**, which walks
+    /// down from record **0** (so record 0); clear → **0x45DB90**: set, and the record by **0x459A20**, the
+    /// walk from `SKYRENDERING` `[0x657D9C]` that 0x459950 made at the build. So with the horizon off the
+    /// cloud layers are left out (the ring and the sun stay, [`Self::draw_items`]) and the frame clears to
+    /// record 0's colour ([`Self::colour_level`]). The constructor sets it again for the next race.
+    pub fn toggle_horizon(&mut self) {
+        self.horizon = !self.horizon;
+    }
+
+    /// Whether the horizon is on (`[this+0x60]`).
+    pub fn horizon(&self) -> bool {
+        self.horizon
+    }
+
+    /// The colour record level the race views clear to: `SKYRENDERING`'s (`level`) with the horizon on,
+    /// record 0's walk with it off (0x4599E0 / 0x459A20, [`Self::toggle_horizon`]).
+    pub fn colour_level(&self, level: usize) -> usize {
+        if self.horizon { level } else { 0 }
+    }
+
     /// Draw items centred on the camera, in metres: the sky pass 0x45D4F0 moves the camera's eye to
     /// the origin (0x45D63D…0x45D679, `0x466220` with `(0, 0, 0)`; the eye back at 0x45D794) and sets
     /// the view's planes to 0.15 / 700 (0x45D501…0x45D51D → 0x467120), so the grid and the ring are
@@ -1111,13 +1135,14 @@ impl Sky {
     /// Forest's flagged stretches the layers are left out while the camera looks level, the ring
     /// alone behind the trees. So the mirror (`+0x12C` 1) shows the ring and the sun, no layer.
     /// `[this+0x60]` is 1 from the constructor (0x45D827); only the `I_HORIZON` key (input bit 0x10,
-    /// 0x4159A3…0x4159C4 → 0x45DBB0 / 0x45DB90) flips it, and `fe.txt` leaves that key unbound
-    /// (`controls.md` §4.170), so it stays 1.
+    /// 0x4159A3…0x4159C4 → 0x45DBB0 / 0x45DB90) flips it — F12, which 0x411760 binds at every race
+    /// start (`[0x5E9928]` = 0x5803; `controls.md` §4.170.2) — [`Self::toggle_horizon`].
+    /// *(Corrected 2026-11-17, ISS4-KEYS: this said `fe.txt` leaves the key unbound, so it stays 1.)*
     pub fn draw_items(&self, view: &SkyView, after_sun: bool) -> impl Iterator<Item = DrawItem> + '_ {
         let t = glam::Mat4::from_translation(view.eye);
         const UNLIT: nfs_renderer::LayerLight = nfs_renderer::LayerLight { ambient: [1.0; 3], diffuse: [0.0; 3], direction: [0.0; 3] };
         let (lo, hi) = ring_window(view.heading(), self.ring_turn);
-        let layers = view.main && ((view.up_row_y() as f64) < 0.95 || !track_c_flag(&self.track_c, self.slice));
+        let layers = self.horizon && view.main && ((view.up_row_y() as f64) < 0.95 || !track_c_flag(&self.track_c, self.slice));
         self.parts
             .iter()
             .filter(move |p| p.3 == after_sun)
