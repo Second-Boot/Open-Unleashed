@@ -74,6 +74,7 @@ switches! {
     nfs_dusk_tracks = "NFS_DUSK_TRACKS",
     nfs_data_sun = "NFS_DATA_SUN",
     nfs_data_sun_full = "NFS_DATA_SUN_FULL",
+    nfs_cars_only_small = "NFS_CARS_ONLY_SMALL",
     nfs_choice = "NFS_CHOICE",
     nfs_fe_clicks = "NFS_FE_CLICKS",
     nfs_fe_clock = "NFS_FE_CLOCK",

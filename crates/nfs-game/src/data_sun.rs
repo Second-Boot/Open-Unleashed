@@ -1,102 +1,155 @@
 //! ENHANCEMENT E51 / E9 (CORSICA-SUN, SUN-ALL, SUN-FULL): the sun of a day track whose sky has none, from the track's data, and
-//! the per-track choices for those tracks in ONE table ([`SUNLESS_DAY_TRACKS`], SHADOW-REFACTOR: before, three name lists
-//! in three files: `bake_light::WEAK_FIT_TRACKS`, `world::DATA_SUN_FULL_TRACKS`, `street_lamps::DUSK_TRACKS`).
+//! what follows from it, by DATA RULES (SHADOW-UNIFY, 2026-11-18: no per-track table; before, `SUNLESS_DAY_TRACKS` with
+//! the choices per name, and before SHADOW-REFACTOR three name lists in three files).
 //!
 //! The four sunless day tracks (`canyon`, `forest`, `foothills`, `autobahn`) have the sky's sun object straight overhead and off,
 //! so the cars' light travels straight down (0x43AC8D, `TrackWorld::sun_direction` = -Y) and E9 has no sun. The sun comes from
 //! the data: the light its `sh80` ground-shadow decals were drawn for ([`crate::decal_sun`]: Corsica), else the light its baked
 //! vertex colours were lit with when that bake is clearly directional ([`crate::bake_light`]: Schwarzwald). Nothing else: a track
-//! whose data gives no direction has no data sun. Render only: nothing reads it but the renderer's shadow frame.
+//! whose data gives no direction has no data sun. Render only: nothing reads it but the renderer's shadow frame and the lamps.
 //!
 //! SHADOW-OVERCAST (2026-11-16): foothills (Pyrenees) and autobahn have NO data sun. Until then (SUN-ALL, 2026-11-14) they
 //! took the bake's best fit below the thresholds (a per-track `weak_fit` flag: foothills 144 / 63 deg, r2 0.49 vs 0.34 overhead;
 //! autobahn -135 / 78 deg, r2 0.48 vs 0.47), which drew a sharp car shadow beside the car 29-58 % dark under a twilight sky
 //! (foothills: the bake has no direction at all, every upright azimuth bin 0.442) and under rain (autobahn). Their shadows are
-//! E43's contact shadow, E14's AO and on autobahn E47's lamp shadows. With no track left on it the weak-fit mechanism is gone.
+//! E43's contact shadow, E14's AO and E47's lamp shadows. With no track left on it the weak-fit mechanism is gone.
+//!
+//! SHADOW-UNIFY (2026-11-18: one shadow mode for every sun track, no per-track cases). APPROXIMATION (enhancement rules,
+//! nothing of the original's: it has no sun there):
+//! * a data sun's full frame is the sky sun's frame - the same casters' rule (`nfs_renderer::SceneryCasters::Shape`) and the
+//!   same receivers' gate (`BakedGate::Relative`);
+//! * FULL OR CARS-ONLY by the sun's source ([`SunSource`]): a sun measured from the track's own `sh80` ground-shadow decals takes
+//!   E51's cars-only frame plus the small upright parts as casters (CANYON-SMALLSH, [`small_parts`]; the big scenery's shade is
+//!   already drawn into the data as decals: Corsica, whose gorge walls shade the
+//!   whole road on the full frame), a sun measured from the bake takes E9's full frame (a vertex bake has no shade of the
+//!   trees, posts, houses: Schwarzwald). On the shipped tracks exactly the choices before (canyon cars-only, forest
+//!   full); foothills and autobahn have no data sun at all;
+//! * DUSK LAMPS ([`dusk_lamps`]): a day track with no sun from any source (no sky sun, no data sun) lights its open street lamps
+//!   by day (E23, E47's lamp shadows): autobahn (the AUTOBAHN-LAMPS choice) and foothills (8 open street lamps).
 
 use glam::Vec3;
 use nfs_assets::track::TrackGeometry;
+pub use nfs_renderer::{BakedGate, SceneryCasters};
 use nfs_formats::crp::Material;
+
+/// Where a data sun was measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SunSource {
+    /// the light the track's `sh80` ground-shadow decals were drawn for ([`crate::decal_sun`])
+    Decals,
+    /// the light the track's vertex colours were baked with ([`crate::bake_light`])
+    Bake,
+}
 
 /// A sunless day track's sun from its data ([`measure`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DataSun {
     /// The light's travel direction (unit, downward).
     pub direction: Vec3,
-    /// `None`: E51's cars-only frame (only the cars cast); `Some(r)` (SUN-FULL): E9's full frame along it, the scenery casting up
-    /// to a bounding radius of `r` m ([`SunlessTrack::scenery_radius`]).
-    pub scenery_radius: Option<f32>,
+    /// where it was measured
+    pub source: SunSource,
+    /// `None`: E51's cars-only frame (only the cars cast); `Some(Small{..})` (CANYON-SMALLSH): the same frame with the small upright
+    /// scenery parts casting too (the decals' sun); `Some(rule)` (SUN-FULL): E9's full frame along it, the scenery casting
+    /// by `rule` (the sky sun's shape rule; a radius only by test glue). By the source ([`full_frame`], [`small_parts`]).
+    pub scenery: Option<SceneryCasters>,
+    /// With `scenery`: E9's "already baked dark" gate on the track: SHADOW-UNIFY (2026-11-18) `Relative` as on every sun
+    /// frame (the renderer falls back to `Absolute` when the track has no bake light); another only by test glue ([`scenery`]).
+    pub baked_gate: BakedGate,
 }
 
-/// One sunless day track's choices (2026-11-13 / 14 / 16; APPROXIMATION: enhancement content, nothing of the
-/// original's: it has no sun there).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SunlessTrack {
-    /// the track's name (`TrackAssets::name`)
-    pub name: &'static str,
-    /// SUN-FULL (2026-11-14): `Some(r)`: the data sun drives E9's FULL frame (the scenery's shadows too: signs, posts, trees, fences
-    /// and houses have no shade of their own in a vertex bake; E9's "baked dark" gate keeps the bake's own shade from being
-    /// darkened twice, as on alps), the scenery casting up to a bounding radius of `r` m (E9's own limit is 60). Forest 15 m
-    /// (APPROXIMATION, by eye on stills at 8 / 15 / 30 / 60 m: with 60 the slopes and the cliff (parts of 20-60 m) throw a
-    /// 27-degree sun's shade over nearly the whole road, which the bake lights evenly - a contradiction, not a doubling; with 8 the
-    /// trees beside the road cast nothing; 15 keeps the trees, signs, posts, fences and the covered bridge, 30 looks like 15 with
-    /// more slope shade). `None`: E51's cars-only frame (canyon, foothills, autobahn: pending a look).
-    pub scenery_radius: Option<f32>,
-    /// AUTOBAHN-LAMPS (2026-11-13): the open street lamps light (E23) and cast the cars' shadows (E47) by day, as on a night track.
-    /// The data gives no rule: autobahn is a day track by the original's own test (no headlight layers: its cars drive unlit,
-    /// which stays so) and neither the sky colour, the `.map` light nor the road's baked colour sets its rainy dusk apart from
-    /// the other day tracks (`ENHANCEMENTS.md` E47, AUTOBAHN-LAMPS).
-    pub dusk_lamps: bool,
-}
-
-/// The sunless day tracks with a choice of their own (see [`SunlessTrack`]; foothills has none since SHADOW-OVERCAST, autobahn
-/// only its lamps).
-pub const SUNLESS_DAY_TRACKS: [SunlessTrack; 3] = [
-    SunlessTrack { name: "canyon", scenery_radius: None, dusk_lamps: false },
-    SunlessTrack { name: "forest", scenery_radius: Some(15.0), dusk_lamps: false },
-    SunlessTrack { name: "autobahn", scenery_radius: None, dusk_lamps: true },
-];
-
-/// SUN-FULL's caster radius when a test glue list gives a track without one (m: E9's own limit).
-const TEST_GLUE_RADIUS: f32 = 60.0;
-
-/// `track`'s row of [`SUNLESS_DAY_TRACKS`], if it has one.
-pub fn sunless_track(track: &str) -> Option<&'static SunlessTrack> {
-    SUNLESS_DAY_TRACKS.iter().find(|t| t.name.eq_ignore_ascii_case(track))
+/// Whether the sky's sun travels straight down (the sunless day tracks' sky: its sun object overhead and off, 0x43AC8D).
+fn straight_down(sun_direction: Vec3) -> bool {
+    sun_direction.x.abs() + sun_direction.z.abs() <= 1e-3
 }
 
 /// The data sun of a track whose sky's sun travels `sun_direction` (`None` unless that is straight down and the data gives one).
 pub fn measure(track: &nfs_assets::track::TrackAssets, geometry: &TrackGeometry, materials: &[Material], sun_direction: Vec3) -> Option<DataSun> {
-    if sun_direction.x.abs() + sun_direction.z.abs() > 1e-3 {
+    if !straight_down(sun_direction) {
         return None;
     }
     let m = crate::decal_sun::measure(geometry, materials).0;
     tracing::info!(?m, "the decals' sun (ENHANCEMENT E51)");
-    let direction = m
-        .map(|m| m.direction)
+    let (direction, source) = m
+        .map(|m| (m.direction, SunSource::Decals))
         .or_else(|| {
             let b = (!track.is_night()).then(|| crate::bake_light::fit(geometry, materials)).flatten();
             tracing::info!(?b, "the bake's light (ENHANCEMENT E51)");
-            b.and_then(|b| b.accepted())
+            b.and_then(|b| b.accepted()).map(|d| (d, SunSource::Bake))
         })
         // TEST GLUE: `NFS_DATA_SUN=<azimuth>,<elevation>` (degrees, `bake_light::travel`) sets this sun by hand, for comparison stills
-        .map_or_else(test_glue_data_sun, |d| Some(test_glue_data_sun().unwrap_or(d)))?;
-    let sun = DataSun { direction, scenery_radius: scenery_radius(&track.name) };
-    tracing::info!(full = ?sun.scenery_radius, "the data sun's frame (ENHANCEMENT E9 full / E51 cars-only)");
+        // (its source stays the data's; a track without one counts as a bake sun)
+        .map_or_else(|| test_glue_data_sun().map(|d| (d, SunSource::Bake)), |(d, s)| Some((test_glue_data_sun().unwrap_or(d), s)))?;
+    let (scenery, baked_gate) = scenery(&track.name, source).map_or((None, BakedGate::Relative), |(r, g)| (Some(r), g));
+    let sun = DataSun { direction, source, scenery, baked_gate };
+    tracing::info!(?source, full = ?sun.scenery, ?baked_gate, "the data sun's frame (ENHANCEMENT E9 full / E51 cars-only)");
     Some(sun)
 }
 
-/// The full E9 frame's caster radius for `track` along its data sun ([`SunlessTrack::scenery_radius`]), `None` = cars-only.
-/// TEST GLUE: `NFS_DATA_SUN_FULL=<track>[:<radius>],..` replaces the table's radii (`none` = none; no radius = 60), for comparison
-/// stills.
-fn scenery_radius(track: &str) -> Option<f32> {
+/// SHADOW-UNIFY: whether a data sun of `source` drives E9's full frame (a bake's sun) or E51's cars-only frame (the decals' sun:
+/// the scenery's shade is drawn into the data already). See the module doc.
+pub fn full_frame(source: SunSource) -> bool {
+    source == SunSource::Bake
+}
+
+/// SHADOW-UNIFY (AUTOBAHN-LAMPS generalised): whether a track lights its open street lamps (E23) and their cars' shadows (E47)
+/// by day: a day track with no sun from any source - its sky's sun straight down (none) and no data sun. APPROXIMATION
+/// (enhancement content): the data has no dusk flag (autobahn is a day track by the original's own test: no headlight layers,
+/// its cars drive unlit, which stays so); a sunless, data-sunless day is the overcast / rainy dusk the lamps stand for.
+pub fn dusk_lamps(night: bool, sun_direction: Vec3, data_sun: Option<&DataSun>) -> bool {
+    !night && straight_down(sun_direction) && data_sun.is_none()
+}
+
+/// The full E9 frame's casters' rule and baked-dark gate for `track` along its data sun of `source` ([`full_frame`]: the sky
+/// sun's rule, `nfs_renderer::scenery_casters`, and the relative gate), `None` = cars-only.
+/// TEST GLUE: `NFS_DATA_SUN_FULL=<track>[:<radius>[:gate|nogate|rel]],..` replaces the rule for the tracks it names (`none` = no
+/// track full; a track not named is cars-only; a radius = the radius rule of before, SUN-FULL / FOREST-TREESH, no radius = the
+/// shape rule; `gate` = the absolute gate, `nogate` = none, no gate word / `rel` = GATE-REL's relative gate), for comparison stills.
+fn scenery(track: &str, source: SunSource) -> Option<(SceneryCasters, BakedGate)> {
     match crate::config::cfg().nfs_data_sun_full.as_str() {
-        Some(list) => list.split(',').find_map(|e| {
-            let (t, r) = e.trim().split_once(':').unwrap_or((e.trim(), ""));
-            t.eq_ignore_ascii_case(track).then(|| r.parse().unwrap_or(TEST_GLUE_RADIUS))
-        }),
-        None => sunless_track(track).and_then(|t| t.scenery_radius),
+        Some(list) => list.split(',').find_map(|e| test_glue_row(e, track)),
+        None if full_frame(source) => Some((nfs_renderer::scenery_casters(), BakedGate::Relative)),
+        None => small_parts(source),
     }
+}
+
+/// CANYON-SMALLSH (2026-11-18): a decals' sun's frame is E51's cars-only frame plus the small upright scenery parts as casters
+/// ([`SMALL_RADIUS`] / [`SMALL_HEIGHT`], `SceneryCasters::Small`). The `sh80` decals are whole draped terrain patches under tree groups,
+/// so the data has no shade of its own for signs, posts, rails, roadside walls or bushes (canyon's audit, `examples/canyon_smallsh.rs`:
+/// of 134 signs, 20 rails, 29 walls and 610 bushes none has a darker bake beside it in the sun's direction and only a few lie in a
+/// decal's patch); the gorge walls and cliffs (broad or tall) still do not cast, the walls' shade being baked / in the decals. The
+/// cars' shadow is the cars-only frame's own (`gpu/csm.rs` `ShadowMode::CarsOnly { small }`). The gate rides along unused (that frame
+/// has no relative gate). TEST GLUE: `NFS_CARS_ONLY_SMALL=off` = the plain cars-only frame, `<radius m>,<height m>` = other limits.
+fn small_parts(source: SunSource) -> Option<(SceneryCasters, BakedGate)> {
+    if source != SunSource::Decals {
+        return None;
+    }
+    let (mut radius, mut height) = (SMALL_RADIUS, SMALL_HEIGHT);
+    if let Some(v) = crate::config::cfg().nfs_cars_only_small.as_str() {
+        if v.trim() == "off" {
+            return None;
+        }
+        let mut f = v.split(',').map(|x| x.trim().parse::<f32>());
+        radius = f.next().and_then(Result::ok).unwrap_or(radius);
+        height = f.next().and_then(Result::ok).unwrap_or(height);
+    }
+    Some((SceneryCasters::Small { radius, height }, BakedGate::Relative))
+}
+
+/// The small parts' bounding radius (m) and height (m, mesh space) limits (CANYON-SMALLSH).
+pub const SMALL_RADIUS: f32 = 15.0;
+pub const SMALL_HEIGHT: f32 = 8.0;
+
+/// One entry of the `NFS_DATA_SUN_FULL` test glue list, if it names `track`: (casters' rule, gate).
+fn test_glue_row(entry: &str, track: &str) -> Option<(SceneryCasters, BakedGate)> {
+    let mut f = entry.trim().split(':');
+    f.next().filter(|t| t.eq_ignore_ascii_case(track))?;
+    let rule = f.next().and_then(|r| r.parse().ok()).map_or_else(nfs_renderer::scenery_casters, SceneryCasters::Radius);
+    let gate = match f.next() {
+        Some("nogate") => BakedGate::Off,
+        Some("gate") => BakedGate::Absolute,
+        _ => BakedGate::Relative,
+    };
+    Some((rule, gate))
 }
 
 /// TEST GLUE: `NFS_DATA_SUN=<azimuth>,<elevation>` — a hand-set sun for a sunless day track (comparison stills only).
@@ -110,19 +163,37 @@ fn test_glue_data_sun() -> Option<Vec3> {
 mod tests {
     use super::*;
 
-    /// every row is a different track, each scenery radius within E9's own 60 m caster limit
+    /// SHADOW-UNIFY: the full frame by the sun's source (the choices of before: forest's bake sun full, canyon's decal sun
+    /// cars-only)
     #[test]
-    fn the_sunless_tracks_table() {
-        for (i, t) in SUNLESS_DAY_TRACKS.iter().enumerate() {
-            assert!(SUNLESS_DAY_TRACKS[..i].iter().all(|u| u.name != t.name), "{} twice", t.name);
-            assert!(t.scenery_radius.is_none_or(|r| r > 0.0 && r <= TEST_GLUE_RADIUS), "{} {:?}", t.name, t.scenery_radius);
-        }
-        // the choices as recorded (2026-11-13 / 14 / 16; SHADOW-OVERCAST: foothills has no row, no data sun)
-        let pick = |f: fn(&SunlessTrack) -> bool| SUNLESS_DAY_TRACKS.iter().filter(|t| f(t)).map(|t| t.name).collect::<Vec<_>>();
-        assert!(sunless_track("foothills").is_none());
-        assert_eq!(pick(|t| t.scenery_radius.is_some()), ["forest"]);
-        assert_eq!(pick(|t| t.dusk_lamps), ["autobahn"]);
-        assert_eq!(sunless_track("FOREST").and_then(|t| t.scenery_radius), Some(15.0));
-        assert!(sunless_track("alps").is_none());
+    fn the_frame_follows_the_suns_source() {
+        assert!(full_frame(SunSource::Bake));
+        assert!(!full_frame(SunSource::Decals));
+        assert_eq!(scenery("forest", SunSource::Bake), Some((SceneryCasters::Shape, BakedGate::Relative)));
+        // the decals' sun: the cars-only frame with the small parts as casters (CANYON-SMALLSH)
+        assert_eq!(scenery("canyon", SunSource::Decals), Some((SceneryCasters::Small { radius: SMALL_RADIUS, height: SMALL_HEIGHT }, BakedGate::Relative)));
+    }
+
+    /// SHADOW-UNIFY: the dusk lamps on a day track with no sun of any kind
+    #[test]
+    fn the_dusk_lamps_need_a_sunless_day() {
+        let down = Vec3::NEG_Y;
+        let sun = DataSun { direction: Vec3::new(0.3, -0.8, 0.2).normalize(), source: SunSource::Bake, scenery: None, baked_gate: BakedGate::Relative };
+        assert!(dusk_lamps(false, down, None), "autobahn, foothills");
+        assert!(!dusk_lamps(false, down, Some(&sun)), "forest, canyon");
+        assert!(!dusk_lamps(false, Vec3::new(0.4, -0.8, 0.1), None), "a sky sun");
+        assert!(!dusk_lamps(true, down, None), "a night track lights them anyway, not by this rule");
+    }
+
+    /// the comparison stills' test glue rows
+    #[test]
+    fn the_test_glue_rows() {
+        let shape = SceneryCasters::Shape;
+        assert_eq!(test_glue_row("forest", "forest"), Some((shape, BakedGate::Relative)));
+        assert_eq!(test_glue_row(" Forest:15", "forest"), Some((SceneryCasters::Radius(15.0), BakedGate::Relative)));
+        assert_eq!(test_glue_row("forest:60:nogate", "forest"), Some((SceneryCasters::Radius(60.0), BakedGate::Off)));
+        assert_eq!(test_glue_row("forest:30:gate", "forest"), Some((SceneryCasters::Radius(30.0), BakedGate::Absolute)));
+        assert_eq!(test_glue_row("forest::rel", "forest"), Some((shape, BakedGate::Relative)));
+        assert_eq!(test_glue_row("canyon:15", "forest"), None);
     }
 }

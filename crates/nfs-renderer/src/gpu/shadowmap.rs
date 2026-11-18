@@ -184,8 +184,9 @@ pub(super) struct Caster {
     pub radius: f32,
     /// a car part (its light has a direction): the cars-only layers' (E51) and the lamp maps' (E47) only casters
     pub car: bool,
-    /// a flat level sheet (`GpuMesh::flat`: a road layer, a marking): E9 and E15 leave it out, E47 keeps it
-    pub flat: bool,
+    /// its mesh's shape (`GpuMesh::shape`): a flat level sheet (a road layer, a marking) E9 and E15 leave out, E47 keeps; E9's
+    /// shape rule (SHADOW-UNIFY, `csm::part_casts`) leaves out a broad terrain-like part
+    pub shape: super::csm::MeshShape,
 }
 
 impl Core {
@@ -202,7 +203,7 @@ impl Core {
             }
             let t = &item.transform;
             let scale = t.x_axis.truncate().length().max(t.y_axis.truncate().length()).max(t.z_axis.truncate().length());
-            out.push(Caster { idx: i as u32, centre: t.transform_point3(Vec3::from(mesh.bounds.0)), radius: mesh.bounds.1 * scale, car: item.car_lit(), flat: mesh.flat });
+            out.push(Caster { idx: i as u32, centre: t.transform_point3(Vec3::from(mesh.bounds.0)), radius: mesh.bounds.1 * scale, car: item.car_lit(), shape: mesh.shape });
         }
     }
 
@@ -211,19 +212,25 @@ impl Core {
     pub(super) fn draw_shadow_casters(&self, pass: &mut wgpu::RenderPass<'_>, scene: &Scene, casters: &[u32]) {
         pass.set_bind_group(1, &self.object_bg, &[]);
         let (mut cur_pipe, mut cur_mat, mut cur_mesh) = (None, u32::MAX, u32::MAX);
+        let mut material_bound = false;
         for &idx in casters {
             let item = &scene.items[idx as usize];
             let mat = &self.materials[item.material.0 as usize];
             // the alpha test: the cut-out pipeline and the material's texture
-            let cut = mat.alpha_blend || mat.device_states || item.alpha_test;
+            // ENHANCEMENT E9 / E15 / E47 (FOLIAGE-OVERDRAW): not for a draw whose test can never fail (`Core::solid_draws`): `fs_cut`
+            // would keep every fragment, so the depth is the opaque pipeline's, which the GPU draws without running a fragment stage
+            let cut = (mat.alpha_blend || mat.device_states || item.alpha_test) && !self.solid.get(idx as usize).copied().unwrap_or(false);
             if cur_pipe != Some(cut) {
                 pass.set_pipeline(if cut { &self.csm.pipe_cut } else { &self.csm.pipe_opaque });
                 cur_pipe = Some(cut);
                 cur_mat = u32::MAX;
             }
-            if cut && cur_mat != item.material.0 {
+            // (the opaque pipeline's layout has the material group too, unread: a pass whose first caster is opaque binds that
+            // caster's, FOLIAGE-OVERDRAW: a solid cut-out can come first)
+            if (cut && cur_mat != item.material.0) || !material_bound {
                 pass.set_bind_group(2, &mat.bind_group, &[]);
                 cur_mat = item.material.0;
+                material_bound = true;
             }
             let mesh = &self.meshes[item.mesh.0 as usize];
             if cur_mesh != item.mesh.0 {

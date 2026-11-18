@@ -73,8 +73,8 @@ struct Csm {
     info: array<vec4<f32>, 4>,
     // xyz the way the light travels, w the cascade count
     dir: vec4<f32>,
-    // x the track's shadow strength, y the view depth where the last cascade fades out, z 0 (unused), w the car's floor of the
-    // direct term
+    // x the track's shadow strength, y the view depth where the last cascade fades out, z 1 = the track's baked-dark gate off
+    // (FOREST-TREESH), 2 = relative to the track's bake light (GATE-REL), else 0, w the car's floor of the direct term
     params: vec4<f32>,
     // ENHANCEMENT E9 (SHADOWFIX): xyz the light the cars are lit with (the shadow's own is lifted to a higher sun), w the
     // cover gate (1 = open sky; the shadows fade out under cover)
@@ -86,6 +86,15 @@ struct Csm {
     // per box 5 vec4: (centre, half length), (forward, half width), (lateral, weight at the back face), (up, weight at the front
     // face), (ceiling height over the centre, nominal half length, 0, 0)
     misc: vec4<f32>,
+    // GATE-REL (`csm.rs` `bake_uniform`): xyz toward the track's bake light, w its base luma; then x its gain, y the drivable
+    // ground's factor, zw the relative gate's ramp
+    bake: vec4<f32>,
+    bake_k: vec4<f32>,
+    // GATE-REL: x the floor (the least share of the shadow), y 1 = the cap mode (the bake's shade counts toward the shadow)
+    bake_f: vec4<f32>,
+    // ENHANCEMENT E9 (FOREST-E9PERF): the world box round every covered box (xyz least, xyz most): outside it a point is in none
+    cover_lo: vec4<f32>,
+    cover_hi: vec4<f32>,
     cover: array<vec4<f32>, 320>,
     // ENHANCEMENT E50: x the moon's track strength (0 = not a moon frame), y the cars' cold term, z the soft edge's radius in texels
     moon: vec4<f32>,
@@ -801,6 +810,11 @@ fn csm_tap(c: i32, world: vec3<f32>, n: vec3<f32>, ndl: f32) -> f32 {
 fn cover_at(world: vec3<f32>) -> f32 {
     let count = i32(csm.misc.x);
     var w = 0.0;
+    // PERF (FOREST-E9PERF, picture identical): a point outside the world box round all the boxes (`cover_lo` / `cover_hi`) is in
+    // none of them; the loop below ran for every fragment of every receiver (under the forest's canopy, layers of foliage cards)
+    if any(world < csm.cover_lo.xyz) || any(world > csm.cover_hi.xyz) {
+        return 0.0;
+    }
     for (var i = 0; i < count; i++) {
         let a = csm.cover[5 * i];
         let b = csm.cover[5 * i + 1];
@@ -841,8 +855,12 @@ fn csm_share(world: vec3<f32>) -> f32 {
 fn csm_split(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
     let count = i32(csm.dir.w);
     let vd = csm_view_depth(world);
+    // (PERF, FOREST-E9PERF: beyond the cascades first, without the covered boxes' loop)
+    if vd >= csm.info[count - 1].z {
+        return vec2<f32>(1.0, 0.0);
+    }
     let share = csm_share(world);
-    if vd >= csm.info[count - 1].z || share <= 0.0 {
+    if share <= 0.0 {
         return vec2<f32>(1.0, 0.0);
     }
     let ndl = dot(n, -csm.dir.xyz);
@@ -1096,9 +1114,35 @@ fn held(c0: vec4<f32>) -> vec4<f32> {
     return clamp(c, vec4<f32>(0.0), vec4<f32>(1.0));
 }
 
+// ENHANCEMENT E9 (FOREST-E9PERF, picture identical): the alpha test decided before `shade` instead of after it. A draw whose final
+// alpha is `shade`'s base alpha (`alpha_is_base`: alpha-tested, and none of the classes that change it later: glass, water, the wet
+// road and its skids, a ground decal) fails or passes the test on that base alpha alone (`base_a255`: the same texel and products as
+// `shade`'s), so a texel the test throws away is discarded before the sun's shadow, the lights and the rest are worked out for it.
+// Only in the entries that discard after `shade` anyway (`fs_opaque`, `fs_main` and their temporal twins: the blended foliage, the
+// reflection faces' cut-outs, a target without MSAA); under the forest's canopy their cut-out texels paid for the whole receiver
+// (E9's cascades and covered boxes) only to be thrown away.
+//@if CSM
+fn alpha_is_base() -> bool {
+    return object.shadow_on.w > 0.0 && object.refl.x < REFL_GLASS - 0.5 && object.lit_d.w < RECV_DECAL - 0.5;
+}
+
+fn base_a255(in: VsOut) -> f32 {
+    let tex = textureSampleBias(t_diffuse, s_diffuse, in.uv, object.shadow_on.z);
+    let base = tex * in.color;
+    return base.a * object.light.a * BYTE;
+}
+//@endif
+
 @fragment
 fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
     object = objects[in.obj];
+    //@if CSM
+    // ENHANCEMENT E9 (FOREST-E9PERF): the test on the base alpha first (`alpha_is_base`)
+    let a0 = base_a255(in);
+    if alpha_is_base() && a0 < object.shadow_on.w {
+        discard;
+    }
+    //@endif
     let c = shade(in, false);
     if object.shadow_on.w > 0.0 && c.a * BYTE < object.shadow_on.w {
         discard;
@@ -1113,6 +1157,8 @@ fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_opaque_a2c(in: VsOut) -> @location(0) vec4<f32> {
     object = objects[in.obj];
+    // (FOREST-E9PERF: no early discard here: a `discard` in this entry, which has none, cost more than it saved — measured 0.3-0.4 ms
+    // slower in the open and under the canopy alike; the GPU's early depth test is worth more than the cut-out texels' shading)
     let c = shade(in, false);
     let a255 = c.a * BYTE;
     let w = max(fwidth(a255), MIN_DIV);
@@ -1123,9 +1169,27 @@ fn fs_opaque_a2c(in: VsOut) -> @location(0) vec4<f32> {
     return held(vec4<f32>(fogged(in, c).rgb, cov));
 }
 
+// ENHANCEMENT E1 (FOLIAGE-OVERDRAW): an alpha-tested opaque draw whose test can never fail (every texel of its texture alpha 255, every
+// vertex alpha 1, the object's own opacity 1, the alpha is `shade`'s base alpha: `Core::solid_draws`). `fs_opaque_a2c` would give it
+// full coverage everywhere, `fs_opaque` would never discard: the same colour without either, so the GPU keeps its hidden-surface
+// removal (a coverage output or a `discard` turns it off for the draw, and every covered layer of the scene was shaded).
+@fragment
+fn fs_opaque_solid(in: VsOut) -> @location(0) vec4<f32> {
+    object = objects[in.obj];
+    let c = shade(in, false);
+    return held(vec4<f32>(fogged(in, c).rgb, 1.0));
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     object = objects[in.obj];
+    //@if CSM
+    // ENHANCEMENT E9 (FOREST-E9PERF): the test on the base alpha first (`alpha_is_base`)
+    let a0 = base_a255(in);
+    if alpha_is_base() && a0 < object.shadow_on.w {
+        discard;
+    }
+    //@endif
     let c = shade(in, false);
     if object.shadow_on.w > 0.0 && c.a * BYTE < object.shadow_on.w {
         discard;
@@ -1190,6 +1254,13 @@ fn composition(alpha: f32) -> f32 {
 @fragment
 fn fs_opaque_t(in: VsOut) -> FsOutT {
     object = objects[in.obj];
+    //@if CSM
+    // ENHANCEMENT E9 (FOREST-E9PERF): the test on the base alpha first (`alpha_is_base`)
+    let a0 = base_a255(in);
+    if alpha_is_base() && a0 < object.shadow_on.w {
+        discard;
+    }
+    //@endif
     let c = shade(in, false);
     if object.shadow_on.w > 0.0 && c.a * BYTE < object.shadow_on.w {
         discard;
@@ -1207,6 +1278,13 @@ fn fs_opaque_t(in: VsOut) -> FsOutT {
 @fragment
 fn fs_main_t(in: VsOut) -> FsOutT {
     object = objects[in.obj];
+    //@if CSM
+    // ENHANCEMENT E9 (FOREST-E9PERF): the test on the base alpha first (`alpha_is_base`)
+    let a0 = base_a255(in);
+    if alpha_is_base() && a0 < object.shadow_on.w {
+        discard;
+    }
+    //@endif
     let c = shade(in, false);
     if object.shadow_on.w > 0.0 && c.a * BYTE < object.shadow_on.w {
         discard;
@@ -1713,6 +1791,30 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         // the "already baked dark" gate (a shadow baked into the colour is not darkened twice), by the mode
         let luma = dot(in.color.rgb, LUMA);
         var bright = smoothstep(BAKED_DARK_LO, BAKED_DARK_HI, luma);
+        // FOREST-TREESH: a frame whose track is set to take the whole shadow (`params.z`, `csm.rs` GATE_OFF): no gate
+        if csm.params.z > 0.5 && csm.params.z < 1.5 {
+            bright = 1.0;
+        }
+        // GATE-REL (`params.z` 2, `csm.rs` GATE_REL; APPROXIMATION, an enhancement's look): the gate by the baked luma against the lit
+        // level the track's bake light gives this orientation (`nfs_game::bake_light`: `base + gain max(0, n.L)`, times the ground's
+        // factor on drivable ground, `lit_d.w`'s RECV_GROUND_MARK): a face darker than that is baked in shade (no second darkening),
+        // a merely dark one lit in the bake (a mossy rock, a dim forest road in a sun patch) takes the whole shadow
+        // `baked` (the cap mode, `bake_f.y` 1): the bake's own shade counts toward the shadow instead: the point is darkened only down
+        // to the shadow's level of a lit face, `min(1, keep / baked)` with `baked` = the luma / lit level, at most 1
+        var baked = 1.0;
+        if csm.params.z > 1.5 {
+            var lit = csm.bake.w + csm.bake_k.x * max(dot(n, csm.bake.xyz), 0.0);
+            if fract(object.lit_d.w) > RECV_GROUND_MARK * 0.5 {
+                lit = lit * csm.bake_k.y;
+            }
+            let ratio = luma / max(lit, MIN_BAKE_LIT);
+            if csm.bake_f.y > 0.5 {
+                baked = clamp(ratio, MIN_BAKE_LIT, 1.0);
+                bright = 1.0;
+            } else {
+                bright = max(smoothstep(csm.bake_k.z, csm.bake_k.w, ratio), csm.bake_f.x);
+            }
+        }
         //@if FOCUS
         // ENHANCEMENT ENH-GARAGE (the front end's focus shadow): the room's floor is baked dark, the car's shadow must still read
         // there: no gate
@@ -1740,6 +1842,8 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
             // a covered box, beyond the cascades)
             let t = csm_split(in.world, n);
             var keep_sun = 1.0 - s * t.y * (1.0 - t.x);
+            // GATE-REL's cap mode (`baked` 1 elsewhere: no change)
+            keep_sun = min(1.0, keep_sun / baked);
             //@if CARSH
             // ENHANCEMENT E51: the cars' shadow passes the "baked dark" gate (a car's shadow is never baked into the road): the point
             // keeps the darker of the gated shadow of everything and the ungated shadow of the cars alone (in full light, `bright` 1,

@@ -310,7 +310,7 @@ mod tests {
     }
 
     fn car(x: f32, z: f32) -> Caster {
-        Caster { idx: 0, centre: Vec3::new(x, 0.7, z), radius: 2.4, car: true, flat: false }
+        Caster { idx: 0, centre: Vec3::new(x, 0.7, z), radius: 2.4, car: true, shape: csm::MeshShape::default() }
     }
 
     /// the frustum holds every caster's sphere, points at them, and its far plane is the lamp's reach

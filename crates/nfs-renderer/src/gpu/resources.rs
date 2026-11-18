@@ -137,7 +137,7 @@ impl Core {
         self.arena_bytes += vertex_len + index_len;
         let serial = self.buffer_serial;
         self.buffer_serial += 1;
-        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0, bounds: { let (c, r, _) = csm::mesh_bounds(&mesh.vertices); (c, r * DYNAMIC_BOUNDS_SLACK) }, flat: false, arena: false, cap: (vertex_len, index_len), released: false });
+        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0, bounds: { let (c, r, _) = csm::mesh_bounds(&mesh.vertices); (c, r * DYNAMIC_BOUNDS_SLACK) }, shape: csm::MeshShape::default(), alpha_one: crate::solid::vertex_bytes_alpha_one(bytemuck::cast_slice(&mesh.vertices)), arena: false, cap: (vertex_len, index_len), released: false });
         MeshId(self.meshes.len() as u32 - 1)
     }
 
@@ -148,6 +148,8 @@ impl Core {
             return;
         }
         self.meshes[id.0 as usize].writes = self.meshes[id.0 as usize].writes.wrapping_add(1);
+        // ENHANCEMENT E1 (FOLIAGE-OVERDRAW): a written vertex below alpha 1 ends the mesh's solid answer
+        self.meshes[id.0 as usize].alpha_one &= crate::solid::vertex_bytes_alpha_one(bytes);
         self.pending_writes.push(PendingWrite { mesh: id.0, start: self.pending_bytes.len(), len: bytes.len() });
         self.pending_bytes.extend_from_slice(bytes);
     }
@@ -245,8 +247,8 @@ impl Core {
             if !ibytes.is_empty() {
                 self.queue.write_buffer(&f.index_buf, f.index_offset, ibytes);
             }
-            let (c, r, flat) = csm::mesh_bounds(&mesh.vertices);
-            return self.add_mesh(GpuMesh { vertex_buf: f.vertex_buf, vertex_offset: f.vertex_offset, vertex_len: vlen, index_buf: f.index_buf, index_offset: f.index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: f.serial, ib_serial: f.serial, writes: 0, bounds: (c, r), flat, arena: true, cap: (f.vertex_cap, f.index_cap), released: false });
+            let (c, r, shape) = csm::mesh_bounds(&mesh.vertices);
+            return self.add_mesh(GpuMesh { vertex_buf: f.vertex_buf, vertex_offset: f.vertex_offset, vertex_len: vlen, index_buf: f.index_buf, index_offset: f.index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: f.serial, ib_serial: f.serial, writes: 0, bounds: (c, r), shape, alpha_one: crate::solid::vertex_bytes_alpha_one(vbytes), arena: true, cap: (f.vertex_cap, f.index_cap), released: false });
         }
         let fits = self.arena.as_ref().is_some_and(|a| a.vertex_used + vreserve <= a.vertex_buf.size() && a.index_used + ireserve <= a.index_buf.size());
         if !fits {
@@ -289,8 +291,8 @@ impl Core {
         }
         a.vertex_used += vreserve;
         a.index_used += ireserve;
-        let (centre, radius, flat) = csm::mesh_bounds(&mesh.vertices);
-        let g = GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0, bounds: (centre, radius), flat, arena: true, cap: (vreserve, ireserve), released: false };
+        let (centre, radius, shape) = csm::mesh_bounds(&mesh.vertices);
+        let g = GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0, bounds: (centre, radius), shape, alpha_one: crate::solid::vertex_bytes_alpha_one(vbytes), arena: true, cap: (vreserve, ireserve), released: false };
         self.add_mesh(g)
     }
 
@@ -363,9 +365,12 @@ impl Core {
     /// One mip level of `Renderer::update_texture`: `data` holds `h` rows of `4 · w` bytes (or more; the
     /// rest is ignored; less and the level is skipped).
     pub(crate) fn queue_texture_level(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
-        let Some(gpu) = self.textures.get(id.0 as usize) else {
+        let Some(gpu) = self.textures.get_mut(id.0 as usize) else {
             return;
         };
+        // ENHANCEMENT E1 (FOLIAGE-OVERDRAW): a written level's alpha lowers the texture's minimum (never raises it)
+        gpu.min_alpha = gpu.min_alpha.min(crate::solid::rgba_min_alpha(&data[..data.len().min(4 * w as usize * h as usize)]));
+        let gpu = &self.textures[id.0 as usize];
         // ENHANCEMENT E2: a level-0 rewrite of a texture with a generated chain (the car page's damage
         // decals) regenerates the levels below it, queued the same way
         if level == 0 && let Some(mode) = gpu.generated && gpu.size == (w, h) && data.len() >= (4 * w * h) as usize {
@@ -480,7 +485,7 @@ impl Core {
         let (svb, sib, stub_serial) = self.mesh_stub.clone().expect("stub made");
         self.pending_mesh.push(id.0);
         let m = &mut self.meshes[i];
-        let old = std::mem::replace(m, GpuMesh { vertex_buf: svb, vertex_offset: 0, vertex_len: 0, index_buf: sib, index_offset: 0, index_len: 0, index_count: 0, vb_serial: stub_serial, ib_serial: stub_serial, writes: 0, bounds: ([0.0; 3], 0.0), flat: false, arena: false, cap: (0, 0), released: true });
+        let old = std::mem::replace(m, GpuMesh { vertex_buf: svb, vertex_offset: 0, vertex_len: 0, index_buf: sib, index_offset: 0, index_len: 0, index_count: 0, vb_serial: stub_serial, ib_serial: stub_serial, writes: 0, bounds: ([0.0; 3], 0.0), shape: csm::MeshShape::default(), alpha_one: true, arena: false, cap: (0, 0), released: true });
         if old.arena {
             self.free_slots.push(FreeMeshSlot { serial: old.vb_serial, vertex_buf: old.vertex_buf, vertex_offset: old.vertex_offset, vertex_cap: old.cap.0, index_buf: old.index_buf, index_offset: old.index_offset, index_cap: old.cap.1 });
         } else {
@@ -566,7 +571,7 @@ impl TexMaker<'_> {
         let view = texture.create_view(&Default::default());
         let sprite_bg = Some(gfx::tex_sampler_bg(device, "sprite tex", sprite_layout, &view, sprite_sampler));
         tracing::debug!(w = width, h = height, "texture uploaded");
-        GpuTexture { _texture: texture, view, sprite_bg, generated, size: (width, height) }
+        GpuTexture { _texture: texture, view, sprite_bg, generated, size: (width, height), min_alpha: crate::solid::rgba_levels_min_alpha(mips) }
     }
 
     /// A BC7 texture of `levels` (`Core::upload_textures_bc7`).
@@ -589,6 +594,6 @@ impl TexMaker<'_> {
         });
         let view = texture.create_view(&Default::default());
         let sprite_bg = Some(gfx::tex_sampler_bg(device, "sprite tex bc7", sprite_layout, &view, sprite_sampler));
-        GpuTexture { _texture: texture, view, sprite_bg, generated: None, size: (width, height) }
+        GpuTexture { _texture: texture, view, sprite_bg, generated: None, size: (width, height), min_alpha: crate::solid::bc7_levels_min_alpha(levels) }
     }
 }

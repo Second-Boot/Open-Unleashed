@@ -45,6 +45,7 @@ mod shafts;
 mod sharpen;
 pub use prof::{BenchSample, LiveStats, live_set, live_stats, timestamps_supported};
 mod smaa;
+mod solid;
 mod soft;
 mod temporal;
 mod upscale;
@@ -527,6 +528,33 @@ mod tests {
         assert_eq!(cover_weight(&[], Vec3::ZERO), 0.0);
     }
 
+    /// ENHANCEMENT E9 (FOREST-E9PERF): a covered box's corners are the corners of the volume `weight` tests (a sheared box too),
+    /// and a box is handed to the shader only while some of it can be in the view and it covers anything.
+    #[test]
+    fn cover_box_corners_and_view_cull() {
+        let up = Vec3::new(0.0, 1.0, 0.3).normalize();
+        let b = CoverBox { centre: Vec3::new(1.0, 2.0, 3.0), forward: Vec3::Z, lateral: Vec3::X, up, half_len: 6.0, half_nom: 3.0, half_wid: 8.0, ceil: 6.5, w_back: 2.0, w_front: 2.0 };
+        for c in b.corners().unwrap() {
+            let r = c - b.centre;
+            assert!((r.dot(b.forward).abs() - b.half_len).abs() < 1e-4);
+            assert!((r.dot(b.lateral).abs() - b.half_wid).abs() < 1e-4);
+            let h = r.dot(b.up);
+            assert!((h - COVER_FLOOR).abs() < 1e-4 || (h - b.ceil).abs() < 1e-4);
+            // just inside each corner, the box covers
+            assert_eq!(b.weight(b.centre + r * 0.999), 1.0);
+        }
+        let cam = |at: Vec3| crate::camera::Camera { position: Vec3::new(1.0, 4.0, -30.0), target: at, up: Vec3::Y, fov_y_radians: 1.0, near: 0.1, far: 5000.0 }.view_projection(1.6);
+        assert!(b.may_cover_view(cam(b.centre), 10.0));
+        assert!(!b.may_cover_view(cam(Vec3::new(1.0, 4.0, -60.0)), 10.0));
+        // (27 m behind the eye: within a 30 m slack it is kept)
+        assert!(b.may_cover_view(cam(Vec3::new(1.0, 4.0, -60.0)), 30.0));
+        assert!(!b.may_cover_view(cam(Vec3::new(200.0, 4.0, -30.0)), 10.0));
+        let none = CoverBox { w_back: -1.0, w_front: -0.5, ..b };
+        assert!(!none.may_cover_view(cam(b.centre), 10.0));
+        let flat = CoverBox { up: Vec3::Z, ..b };
+        assert!(flat.corners().is_none() && flat.may_cover_view(cam(Vec3::new(1.0, 4.0, -60.0)), 10.0));
+    }
+
     #[test]
     fn farthest_first_sorts_descending() {
         let out = farthest_first(vec![(10, item(1)), (30, item(2)), (20, item(3))]);
@@ -806,6 +834,11 @@ pub enum NearSky {
     Hue,
 }
 
+/// ENHANCEMENT E9 (ENH-TUNPOOL): how far under a covered slice's road its box reaches (m; the shader's `cover_at` has the same)
+pub const COVER_FLOOR: f32 = -2.0;
+/// ENHANCEMENT E9 (FOREST-E9PERF): the least determinant of a covered box's axes for its corners to be solved (else it is kept)
+const COVER_MIN_DET: f32 = 1e-6;
+
 /// ENHANCEMENT E9 (ENH-TUNPOOL): one road slice's covered volume: a box round the slice (its own axes), `half_len` along the
 /// road (`half_len`: the tested extent, a little more than the slice's own share so the boxes of a bend overlap), `half_wid`
 /// across it, from just under the road to `ceil` over it. `w_back` / `w_front` are the cover weights at the faces of the slice's
@@ -827,6 +860,43 @@ pub struct CoverBox {
 }
 
 impl CoverBox {
+    /// ENHANCEMENT E9 (FOREST-E9PERF): the eight corners of the volume `weight` tests (the parallelepiped of its three tests,
+    /// `|r . forward| <= half_len`, `|r . lateral| <= half_wid`, `COVER_FLOOR <= r . up <= ceil`, solved for `r`), or `None` when
+    /// the axes have no inverse.
+    pub fn corners(&self) -> Option<[Vec3; 8]> {
+        let m = glam::Mat3::from_cols(self.forward, self.lateral, self.up).transpose();
+        if m.determinant().abs() < COVER_MIN_DET {
+            return None;
+        }
+        let inv = m.inverse();
+        Some(std::array::from_fn(|c| {
+            let b = Vec3::new(
+                if c & 1 == 0 { -self.half_len } else { self.half_len },
+                if c & 2 == 0 { -self.half_wid } else { self.half_wid },
+                if c & 4 == 0 { COVER_FLOOR } else { self.ceil },
+            );
+            self.centre + inv * b
+        }))
+    }
+
+    /// ENHANCEMENT E9 (FOREST-E9PERF): whether any point this box covers (`weight` above 0) can lie within `slack` metres of the
+    /// view volume of `vp` (its four sides and its near plane; `0 <= z`, `-w <= x, y <= w`). False only when the box's weight is
+    /// 0 everywhere or its whole volume ([`Self::corners`]) lies farther than `slack` outside one of those planes, so no point the
+    /// view shades can fall in it (`slack` holds a particle's centre, which E9 reads for the whole sprite, off the screen's edge).
+    /// A degenerate box is kept.
+    pub fn may_cover_view(&self, vp: Mat4, slack: f32) -> bool {
+        // the weight at the box's two ends (it is linear along `l`, then clamped: 0 at both = 0 everywhere; a NaN keeps the box)
+        let at = |l: f32| self.w_back + (self.w_front - self.w_back) * ((l + self.half_nom) / (2.0 * self.half_nom));
+        if at(-self.half_len) <= 0.0 && at(self.half_len) <= 0.0 {
+            return false;
+        }
+        let Some(corners) = self.corners() else { return true };
+        // the view volume's planes from the rows of `vp` (w + x, w - x, w + y, w - y, z), as world distances (inside > 0)
+        let (rx, ry, rz, rw) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
+        let planes = [rw + rx, rw - rx, rw + ry, rw - ry, rz].map(|p| p / p.truncate().length().max(f32::MIN_POSITIVE));
+        !planes.iter().any(|p| corners.iter().all(|c| p.dot(c.extend(1.0)) < -slack))
+    }
+
     /// How covered `p` is by this box, 0..1 (0 outside it): the shader's `cover_at` for one box.
     pub fn weight(&self, p: Vec3) -> f32 {
         let r = p - self.centre;
@@ -835,7 +905,7 @@ impl CoverBox {
             return 0.0;
         }
         let h = r.dot(self.up);
-        if !(-2.0..=self.ceil).contains(&h) {
+        if !(COVER_FLOOR..=self.ceil).contains(&h) {
             return 0.0;
         }
         (self.w_back + (self.w_front - self.w_back) * ((l + self.half_nom) / (2.0 * self.half_nom))).clamp(0.0, 1.0)
@@ -1130,17 +1200,55 @@ pub struct ShadowLights {
     /// strength (the cover gate scaled by it: the track's darkening, the cars' direct-term shadow, the car's `SHAD` patch and the
     /// `sh80` decals' give-way all follow); at 1 no frame is drawn. 0 (the `Default`) changes nothing.
     pub precipitation: f32,
+    /// ENHANCEMENT E9 (GATE-REL): the track's bake light, for [`BakedGate::Relative`] (`None`: that gate is `Absolute`).
+    pub bake: Option<BakeLight>,
 }
 
 impl ShadowLights {
     /// No shadow light (the `Default`, usable in a `const`).
-    pub const NONE: Self = Self { sun: None, data_sun: None, moon: None, moon_level_cap: None, precipitation: 0.0 };
+    pub const NONE: Self = Self { sun: None, data_sun: None, moon: None, moon_level_cap: None, precipitation: 0.0, bake: None };
 
     /// Whether a frame of these lights can draw the scenery's shadows (any light but the cars-only data sun): the race then adds
     /// the casters round the camera (`TrackWorld::shadow_casters`). By the lights set, not by the switches.
     pub fn casts_scenery(&self) -> bool {
-        self.sun.is_some() || self.moon.is_some() || self.data_sun.is_some_and(|d| d.scenery_radius.is_some())
+        self.sun.is_some() || self.moon.is_some() || self.data_sun.is_some_and(|d| d.scenery.is_some())
     }
+}
+
+/// ENHANCEMENT E9 (SHADOW-UNIFY): which non-ground scenery parts cast the sun's / the moon's shadow (never a level flat sheet).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SceneryCasters {
+    /// every part whatever its size, but the terrain-like ones: broad (bounding radius over 60 m) and neither upright nor built
+    /// (`gpu/csm.rs` `terrain_like`; hills, cliffs, slopes, fields). APPROXIMATION: an enhancement's rule, by the caster audit.
+    Shape,
+    /// TEST GLUE (comparison): the rule before SHADOW-UNIFY, every part up to this bounding radius (m; E9's was 60, SUN-FULL's
+    /// forest row 15)
+    Radius(f32),
+    /// TEST GLUE (CANYON-SMALLSH, comparison): only the small upright parts: bounding radius up to `radius` m and (mesh space) height up
+    /// to `height` m
+    Small { radius: f32, height: f32 },
+}
+
+/// ENHANCEMENT E9 (SHADOW-UNIFY): the casters' rule of a frame that sets none of its own (the sky sun, E50's moon, the front end,
+/// the data sun's full frame without a test glue radius): [`SceneryCasters::Shape`].
+/// TEST GLUE: `NFS_CASTER_RULE=radius[:<m>]` = the radius rule of before (60 m), for comparison stills; it also moves ENH-DBLSH's
+/// decal tagging (`nfs_game` `world.rs`, [`scenery_part_casts`]).
+pub fn scenery_casters() -> SceneryCasters {
+    static RULE: std::sync::OnceLock<SceneryCasters> = std::sync::OnceLock::new();
+    *RULE.get_or_init(|| {
+        let v = std::env::var("NFS_CASTER_RULE").unwrap_or_default();
+        match v.trim().split_once(':').map_or((v.trim(), None), |(a, b)| (a, Some(b))) {
+            ("radius", r) => SceneryCasters::Radius(r.and_then(|r| r.trim().parse().ok()).unwrap_or(60.0)),
+            _ => SceneryCasters::Shape,
+        }
+    })
+}
+
+/// ENHANCEMENT E9 (SHADOW-UNIFY): whether a non-ground scenery part with these vertices (mesh space) placed at `scale` casts under
+/// `rule`, as the renderer's shadow pass decides it (its bounding sphere and shape at upload, `gpu/csm.rs` `mesh_bounds` /
+/// `part_casts`). For ENH-DBLSH's decal tagging: a decal under a caster gives way to its shadow.
+pub fn scenery_part_casts(vertices: &[Vertex], scale: f32, rule: SceneryCasters) -> bool {
+    gpu::part_casts_vertices(vertices, scale, rule)
 }
 
 /// ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL) / E9 (SUN-FULL): the sun of a day track whose sky has none (the sky's sun object overhead
@@ -1151,10 +1259,39 @@ impl ShadowLights {
 pub struct DataSun {
     pub light: SunShadow,
     /// `None`: E51's cars-only frame (only the cars cast, onto the track; the scenery's shade is already baked / in the decals).
-    /// `Some(r)` (SUN-FULL): E9's FULL frame (scenery and cars cast, the scenery only up to a bounding radius of `r` m, held to E9's
-    /// own limit: a hillside's shade along a sun the bake never had would cover whole stretches), E9's baked-dark gate on the
-    /// track, E51's cars-only layers on top when E51 is on, as on a sky-sun track.
-    pub scenery_radius: Option<f32>,
+    /// `Some(rule)` (SUN-FULL): E9's FULL frame (scenery and cars cast, the scenery by `rule`: SHADOW-UNIFY's shape rule as on a
+    /// sky-sun track, which keeps the terrain out: a hillside's shade along a sun the bake never had would cover whole stretches),
+    /// E9's baked-dark gate on the track, E51's cars-only layers on top when E51 is on, as on a sky-sun track.
+    pub scenery: Option<SceneryCasters>,
+    /// FOREST-TREESH (with `scenery`): E9's baked-dark gate on the track for this frame ([`BakedGate`]; SHADOW-UNIFY: `Relative` but
+    /// by test glue; the gate keeps a shadow baked into the colour from being darkened twice).
+    pub baked_gate: BakedGate,
+}
+
+/// ENHANCEMENT E9: how a track receiver's baked colour scales the sun's shadow on it (the "already baked dark" gate: a shade the
+/// bake already has is not darkened twice). APPROXIMATION: an enhancement's look, nothing of the original.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BakedGate {
+    /// by the baked colour's absolute luma (`smoothstep(0.3, 0.7)`, E9's gate since it came)
+    Absolute,
+    /// none: the whole shadow everywhere (FOREST-TREESH, the "full shadows" trial on forest)
+    Off,
+    /// GATE-REL: by the baked luma against the lit level the track's own bake light gives that orientation ([`BakeLight`]): a
+    /// receiver counts as baked in shade when it is well below its own lit level, not when it is merely dark. Without a
+    /// [`BakeLight`] it is `Absolute`.
+    Relative,
+}
+
+/// ENHANCEMENT E9 (GATE-REL): the light a track's vertex colours were baked with, as `nfs_game::bake_light` fits it over the
+/// scenery, `luma = base + gain max(0, n . to_light)`; the drivable ground's lit level is `ground` times that (its bake is lighter
+/// than the scenery's). Read only by [`BakedGate::Relative`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BakeLight {
+    /// toward the bake's light (unit, upward)
+    pub to_light: Vec3,
+    pub base: f32,
+    pub gain: f32,
+    pub ground: f32,
 }
 
 /// ENHANCEMENT ENH-FE3D: a front-end car's shadow volume.

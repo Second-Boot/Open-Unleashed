@@ -177,7 +177,7 @@ impl Core {
             casters
                 .iter()
                 .filter(|c| {
-                    if c.flat || c.radius > MAX_CASTER_RADIUS {
+                    if c.shape.flat || c.radius > MAX_CASTER_RADIUS {
                         return false;
                     }
                     let v = c.centre - origin;

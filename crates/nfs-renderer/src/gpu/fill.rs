@@ -272,6 +272,8 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], match &csm_frame {
             // ENHANCEMENT ENH-DBLSH: 3 = a track `sh80` decal under a caster (the shader fades it out with the shadow)
             Some(f) if item.csm & crate::CSM_DECAL != 0 && f.decal_fades => classes::RECV_DECAL,
+            // GATE-REL: drivable ground (a track item that receives and does not cast) carries the mark
+            Some(_) if item.csm & (crate::CSM_RECEIVE | crate::CSM_CAST | crate::CSM_ROOM) == crate::CSM_RECEIVE && receives() == classes::RECV_TRACK => classes::RECV_TRACK + classes::RECV_GROUND_MARK,
             Some(_) => receives(),
             None => classes::RECV_NONE,
         }]),

@@ -473,6 +473,29 @@ impl Core {
         self.belt.write_buffer(encoder, &self.object_buf, 0, size).copy_from_slice(bytemuck::cast_slice(objects));
         // PERF (PERF-B): which items draw with the set that has the per-item parts
         self.item_var.extend(objects.iter().map(fill::ItemVariant::of));
+        self.solid_draws(f.scene, objects, draws);
+    }
+
+    /// ENHANCEMENT E1 (FOLIAGE-OVERDRAW): which items' alpha test can never fail, into `self.solid`: the object's own opacity is 1,
+    /// its final alpha is `shade`'s base alpha (no glass / water / wet road / skid, no ground decal: the shader's `alpha_is_base`),
+    /// the mesh drawn has vertex alpha 1 everywhere, and its texture (the original's and the one the material shows, ENH-LIVETEX's
+    /// twin) has no texel whose alpha comes near the test's reference (`solid::solid_alpha`). Such a draw's base alpha is the
+    /// texel's: `fs_opaque_a2c` gives it full coverage at every fragment, `fs_opaque` and the shadow pass's `fs_cut` never discard
+    /// it.
+    fn solid_draws(&mut self, scene: &Scene, objects: &[ObjectUniform], draws: &[ItemDraw]) {
+        use crate::classes::{RECV_DECAL, REFL_GLASS};
+        let mut solid = std::mem::take(&mut self.solid);
+        solid.clear();
+        let min_alpha = |t: TextureId| self.textures.get(t.0 as usize).map_or(0, |g| g.min_alpha);
+        solid.extend(scene.items.iter().zip(objects).zip(draws).map(|((item, o), d)| {
+            let Some(m) = self.materials.get(item.material.0 as usize) else { return false };
+            o.light[3] == 1.0
+                && o.refl[0] < REFL_GLASS - 0.5
+                && o.lit_d[3] < RECV_DECAL - 0.5
+                && crate::solid::solid_alpha(min_alpha(m.texture).min(min_alpha(self.shown_texture(m.texture))), o.shadow_on[3])
+                && self.meshes.get(d.mesh as usize).is_some_and(|mesh| mesh.alpha_one)
+        }));
+        self.solid = solid;
     }
 
     /// Which passes over the finished scene this frame has (E13 shafts, E36 haze, E44 lighthouse beam) and so which images
@@ -725,6 +748,16 @@ impl Core {
         let f = FrameIn { scene, with_sprites, depth_far, n, tcur, vp_j, soft_split, env, near };
         self.write_globals(&mut encoder, &f, camera);
         self.write_objects(&mut encoder, &f, camera, &lights, &mut scratch);
+        // ENHANCEMENT E1 (FOLIAGE-OVERDRAW): an alpha-tested opaque draw whose test can never fail takes the plain opaque pipeline
+        // instead of the alpha-to-coverage one: the same picture, the GPU's hidden-surface removal kept. The draw order is the original's.
+        if self.multisampled_set && self.enhancements.is_on(crate::E1) {
+            for &i in &buckets[DrawStage::Opaque as usize] {
+                let d = &mut scratch.draws[i as usize];
+                if d.group.group == pipelines::Group::AlphaToCoverage && !d.twice && self.solid.get(i as usize).copied().unwrap_or(false) {
+                    d.group.group = pipelines::Group::Solid;
+                }
+            }
+        }
         // TEST GLUE (`--perf-bench`): the stage marks of the frame (nothing is recorded without the bench)
         crate::prof::mark(&mut encoder, Stage::Uploads);
 
@@ -735,7 +768,7 @@ impl Core {
             self.frame_casters(scene, n, &mut casters);
         }
         // ENHANCEMENT E9: the shadow cascades, before the passes that read them
-        self.csm_pass(&mut encoder, scene, &casters, camera, lights.csm.as_ref());
+        self.csm_pass(&mut encoder, scene, &casters, camera, vp, lights.csm.as_ref());
         crate::prof::mark(&mut encoder, Stage::SunShadow);
         // ENHANCEMENT E15: the player's lamp pair's shadow map
         self.spot_pass(&mut encoder, scene, &casters, lights.spot.as_ref());

@@ -230,6 +230,7 @@ impl Core {
             pending_texture_bytes: Vec::new(),
             depth_cache: std::collections::HashMap::new(),
             buckets: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            solid: Vec::new(),
             frame_scratch: FrameScratch::default(),
             lens_enabled: false,
             lens_pending: Vec::new(),

@@ -46,20 +46,21 @@ const CLUSTER_GAP: f32 = 1.5;
 pub(crate) const DAY_TUNNEL_GAIN: f32 = 0.35;
 
 /// AUTOBAHN-LAMPS: the brightness of an open street lamp on a track whose open street lamps light by day
-/// (`nfs_game::data_sun::SunlessTrack::dusk_lamps`), times E23's night term. The rainy dusk's baked
+/// (`dusk_lamps`), times E23's night term. The rainy dusk's baked
 /// road is much lighter than a night track's and the motorway posts are high (16-20 m: wide, faint pools), so at the night term the
 /// pools and the cars' lamp shadows hardly showed (the lower screen's mean luma +5 near a post); at 1.6 +7 there and +14 right under
 /// a post, the clipped share 0.04 -> 0.35 % (the car's lit roof). APPROXIMATION (by the stills, `ENHANCEMENTS.md` E47 AUTOBAHN-LAMPS).
 pub(crate) const DUSK_STREET_GAIN: f32 = 1.6;
 
-/// AUTOBAHN-LAMPS: whether `track` lights its open street lamps by day (`nfs_game::data_sun::SunlessTrack::dusk_lamps`: a chosen
-/// setting, APPROXIMATION).
-pub(crate) fn dusk_lamps(track: &str) -> bool {
-    // TEST GLUE: `NFS_DUSK_TRACKS=<a,b,..>` replaces the list (comparison stills only)
+/// AUTOBAHN-LAMPS / SHADOW-UNIFY: whether `track` lights its open street lamps by day: a day track with no sun from any source
+/// (`nfs_game::data_sun::dusk_lamps`, `TrackWorld::dusk_lamps`: a data rule, APPROXIMATION; it was a per-track choice
+/// for autobahn until SHADOW-UNIFY). No world (the front end): none.
+pub(crate) fn dusk_lamps(track: &str, world: Option<&nfs_game::world::TrackWorld>) -> bool {
+    // TEST GLUE: `NFS_DUSK_TRACKS=<a,b,..>` replaces the rule (comparison stills only; `none` = no track)
     if let Some(list) = nfs_game::config::cfg().nfs_dusk_tracks.as_str() {
         return list.split(',').any(|t| t.trim().eq_ignore_ascii_case(track));
     }
-    nfs_game::data_sun::sunless_track(track).is_some_and(|t| t.dusk_lamps)
+    world.is_some_and(|w| w.dusk_lamps)
 }
 
 /// LAMP-TUNE: the reach of a lamp `height` m over the road made of `heads` heads (m): E23's `clamp(1.5 h + 6, 10, 30)` per head,

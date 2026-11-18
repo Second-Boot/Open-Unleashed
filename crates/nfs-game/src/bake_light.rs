@@ -70,6 +70,10 @@ pub struct BakeFit {
     pub bins: usize,
     /// The scenery faces binned.
     pub faces: usize,
+    /// GATE-REL: the fit's `a` (the bins' luma with the face turned away from the light).
+    pub intercept: f32,
+    /// GATE-REL: the fit's `b` (the luma the light adds to a face looking straight at it).
+    pub slope: f32,
 }
 
 impl BakeFit {
@@ -141,6 +145,11 @@ fn faces(geometry: &TrackGeometry, materials: &[Material], occluders: bool) -> (
 
 /// The weighted fit of `y = a + b x`, `x = max(0, n.L)`, over the bins: its r2 (0 when `b <= 0`).
 fn r2(bins: &[(Vec3, f32, f32)], to_light: Vec3) -> f32 {
+    line(bins, to_light).2
+}
+
+/// The weighted fit of `y = a + b x`, `x = max(0, n.L)`, over the bins: (a, b, r2), r2 0 when `b <= 0`.
+fn line(bins: &[(Vec3, f32, f32)], to_light: Vec3) -> (f32, f32, f32) {
     let (mut sw, mut sx, mut sy, mut sxx, mut sxy, mut syy) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
     for (n, y, w) in bins {
         let (x, y, w) = (f64::from(n.dot(to_light).max(0.0)), f64::from(*y), f64::from(*w));
@@ -152,14 +161,15 @@ fn r2(bins: &[(Vec3, f32, f32)], to_light: Vec3) -> f32 {
         syy += w * y * y;
     }
     if sw <= 0.0 {
-        return 0.0;
+        return (0.0, 0.0, 0.0);
     }
     let cov = sxy / sw - (sx / sw) * (sy / sw);
     let (vx, vy) = (sxx / sw - (sx / sw).powi(2), syy / sw - (sy / sw).powi(2));
     if vx <= 1e-12 || vy <= 1e-12 || cov <= 0.0 {
-        return 0.0;
+        return (0.0, 0.0, 0.0);
     }
-    (cov * cov / (vx * vy)) as f32
+    let b = cov / vx;
+    (((sy - b * sx) / sw) as f32, b as f32, (cov * cov / (vx * vy)) as f32)
 }
 
 /// The normal bins of the scenery: (bin's normal, the `q` quantile of its lumas, weight).
@@ -189,8 +199,12 @@ fn bins(scenery: &[Face], q: f32) -> Vec<(Vec3, f32, f32)> {
 
 /// The fit over the hemisphere on the `q`-quantile bins (0.5 = the rule; the example prints 0.8 beside it).
 pub fn fit_quantile(geometry: &TrackGeometry, materials: &[Material], q: f32) -> Option<BakeFit> {
-    let (scenery, _, _) = faces(geometry, materials, false);
-    let b = bins(&scenery, q);
+    fit_faces(&faces(geometry, materials, false).0, q)
+}
+
+/// [`fit_quantile`] over the scenery's faces.
+fn fit_faces(scenery: &[Face], q: f32) -> Option<BakeFit> {
+    let b = bins(scenery, q);
     if b.len() < 10 {
         return None;
     }
@@ -206,12 +220,46 @@ pub fn fit_quantile(geometry: &TrackGeometry, materials: &[Material], q: f32) ->
         }
     }
     let (r, azimuth, elevation) = best;
-    Some(BakeFit { direction: travel(azimuth, elevation), azimuth, elevation, r2: r, r2_overhead: r2(&b, Vec3::Y), bins: b.len(), faces: scenery.len() })
+    let direction = travel(azimuth, elevation);
+    let (intercept, slope, _) = line(&b, -direction);
+    Some(BakeFit { direction, azimuth, elevation, r2: r, r2_overhead: r2(&b, Vec3::Y), bins: b.len(), faces: scenery.len(), intercept, slope })
 }
 
 /// The measurement of the module doc.
 pub fn fit(geometry: &TrackGeometry, materials: &[Material]) -> Option<BakeFit> {
     fit_quantile(geometry, materials, 0.5)
+}
+
+/// ENHANCEMENT E9 (GATE-REL): the quantile of the drivable ground's `luma / (a + b max(0, n.L))` taken as its lit level (the
+/// ground's bake is lighter than the scenery's: forest's ground faces' ratio has its median at 1.24 and its 90th percentile at
+/// 1.92, where the lit forest road's luma saturates at 1.0; castle 1.17 / 1.34, coastal 0.94 / 1.39, alps 0.90 / 1.35,
+/// farmland 0.93 / 1.14; `examples/bake_gate.rs`). APPROXIMATION: the quantile is a choice.
+pub const GROUND_LIT_Q: f32 = 0.9;
+
+/// ENHANCEMENT E9 (GATE-REL): the bake's light model for the relative "already baked dark" gate, on every day track (also those
+/// whose sky has a sun, and a fit too weak to give a data sun: it still says how lit each orientation is in the bake): the fit's
+/// `a`, `b` and light, and the drivable ground's factor ([`GROUND_LIT_Q`]). `None` when the fit has no light (`b <= 0`).
+/// Render only.
+pub fn gate_light(geometry: &TrackGeometry, materials: &[Material]) -> Option<nfs_renderer::BakeLight> {
+    let (scenery, floor, _) = faces(geometry, materials, false);
+    let f = fit_faces(&scenery, 0.5).filter(|f| f.slope > 0.0)?;
+    let l = -f.direction;
+    let mut ratio: Vec<f32> = floor.iter().map(|g| g.luma / (f.intercept + f.slope * g.n.dot(l).max(0.0)).max(0.05)).collect();
+    ratio.sort_by(f32::total_cmp);
+    let ground = ratio.get(((ratio.len().max(1) - 1) as f32 * GROUND_LIT_Q) as usize).copied().unwrap_or(1.0).max(0.5);
+    Some(nfs_renderer::BakeLight { to_light: l, base: f.intercept, gain: f.slope, ground })
+}
+
+/// GATE-REL diagnostic (`examples/bake_gate.rs`): per face of the scenery and of the ground, (its baked luma, the fit's luma for
+/// its orientation `a + b max(0, n.L)`, `n.L`).
+pub fn face_predictions(geometry: &TrackGeometry, materials: &[Material], fit: &BakeFit) -> (Vec<(f32, f32, f32)>, Vec<(f32, f32, f32)>) {
+    let (scenery, floor, _) = faces(geometry, materials, false);
+    let l = -fit.direction;
+    let pred = |f: &Face| {
+        let d = f.n.dot(l);
+        (f.luma, fit.intercept + fit.slope * d.max(0.0), d)
+    };
+    (scenery.iter().map(pred).collect(), floor.iter().map(pred).collect())
 }
 
 /// The cast-shadow cue (validation only, not used at load): of the ground faces facing the light (`n.L` > 0.2; every
@@ -345,6 +393,11 @@ mod tests {
         };
         let f = run("forest");
         assert!(f.accepted().is_some() && (f.azimuth + 162.0).abs() < 10.0 && (15.0..50.0).contains(&f.elevation), "{f:?}");
+        // GATE-REL: the relative gate's model (the fit's line, the ground's lit level above the scenery's)
+        assert!(f.intercept > 0.3 && f.slope > 0.25, "{f:?}");
+        let t = nfs_assets::track::TrackAssets::load(&paths, "forest").unwrap();
+        let g = gate_light(&t.build_geometry().unwrap(), &t.materials().unwrap()).unwrap();
+        assert!((g.to_light + f.direction).length() < 1e-5 && (1.5..2.5).contains(&g.ground), "{g:?}");
         let k = run("castle");
         assert!((k.azimuth - 136.0).abs() < 10.0, "{k:?}");
         assert!(run("foothills").accepted().is_none());

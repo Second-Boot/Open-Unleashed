@@ -68,6 +68,12 @@ pub struct TrackWorld {
     /// ENHANCEMENT E51 / E9 (CORSICA-SUN, SUN-ALL, SUN-FULL): on a day track whose sky has no sun (`sun_direction` straight down),
     /// the sun its data gives and the frame it drives ([`crate::data_sun`]); `None` elsewhere. Render only.
     pub data_sun: Option<crate::data_sun::DataSun>,
+    /// ENHANCEMENT E23 / E47 (AUTOBAHN-LAMPS, SHADOW-UNIFY): a day track with no sun from any source lights its open street lamps
+    /// by day ([`crate::data_sun::dusk_lamps`]). Render only.
+    pub dusk_lamps: bool,
+    /// ENHANCEMENT E9 (GATE-REL): on a day track the light its vertex colours were baked with, for E9's relative "already baked
+    /// dark" gate ([`crate::bake_light::gate_light`]); `None` on a night track. Render only.
+    pub bake_light: Option<nfs_renderer::BakeLight>,
     /// ENHANCEMENT E50 (SHADOW-OVERCAST): the sky's layers cover the sun (`SkyFile::blocks_the_sun`: Industrial); a night track so
     /// covered has no moon. Render only.
     pub sky_blocks_sun: bool,
@@ -2074,6 +2080,13 @@ impl TrackWorld {
         // ENHANCEMENT E51 / E9 (CORSICA-SUN, SUN-ALL, SUN-FULL): a track whose sky has no sun (the cars' light straight down): the
         // sun its data gives and the frame it drives (render only)
         let data_sun = crate::data_sun::measure(track, &geometry, &materials, sun_direction);
+        let dusk_lamps = crate::data_sun::dusk_lamps(track.is_night(), sun_direction, data_sun.as_ref());
+        tracing::info!(dusk_lamps, "open street lamps lit by day (ENHANCEMENT E23 / E47, a day with no sun)");
+        // ENHANCEMENT E9 (GATE-REL): the bake's light model for the relative gate (render only)
+        let bake_light = (!track.is_night()).then(|| crate::bake_light::gate_light(&geometry, &materials)).flatten();
+        // (SHADOW-FLOOR: the sun frame's darkness at most `1 - a / (a + b)`, `nfs_renderer` `csm.rs` floored_strength)
+        let floor_darkness = bake_light.map(|b| 1.0 - (b.base / (b.base + b.gain).max(1e-4)).clamp(0.0, 1.0));
+        tracing::info!(?bake_light, ?floor_darkness, "the bake light for E9's relative gate (GATE-REL) and its shadow floor (SHADOW-FLOOR)");
         // ENHANCEMENT E50 (SHADOW-OVERCAST): whether the sky's layers cover the sun (render only)
         let sky_blocks_sun = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).is_ok_and(|f| f.blocks_the_sun());
         let map_sections = MapSection::all(&track.map);
@@ -2094,7 +2107,7 @@ impl TrackWorld {
             it.water = water.contains(&it.material);
         }
         // ENHANCEMENT ENH-BEAM (E9): a translucent glow sheet takes no sun shadow and casts none. A material whose texture's
-        // alpha never reaches one half ([`is_translucent_sheet`]: the lighthouse beam `lths` peaks at 119 / 255; on the shipped
+        // alpha is faint ([`is_translucent_sheet`]: max below 192, mean below 64; the lighthouse beam `lths` peaks at 119 / 255, forest's god rays `bem2` at 136; on the shipped
         // tracks also coastal's / canyon's `wtr4` foam strips) is a sheet of light or haze, not an object: the shadow pass's
         // own cut (`shadow_on.w`, the alpha test GREATER 10 of the track's blended items) made every such texel a solid
         // occluder (the beam's box shadow on the road) and the receiving darkened the glow into a grey box with straight
@@ -2117,23 +2130,36 @@ impl TrackWorld {
         }
         // ENHANCEMENT ENH-DBLSH: the track's `sh80` ground-shadow decals (the depth-biased `S_Normal` / `S_UVAnimate` blocks,
         // `thrash.md` section 6d.3) that have a sun-shadow caster over them fade out where E9 draws that caster's shadow
-        // (`CSM_DECAL`): a decal is tagged when some caster (an instance prop or a non-ground article part under
-        // `MAX_CASTER_RADIUS`) stands inside its footprint; a decal over no caster (a hillside, a part too big to cast) stays.
+        // (`CSM_DECAL`): a decal is tagged when some caster (an instance prop or a non-ground article part that casts by E9's
+        // casters' rule, `nfs_renderer::scenery_part_casts`: SHADOW-UNIFY's shape rule) stands inside its footprint; a decal over
+        // no caster (a hillside, a terrain-like part) stays. A part over 60 m (SHADOW-UNIFY: a wall, a row of tree sheets, a fence
+        // row) counts by its whole box, not its centre: the decals along a 200 m tree row lie far from the row's middle.
         {
             let decal_mats: std::collections::HashSet<MaterialId> = mat_ids
                 .iter()
                 .filter(|(id, _)| materials.get(**id as usize).and_then(|m| nfs_assets::track::render_states(&methods, m)).is_some_and(|rs| rs[4] != 0))
                 .map(|(_, mid)| *mid)
                 .collect();
-            let mut casters: Vec<Vec3> = items.iter().filter(|i| i.csm & nfs_renderer::CSM_CAST != 0 && !decal_mats.contains(&i.material)).map(|i| i.transform.w_axis.truncate()).collect();
+            let rule = nfs_renderer::scenery_casters();
+            // the casters' world boxes (a point for a prop and a part up to 60 m, as before)
+            let mut casters: Vec<(Vec3, Vec3)> = items.iter().filter(|i| i.csm & nfs_renderer::CSM_CAST != 0 && !decal_mats.contains(&i.material)).map(|i| (i.transform.w_axis.truncate(), i.transform.w_axis.truncate())).collect();
             for art in &geometry.world {
                 if let Some(g) = track_lods.iter().find(|g| g.article == art.index) {
+                    let t = art.transform;
+                    let scale = t.x_axis.truncate().length().max(t.y_axis.truncate().length()).max(t.z_axis.truncate().length());
                     for ((_, meshes), (_, drawn)) in art.lods.iter().zip(g.lods.iter()) {
                         for (mm, it) in meshes.iter().zip(drawn.iter()) {
-                            if it.csm & nfs_renderer::CSM_CAST != 0 && !decal_mats.contains(&it.material) && !mm.mesh.vertices.is_empty() {
+                            if it.csm & nfs_renderer::CSM_CAST != 0 && !decal_mats.contains(&it.material) && nfs_renderer::scenery_part_casts(&mm.mesh.vertices, scale, rule) {
                                 let (lo, hi) = mm.mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.position)), h.max(Vec3::from(v.position))));
-                                if (hi - lo).length() * 0.5 < 60.0 {
-                                    casters.push(art.transform.transform_point3((lo + hi) * 0.5));
+                                if (hi - lo).length() * 0.5 * scale <= 60.0 {
+                                    let c = t.transform_point3((lo + hi) * 0.5);
+                                    casters.push((c, c));
+                                } else {
+                                    let (wl, wh) = mm.mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| {
+                                        let p = t.transform_point3(Vec3::from(v.position));
+                                        (l.min(p), h.max(p))
+                                    });
+                                    casters.push((wl, wh));
                                 }
                             }
                         }
@@ -2153,7 +2179,7 @@ impl TrackWorld {
                             (l.min(p), h.max(p))
                         });
                         total += 1;
-                        if casters.iter().any(|c| c.x >= lo.x - 3.0 && c.x <= hi.x + 3.0 && c.z >= lo.z - 3.0 && c.z <= hi.z + 3.0 && c.y >= lo.y - 8.0 && c.y <= hi.y + 40.0) {
+                        if casters.iter().any(|(cl, ch)| ch.x >= lo.x - 3.0 && cl.x <= hi.x + 3.0 && ch.z >= lo.z - 3.0 && cl.z <= hi.z + 3.0 && ch.y >= lo.y - 8.0 && cl.y <= hi.y + 40.0) {
                             it.csm |= nfs_renderer::CSM_DECAL;
                             tagged += 1;
                         }
@@ -2241,6 +2267,8 @@ impl TrackWorld {
             map_light,
             sun_direction,
             data_sun,
+            dusk_lamps,
+            bake_light,
             sky_blocks_sun,
             map_sections,
             env_by_id,
@@ -3386,13 +3414,26 @@ fn quat_rows_0x48a1e0(q: [f32; 4]) -> [Vec3; 3] {
     ]
 }
 
-/// ENHANCEMENT ENH-BEAM (E9): a texture (RGBA8) whose alpha has texels above the test reference (10) but never reaches one
-/// half: a translucent sheet (glow, haze, foam), which neither casts nor takes a sun shadow. A cut-out (foliage, fence,
-/// sign) has opaque texels and is not one; a fully transparent texture is not either.
+/// ENHANCEMENT ENH-BEAM (E9): a texture (RGBA8) whose alpha is faint: some texels above the test reference (10), none
+/// near opaque (maximum below 192, three quarters) and a low mean (below 64, a quarter): a translucent sheet (glow,
+/// haze, foam, painted god rays), which neither casts nor takes a sun shadow. A cut-out (foliage, fence, sign) has
+/// opaque texels or a high mean and is not one; a fully transparent texture is not either. FOREST-BEAMSHEET: forest's
+/// god-ray cards `bem2` peak at 136 (1.7 % of texels at or above one half, mean 36), so the cut is no longer "all
+/// below one half".
 fn is_translucent_sheet(rgba: &[u8]) -> bool {
     const REF: u8 = 10;
-    const HALF: u8 = 128;
-    rgba.chunks_exact(4).any(|p| p[3] > REF) && rgba.chunks_exact(4).all(|p| p[3] < HALF)
+    const MAX_BELOW: u8 = 192;
+    const MEAN_BELOW: u64 = 64;
+    let n = rgba.len() / 4;
+    if n == 0 {
+        return false;
+    }
+    let (mut max, mut sum) = (0u8, 0u64);
+    for p in rgba.chunks_exact(4) {
+        max = max.max(p[3]);
+        sum += p[3] as u64;
+    }
+    max > REF && max < MAX_BELOW && sum < MEAN_BELOW * n as u64
 }
 
 /// ENHANCEMENT E44: a lighthouse beam found in the track's data: the articles (animated, translucent sheets) that make it, its
@@ -4316,8 +4357,8 @@ mod sheet_tests {
         assert!(b[0].sigma0 > 0.2 && b[0].sigma0 < 3.0 && b[0].spread >= 0.0);
     }
 
-    /// ENHANCEMENT ENH-BEAM: the lighthouse beam's alpha (0..=119) is a sheet; a cut-out with opaque texels, a fully
-    /// transparent texture and a half-opaque fence (231 max) are not
+    /// ENHANCEMENT ENH-BEAM: the lighthouse beam's alpha (0..=119) and forest's god rays (max 136) are sheets; a cut-out
+    /// with opaque texels, a fully transparent texture, a half-opaque fence (231 max) and a high-mean one are not
     #[test]
     fn translucent_sheet_rule() {
         assert!(is_translucent_sheet(&tex(&[0, 34, 80, 119])));
@@ -4325,5 +4366,15 @@ mod sheet_tests {
         assert!(!is_translucent_sheet(&tex(&[0, 0, 0, 5])));
         assert!(!is_translucent_sheet(&tex(&[0, 151, 231])));
         assert!(!is_translucent_sheet(&tex(&[0, 100, 128])));
+        // FOREST-BEAMSHEET: `bem2`-like (max 136, mean ~36, mostly 0 and a few texels past one half) is a sheet
+        let mut bem: Vec<u8> = vec![0; 226];
+        bem.extend(std::iter::repeat(30).take(400));
+        bem.extend(std::iter::repeat(60).take(340));
+        bem.extend(std::iter::repeat(100).take(17));
+        bem.extend(std::iter::repeat(136).take(17));
+        assert!(is_translucent_sheet(&tex(&bem)));
+        // faint but with a bright core (max 192) or a high mean is not
+        assert!(!is_translucent_sheet(&tex(&[0, 0, 0, 0, 0, 192])));
+        assert!(!is_translucent_sheet(&tex(&[60, 70, 80, 90])));
     }
 }

@@ -145,7 +145,7 @@ impl Core {
                 let texture = gfx::texture_2d(&self.device, "offscreen 3d", width, height, self.config.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
                 let view = texture.create_view(&Default::default());
                 let sprite_bg = Some(gfx::tex_sampler_bg(&self.device, "offscreen tex", &self.sprite_layout, &view, &self.sprite_sampler));
-                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg, generated: None, size: (width, height) });
+                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg, generated: None, size: (width, height), min_alpha: 0 });
                 let id = TextureId(self.textures.len() as u32 - 1);
                 self.offscreen.insert(id.0, (width, height));
                 id

@@ -28,6 +28,7 @@ mod diag;
 
 // the items the rest of gpu/ names from the two modules above (their own glob `use super::*` sees these)
 use pipelines::{build_mesh_pipelines, HDR_KEY};
+pub(crate) use csm::part_casts_vertices;
 use post::{GammaPass, ScaleBlit, ToneKey};
 use frame::FrameDesc;
 #[cfg(test)]
@@ -186,8 +187,10 @@ struct GpuMesh {
     writes: u32,
     /// ENHANCEMENT E9: the bounding sphere (centre, radius) of the vertices at upload, in mesh space
     bounds: ([f32; 3], f32),
-    /// ENHANCEMENT E9: a level flat sheet (a road layer, a decal): no caster
-    flat: bool,
+    /// ENHANCEMENT E9: the shape the casters' rule reads (a level flat sheet: no caster; SHADOW-UNIFY: upright / built)
+    shape: csm::MeshShape,
+    /// ENHANCEMENT E1 (FOLIAGE-OVERDRAW): every vertex has colour alpha 1 (`solid.rs`; once a write breaks it, `false` for good)
+    alpha_one: bool,
     /// ENHANCEMENT ENH-LIVELEAK: carved out of a shared arena (its ranges go to the free list on release), the reserved byte sizes of
     /// the two ranges (the slot a later mesh may take over), and whether the mesh was released (an empty stub now)
     arena: bool,
@@ -254,6 +257,9 @@ struct GpuTexture {
     /// While E2 is off such a texture is sampled at level 0 only, so it looks as before.
     generated: Option<crate::mipgen::MipAlpha>,
     size: (u32, u32),
+    /// ENHANCEMENT E1 (FOLIAGE-OVERDRAW): the smallest alpha (bytes) any texel of any level has, or a bound below it (`solid.rs`; 0
+    /// when not known)
+    min_alpha: u8,
 }
 
 #[repr(C)]
@@ -503,6 +509,8 @@ pub(crate) struct Core {
     var_set: [u8; 4],
     /// PERF (PERF-B): per item of the frame, its variant ([`fill::ItemVariant::of`])
     item_var: Vec<fill::ItemVariant>,
+    /// ENHANCEMENT E1 (FOLIAGE-OVERDRAW): per item of the frame, whether its alpha test can never fail ([`Core::solid_draws`])
+    solid: Vec<bool>,
     /// the mesh shader of the original's set (no part, `classes::mesh_shader_source(0)`)
     mesh_shader: wgpu::ShaderModule,
     /// PERF (PERF-B): the mesh shader by its parts (`classes::feat`), built when a set of switches first needs it

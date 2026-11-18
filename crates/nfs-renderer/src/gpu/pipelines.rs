@@ -46,6 +46,10 @@ pub(super) enum Group {
     AlphaToCoverage,
     /// the layered passes of a blended material (`fs_layers`, the plain pair), without / with depth writes
     Layered { zwrite: bool },
+    /// ENHANCEMENT E1 (FOLIAGE-OVERDRAW): an alpha-TESTED opaque draw whose test can never fail (`Core::solid_draws`): the plain
+    /// opaque pipeline with no coverage and no `discard` (`fs_opaque_solid`), so the GPU keeps its hidden-surface removal; only in
+    /// a multisampled set (a 1-sample set has no such group: the original's `fs_opaque`, `PipelineKey::index`)
+    Solid,
 }
 
 /// The Thrash 0x38 pairs a [`Group::Blend`] takes (0 = the plain alpha pair).
@@ -53,7 +57,8 @@ const BLEND_PAIRS: u8 = 4;
 
 impl Group {
     /// The group's place in a set: 0 opaque, 1..=4 the pairs, 5..=8 the pairs with depth writes, then E1's alpha-to-coverage
-    /// group (`multisampled` sets only), then the two layered groups (master's 9 / 10).
+    /// group (`multisampled` sets only), then the two layered groups (master's 9 / 10), then E1's solid group (`multisampled`
+    /// sets only).
     fn slot(self, multisampled: bool) -> usize {
         let layered = if multisampled { 10 } else { 9 };
         match self {
@@ -62,6 +67,8 @@ impl Group {
             Group::AlphaToCoverage if multisampled => 9,
             Group::AlphaToCoverage => 0,
             Group::Layered { zwrite } => layered + zwrite as usize,
+            Group::Solid if multisampled => 12,
+            Group::Solid => 0,
         }
     }
 
@@ -73,6 +80,7 @@ impl Group {
             .chain(blends(true))
             .chain(multisampled.then_some(Group::AlphaToCoverage))
             .chain([false, true].map(|zwrite| Group::Layered { zwrite }))
+            .chain(multisampled.then_some(Group::Solid))
     }
 }
 
@@ -100,7 +108,8 @@ impl PipelineKey {
 }
 
 /// The mesh pipelines (54: blend group × cull × depth, [`PipelineKey`]; with `samples > 1` six more, the alpha-to-coverage
-/// opaque group 9 — ENHANCEMENT E1; then the two layered groups, 12 — master's 9 / 10) for a target of `samples`.
+/// opaque group 9 — ENHANCEMENT E1; then the two layered groups, 12 — master's 9 / 10; with `samples > 1` six more, E1's solid
+/// group 12) for a target of `samples`.
 pub(super) fn build_mesh_pipelines(device: &wgpu::Device, shader: &wgpu::ShaderModule, pipeline_layout: &wgpu::PipelineLayout, format: wgpu::TextureFormat, samples: u32, temporal: bool) -> Vec<wgpu::RenderPipeline> {
     build_mesh_pipelines_on(device, shader, pipeline_layout, format, samples, temporal, std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8))
 }
@@ -120,7 +129,7 @@ fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, p
         let c = wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: wgpu::BlendOperation::Add };
         wgpu::BlendState { color: c, alpha: c }
     };
-    let make_pipeline = |blend: bool, pair: u8, cull: Option<wgpu::Face>, depth: bool, zwrite: bool, a2c: bool, layers: bool| {
+    let make_pipeline = |blend: bool, pair: u8, cull: Option<wgpu::Face>, depth: bool, zwrite: bool, a2c: bool, layers: bool, solid: bool| {
         // ENHANCEMENT ENH-TEMPORAL: next to the colour, the motion vector (replaced by an opaque or depth-writing draw;
         // a translucent one keeps the surface behind it, but for a sky layer, which its `.w` lets through), the reactive
         // mask and the transparency-and-composition mask (replaced by an opaque draw, the larger value kept by a
@@ -175,6 +184,8 @@ fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, p
                     (true, false) => "fs_opaque_t",
                     (false, true) => "fs_main",
                     (false, false) if a2c => "fs_opaque_a2c",
+                    // ENHANCEMENT E1 (FOLIAGE-OVERDRAW)
+                    (false, false) if solid => "fs_opaque_solid",
                     (false, false) => "fs_opaque",
                 }),
                 compilation_options: wgpu::PipelineCompilationOptions { constants: if temporal && blend { &pair_const } else { &[] }, ..Default::default() },
@@ -212,16 +223,17 @@ fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, p
     // (the pipelines compile independently: built on worker threads, kept in the set's order)
     let specs: Vec<_> = PipelineKey::set(samples > 1)
         .map(|k| {
-            let (blend, pair, zwrite, a2c, layers) = match k.group {
-                Group::Opaque => (false, 0, false, false, false),
-                Group::Blend { pair, zwrite } => (true, pair, zwrite, false, false),
-                Group::AlphaToCoverage => (false, 0, false, true, false),
-                Group::Layered { zwrite } => (true, 0, zwrite, false, true),
+            let (blend, pair, zwrite, a2c, layers, solid) = match k.group {
+                Group::Opaque => (false, 0, false, false, false, false),
+                Group::Blend { pair, zwrite } => (true, pair, zwrite, false, false, false),
+                Group::AlphaToCoverage => (false, 0, false, true, false, false),
+                Group::Layered { zwrite } => (true, 0, zwrite, false, true, false),
+                Group::Solid => (false, 0, false, false, false, true),
             };
-            (blend, pair, k.cull.face(), k.depth_test, zwrite, a2c, layers)
+            (blend, pair, k.cull.face(), k.depth_test, zwrite, a2c, layers, solid)
         })
         .collect();
-    super::kit::par_build_on(&specs, workers, |&(blend, pair, cull, depth, zwrite, a2c, layers)| make_pipeline(blend, pair, cull, depth, zwrite, a2c, layers))
+    super::kit::par_build_on(&specs, workers, |&(blend, pair, cull, depth, zwrite, a2c, layers, solid)| make_pipeline(blend, pair, cull, depth, zwrite, a2c, layers, solid))
 }
 
 
@@ -620,12 +632,13 @@ mod tests {
     }
 
     /// The keys' indices are the hand-written scheme they replaced: `group * 6 + 2 * cull + !depth`, the blend groups `1 + pair`
-    /// and `5 + pair` (with depth writes), E1's alpha-to-coverage group 9 when the set has more than 66 pipelines, the layered
-    /// groups `len / 6 - 2` and one after it; and `PipelineKey::set` lists every key once, in index order.
+    /// and `5 + pair` (with depth writes), E1's alpha-to-coverage group 9 in a multisampled set, the layered groups 9 / 10 (10 / 11
+    /// multisampled), E1's solid group 12 (multisampled only, after master's groups); and `PipelineKey::set` lists every key once,
+    /// in index order.
     #[test]
     fn the_pipeline_keys_are_the_old_index_scheme() {
         for ms in [false, true] {
-            let len = if ms { 72 } else { 66 };
+            let len = if ms { 78 } else { 66 };
             let keys: Vec<_> = PipelineKey::set(ms).collect();
             assert_eq!(keys.len(), len);
             for (i, k) in keys.iter().enumerate() {
@@ -641,8 +654,10 @@ mod tests {
                         assert_eq!(idx(Group::Blend { pair, zwrite: false }), plain * 6 + sub);
                         assert_eq!(idx(Group::Blend { pair, zwrite: true }), (5 + pair as usize) * 6 + sub);
                     }
-                    assert_eq!(idx(Group::AlphaToCoverage), if len > 66 { 9 * 6 + sub } else { sub });
-                    let first = len / 6 - 2;
+                    assert_eq!(idx(Group::AlphaToCoverage), if ms { 9 * 6 + sub } else { sub });
+                    // FOLIAGE-OVERDRAW: a 1-sample set draws E1's solid group with the original's opaque pipeline
+                    assert_eq!(idx(Group::Solid), if ms { 12 * 6 + sub } else { sub });
+                    let first = if ms { 10 } else { 9 };
                     assert_eq!(idx(Group::Layered { zwrite: false }), first * 6 + sub);
                     assert_eq!(idx(Group::Layered { zwrite: true }), (first + 1) * 6 + sub);
                 }

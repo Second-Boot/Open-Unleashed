@@ -58,9 +58,44 @@ const MOON_MAX_LEVEL: u8 = 2;
 pub(super) const CAR_CASCADES: usize = 2;
 /// How far toward the sun a caster may stand and still shade a cascade (m), beyond the cascade's sphere.
 const CASTER_REACH: f32 = 120.0;
-/// A caster whose bounding sphere is larger than this (m) is left out: a hillside or a cliff face would
-/// fill the map with geometry whose shade the track's own baked light already carries.
-const MAX_CASTER_RADIUS: f32 = 60.0;
+/// SHADOW-UNIFY (casters): a scenery part whose bounding sphere is larger than this (m) is BROAD: it casts only when it is not
+/// terrain-like ([`terrain_like`]). Until SHADOW-UNIFY this was a plain limit (`MAX_CASTER_RADIUS`: every part over 60 m left out,
+/// so a hillside or a cliff face would not fill the map with a shade the bake never had); but a track's parts are one mesh per
+/// material per article, and the limit also left out whole objects whose one material spans an article: castle's courtyard ring
+/// wall (`ct42`, 77.8 m) and its roof slopes, the terraced walls, rows of tree sheets (`fhtm`, `fht1`, `lin1`, `ftl5`, `trl1`),
+/// farmyard walls and fence rows, the coastal freighter's hull, Monaco's facades (the caster audit of 2026-11-18).
+const BROAD_CASTER_RADIUS: f32 = 60.0;
+/// SHADOW-UNIFY (APPROXIMATION, by the caster audit's scan of every track's parts): a broad part is upright, so an object and a
+/// caster, when the mean `|n.y|` of its vertex normals is under [`UPRIGHT_UP`] (a wall, a facade, a fence, a hull, a sheet of
+/// trees: on the shipped tracks every broad part under 0.1 is one, but canyon's `mn02` rock face), or when it is built: low
+/// (under [`BUILT_HEIGHT`] m tall) and steep (mean `|n.y|` under [`BUILT_UP`]: castle's roof slopes `ct59`, a fence row on a
+/// slope, a ship's superstructure). Every other broad part is terrain-like (hills, cliffs, slopes, fields, the sea bed: on the
+/// shipped tracks they are either over 30 m tall or, lower, mostly facing up, mean `|n.y|` 0.65 and over) and casts nothing: its
+/// shade along the sun would contradict the bake, which lights the road beside it evenly.
+const UPRIGHT_UP: f32 = 0.1;
+const BUILT_UP: f32 = 0.65;
+const BUILT_HEIGHT: f32 = 30.0;
+/// FOREST-TREESH: `Csm::params.z` of a frame whose track takes the shadow without E9's baked-dark gate (the shader tests it against one half).
+const GATE_OFF: f32 = 1.0;
+/// GATE-REL: `Csm::params.z` of a frame whose track's gate is relative to its bake light (`crate::BakedGate::Relative`; the shader
+/// tests it against one and a half).
+const GATE_REL: f32 = 2.0;
+/// GATE-REL (APPROXIMATION, an enhancement's look; the ramp variant, [`GATE_REL_CAP`] off): the ramp over `baked luma / the bake
+/// light's lit level`: no extra darkening at or under `lo` (the bake has the shade), the whole shadow from `hi` (lit in the bake).
+const GATE_REL_RAMP: [f32; 2] = [0.5, 0.85];
+/// GATE-REL (APPROXIMATION; the ramp variant): the least share of the shadow a receiver takes however deep in the bake's shade it is.
+const GATE_REL_FLOOR: f32 = 0.0;
+/// GATE-REL (APPROXIMATION): the drivable ground's lit level, as a share of `BakeLight::ground` (its 90th percentile). At 1.0 a dim
+/// forest road under the trees counts as baked shade and takes nearly no shadow (the trees before the covered bridge cast none, as
+/// with the absolute gate; by comparing stills of the forest); 0.65 put it near the
+/// ground's median (forest 1.92 x 0.65 = 1.25 against a median of 1.24). SHADOW-UNIFY (2026-11-18, by sheet): 0.80 keeps the
+/// forest canopy's dappled stripes and still shades the road under the trees before the covered bridge and at the rock / bush seam.
+const GATE_REL_GROUND_SCALE: f32 = 0.80;
+/// GATE-REL (APPROXIMATION): the cap mode instead of the ramp: the bake's own shade counts toward the shadow, `keep' = min(1, keep /
+/// min(1, baked / lit))`: a point is darkened only down to the level a face lit in the bake takes in the same shadow, never twice;
+/// a baked-dark stretch still shows the shadow's shapes, weaker (the dappled canopy), a lit one takes it whole. The ramp and floor
+/// are then unused (kept for the comparison, `NFS_GATE_REL`).
+const GATE_REL_CAP: bool = true;
 /// A cascade's sphere radius is rounded up to whole steps of this many per metre, so the box keeps its size as the camera turns.
 const RADIUS_STEPS_PER_M: f32 = 8.0;
 /// The depth margin (m) added to a cascade's range beyond its sphere and the casters' reach.
@@ -106,29 +141,91 @@ pub(super) fn level_config(level: u8) -> (u32, &'static [f32]) {
 pub(super) enum ShadowMode {
     /// ENHANCEMENT ENH-FE3D: a front-end car's one soft cascade ([`crate::SunShadow::focus`])
     Focus(crate::ShadowFocus),
-    /// the race's sun: the sky's (E9), or a sunless track's data sun with its scenery (SUN-FULL); scenery casts up to
-    /// `caster_radius` m
-    Sun { caster_radius: f32 },
+    /// the race's sun: the sky's (E9), or a sunless track's data sun with its scenery (SUN-FULL); `casters`: which scenery parts
+    /// cast (SHADOW-UNIFY: the shape rule, [`terrain_like`]); `baked_gate` (FOREST-TREESH, GATE-REL): E9's "already baked dark"
+    /// gate on the track (`Relative` only with the track's bake light)
+    Sun { casters: crate::SceneryCasters, baked_gate: crate::BakedGate },
     /// ENHANCEMENT E51 (CORSICA-SUN): a sunless track's data sun with the cars alone: the near cascades only, the scenery casts
     /// nothing (its shade is baked / in the decals)
-    CarsOnly,
+    /// `small` (CANYON-SMALLSH, 2026-11-18): the small upright scenery parts (signs, posts, rails, walls, bushes: `SceneryCasters::Small`)
+    /// that also cast into the same near cascades; everything else of the frame (cascades, strength, gate, floor, the cars' shadow) is
+    /// the cars-only frame's own
+    CarsOnly { small: Option<crate::SceneryCasters> },
     /// ENHANCEMENT E50: the moon at its level (1 weak, 2 normal: faint, its own soft edge)
     Moon { level: u8 },
+}
+
+/// SHADOW-UNIFY (2026-11-18: one shadow mode for every sun track): the sky sun's baked-dark gate is GATE-REL's relative one,
+/// as the data sun's ([`ShadowMode::pick`] falls back to the absolute gate when the track has no bake light, a data rule).
+/// TEST GLUE (comparison stills): `NFS_SKY_SUN_GATE=on` = the absolute gate (the default before SHADOW-UNIFY), `off` = no gate
+/// (the FULL-SHADOWS trial), `rel` / unset = the relative gate.
+fn sky_sun_gate() -> crate::BakedGate {
+    static GATE: std::sync::OnceLock<crate::BakedGate> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| match std::env::var("NFS_SKY_SUN_GATE").as_deref().map(str::trim) {
+        Ok("off") => crate::BakedGate::Off,
+        Ok("on") => crate::BakedGate::Absolute,
+        _ => crate::BakedGate::Relative,
+    })
+}
+
+/// TEST GLUE (GATE-REL, comparison stills): `NFS_GATE_REL=<lo>,<hi>[,<floor>[,<ground scale>[,<cap 0|1>]]]` replaces
+/// [`GATE_REL_RAMP`], [`GATE_REL_FLOOR`], [`GATE_REL_GROUND_SCALE`] and [`GATE_REL_CAP`].
+fn gate_rel_tune() -> [f32; 5] {
+    static TUNE: std::sync::OnceLock<[f32; 5]> = std::sync::OnceLock::new();
+    *TUNE.get_or_init(|| {
+        let mut t = [GATE_REL_RAMP[0], GATE_REL_RAMP[1], GATE_REL_FLOOR, GATE_REL_GROUND_SCALE, f32::from(u8::from(GATE_REL_CAP))];
+        let v = std::env::var("NFS_GATE_REL").ok();
+        let p: Vec<f32> = v.as_deref().map_or(Vec::new(), |v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+        if p.len() >= 2 && p[0] < p[1] {
+            t[..p.len().min(5)].copy_from_slice(&p[..p.len().min(5)]);
+        }
+        t
+    })
+}
+
+/// ENHANCEMENT E9 (SHADOW-FLOOR, 2026-11-18; APPROXIMATION, an enhancement's look): a sun frame's shadow may not darken a
+/// receiver below the bake's own ambient share. The bake light's fit (`luma = a + b max(0, n.L)`, [`crate::BakeLight`] `base` /
+/// `gain`) says a face turned away from the bake's light keeps `a` of a lit face's `a + b`: that is the light a shadow leaves. So
+/// the frame's darkness (`params.x`, [`GROUND_STRENGTH`]: the track receivers and the cars' shadows on them, E51's cars-only frame
+/// too) is `min(strength, 1 - a / (a + b))`; without a bake light (no fit, night) the strength stays. One data rule for every sun
+/// track instead of one darkness for all: a bake with much ambient light (a dusk, an overcast-like bake) takes lighter shadows.
+fn floored_strength(strength: f32, bake: Option<&crate::BakeLight>) -> f32 {
+    bake.filter(|b| b.base + b.gain > 1e-4).map_or(strength, |b| strength.min(1.0 - (b.base / (b.base + b.gain)).clamp(0.0, 1.0)))
+}
+
+/// TEST GLUE (SHADOW-FLOOR, comparison stills): `NFS_SHADOW_FLOOR=off` = the frame's darkness without the bake's ambient floor.
+fn shadow_floor_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NFS_SHADOW_FLOOR").map_or(true, |v| v.trim() != "off"))
+}
+
+/// GATE-REL: `Csm::bake` / `bake_k` / `bake_f` of a frame: (toward the bake light, its base), (its gain, the ground's factor, the
+/// ramp), (the floor).
+fn bake_uniform(bake: Option<&crate::BakeLight>) -> [[f32; 4]; 3] {
+    bake.map_or([[0.0; 4]; 3], |b| {
+        let [lo, hi, floor, gs, cap] = gate_rel_tune();
+        [[b.to_light.x, b.to_light.y, b.to_light.z, b.base], [b.gain, b.ground * gs, lo, hi], [floor, cap, 0.0, 0.0]]
+    })
 }
 
 impl ShadowMode {
     /// The light and the mode of a frame: the first light of `lights` that is set and whose switch is on, in
     /// [`crate::ShadowLights`]' order (the sun, the data sun, E50's moon).
     fn pick(lights: &crate::ShadowLights, e: &crate::Enhancements) -> Option<(crate::SunShadow, Self)> {
+        // GATE-REL: the relative gate needs the track's bake light
+        let gate = |g: crate::BakedGate| if g == crate::BakedGate::Relative && lights.bake.is_none() { crate::BakedGate::Absolute } else { g };
         if let Some(s) = lights.sun {
-            return Some((s, s.focus.map_or(Self::Sun { caster_radius: MAX_CASTER_RADIUS }, Self::Focus)));
+            return Some((s, s.focus.map_or(Self::Sun { casters: crate::scenery_casters(), baked_gate: gate(sky_sun_gate()) }, Self::Focus)));
         }
         // ENHANCEMENT E51 (CORSICA-SUN): the cars-only frame with E51 on; E9 / E51 (SUN-FULL): the full frame with E9 alone, the
-        // scenery casters held to the track's own radius
+        // scenery casters by the frame's rule (SHADOW-UNIFY: the shape rule, as on a sky-sun track)
         if let Some(d) = lights.data_sun {
-            match d.scenery_radius {
-                Some(r) => return Some((d.light, Self::Sun { caster_radius: r.min(MAX_CASTER_RADIUS) })),
-                None if e.is_on(crate::E51) => return Some((d.light, Self::CarsOnly)),
+            match d.scenery {
+                // CANYON-SMALLSH: the decals' sun's frame: the cars-only frame with the small parts added (with E51 on, as it)
+                Some(small @ crate::SceneryCasters::Small { .. }) if e.is_on(crate::E51) => return Some((d.light, Self::CarsOnly { small: Some(small) })),
+                Some(crate::SceneryCasters::Small { .. }) => {}
+                Some(casters) => return Some((d.light, Self::Sun { casters, baked_gate: gate(d.baked_gate) })),
+                None if e.is_on(crate::E51) => return Some((d.light, Self::CarsOnly { small: None })),
                 None => {}
             }
         }
@@ -140,35 +237,39 @@ impl ShadowMode {
     /// The class the shader tests (`csm.misc.y`, `classes::SHADOW_*`).
     fn shader_class(&self) -> f32 {
         match self {
-            Self::Sun { .. } | Self::CarsOnly => classes::SHADOW_SUN,
+            Self::Sun { .. } | Self::CarsOnly { .. } => classes::SHADOW_SUN,
             Self::Moon { .. } => classes::SHADOW_MOON,
             Self::Focus(_) => classes::SHADOW_FOCUS,
         }
     }
 
-    /// `params`: x the track's strength, y where the last cascade (ending at `last`) starts to fade out, z 0 (once E25's kernel
-    /// spacing; the race's kernel is 3 x 3), w the cars' floor of the direct term.
+    /// `params`: x the track's strength, y where the last cascade (ending at `last`) starts to fade out, z [`GATE_OFF`] when the
+    /// track's baked-dark gate is off (FOREST-TREESH), [`GATE_REL`] when it is relative (GATE-REL), else 0, w the cars' floor of the
+    /// direct term.
     fn params(&self, last: f32) -> [f32; 4] {
         match *self {
-            Self::Sun { .. } | Self::CarsOnly => [GROUND_STRENGTH, last * FADE_START, 0.0, SUN_CAR_FLOOR],
+            Self::Sun { baked_gate: crate::BakedGate::Off, .. } => [GROUND_STRENGTH, last * FADE_START, GATE_OFF, SUN_CAR_FLOOR],
+            Self::Sun { baked_gate: crate::BakedGate::Relative, .. } => [GROUND_STRENGTH, last * FADE_START, GATE_REL, SUN_CAR_FLOOR],
+            Self::Sun { .. } | Self::CarsOnly { .. } => [GROUND_STRENGTH, last * FADE_START, 0.0, SUN_CAR_FLOOR],
             Self::Moon { level } => [MOON_STRENGTH[usize::from(level)], last * FADE_START, 0.0, MOON_FLOOR],
             // ENHANCEMENT ENH-FE3D: the front-end car's own strength
             Self::Focus(f) => [f.strength, last * FOCUS_FADE_START, 0.0, SUN_CAR_FLOOR],
         }
     }
 
-    /// The largest scenery caster (m).
-    fn caster_radius(&self) -> f32 {
+    /// Which scenery parts cast in this mode (the moon's and the front end's frames: the default rule, [`crate::scenery_casters`]).
+    fn casters(&self) -> crate::SceneryCasters {
         match *self {
-            Self::Sun { caster_radius } => caster_radius,
-            _ => MAX_CASTER_RADIUS,
+            Self::Sun { casters, .. } => casters,
+            Self::CarsOnly { small: Some(small) } => small,
+            _ => crate::scenery_casters(),
         }
     }
 
     /// ENHANCEMENT E9 / E51 (SHADOW-OVERCAST): whether the sky data's precipitation weakens this mode's shadows
     /// ([`crate::ShadowLights::precipitation`]): the race's sun and data sun, not the front end's focus or the moon
     fn fades_with_precipitation(&self) -> bool {
-        matches!(self, Self::Sun { .. } | Self::CarsOnly)
+        matches!(self, Self::Sun { .. } | Self::CarsOnly { .. })
     }
 
     /// ENHANCEMENT ENH-DBLSH: whether a track's `sh80` decals give way to this frame's shadows: the sun's (not the front end's focus,
@@ -181,7 +282,7 @@ impl ShadowMode {
     /// ENHANCEMENT E9: whether the car's `SHAD` patch gives way to the sun's car shadow in the open (the race's sun and the cars-only
     /// frame; not the front end's focus or the moon, whose car shadow is too faint to stand in for it)
     fn takes_car_patch(&self) -> bool {
-        matches!(self, Self::Sun { .. } | Self::CarsOnly)
+        matches!(self, Self::Sun { .. } | Self::CarsOnly { .. })
     }
 }
 
@@ -319,6 +420,15 @@ pub(super) struct CsmUniform {
     /// x (ENHANCEMENT E9, ENH-TUNPOOL) the count of covered boxes below (the nearest to the camera; 0 = none), y the frame's
     /// [`ShadowMode`] class (`classes::SHADOW_*`)
     misc: [f32; 4],
+    /// GATE-REL ([`bake_uniform`]): xyz toward the track's bake light, w its base; then x its gain, y the drivable ground's factor,
+    /// zw the relative gate's ramp. Zero unless the frame's gate is relative.
+    bake: [f32; 4],
+    bake_k: [f32; 4],
+    bake_f: [f32; 4],
+    /// ENHANCEMENT E9 (FOREST-E9PERF): the world box round every covered box below (xyz least, xyz most; empty with no boxes): a
+    /// point outside it is in none of them (`cover_at` skips its loop)
+    cover_lo: [f32; 4],
+    cover_hi: [f32; 4],
     /// per box, 5 vec4: (centre, half length), (forward, half width), (lateral, weight at the back face),
     /// (up, weight at the front face), (ceiling height, nominal half length, 0, 0)
     cover: [[f32; 4]; MAX_COVER * COVER_VEC4S],
@@ -351,6 +461,12 @@ const COVER_BYTES: usize = COVER_VEC4S * std::mem::size_of::<[f32; 4]>();
 /// Covered boxes farther than this from the camera are left out (m); past it a tunnel's interior is shaded as open ground, which
 /// E9's own far fade has reached (the last cascade ends at 400 m / 520 m).
 const COVER_REACH: f32 = 420.0;
+/// PERF (FOREST-E9PERF): how far outside the view volume (m) a covered box may stand and still be handed to the shader: a
+/// particle's light reads E9 at the particle's centre (`particle_fx`), which may be off the screen while its sprite is on it.
+const COVER_VIEW_SLACK: f32 = 30.0;
+/// PERF (FOREST-E9PERF): how much wider than its boxes' corners (m) the world box round the covered boxes is: room for the
+/// rounding of the corners and of the shader's own tests.
+const COVER_BOUND_PAD: f32 = 0.05;
 
 /// Everything E9 keeps: the pass's pipelines, the uniform the main shader reads, the map.
 pub(super) struct CsmState {
@@ -483,12 +599,46 @@ pub(super) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
 const FLAT_THICKNESS: f32 = 0.5;
 const FLAT_UP: f32 = 0.85;
 
-/// A mesh's bounding sphere (the box's centre, the farthest vertex from it) and whether it is a flat
-/// sheet lying level (thinner than half a metre with mostly upward normals: a road layer, a marking, a
-/// ground decal), which casts nothing worth the coplanar acne it would give the road under it.
-pub(super) fn mesh_bounds(vertices: &[Vertex]) -> ([f32; 3], f32, bool) {
+/// ENHANCEMENT E9: a mesh's shape as the casters' rule reads it ([`mesh_bounds`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct MeshShape {
+    /// a level flat sheet (a road layer, a marking, a ground decal): never a caster
+    pub flat: bool,
+    /// SHADOW-UNIFY: upright or built (see [`UPRIGHT_UP`]): a broad part of this shape is an object, not terrain
+    pub upright: bool,
+    /// the part's height in mesh space (m; the track's articles and props are not scaled): TEST GLUE's small-parts rule
+    pub height: f32,
+}
+
+/// SHADOW-UNIFY: whether a scenery part of bounding radius `radius` (m, world) and `shape` is terrain-like, so no caster under
+/// the shape rule: broad ([`BROAD_CASTER_RADIUS`]) and neither upright nor built ([`UPRIGHT_UP`]).
+pub(crate) fn terrain_like(radius: f32, shape: MeshShape) -> bool {
+    radius > BROAD_CASTER_RADIUS && !shape.upright
+}
+
+/// SHADOW-UNIFY: whether a scenery part of bounding radius `radius` (m, world) and `shape` casts under `rule` (never a flat sheet).
+pub(crate) fn part_casts(rule: crate::SceneryCasters, radius: f32, shape: MeshShape) -> bool {
+    !shape.flat
+        && match rule {
+            crate::SceneryCasters::Shape => !terrain_like(radius, shape),
+            crate::SceneryCasters::Radius(r) => radius <= r,
+            crate::SceneryCasters::Small { radius: r, height: h } => radius <= r && shape.height <= h,
+        }
+}
+
+/// SHADOW-UNIFY: [`part_casts`] of a mesh's vertices placed at `scale` (`crate::scenery_part_casts`).
+pub(crate) fn part_casts_vertices(vertices: &[Vertex], scale: f32, rule: crate::SceneryCasters) -> bool {
+    let (_, r, shape) = mesh_bounds(vertices);
+    !vertices.is_empty() && part_casts(rule, r * scale, shape)
+}
+
+/// A mesh's bounding sphere (the box's centre, the farthest vertex from it) and its shape: whether it is a flat sheet lying level
+/// (thinner than half a metre with mostly upward normals: a road layer, a marking, a ground decal), which casts nothing worth the
+/// coplanar acne it would give the road under it, and (SHADOW-UNIFY) whether it is upright or built ([`UPRIGHT_UP`]; the height in
+/// mesh space: the track's articles and props are not scaled).
+pub(super) fn mesh_bounds(vertices: &[Vertex]) -> ([f32; 3], f32, MeshShape) {
     if vertices.is_empty() {
-        return ([0.0; 3], 0.0, false);
+        return ([0.0; 3], 0.0, MeshShape::default());
     }
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
     for v in vertices {
@@ -500,7 +650,9 @@ pub(super) fn mesh_bounds(vertices: &[Vertex]) -> ([f32; 3], f32, bool) {
     let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
     let r2 = vertices.iter().map(|v| (0..3).map(|i| (v.position[i] - c[i]) * (v.position[i] - c[i])).sum::<f32>()).fold(0.0, f32::max);
     let up = vertices.iter().map(|v| v.normal[1].abs()).sum::<f32>() / vertices.len() as f32;
-    (c, r2.sqrt(), hi[1] - lo[1] < FLAT_THICKNESS && up > FLAT_UP)
+    let height = hi[1] - lo[1];
+    let shape = MeshShape { flat: height < FLAT_THICKNESS && up > FLAT_UP, upright: up < UPRIGHT_UP || (up < BUILT_UP && height < BUILT_HEIGHT), height };
+    (c, r2.sqrt(), shape)
 }
 
 impl Core {
@@ -542,7 +694,7 @@ impl Core {
         // and they are the cars-only layers themselves
         let e51 = self.enhancements.is_on(crate::E51);
         let car_layers = match mode {
-            ShadowMode::CarsOnly => CarLayers::Own,
+            ShadowMode::CarsOnly { .. } => CarLayers::Own,
             // (CARSH-FADE: level 1 asks per car how much of the sun reaches it past the scenery; without compute shaders it draws
             // as level 2)
             ShadowMode::Sun { .. } if e51 => CarLayers::Extra { sun_share: self.compute_supported && self.enhancements.level(crate::E51) == crate::Enhancements::E51_WHERE_SUN },
@@ -615,14 +767,30 @@ impl Core {
     /// [`COVER_REACH`], at most [`MAX_COVER`]; a fragment inside one takes no sun-shadow darkening (the shader's `cover_at`),
     /// whatever the camera is doing: a tunnel's pools look the same from outside and inside.
     /// `near`: the pass's kept list (refilled).
-    fn write_cover(u: &mut CsmUniform, cover: &[crate::CoverBox], eye: Vec3, near: &mut Vec<(f32, usize)>) {
+    fn write_cover(u: &mut CsmUniform, cover: &[crate::CoverBox], eye: Vec3, vp: Mat4, near: &mut Vec<(f32, usize)>) {
         near.clear();
         near.extend(cover.iter().enumerate().map(|(i, b)| (b.centre.distance_squared(eye), i)).filter(|(d, _)| *d < COVER_REACH * COVER_REACH));
         if near.len() > MAX_COVER {
             near.select_nth_unstable_by(MAX_COVER - 1, |a, b| a.0.total_cmp(&b.0));
             near.truncate(MAX_COVER);
         }
+        // PERF (FOREST-E9PERF, picture identical): of those, only the boxes a fragment of this view can fall in (`cover_at` loops
+        // over every box for every fragment). Culled after the nearest 64 are picked, so the boxes that remain are exactly the ones
+        // that could change a pixel before.
+        near.retain(|&(_, i)| cover[i].may_cover_view(vp, COVER_VIEW_SLACK));
         u.misc[0] = near.len() as f32;
+        // PERF (FOREST-E9PERF, picture identical): the world box round them all (a degenerate box: round everything), widened a
+        // little against rounding; a point outside it skips the loop
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for &(_, i) in near.iter() {
+            match cover[i].corners() {
+                Some(cs) => cs.iter().for_each(|&c| (lo, hi) = (lo.min(c), hi.max(c))),
+                None => (lo, hi) = (Vec3::splat(f32::MIN), Vec3::splat(f32::MAX)),
+            }
+        }
+        let pad = Vec3::splat(COVER_BOUND_PAD);
+        u.cover_lo = (lo - pad).extend(0.0).to_array();
+        u.cover_hi = (hi + pad).extend(0.0).to_array();
         for (box_, b) in u.cover.chunks_exact_mut(COVER_VEC4S).zip(near.iter().map(|&(_, i)| &cover[i])) {
             box_.copy_from_slice(&[
                 [b.centre.x, b.centre.y, b.centre.z, b.half_len],
@@ -636,7 +804,7 @@ impl Core {
 
     /// Write the frame's uniform and draw the cascades' casters (`casters`: the frame's, [`Core::frame_casters`]). Without a frame
     /// the uniform is set to "off" once if it was on.
-    pub(super) fn csm_pass(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &Scene, casters: &[Caster], camera: &Camera, frame: Option<&CsmFrame>) {
+    pub(super) fn csm_pass(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &Scene, casters: &[Caster], camera: &Camera, vp: Mat4, frame: Option<&CsmFrame>) {
         let Some(frame) = frame else {
             self.csm.uniform.clear(&mut self.belt, encoder);
             return;
@@ -650,7 +818,14 @@ impl Core {
         u.dir = [frame.dir.x, frame.dir.y, frame.dir.z, cascades.len() as f32];
         u.orig = [frame.orig.x, frame.orig.y, frame.orig.z, frame.gate];
         u.params = frame.mode.params(cascades.last().map_or(0.0, |c| c.split));
+        // ENHANCEMENT E9 (SHADOW-FLOOR): a sun frame's darkness held to the bake's own ambient share
+        if matches!(frame.mode, ShadowMode::Sun { .. } | ShadowMode::CarsOnly { .. }) && shadow_floor_on() {
+            u.params[0] = floored_strength(u.params[0], scene.shadows.bake.as_ref());
+        }
         u.misc[1] = frame.mode.shader_class();
+        if let ShadowMode::Sun { baked_gate: crate::BakedGate::Relative, .. } = frame.mode {
+            [u.bake, u.bake_k, u.bake_f] = bake_uniform(scene.shadows.bake.as_ref());
+        }
         match frame.mode {
             // ENHANCEMENT ENH-FE3D: the front-end car's shadow: a soft jittered disc and (ENH-GARAGE) a contact core
             ShadowMode::Focus(f) => u.extra = [f.blur / cascades[0].texel, f.core / cascades[0].texel, f.soft, f.blob_fade],
@@ -681,7 +856,7 @@ impl Core {
             u.carsh = [car_layers as f32, car_base as f32, f32::from(u8::from(sun_share)), sun_cars as f32];
         }
         if !scene.cover.is_empty() && !matches!(frame.mode, ShadowMode::Focus(_)) {
-            Self::write_cover(&mut u, &scene.cover, camera.position, &mut self.csm.cover_near);
+            Self::write_cover(&mut u, &scene.cover, camera.position, vp, &mut self.csm.cover_near);
         }
         // PERF (picture identical): the covered boxes past the count are not written (`cover_at` reads `misc.x` of them; the
         // rest of the 5 KB keep an earlier frame's)
@@ -697,14 +872,16 @@ impl Core {
         let extra = if matches!(frame.car_layers, CarLayers::Extra { .. }) { car_layers } else { 0 };
         let passes = (0..cascades.len()).map(|ci| (ci, ci, own_cars)).chain((0..extra).map(|ci| (ci, car_base + ci, true)));
         let axes = { let (ax, ay) = light_axes(frame.dir); (ax, ay, frame.dir) };
-        // (the mode's casters: E9 leaves the flat sheets and the casters over its radius out)
-        let radius = frame.mode.caster_radius();
-        let ours = || casters.iter().filter(|k| !k.flat && k.radius <= radius);
+        // (the mode's casters: E9 leaves the flat sheets out and, SHADOW-UNIFY, the terrain-like broad parts, `part_casts`)
+        let rule = frame.mode.casters();
+        // (CANYON-SMALLSH: the cars-only frame's scenery is the small parts alone: a car casts as before, a scenery part by `Small`)
+        let small = matches!(frame.mode, ShadowMode::CarsOnly { small: Some(_) });
+        let ours = || casters.iter().filter(|k| part_casts(rule, k.radius, k.shape));
         let mut list = std::mem::take(&mut self.csm.list);
         for (ci, layer, cars_only) in passes {
             let c = &cascades[ci];
             list.clear();
-            list.extend(ours().filter(|k| (k.car || !cars_only) && c.reaches(axes, k)).map(|k| k.idx));
+            list.extend(ours().filter(|k| (k.car || !cars_only || small) && c.reaches(axes, k)).map(|k| k.idx));
             let map = self.csm.map.as_mut().expect("shadow map made");
             // PERF (SHADOW-REFACTOR): a layer the last frame left cleared, with no caster now, holds what this pass would write
             // (E51's far cars-only layer with no car in it, most frames)
@@ -782,34 +959,94 @@ mod tests {
     #[test]
     fn bounds_cover_the_vertices() {
         let v = |x: f32, y: f32, z: f32| Vertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4] };
-        let (c, r, flat) = mesh_bounds(&[v(0.0, 0.0, 0.0), v(2.0, 0.0, 0.0), v(1.0, 2.0, 0.0)]);
+        let (c, r, shape) = mesh_bounds(&[v(0.0, 0.0, 0.0), v(2.0, 0.0, 0.0), v(1.0, 2.0, 0.0)]);
         assert_eq!(c, [1.0, 1.0, 0.0]);
         assert!((r - 2f32.sqrt()).abs() < 1e-6);
-        assert!(!flat);
+        assert!(!shape.flat);
+    }
+
+    /// SHADOW-FLOOR: the darkness held to the bake's ambient share; no bake light, no floor
+    #[test]
+    fn the_shadow_floor_follows_the_bake() {
+        let b = |base: f32, gain: f32| crate::BakeLight { to_light: Vec3::Y, base, gain, ground: 1.5 };
+        let forest = floored_strength(GROUND_STRENGTH, Some(&b(0.384, 0.335)));
+        assert!((forest - (1.0 - 0.384 / 0.719)).abs() < 1e-6, "{forest}");
+        assert_eq!(floored_strength(GROUND_STRENGTH, Some(&b(0.1, 0.9))), GROUND_STRENGTH, "a strong bake keeps the strength");
+        assert_eq!(floored_strength(GROUND_STRENGTH, None), GROUND_STRENGTH);
+        assert_eq!(floored_strength(GROUND_STRENGTH, Some(&b(0.0, 0.0))), GROUND_STRENGTH);
+    }
+
+    /// SHADOW-UNIFY: the casters' shape rule: a broad part casts when upright or built, not when terrain-like; a flat sheet never
+    #[test]
+    fn the_shape_rule_keeps_terrain_out() {
+        let v = |x: f32, y: f32, z: f32, ny: f32| Vertex { position: [x, y, z], normal: [(1.0 - ny * ny).sqrt(), ny, 0.0], uv: [0.0; 2], color: [1.0; 4] };
+        let part = |w: f32, h: f32, ny: f32| [v(-w, 0.0, 0.0, ny), v(w, 0.0, 0.0, ny), v(0.0, h, 1.0, ny)];
+        let casts = |p: &[Vertex]| part_casts_vertices(p, 1.0, crate::SceneryCasters::Shape);
+        assert!(casts(&part(80.0, 34.0, 0.02)), "a ring wall 160 m round (castle ct42)");
+        assert!(casts(&part(80.0, 120.0, 0.0)), "a sheet of trees 120 m tall (forest ftl6)");
+        assert!(casts(&part(75.0, 15.0, 0.58)), "roof slopes (castle ct59)");
+        assert!(!casts(&part(70.0, 120.0, 0.4)), "a cliff (canyon clfa)");
+        assert!(!casts(&part(70.0, 60.0, 0.8)), "a hillside (farmland grs2)");
+        assert!(!casts(&part(70.0, 12.0, 0.98)), "a field (farmland fm03)");
+        assert!(casts(&part(20.0, 40.0, 0.8)), "anything under 60 m casts as before");
+        assert!(!casts(&part(20.0, 0.2, 1.0)), "a flat sheet never");
+        assert!(!part_casts_vertices(&part(80.0, 34.0, 0.02), 1.0, crate::SceneryCasters::Radius(60.0)), "the radius rule of before");
+        assert!(!part_casts_vertices(&[], 1.0, crate::SceneryCasters::Shape));
+        let small = crate::SceneryCasters::Small { radius: 15.0, height: 8.0 };
+        assert!(part_casts_vertices(&part(1.0, 2.0, 0.0), 1.0, small), "a sign");
+        assert!(part_casts_vertices(&part(12.0, 3.0, 0.0), 1.0, small), "a roadside wall");
+        assert!(!part_casts_vertices(&part(12.0, 20.0, 0.4), 1.0, small), "a cliff chunk (too tall)");
+        assert!(!part_casts_vertices(&part(40.0, 3.0, 0.0), 1.0, small), "a long gorge wall (too broad)");
     }
 
     /// SHADOW-REFACTOR: the mode a set of lights and switches gives, in the lights' order (the sun, the data sun, E50), as the
     /// flags of before decided it.
     #[test]
     fn the_shadow_mode_follows_the_lights_and_switches() {
-        use crate::{DataSun, Enhancements, ShadowLights, SunShadow, E50, E51};
+        use crate::{DataSun, Enhancements, SceneryCasters, ShadowLights, SunShadow, E50, E51};
         let s = SunShadow::race(Vec3::new(0.3, -0.8, 0.2));
         let mut e = Enhancements::ORIGINAL;
         let pick = |l: &ShadowLights, e: &Enhancements| ShadowMode::pick(l, e).map(|(_, m)| m);
-        let sun = ShadowLights { sun: Some(s), data_sun: Some(DataSun { light: s, scenery_radius: None }), ..ShadowLights::NONE };
-        assert_eq!(pick(&sun, &e), Some(ShadowMode::Sun { caster_radius: MAX_CASTER_RADIUS }));
-        let cars = DataSun { light: s, scenery_radius: None };
+        let sun = ShadowLights { sun: Some(s), data_sun: Some(DataSun { light: s, scenery: None, baked_gate: crate::BakedGate::Absolute }), ..ShadowLights::NONE };
+        assert_eq!(pick(&sun, &e), Some(ShadowMode::Sun { casters: SceneryCasters::Shape, baked_gate: crate::BakedGate::Absolute }));
+        let cars = DataSun { light: s, scenery: None, baked_gate: crate::BakedGate::Absolute };
         let sunless = ShadowLights { data_sun: Some(cars), ..ShadowLights::NONE };
         // E51 off: nothing; E51: the cars-only frame
         assert_eq!(pick(&sunless, &e), None);
         e.set_level(E51, 1);
-        assert_eq!(pick(&sunless, &e), Some(ShadowMode::CarsOnly));
-        // SUN-FULL does not need E51 on; its radius is held to E9's own limit
+        assert_eq!(pick(&sunless, &e), Some(ShadowMode::CarsOnly { small: None }));
+        // CANYON-SMALLSH: the small parts ride on the cars-only frame (E51 on); with E51 off the frame is not drawn
+        let small = SceneryCasters::Small { radius: 15.0, height: 8.0 };
+        let with_small = ShadowLights { data_sun: Some(DataSun { light: s, scenery: Some(small), baked_gate: crate::BakedGate::Relative }), ..ShadowLights::NONE };
+        assert_eq!(pick(&with_small, &e), Some(ShadowMode::CarsOnly { small: Some(small) }));
         e.set_level(E51, 0);
-        let full = ShadowLights { data_sun: Some(DataSun { light: s, scenery_radius: Some(90.0) }), ..ShadowLights::NONE };
-        assert_eq!(pick(&full, &e), Some(ShadowMode::Sun { caster_radius: MAX_CASTER_RADIUS }));
-        let full = ShadowLights { data_sun: Some(DataSun { light: s, scenery_radius: Some(15.0) }), ..ShadowLights::NONE };
-        assert_eq!(pick(&full, &e), Some(ShadowMode::Sun { caster_radius: 15.0 }));
+        assert_eq!(pick(&with_small, &e), None);
+        e.set_level(E51, 1);
+        assert_eq!(ShadowMode::CarsOnly { small: Some(small) }.params(100.0), ShadowMode::CarsOnly { small: None }.params(100.0), "the cars' shadow's strength and gate are the cars-only frame's");
+        assert!(!ShadowMode::CarsOnly { small: Some(small) }.decal_fades());
+        // SUN-FULL does not need E51 on; its casters' rule rides along (SHADOW-UNIFY: the shape rule; a radius only by test glue)
+        e.set_level(E51, 0);
+        let full = ShadowLights { data_sun: Some(DataSun { light: s, scenery: Some(SceneryCasters::Shape), baked_gate: crate::BakedGate::Absolute }), ..ShadowLights::NONE };
+        assert_eq!(pick(&full, &e), Some(ShadowMode::Sun { casters: SceneryCasters::Shape, baked_gate: crate::BakedGate::Absolute }));
+        let full = ShadowLights { data_sun: Some(DataSun { light: s, scenery: Some(SceneryCasters::Radius(15.0)), baked_gate: crate::BakedGate::Absolute }), ..ShadowLights::NONE };
+        assert_eq!(pick(&full, &e), Some(ShadowMode::Sun { casters: SceneryCasters::Radius(15.0), baked_gate: crate::BakedGate::Absolute }));
+        // FOREST-TREESH: the gate's switch rides along and reaches the shader's params
+        let ungated = ShadowLights { data_sun: Some(DataSun { light: s, scenery: Some(SceneryCasters::Shape), baked_gate: crate::BakedGate::Off }), ..ShadowLights::NONE };
+        let m = pick(&ungated, &e).unwrap();
+        assert_eq!(m, ShadowMode::Sun { casters: SceneryCasters::Shape, baked_gate: crate::BakedGate::Off });
+        assert_eq!(m.params(100.0)[2], GATE_OFF);
+        assert_eq!(ShadowMode::Sun { casters: SceneryCasters::Shape, baked_gate: crate::BakedGate::Absolute }.params(100.0)[2], 0.0);
+        // GATE-REL: the relative gate with the track's bake light; without one it is the absolute gate
+        let rel = DataSun { light: s, scenery: Some(SceneryCasters::Shape), baked_gate: crate::BakedGate::Relative };
+        let bake = crate::BakeLight { to_light: Vec3::Y, base: 0.3, gain: 0.3, ground: 1.5 };
+        let m = pick(&ShadowLights { data_sun: Some(rel), bake: Some(bake), ..ShadowLights::NONE }, &e).unwrap();
+        assert_eq!(m, ShadowMode::Sun { casters: SceneryCasters::Shape, baked_gate: crate::BakedGate::Relative });
+        assert_eq!(m.params(100.0)[2], GATE_REL);
+        let m = pick(&ShadowLights { data_sun: Some(rel), ..ShadowLights::NONE }, &e).unwrap();
+        assert_eq!(m, ShadowMode::Sun { casters: SceneryCasters::Shape, baked_gate: crate::BakedGate::Absolute });
+        let u = bake_uniform(Some(&bake));
+        assert_eq!(u[1][..2], [0.3, 1.5 * GATE_REL_GROUND_SCALE]);
+        assert_eq!(u[2][1], 1.0, "the cap mode by default");
         // the moon at E50's level
         let night = ShadowLights { moon: Some(s), ..ShadowLights::NONE };
         assert_eq!(pick(&night, &e), None);
@@ -825,7 +1062,7 @@ mod tests {
         e.set_level(E50, 2);
         assert_eq!(pick(&ShadowLights { moon_level_cap: Some(0), ..night }, &e), None);
         // which modes fade the decals and take the car's patch
-        let modes = [ShadowMode::Sun { caster_radius: 1.0 }, ShadowMode::CarsOnly, ShadowMode::Moon { level: 1 }];
+        let modes = [ShadowMode::Sun { casters: SceneryCasters::Radius(1.0), baked_gate: crate::BakedGate::Absolute }, ShadowMode::CarsOnly { small: None }, ShadowMode::Moon { level: 1 }];
         assert_eq!(modes.map(|m| m.decal_fades()), [true, false, false]);
         assert_eq!(modes.map(|m| m.takes_car_patch()), [true, true, false]);
         // SHADOW-OVERCAST: the precipitation weakens the sun's and the data sun's shadows, not the moon's

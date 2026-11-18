@@ -47,7 +47,7 @@ impl RenderOptions {
             car_detail: app.car_detail(),
             sky_level: app.sky_level(),
             sky_off: app.sky_off(),
-            dusk_lamps: super::street_lamps::dusk_lamps(&app.track.name),
+            dusk_lamps: super::street_lamps::dusk_lamps(&app.track.name, app.world.as_ref()),
         }
     }
 }
@@ -519,14 +519,16 @@ impl App {
         let precipitation = self.shadow_precipitation();
         if sky_sun {
             // ENHANCEMENT E9: the sun the cars are lit with (`-SkyBin::sun_position`, 0x43AC8D; `TrackWorld::sun_direction`)
-            return nfs_renderer::ShadowLights { sun: Some(light(w.sun_direction)), precipitation, ..nfs_renderer::ShadowLights::NONE };
+            return nfs_renderer::ShadowLights { sun: Some(light(w.sun_direction)), precipitation, bake: w.bake_light, ..nfs_renderer::ShadowLights::NONE };
         }
         nfs_renderer::ShadowLights {
             // ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL) / E9 (SUN-FULL): its data's sun (`nfs_game::data_sun`): the cars' own shadow
             // along it, or on the tracks so chosen E9's full frame (the scenery casts too: a vertex bake has no shade of the signs,
             // posts, trees); the cars' shading stays the original's. A track whose data gives no sun (foothills, autobahn since
             // SHADOW-OVERCAST) has none: nothing else stands in for it
-            data_sun: w.data_sun.map(|d| nfs_renderer::DataSun { light: light(d.direction), scenery_radius: d.scenery_radius }),
+            data_sun: w.data_sun.map(|d| nfs_renderer::DataSun { light: light(d.direction), scenery: d.scenery, baked_gate: d.baked_gate }),
+            // ENHANCEMENT E9 (GATE-REL): the bake's light for the relative gate
+            bake: w.bake_light,
             precipitation,
             ..nfs_renderer::ShadowLights::NONE
         }

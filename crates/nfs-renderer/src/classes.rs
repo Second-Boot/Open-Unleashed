@@ -29,6 +29,11 @@ pub(crate) const RECV_CAR: f32 = 1.0;
 pub(crate) const RECV_TRACK: f32 = 2.0;
 /// `lit_d.w` only, ENHANCEMENT ENH-DBLSH: a track `sh80` decal under a caster (the shader fades it out with the shadow)
 pub(crate) const RECV_DECAL: f32 = 3.0;
+/// ENHANCEMENT E9 (GATE-REL): added to `lit_d.w`'s [`RECV_TRACK`] for a drivable-ground item (it receives and does not cast): the
+/// relative gate takes the ground's own lit level there. The class tests compare with half steps, so the mark leaves them alone.
+pub(crate) const RECV_GROUND_MARK: f32 = 0.25;
+/// ENHANCEMENT E9 (GATE-REL): the least lit level the relative gate divides by.
+pub(crate) const MIN_BAKE_LIT: f32 = 0.05;
 
 /// `ObjectUniform::soft.w` — ENHANCEMENT ENH-TEMPORAL: the item's role for the masks: an opaque-like item.
 pub(crate) const ROLE_OPAQUE: f32 = 0.0;
@@ -98,6 +103,8 @@ pub(crate) const WGSL: &[(&str, f32)] = &[
     ("RECV_CAR", RECV_CAR),
     ("RECV_TRACK", RECV_TRACK),
     ("RECV_DECAL", RECV_DECAL),
+    ("RECV_GROUND_MARK", RECV_GROUND_MARK),
+    ("MIN_BAKE_LIT", MIN_BAKE_LIT),
     ("ROLE_OPAQUE", ROLE_OPAQUE),
     ("ROLE_EFFECT", ROLE_EFFECT),
     ("ROLE_SKY", ROLE_SKY),
