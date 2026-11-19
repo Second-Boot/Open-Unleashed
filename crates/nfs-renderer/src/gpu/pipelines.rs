@@ -1,5 +1,5 @@
 //! The mesh pipelines: the sets keyed by sample count / float scene / temporal view (`ensure_pipelines`, `HDR_KEY`,
-//! `TEMPORAL_KEY`) and `build_mesh_pipelines` with the original's Thrash state tables. Moved out of gpu.rs as it was.
+//! `TEMPORAL_KEY`) and `build_mesh_pipelines` with the original's Thrash state tables.
 
 use super::*;
 
@@ -101,10 +101,36 @@ impl PipelineKey {
         self.group.slot(multisampled) * PER_GROUP + self.cull as usize * 2 + !self.depth_test as usize
     }
 
+    /// The build parameters of this key's pipeline.
+    fn spec(self) -> MeshPipeSpec {
+        let (blend, pair, zwrite, a2c, layers, solid) = match self.group {
+            Group::Opaque => (false, 0, false, false, false, false),
+            Group::Blend { pair, zwrite } => (true, pair, zwrite, false, false, false),
+            Group::AlphaToCoverage => (false, 0, false, true, false, false),
+            Group::Layered { zwrite } => (true, 0, zwrite, false, true, false),
+            Group::Solid => (false, 0, false, false, false, true),
+        };
+        MeshPipeSpec { blend, pair, cull: self.cull.face(), depth: self.depth_test, zwrite, a2c, layers, solid }
+    }
+
     /// Every key of a set, in index order.
     fn set(multisampled: bool) -> impl Iterator<Item = PipelineKey> {
         Group::all(multisampled).flat_map(|group| Cull::ALL.into_iter().flat_map(move |cull| [true, false].map(|depth_test| PipelineKey { group, cull, depth_test })))
     }
+}
+
+/// One mesh pipeline's build parameters, from its [`PipelineKey`] ([`PipelineKey::spec`]): blending (`pair`: Thrash state 0x38's
+/// blend pair), culling, the depth test and write, alpha-to-coverage, the layered shader, E1's solid shader.
+#[derive(Clone, Copy)]
+struct MeshPipeSpec {
+    blend: bool,
+    pair: u8,
+    cull: Option<wgpu::Face>,
+    depth: bool,
+    zwrite: bool,
+    a2c: bool,
+    layers: bool,
+    solid: bool,
 }
 
 /// The mesh pipelines (54: blend group × cull × depth, [`PipelineKey`]; with `samples > 1` six more, the alpha-to-coverage
@@ -129,7 +155,8 @@ fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, p
         let c = wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: wgpu::BlendOperation::Add };
         wgpu::BlendState { color: c, alpha: c }
     };
-    let make_pipeline = |blend: bool, pair: u8, cull: Option<wgpu::Face>, depth: bool, zwrite: bool, a2c: bool, layers: bool, solid: bool| {
+    let make_pipeline = |spec: &MeshPipeSpec| {
+        let MeshPipeSpec { blend, pair, cull, depth, zwrite, a2c, layers, solid } = *spec;
         // ENHANCEMENT ENH-TEMPORAL: next to the colour, the motion vector (replaced by an opaque or depth-writing draw;
         // a translucent one keeps the surface behind it, but for a sky layer, which its `.w` lets through), the reactive
         // mask and the transparency-and-composition mask (replaced by an opaque draw, the larger value kept by a
@@ -164,9 +191,9 @@ fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, p
         let pair_const = [("PAIR", pair as f64)];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mesh pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
@@ -176,7 +203,7 @@ fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, p
                 })],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: shader,
                 entry_point: Some(match (temporal, blend) {
                     (true, true) if layers => "fs_layers_t",
                     (false, true) if layers => "fs_layers",
@@ -221,19 +248,8 @@ fn build_mesh_pipelines_on(device: &wgpu::Device, shader: &wgpu::ShaderModule, p
         })
     };
     // (the pipelines compile independently: built on worker threads, kept in the set's order)
-    let specs: Vec<_> = PipelineKey::set(samples > 1)
-        .map(|k| {
-            let (blend, pair, zwrite, a2c, layers, solid) = match k.group {
-                Group::Opaque => (false, 0, false, false, false, false),
-                Group::Blend { pair, zwrite } => (true, pair, zwrite, false, false, false),
-                Group::AlphaToCoverage => (false, 0, false, true, false, false),
-                Group::Layered { zwrite } => (true, 0, zwrite, false, true, false),
-                Group::Solid => (false, 0, false, false, false, true),
-            };
-            (blend, pair, k.cull.face(), k.depth_test, zwrite, a2c, layers, solid)
-        })
-        .collect();
-    super::kit::par_build_on(&specs, workers, |&(blend, pair, cull, depth, zwrite, a2c, layers, solid)| make_pipeline(blend, pair, cull, depth, zwrite, a2c, layers, solid))
+    let specs: Vec<MeshPipeSpec> = PipelineKey::set(samples > 1).map(PipelineKey::spec).collect();
+    super::kit::par_build_on(&specs, workers, |spec| make_pipeline(spec))
 }
 
 
@@ -437,12 +453,12 @@ impl Core {
         self.take_built_sets();
         // PERF (PERF-B): the shader has only the parts the switches can run, less those the mirror's pass never runs (its own set)
         let mut fam = crate::classes::mesh_features(&self.enhancements);
-        if self.no_reflections {
+        if self.modes.no_reflections {
             fam &= !crate::classes::feat::NOT_IN_MIRROR;
         }
         let spec = |feats: u32| SetSpec { feats, samples, hdr, temporal };
         let full = spec(fam);
-        if !self.pipeline_sets.contains_key(&full.key()) {
+        if !self.pipes.sets.contains_key(&full.key()) {
             self.wait_or_build(full);
             self.prewarm_family(full, shut, PREWARM_DEPTH);
         }
@@ -453,79 +469,79 @@ impl Core {
         let mut chosen = [0u64; 4];
         for (v, c) in chosen.iter_mut().enumerate() {
             let want = spec(variant_feats(feats, v));
-            if self.exact_sets && !self.pipeline_sets.contains_key(&want.key()) {
+            if self.pipes.exact && !self.pipes.sets.contains_key(&want.key()) {
                 self.queue_set(want, true);
                 self.wait_or_build(want);
             }
-            *c = if self.pipeline_sets.contains_key(&want.key()) {
+            *c = if self.pipes.sets.contains_key(&want.key()) {
                 want.key()
             } else {
                 self.queue_set(want, true);
-                superset_of(self.pipeline_sets.keys().copied(), want, fam).unwrap_or(full.key())
+                superset_of(self.pipes.sets.keys().copied(), want, fam).unwrap_or(full.key())
             };
         }
-        if chosen == self.pipeline_cur {
+        if chosen == self.pipes.cur {
             return;
         }
         let mut var_set = [0u8; 4];
         for v in 0..4 {
             var_set[v] = (0..v).find(|&u| chosen[u] == chosen[v]).map_or(v as u8, |u| var_set[u]);
         }
-        self.pipelines = self.pipeline_sets[&chosen[0]].clone();
-        self.multisampled_set = samples > 1;
+        self.pipes.pipelines = self.pipes.sets[&chosen[0]].clone();
+        self.pipes.multisampled = samples > 1;
         for v in 1..4 {
-            self.pipeline_vars[v - 1] = if var_set[v] as usize == v { self.pipeline_sets[&chosen[v]].clone() } else { Vec::new() };
+            self.pipes.vars[v - 1] = if var_set[v] as usize == v { self.pipes.sets[&chosen[v]].clone() } else { Vec::new() };
         }
-        self.var_set = var_set;
-        self.pipeline_cur = chosen;
+        self.pipes.var_set = var_set;
+        self.pipes.cur = chosen;
     }
 
     /// PERF (PERF-D): take in the sets the builder thread has finished.
     fn take_built_sets(&mut self) {
-        while let Ok(b) = self.set_builder.rx.try_recv() {
+        while let Ok(b) = self.pipes.builder.rx.try_recv() {
             self.keep_built(b);
         }
     }
 
     fn keep_built(&mut self, b: BuiltSet) {
         let key = b.spec.key();
-        self.set_builder.queued.remove(&key);
+        self.pipes.builder.queued.remove(&key);
         if b.spec.feats != 0 {
-            self.mesh_shaders.entry(b.spec.feats).or_insert(b.module);
+            self.pipes.shaders.entry(b.spec.feats).or_insert(b.module);
         }
         tracing::info!(samples = b.spec.samples, hdr = b.spec.hdr, temporal = b.spec.temporal, parts = format_args!("{:#06x}", b.spec.feats), ms = b.ms, "mesh pipeline set built (builder thread)");
-        self.pipeline_sets.entry(key).or_insert(b.set);
+        self.pipes.sets.entry(key).or_insert(b.set);
     }
 
     /// PERF (PERF-D): the set `spec` now: waited for when it is queued (moved to the front), else built in the frame.
     fn wait_or_build(&mut self, spec: SetSpec) {
         let key = spec.key();
-        if self.pipeline_sets.contains_key(&key) {
+        if self.pipes.sets.contains_key(&key) {
             return;
         }
         let t0 = std::time::Instant::now();
-        if self.set_builder.queued.contains(&key) {
-            self.set_builder.promote(key);
-            while !self.pipeline_sets.contains_key(&key) {
-                match self.set_builder.rx.recv() {
+        if self.pipes.builder.queued.contains(&key) {
+            self.pipes.builder.promote(key);
+            while !self.pipes.sets.contains_key(&key) {
+                match self.pipes.builder.rx.recv() {
                     Ok(b) => self.keep_built(b),
                     Err(_) => break,
                 }
             }
-            if self.pipeline_sets.contains_key(&key) {
+            if self.pipes.sets.contains_key(&key) {
                 tracing::info!(parts = format_args!("{:#06x}", spec.feats), ms = crate::prof::elapsed_ms(t0) as f32, "mesh pipeline set waited for");
                 return;
             }
         }
-        if spec.feats != 0 && !self.mesh_shaders.contains_key(&spec.feats) {
+        if spec.feats != 0 && !self.pipes.shaders.contains_key(&spec.feats) {
             let module = crate::gfx::wgsl_module(&self.device, "mesh shader (parts)", &crate::classes::mesh_shader_source(spec.feats));
-            self.mesh_shaders.insert(spec.feats, module);
+            self.pipes.shaders.insert(spec.feats, module);
         }
-        let shader = if spec.feats != 0 { &self.mesh_shaders[&spec.feats] } else { &self.mesh_shader };
+        let shader = if spec.feats != 0 { &self.pipes.shaders[&spec.feats] } else { &self.pipes.shader };
         let (layout, format) = self.set_target(spec);
         let set = build_mesh_pipelines(&self.device, shader, &layout, format, spec.samples, spec.temporal);
         tracing::info!(samples = spec.samples, hdr = spec.hdr, temporal = spec.temporal, parts = format_args!("{:#06x}", spec.feats), ms = crate::prof::elapsed_ms(t0) as f32, "mesh pipeline set built (in the frame)");
-        self.pipeline_sets.insert(key, set);
+        self.pipes.sets.insert(key, set);
     }
 
     /// The layout and colour format of a set: the temporal set's object layout has the matrices and its vector / mask targets
@@ -534,7 +550,7 @@ impl Core {
         if spec.temporal {
             (self.temporal_gpu.as_ref().expect("temporal gpu").pipeline_layout.clone(), HDR_FORMAT)
         } else {
-            (self.mesh_layout.clone(), if spec.hdr { HDR_FORMAT } else { self.config.format })
+            (self.layouts.mesh.clone(), if spec.hdr { HDR_FORMAT } else { self.config.format })
         }
     }
 
@@ -542,16 +558,16 @@ impl Core {
     /// front of the queue; else a prewarm — to the back).
     fn queue_set(&mut self, spec: SetSpec, need: bool) {
         let key = spec.key();
-        if self.pipeline_sets.contains_key(&key) || (spec.temporal && self.temporal_gpu.is_none()) {
+        if self.pipes.sets.contains_key(&key) || (spec.temporal && self.temporal_gpu.is_none()) {
             return;
         }
-        if self.set_builder.queued.contains(&key) {
+        if self.pipes.builder.queued.contains(&key) {
             if need {
-                self.set_builder.promote(key);
+                self.pipes.builder.promote(key);
             }
             return;
         }
-        if !self.set_builder.running() {
+        if !self.pipes.builder.running() {
             // no thread: a wanted set is built now (the frame draws its stand-in until the next), a prewarm is dropped
             if need {
                 self.wait_or_build(spec);
@@ -559,8 +575,8 @@ impl Core {
             return;
         }
         let (layout, format) = self.set_target(spec);
-        let module = if spec.feats == 0 { Some(self.mesh_shader.clone()) } else { self.mesh_shaders.get(&spec.feats).cloned() };
-        self.set_builder.push(SetJob { spec, device: self.device.clone(), module, layout, format, need }, need);
+        let module = if spec.feats == 0 { Some(self.pipes.shader.clone()) } else { self.pipes.shaders.get(&spec.feats).cloned() };
+        self.pipes.builder.push(SetJob { spec, device: self.device.clone(), module, layout, format, need }, need);
     }
 
     /// PERF (PERF-D): queue (at the back) the sets of the family whose whole set is `full` for the light states at most `depth`

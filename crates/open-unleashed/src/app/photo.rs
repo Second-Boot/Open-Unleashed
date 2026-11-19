@@ -326,7 +326,7 @@ impl App {
 
     /// Whether the window is the render target a still is sized from.
     fn photo_base_size(&self) -> Option<(u32, u32)> {
-        if self.screenshot.is_some() || self.photo.scripted {
+        if self.glue.screenshot.is_some() || self.photo.scripted {
             let g = shot_geometry();
             return Some((g.0, g.1));
         }
@@ -342,7 +342,7 @@ impl App {
             dialog: self.replay_save.up || self.replay_save.overwrite || self.net_notice.is_some(),
             replay_playing: self.playback_running(),
             paused: self.paused,
-            quit_question: self.pause_confirm.is_some(),
+            quit_question: self.hud_state.pause_confirm.is_some(),
         })
     }
 
@@ -355,7 +355,7 @@ impl App {
     /// PORT-DEVIATION D46: how many buttons the pause menu has — `HPauseMenu`'s three (0x42A440), plus the photo-mode
     /// item when photo mode can be entered from the menu (not in a network race).
     pub(crate) fn pause_items(&self) -> usize {
-        if self.paused && self.pause_confirm.is_none() && self.photo_entry() == Some(PhotoEntry::Pause) { 4 } else { 3 }
+        if self.paused && self.hud_state.pause_confirm.is_none() && self.photo_entry() == Some(PhotoEntry::Pause) { 4 } else { 3 }
     }
 
     /// The pause menu's photo-mode button caption (the port's own string).
@@ -461,8 +461,8 @@ impl App {
                 }
                 "pause" => {
                     self.paused = true;
-                    self.pause_sel = 0;
-                    self.pause_confirm = None;
+                    self.hud_state.pause_sel = 0;
+                    self.hud_state.pause_confirm = None;
                     None
                 }
                 // TEST GLUE (PORT-DEVIATION D64): the replay-save dialog and its overwrite question up, for stills
@@ -478,8 +478,8 @@ impl App {
                     let mission = self.mission_outcome();
                     self.results = Some(RaceResults { racers, order, clean: [true; 8], mission, opened: 0, congrats: true });
                     self.mission_result = Some((false, None));
-                    self.pages.open_tick = Some(0);
-                    self.pages.seen = Some(0);
+                    self.hud_state.pages.open_tick = Some(0);
+                    self.hud_state.pages.seen = Some(0);
                     // a drawn frame opens the billboard and types the text a step each: stand-ins for them
                     for _ in 0..60 {
                         self.rebuild_scene();
@@ -543,9 +543,9 @@ impl App {
                 photo = self.photo.active,
                 paused = self.paused,
                 items = self.pause_items(),
-                sel = self.pause_sel,
-                map = self.hud_keys.map,
-                mapscale = self.hud_keys.mapscale,
+                sel = self.hud_state.pause_sel,
+                map = self.hud_state.hud_keys.map,
+                mapscale = self.hud_state.hud_keys.mapscale,
                 view_distance = self.view_distance,
                 horizon = self.sky.as_ref().map(|s| s.horizon()),
                 enh_view = self.enh_stash.is_some(),
@@ -847,7 +847,7 @@ impl App {
         self.photo.shots += 1;
         let name = format!("PorscheUnleashed_{}_{}_{}x_{}.png", file_safe(&self.track.name), utc_stamp(secs), scale, self.photo.shots);
         let path = dir.join(&name);
-        let sync = self.screenshot.is_some() || self.photo.scripted;
+        let sync = self.glue.screenshot.is_some() || self.photo.scripted;
         let toast = format!("{}: {} ({}x{})", self.photo_text(S_SAVED), name, w, h);
         let write = move || {
             // RGB: the frame's alpha is not an image's

@@ -333,8 +333,7 @@ struct Image {
 
 impl Image {
     fn open() -> Option<Self> {
-        let home = std::env::var_os("HOME")?;
-        let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/nfs5.exe");
+        let p = nfs_devdata::dev_game_root()?.join("nfs5.exe");
         let bytes = std::fs::read(p).ok()?;
         let u16at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize;
         let u32at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);

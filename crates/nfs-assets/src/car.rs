@@ -47,6 +47,12 @@ impl GlobalPack {
         }
     }
 
+    /// The file name without its extension (`INTGLASS`): the `<file>` of the pack key `carglobal/<file>/<entry>`.
+    fn stem(self) -> &'static str {
+        let n = self.file_name();
+        n.rsplit_once('.').map_or(n, |s| s.0)
+    }
+
     /// The two packs with alpha content (the wheel shadows', the interior glass): their pages keep
     /// the alpha and are blended.
     fn keeps_alpha(self) -> bool {
@@ -711,7 +717,7 @@ impl CarAssets {
             let file_tint = det.get_i64("tint").unwrap_or(1) != 0;
             let (moffx, moffy) = (det.get_i64("mirroroffsetx").unwrap_or(0), det.get_i64("mirroroffsety").unwrap_or(0));
             // ENHANCEMENT E41: which pack the entries' keys name (`hdpack` docs)
-            let global_name = det.get_i64("global").and_then(GlobalPack::from_key).map(GlobalPack::file_name);
+            let global_pack = det.get_i64("global").and_then(GlobalPack::from_key);
             // source SHPI bytes
             let data: &[u8] = if let Some(g) = det.get_i64("global") {
                 let Some(pack) = GlobalPack::from_key(g) else { continue };
@@ -784,11 +790,8 @@ impl CarAssets {
                 // flag here and the page text below
                 let lower_sec = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase()));
                 let bl = lower_sec.and_then(|s| s.get_i64("tint")).map_or(file_tint, |t| t != 0);
-                let path = match fmt {
-                    nfs_formats::fsh::PixelFormat::Indexed8 if bl => BlitPath::Palette,
-                    nfs_formats::fsh::PixelFormat::Argb8888 if bl && (page_fmt == page_bpp::ARGB8888 || page_fmt == page_bpp::ARGB1555) => BlitPath::Texel,
-                    _ => BlitPath::Blitter,
-                };
+                let class = classify_entry(fmt, page_fmt, bl, lower_sec);
+                let path = class.path;
                 // the palette path reads its palette as 0x444130 does — the block 0x537FB0 finds,
                 // taken as 255 raw dwords whatever its format — tints it, not the texels, and never
                 // writes its last entry (`palette_path_texels`)
@@ -813,12 +816,11 @@ impl CarAssets {
                 // page text (the plate, the race number: drawn at the original size over the finished texels) nor for
                 // a tinted palette entry on a 565 page (the original's writer leaves the page as it was there)
                 let hd_img = hd_state.as_ref().and_then(|st| {
-                    let has_text = text_page.is_some_and(|(_, sec)| ["license", "racedecal", "flyer"].iter().any(|k| sec.get_i64(k).unwrap_or(0) != 0));
-                    if has_text || (page_fmt == page_bpp::RGB565 && path == BlitPath::Palette) {
+                    if (text_page.is_some() && class.has_text) || class.palette_on_565 {
                         return None;
                     }
-                    let key = match global_name {
-                        Some(n) => crate::hdpack::key_car_global(n.rsplit_once('.').map_or(n, |s| s.0), &ename),
+                    let key = match global_pack {
+                        Some(g) => crate::hdpack::key_car_global(g.stem(), &ename),
                         None => crate::hdpack::key_car(&self.model, file_no, &ename),
                     };
                     if !st.pack.has(&key) {
@@ -1116,6 +1118,45 @@ fn page_text_draw(page: &mut TexturePage, paths: &GamePaths, font_file: &str, te
     }
 }
 
+/// The keys of an entry's `[file<n>.<name>]` section that make the page builder draw text over it (the plate, the race number,
+/// the flyer): such an entry is never replaced by an HD image.
+const PAGE_TEXT_KEYS: [&str; 3] = ["license", "racedecal", "flyer"];
+
+/// Whether an entry's section carries page text ([`PAGE_TEXT_KEYS`]).
+fn section_has_text(sec: Option<&nfs_formats::ini::IniSection>) -> bool {
+    sec.is_some_and(|s| PAGE_TEXT_KEYS.iter().any(|k| s.get_i64(k).unwrap_or(0) != 0))
+}
+
+/// What the page builder decides about one entry, from its source format, its page's `bpp`, its tint flag `bl` and its section: the
+/// single place the page builder (`build_pages_hd`), the exporter's entry list (`car_entries`) and the HD eligibility share.
+#[derive(Debug, Clone, Copy)]
+struct EntryClass {
+    /// the path the builder sends the entry down
+    path: BlitPath,
+    /// the paint-slot rule runs on it (a palette or texel path)
+    tinted: bool,
+    /// its section carries page text
+    has_text: bool,
+    /// a tinted palette entry on a 565 page: the original writes nothing there, so an HD image has nothing to replace
+    palette_on_565: bool,
+}
+
+impl EntryClass {
+    /// Whether the exporter puts the entry in the pack: no page text, and not a tinted palette entry on a 565 page.
+    fn hd_eligible(&self) -> bool {
+        !self.has_text && !self.palette_on_565
+    }
+}
+
+fn classify_entry(fmt: nfs_formats::fsh::PixelFormat, page_fmt: i64, bl: bool, sec: Option<&nfs_formats::ini::IniSection>) -> EntryClass {
+    let path = match fmt {
+        nfs_formats::fsh::PixelFormat::Indexed8 if bl => BlitPath::Palette,
+        nfs_formats::fsh::PixelFormat::Argb8888 if bl && (page_fmt == page_bpp::ARGB8888 || page_fmt == page_bpp::ARGB1555) => BlitPath::Texel,
+        _ => BlitPath::Blitter,
+    };
+    EntryClass { path, tinted: path != BlitPath::Blitter, has_text: section_has_text(sec), palette_on_565: page_fmt == page_bpp::RGB565 && path == BlitPath::Palette }
+}
+
 /// Which of the page builder's paths an entry takes (`RE/notes/car-model.md` §5.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlitPath {
@@ -1330,6 +1371,8 @@ pub struct CarEntryInfo {
     pub tinted: bool,
     /// the entry carries page text (`license` / `racedecal` / `flyer`): drawn at the original size, never replaced
     pub has_text: bool,
+    /// the exporter puts it in the pack (no page text, not a tinted palette entry on a 565 page)
+    pub hd_eligible: bool,
     /// the 1-based `.tpg` page the entry is blitted onto, and that page's `bpp`
     pub page: usize,
     pub page_bpp: i64,
@@ -1341,7 +1384,6 @@ impl CarAssets {
     /// Every entry of every `.tpg` file of this car (the embedded `sf` packs and the global packs), in file
     /// order, with the classification the page builder gives it. Not filtered by the style: the superset.
     pub fn car_entries(&self, paths: &GamePaths) -> Result<Vec<CarEntryInfo>, AssetError> {
-        const GLOBALS: [&str; 5] = ["Shadow.fsh", "INTGLASS.FSH", "Suit.fsh", "Head.fsh", "Cabrio.fsh"];
         let crp_path = paths.car_model_dir().join(format!("{}.crp", self.model));
         let hdr = self.tpg.section("header");
         let numfiles = hdr.and_then(|h| h.get_i64("numfiles")).unwrap_or(0) as usize;
@@ -1355,11 +1397,12 @@ impl CarAssets {
             let page_bpp = page_d.and_then(|d| d.get_i64("bpp")).unwrap_or(1555);
             let blended_page = page_d.and_then(|d| d.get_i64("window")).unwrap_or(0) == 1;
             let owned: Vec<u8>;
-            let (data, global_name, container): (&[u8], Option<&str>, String) = if let Some(g) = det.get_i64("global") {
-                let Some(name) = GLOBALS.get((g as usize).wrapping_sub(1)).copied() else { continue };
+            let (data, global_pack, container): (&[u8], Option<GlobalPack>, String) = if let Some(g) = det.get_i64("global") {
+                let Some(pack) = GlobalPack::from_key(g) else { continue };
+                let name = pack.file_name();
                 let Some(p) = GamePaths::find_file(&paths.car_model_dir(), name) else { continue };
                 owned = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
-                (&owned, Some(name), format!("CarModel/{name}"))
+                (&owned, Some(pack), format!("CarModel/{name}"))
             } else {
                 match sf_indices.iter().position(|&i| i as usize + 1 == file_no) {
                     Some(k) => (embedded[k], None, format!("CarModel/{}.crp#sf{k}", self.model)),
@@ -1374,15 +1417,14 @@ impl CarAssets {
                 let Some(fmt) = nfs_formats::fsh::PixelFormat::from_code(b.format_code()) else { continue };
                 let sec = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase()));
                 let bl = sec.and_then(|s| s.get_i64("tint")).map_or(file_tint, |t| t != 0);
-                // `BlitPath::Palette` / `BlitPath::Texel` of `build_pages_hd`
-                let tinted = bl && (fmt == nfs_formats::fsh::PixelFormat::Indexed8 || (fmt == nfs_formats::fsh::PixelFormat::Argb8888 && (page_bpp == 32 || page_bpp == 1555)));
-                let has_text = sec.is_some_and(|s| ["license", "racedecal", "flyer"].iter().any(|k| s.get_i64(k).unwrap_or(0) != 0));
+                // the page builder's own classification (`BlitPath::Palette` / `Texel` = tinted)
+                let class = classify_entry(fmt, page_bpp, bl, sec);
                 let Ok(img) = fsh.decode(data, ei) else { continue };
-                let key = match global_name {
-                    Some(n) => crate::hdpack::key_car_global(n.rsplit_once('.').map_or(n, |s| s.0), &ename),
+                let key = match global_pack {
+                    Some(g) => crate::hdpack::key_car_global(g.stem(), &ename),
                     None => crate::hdpack::key_car(&self.model, file_no, &ename),
                 };
-                out.push(CarEntryInfo { key, container: container.clone(), entry: ename, width: img.width, height: img.height, format: format!("{fmt:?}"), rgba: img.rgba, tinted, has_text, page: tpage.max(0) as usize, page_bpp, blended_page });
+                out.push(CarEntryInfo { key, container: container.clone(), entry: ename, width: img.width, height: img.height, format: format!("{fmt:?}"), rgba: img.rgba, tinted: class.tinted, has_text: class.has_text, hd_eligible: class.hd_eligible(), page: tpage.max(0) as usize, page_bpp, blended_page });
             }
         }
         Ok(out)

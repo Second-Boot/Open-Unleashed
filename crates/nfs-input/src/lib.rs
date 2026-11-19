@@ -749,8 +749,7 @@ mod tests {
     /// of 0x40 counted as held and jumped to full lock. A key or a `press` still gives 255.
     #[test]
     fn a_bound_stick_steers_in_proportion() {
-        let mut st = InputState::default();
-        st.axis_bands = [[0, 0x80]; 8];
+        let mut st = InputState { axis_bands: [[0, 0x80]; 8], ..Default::default() };
         st.bindings.by_id.insert(bindings::id::C1_LEFT, bindings::Binding { kind: 1, device: 0, index: 0, dir: -1, pov: 0, key: 0 });
         st.bindings.by_id.insert(bindings::id::C1_RIGHT, bindings::Binding { kind: 1, device: 0, index: 0, dir: 1, pov: 0, key: 0 });
         let mut rec = bindings::PadRecord { mask: 0x1B, ..Default::default() };
@@ -1108,8 +1107,8 @@ mod tests {
     /// then `ret`, are [`bindings::RACE_FIXED`] in order.
     #[test]
     fn the_race_bindings_match_the_image() {
-        let Some(home) = std::env::var_os("HOME") else { return };
-        let Ok(img) = std::fs::read(std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/nfs5.exe")) else { return };
+        let Some(root) = nfs_devdata::dev_game_root() else { return };
+        let Ok(img) = std::fs::read(root.join("nfs5.exe")) else { return };
         let u16at = |o: usize| u16::from_le_bytes([img[o], img[o + 1]]) as usize;
         let u32at = |o: usize| u32::from_le_bytes([img[o], img[o + 1], img[o + 2], img[o + 3]]);
         let pe = u32at(0x3C) as usize;

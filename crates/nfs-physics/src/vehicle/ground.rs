@@ -42,7 +42,7 @@ impl Vehicle {
             // `amp · [0x5B49D4] − r16 · amp · [0x5B253C]` (1/6, 2⁻¹⁶), in that order
             // (0x49982D…0x499864)
             // one register chain, one `fstp [ecx+0x830]`
-            w.rough_target = (f64::from(amp) * f64::from(f32::from_bits(0x3E2A_AAAB)) - f64::from(r) * f64::from(amp) * f64::from(1.525_878_9e-5f32)) as f32;
+            w.rough_target = (amp * f64::from(f32::from_bits(0x3E2A_AAAB)) - f64::from(r) * amp * f64::from(1.525_878_9e-5f32)) as f32;
         }
         let w = &self.wheels[i];
         let (prev, target) = (f64::from(w.rough_prev), f64::from(w.rough_target));
@@ -213,7 +213,7 @@ impl Vehicle {
         }
         if upright {
             // 0x49AA23…0x49AA40: `((((l3 + l2) + l1) + l0) · 0.25 + l0) · 0.5` in the register, one `fst` / `fstp`
-            let l = |x: f32| f64::from(x);
+            let l = crate::x87::wide;
             let v = (((((l(low[3]) + l(low[2])) + l(low[1])) + l(low[0])) * 0.25 + l(low[0])) * 0.5) as f32;
             self.body_height = v;
             self.min_height = v;
@@ -688,7 +688,7 @@ impl Vehicle {
             // are evaluated in `f64` and stored once, `RE/notes/REFERENCE-2026-10-31-HUMAN-DRIFT.md`.
             let w_roll_wide = dot_x87_wide(self.angular_velocity, m.row(2));
             let w_body = Vec3::new(dot_x87(self.angular_velocity, m.row(0)), dot_x87(self.angular_velocity, m.row(1)), w_roll_wide as f32);
-            let d = |x: f32| f64::from(x);
+            let d = crate::x87::wide;
             // `((s2 + s3) − (s0 + s1)) / div`, which stays in the register (0x49A493…0x49A4B8)
             let p_in = ((d(susp_y[2]) + d(susp_y[3])) - (d(susp_y[0]) + d(susp_y[1]))) / d(div);
             let a_l = self.accel_local.z;

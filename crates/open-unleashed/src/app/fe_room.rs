@@ -1002,7 +1002,7 @@ impl App {
             // (0x4FC20E…0x4FC3C3); none running: `Knockout.Track`'s linked row (slot 0x78, then
             // 0x4FA690, 0x4FC3CD…0x4FC411) and nothing else — `rev` / `mir` keep the zeros
             // 0x4FC0E3 / 0x4FC0E6 wrote, so the wall shows the selected row forward and unmirrored
-            game_type::KNOCKOUT => match self.knockout.as_ref().filter(|k| k.state.active) {
+            game_type::KNOCKOUT => match self.ko.knockout.as_ref().filter(|k| k.state.active) {
                 Some(k) => {
                     let r = m.ko_row(k.state.race_index.max(0) as usize);
                     (m.tracks.get(r.track_idx)?.clone(), r.backwards, r.mirror)

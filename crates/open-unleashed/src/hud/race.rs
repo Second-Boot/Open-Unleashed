@@ -1,6 +1,7 @@
 //! The in-race HUD: replay bar, map, trays, dials, damage and the sprite assembly.
 
 use crate::*;
+use nfs_game::colour::argb_rgba as argb;
 
 /// What [`Hud::replay_bar`] draws: the pause and network flags, the bar's state and fade, the
 /// pointer and the seven tooltips.
@@ -63,7 +64,6 @@ impl Hud {
     /// them), so the picture's left edge is `c` and its right edge `o`, shading across it
     /// ([`Sprite::corner_colors`]).
     pub(crate) fn blip_color(paint: [u8; 3], police: Option<u32>) -> [[f32; 4]; 4] {
-        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
         if let Some(c) = police {
             let other = if c == 0xC000_00FF { 0xC0FF_0000 } else { 0xC000_00FF };
             let (c, other) = (argb(c), argb(other));
@@ -423,7 +423,6 @@ impl Hud {
         self.tray(out, aspect, tx, ty, tw, th);
         // the rule over the title: `(h − 2) − title height − 1` (0x422CFE…0x422D2A)
         self.tray_rule(out, aspect, tx, ty, tw, th - 2.0 - EXT_MAIN - 1.0);
-        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
         const LEVELS: [u32; 10] = [
             0xAA05_8228, 0xAA02_912D, 0xAA00_9B32, 0xAAFF_E100, 0xAAFF_CD05,
             0xAAFF_B405, 0xAAFF_A005, 0xAADC_6E05, 0xAADC_4605, 0xAADC_1905,
@@ -517,7 +516,6 @@ impl Hud {
         let (lh, th) = (FONT_SMALL, FONT_MAIN);
         self.tray(out, aspect, x, y, w, h);
         self.tray_rule(out, aspect, x, y, w, h - 2.0 - EXT_MAIN - 1.0);
-        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
         let row_h = (h / 5.0).trunc();
         let span = w - 2.0 * 5.0;
         for (i, &v) in values.iter().enumerate() {

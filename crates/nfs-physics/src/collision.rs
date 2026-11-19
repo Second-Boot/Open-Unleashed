@@ -147,7 +147,7 @@ impl PatchTracker {
             // 0x485F90: the edges are `f32` subtractions (0x485F99…0x485FD9), the cross 0x532880 (0x56E8F5, one rounding per
             // component) of `(v0 − v2)` and `(v1 − v0)` — the same plane as `(b − a) × (c − a)`, the negation exact — and
             // 0x5328D0 normalises with the reciprocal in the register
-            let mut n = crate::vehicle::x87::normalize_x87(crate::vehicle::x87::cross_x87(b - a, c - a));
+            let mut n = crate::x87::normalize_x87(crate::x87::cross_x87(b - a, c - a));
             if n.y < 0.0 {
                 n = -n;
             }

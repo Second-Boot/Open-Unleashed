@@ -6,6 +6,5 @@ license.workspace = true
 
 [dependencies]
 nfs-formats.workspace = true
-nfs-assets.workspace = true
 anyhow.workspace = true
 image.workspace = true

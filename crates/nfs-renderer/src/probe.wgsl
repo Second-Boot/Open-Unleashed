@@ -25,7 +25,7 @@ var<workgroup> red: array<vec3<f32>, 256>;
 
 // the cosine lobe's band weights (l = 0, 1, 2: pi, 2 pi / 3, pi / 4), the upper hemisphere's mean of the band-1 y term
 // (SH_Y1 / 2), and the least luminance of a mean that is normalised (below: a black map, the flat probe)
-const LOBE_L0: f32 = 3.14159265;
+const LOBE_L0: f32 = PI;
 const LOBE_L1: f32 = 2.0943951;
 const LOBE_L2: f32 = 0.78539816;
 const UPPER_Y1: f32 = 0.244301;

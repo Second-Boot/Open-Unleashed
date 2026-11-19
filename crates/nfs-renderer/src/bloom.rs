@@ -215,8 +215,7 @@ impl BloomPass {
     pub fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Self {
         let module = gfx::wgsl_module(device, "bloom", &source());
         let pl = gfx::pipeline_layout(device, "bloom", &[layout]);
-        let tex = |binding| gfx::bgl_tex(binding, wgpu::TextureSampleType::Float { filterable: true }, false);
-        let tone_layout = gfx::bgl(device, "bloom (tone map)", &[tex(0), gfx::bgl_sampler(1, wgpu::SamplerBindingType::Filtering), tex(2), tex(3)]);
+        let tone_layout = gfx::bgl(device, "bloom (tone map)", &[gfx::bgl_float(0, true), gfx::bgl_sampler(1, wgpu::SamplerBindingType::Filtering), gfx::bgl_float(2, true), gfx::bgl_float(3, true)]);
         Self { module, pl, tone_layout, pipes: Variants::default(), size: (0, 0), mips: Vec::new(), tone_bg: gfx::Keyed::default() }
     }
 
@@ -269,14 +268,7 @@ impl BloomPass {
         let (layout, sampler) = (&self.tone_layout, cx.sampler);
         // without the dirt its two slots hold the first mip (the shader does not read them: `BLOOM_DIRT` is 0)
         self.tone_bg.get((first.clone(), dirt.cloned()), || {
-            fn view(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
-                wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
-            }
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("bloom (tone map)"),
-                layout,
-                entries: &[view(0, first), wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) }, view(2, dirt.unwrap_or(first)), view(3, if dirt.is_some() { wide } else { first })],
-            })
+            gfx::bind_group(device, "bloom (tone map)", layout, &[gfx::bg_view(0, first), gfx::bg_sampler(1, sampler), gfx::bg_view(2, dirt.unwrap_or(first)), gfx::bg_view(3, if dirt.is_some() { wide } else { first })])
         });
     }
 

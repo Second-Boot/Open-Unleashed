@@ -142,6 +142,107 @@ pub fn pad_pick(targets: &[PadTarget], from: usize, dir: PadDir) -> Option<usize
         .map(|(i, _)| i)
 }
 
+/// The place the pad first stands on a screen it has not stood on yet: the first target in reading order (top row first,
+/// left first within a row; equal centres keep their list order).
+pub fn pad_start(targets: &[PadTarget]) -> Option<usize> {
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (ca, cb) = (targets[a].centre(), targets[b].centre());
+        ca.1.total_cmp(&cb.1).then(ca.0.total_cmp(&cb.0))
+    });
+    order.first().copied()
+}
+
+/// The pick from `from` among the targets `rest` (the ones outside its own list / strip): `from` leads the set so
+/// [`pad_pick`] measures from it.
+pub fn pad_pick_outside(from: &PadTarget, rest: &[PadTarget], dir: PadDir) -> Option<PadTarget> {
+    let mut v = vec![from.clone()];
+    v.extend(rest.iter().cloned());
+    pad_pick(&v, 0, dir).map(|i| v[i].clone())
+}
+
+/// What a direction key does from the target `from` (an index into `targets`), by [`pad_step`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PadStep {
+    /// stand on this target
+    To(PadTarget),
+    /// nowhere to go
+    Stay,
+    /// the end of a list's / drop-down's visible rows: the caller scrolls by `step` rows (a drop-down from row `first`),
+    /// asks [`pad_targets`](LayoutScreen::pad_targets) again, and settles with [`pad_after_scroll`]; `before` = the first
+    /// and last visible row now
+    ScrollRows { step: i32, first: i32, before: (Option<usize>, Option<usize>) },
+}
+
+/// The step of a direction key from `targets[from]`: a tab walks its strip along the strip's own line — the graphic
+/// tabs side by side with Left / Right, the staircase of text tabs with Up / Down — and any other key leaves the strip,
+/// past its (overlapping) boxes; inside a list or an open drop-down Up / Down walk the rows and run out into a scroll;
+/// everything else is [`pad_pick`]. `strips` = the screen's [`TabStrip`]s (only read for a tab).
+pub fn pad_step(targets: &[PadTarget], strips: &[TabStrip], from: usize, dir: PadDir) -> PadStep {
+    let cur = &targets[from];
+    let vertical = matches!(dir, PadDir::Up | PadDir::Down);
+    let strip: Option<&Vec<usize>> = (cur.kind == PadKind::Tab).then(|| strips.iter().find(|s| s.tabs.contains(&cur.index)).map(|s| &s.tabs)).flatten();
+    if let Some(tabs) = strip {
+        let ys: Vec<f32> = targets.iter().filter(|t| tabs.contains(&t.index)).map(|t| t.y).collect();
+        let staircase = ys.iter().cloned().fold(f32::MIN, f32::max) - ys.iter().cloned().fold(f32::MAX, f32::min) > 20.0;
+        let along = if staircase { vertical } else { !vertical };
+        let at = tabs.iter().position(|t| *t == cur.index).unwrap_or(0);
+        let step: i32 = if matches!(dir, PadDir::Down | PadDir::Right) { 1 } else { -1 };
+        let to = at as i32 + step;
+        if along
+            && to >= 0
+            && (to as usize) < tabs.len()
+            && let Some(t) = targets.iter().find(|t| t.index == tabs[to as usize])
+        {
+            return PadStep::To(t.clone());
+        }
+        let rest: Vec<PadTarget> = targets.iter().filter(|t| !tabs.contains(&t.index)).cloned().collect();
+        return pad_pick_outside(cur, &rest, dir).map_or(PadStep::Stay, PadStep::To);
+    }
+    if matches!(cur.kind, PadKind::ComboRow | PadKind::ListRow) && vertical {
+        // the rows of this list, top to bottom
+        let mut rows: Vec<&PadTarget> = targets.iter().filter(|t| t.index == cur.index && t.kind == cur.kind).collect();
+        rows.sort_by_key(|t| t.row);
+        let at = rows.iter().position(|t| t.row == cur.row).unwrap_or(0);
+        let step: i32 = if dir == PadDir::Down { 1 } else { -1 };
+        let to = at as i32 + step;
+        if to >= 0 && (to as usize) < rows.len() {
+            PadStep::To(rows[to as usize].clone())
+        } else {
+            let first = rows.first().map_or(0, |t| t.row) as i32;
+            PadStep::ScrollRows { step, first, before: (rows.first().map(|t| t.row), rows.last().map(|t| t.row)) }
+        }
+    } else if cur.kind == PadKind::ComboRow {
+        // an open drop-down answers to Up and Down alone
+        PadStep::Stay
+    } else if cur.kind == PadKind::ListRow {
+        let rest: Vec<PadTarget> = targets.iter().filter(|t| t.index != cur.index).cloned().collect();
+        pad_pick_outside(cur, &rest, dir).map_or(PadStep::Stay, PadStep::To)
+    } else {
+        // a list's rows count once for the pick: the row level with the pad's centre is what matters
+        pad_pick(targets, from, dir).map_or(PadStep::Stay, |i| PadStep::To(targets[i].clone()))
+    }
+}
+
+/// Did the scroll of a [`PadStep::ScrollRows`] bring a new row in? `after` = the list's rows now (empty when it scrolled
+/// past the last one: the caller then scrolls back).
+pub fn pad_rows_moved(before: (Option<usize>, Option<usize>), after: &[PadTarget]) -> bool {
+    !after.is_empty() && (after.first().map(|t| t.row), after.last().map(|t| t.row)) != before
+}
+
+/// The step after a [`PadStep::ScrollRows`]: the row that came in (`moved`); a list's end (not a drop-down's) goes on to
+/// the next control that way, outside the list; a drop-down's end stays.
+pub fn pad_after_scroll(targets: &[PadTarget], from: &PadTarget, dir: PadDir, moved: bool, after: &[PadTarget]) -> Option<PadTarget> {
+    if moved {
+        if dir == PadDir::Down { after.last().cloned() } else { after.first().cloned() }
+    } else if from.kind == PadKind::ListRow {
+        let rest: Vec<PadTarget> = targets.iter().filter(|t| t.index != from.index).cloned().collect();
+        pad_pick_outside(from, &rest, dir)
+    } else {
+        None
+    }
+}
+
 impl LayoutScreen {
     /// Every place the pad can stand on this screen, panels included, in the flattened index space
     /// `hovered` uses. An open drop-down takes the pad whole: its visible rows are all there is.
@@ -375,5 +476,64 @@ mod tests {
         assert_eq!(pad_pick(&v, 2, PadDir::Down), Some(0));
         assert_eq!(pad_pick(&v, 0, PadDir::Up), Some(2));
         assert_eq!(pad_pick(&v[..1], 0, PadDir::Up), None);
+    }
+
+    fn kt(index: usize, kind: PadKind, x: f32, y: f32, row: usize) -> PadTarget {
+        PadTarget { index, kind, x, y, w: 100.0, h: 20.0, click: (x + 50.0, y + 10.0), row }
+    }
+
+    /// the pad's first place is the top-left one in reading order, whatever the list order
+    #[test]
+    fn the_start_is_the_first_in_reading_order() {
+        let v = vec![t(0, 200.0, 40.0), t(1, 100.0, 0.0), t(2, 0.0, 0.0), t(3, 0.0, 40.0)];
+        assert_eq!(pad_start(&v), Some(2));
+        assert_eq!(pad_start(&[]), None);
+    }
+
+    /// side-by-side tabs walk with Left / Right and leave with Up / Down; a staircase the other way round
+    #[test]
+    fn a_tab_walks_its_strip_along_its_line() {
+        let row = vec![kt(0, PadKind::Tab, 0.0, 0.0, 0), kt(1, PadKind::Tab, 100.0, 0.0, 0), kt(2, PadKind::Tab, 200.0, 0.0, 0), t(3, 100.0, 60.0)];
+        let strips = vec![TabStrip { tabs: vec![0, 1, 2], current: Some(0), depth: 0 }];
+        assert_eq!(pad_step(&row, &strips, 1, PadDir::Right), PadStep::To(row[2].clone()));
+        assert_eq!(pad_step(&row, &strips, 1, PadDir::Left), PadStep::To(row[0].clone()));
+        // the strip's end holds along the line: it leaves to the pick outside, which wraps back to the one other target
+        assert_eq!(pad_step(&row, &strips, 2, PadDir::Right), PadStep::To(row[3].clone()));
+        assert_eq!(pad_step(&row, &strips, 1, PadDir::Down), PadStep::To(row[3].clone()));
+        let stairs = vec![kt(0, PadKind::Tab, 0.0, 0.0, 0), kt(1, PadKind::Tab, 0.0, 30.0, 0), kt(2, PadKind::Tab, 0.0, 60.0, 0)];
+        let strips = vec![TabStrip { tabs: vec![0, 1, 2], current: None, depth: 0 }];
+        assert_eq!(pad_step(&stairs, &strips, 0, PadDir::Down), PadStep::To(stairs[1].clone()));
+        assert_eq!(pad_step(&stairs, &strips, 2, PadDir::Up), PadStep::To(stairs[1].clone()));
+        // Left / Right leave the staircase: nothing else there
+        assert_eq!(pad_step(&stairs, &strips, 1, PadDir::Right), PadStep::Stay);
+    }
+
+    /// rows of a list: Down walks, the end asks for a scroll; a drop-down row ignores Left / Right
+    #[test]
+    fn list_rows_walk_then_scroll() {
+        let v = vec![kt(5, PadKind::ListRow, 0.0, 0.0, 3), kt(5, PadKind::ListRow, 0.0, 20.0, 4), t(9, 0.0, 100.0)];
+        assert_eq!(pad_step(&v, &[], 0, PadDir::Down), PadStep::To(v[1].clone()));
+        assert_eq!(pad_step(&v, &[], 1, PadDir::Down), PadStep::ScrollRows { step: 1, first: 3, before: (Some(3), Some(4)) });
+        assert_eq!(pad_step(&v, &[], 0, PadDir::Up), PadStep::ScrollRows { step: -1, first: 3, before: (Some(3), Some(4)) });
+        // a list row leaves sideways to the controls outside the list
+        assert_eq!(pad_step(&v, &[], 0, PadDir::Left), PadStep::To(v[2].clone()));
+        let d = vec![kt(5, PadKind::ComboRow, 0.0, 0.0, 0), kt(5, PadKind::ComboRow, 0.0, 20.0, 1)];
+        assert_eq!(pad_step(&d, &[], 0, PadDir::Right), PadStep::Stay);
+    }
+
+    /// after a scroll: a new row comes in, else the list's end goes on outside the list, a drop-down's end stays
+    #[test]
+    fn the_scroll_settles_on_the_row_that_came_in() {
+        let v = vec![kt(5, PadKind::ListRow, 0.0, 0.0, 3), kt(5, PadKind::ListRow, 0.0, 20.0, 4), t(9, 0.0, 100.0)];
+        let after = vec![kt(5, PadKind::ListRow, 0.0, 0.0, 4), kt(5, PadKind::ListRow, 0.0, 20.0, 5)];
+        let before = (Some(3), Some(4));
+        assert!(pad_rows_moved(before, &after));
+        assert!(!pad_rows_moved(before, &v[..2]));
+        assert!(!pad_rows_moved(before, &[]));
+        assert_eq!(pad_after_scroll(&v, &v[1], PadDir::Down, true, &after), Some(after[1].clone()));
+        assert_eq!(pad_after_scroll(&v, &v[0], PadDir::Up, true, &after), Some(after[0].clone()));
+        assert_eq!(pad_after_scroll(&v, &v[1], PadDir::Down, false, &v[..2]), Some(v[2].clone()));
+        let d = vec![kt(5, PadKind::ComboRow, 0.0, 0.0, 0)];
+        assert_eq!(pad_after_scroll(&d, &d[0], PadDir::Down, false, &d), None);
     }
 }

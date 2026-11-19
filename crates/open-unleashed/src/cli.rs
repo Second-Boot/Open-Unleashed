@@ -103,7 +103,7 @@ impl Cli {
     /// **TOOLING:** `--resim` runs with no window, no GPU device, no audio device and no controller layer (the server's plain Linux
     /// box has none of them), unless `NFS_RESIM_GPU=1` asks for the windowed scripted run it used to be (the equivalence check of the two).
     pub(crate) fn headless_resim(&self) -> bool {
-        self.resim.is_some() && std::env::var_os("NFS_RESIM_GPU").is_none_or(|v| v.is_empty() || v == "0")
+        self.resim.is_some() && nfs_game::config::cfg().nfs_resim_gpu.is_off()
     }
 
     /// The process's own arguments, the program name skipped.

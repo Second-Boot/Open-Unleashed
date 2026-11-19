@@ -26,4 +26,7 @@ pub(crate) struct SceneScratch {
     pub(crate) mirror_dyn: Vec<(u32, nfs_renderer::DrawItem)>,
     pub(crate) mirror_merged: Vec<nfs_renderer::DrawItem>,
     pub(crate) mirror_items: Vec<nfs_renderer::DrawItem>,
+    /// the flares that run this frame (`running_flares_into`; a `RefCell`: the flare pass takes `&self`) and the lighthouse beams in world space
+    pub(crate) flares: std::cell::RefCell<Vec<nfs_game::world::TrackFlare>>,
+    pub(crate) lbeams: Vec<nfs_renderer::LBeam>,
 }

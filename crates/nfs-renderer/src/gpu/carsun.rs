@@ -58,7 +58,7 @@ pub(crate) fn source() -> String {
         BODY_GRID,
         SAMPLES
     );
-    crate::wgsl::compose(&[&header, include_str!("carsun.wgsl")])
+    crate::wgsl::compose(&[&header, crate::wgsl::ANGLES, include_str!("carsun.wgsl")])
 }
 
 #[repr(C)]
@@ -86,6 +86,18 @@ pub(super) struct CarSun {
     prev_at: Option<f64>,
     /// PERF: the bind group, kept while the map's view is the same
     bg: gfx::Keyed<wgpu::TextureView, wgpu::BindGroup>,
+}
+
+/// What [`CarSun::prepare`] measures from: the frame's belt and encoder, the cascades and the camera's view, the cars, and the
+/// cars-only layers (how many near cascades have one, where they start in the map).
+pub(super) struct Measure<'a> {
+    pub belt: &'a mut wgpu::util::StagingBelt,
+    pub encoder: &'a mut wgpu::CommandEncoder,
+    pub cascades: &'a [Cascade],
+    pub view: glam::Mat4,
+    pub cars: &'a crate::SunCars,
+    pub car_layers: usize,
+    pub car_base: usize,
 }
 
 impl CarSun {
@@ -122,11 +134,11 @@ impl CarSun {
 
 
     /// Write this frame's measure (the cascades; the cars, each one's cascade by its view depth, blended into the next over the
-    /// last eighth as the receiver's are; whether a car is new; the ease's share), through the frame's belt (`up`). Writes the
+    /// last eighth as the receiver's are; whether a car is new; the ease's share), through the frame's belt (`m.belt`). Writes the
     /// cars' (centre, reach) for the track receiver into `centres` (`Csm::carsh_cars`) and returns their count; 0 = no car (then
     /// nothing is to be recorded).
-    pub(super) fn prepare(&mut self, up: (&mut wgpu::util::StagingBelt, &mut wgpu::CommandEncoder), cascades: &[Cascade], view: glam::Mat4, cars: &crate::SunCars, layers: (usize, usize), centres: &mut [[f32; 4]]) -> usize {
-        let (car_layers, car_base) = layers;
+    pub(super) fn prepare(&mut self, m: Measure, centres: &mut [[f32; 4]]) -> usize {
+        let Measure { belt, encoder, cascades, view, cars, car_layers, car_base } = m;
         let dt = self.prev_at.map_or(-1.0, |t| (cars.clock - t) as f32);
         self.prev_at = Some(cars.clock);
         // a new race (the clock went back) or a long gap: every car takes its target as it is
@@ -168,7 +180,7 @@ impl CarSun {
         std::mem::swap(&mut self.prev, &mut self.seen);
         if n > 0 {
             let size = wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64).expect("car sun params size");
-            up.0.write_buffer(up.1, &self.params, 0, size).copy_from_slice(bytemuck::bytes_of(&u));
+            belt.write_buffer(encoder, &self.params, 0, size).copy_from_slice(bytemuck::bytes_of(&u));
         }
         n
     }

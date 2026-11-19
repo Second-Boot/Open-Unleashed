@@ -238,17 +238,13 @@ mod mac {
                 self.gain_view(device, (1, 1));
             }
             let (Some((_, layout, uniform, sampler)), Some(t), Some((_, _, gain_view))) = (self.pipeline.as_ref(), self.targets.as_ref(), self.gain.as_ref()) else { return };
-            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("edr present"),
-                layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&t.frame_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&t.pre_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(gain_view) },
-                    wgpu::BindGroupEntry { binding: 3, resource: uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) },
-                ],
-            }));
+            self.bind_group = Some(gfx::bind_group(device, "edr present", layout, &[
+                    gfx::bg_view(0, &t.frame_view),
+                    gfx::bg_view(1, &t.pre_view),
+                    gfx::bg_view(2, gain_view),
+                    gfx::bg_buf(3, uniform),
+                    gfx::bg_sampler(4, sampler),
+                ]));
         }
 
         /// Copy the frame image (before the 2D) and mark the frame as one with a gain map.
@@ -278,11 +274,10 @@ mod mac {
     }
 
     fn build_present(device: &wgpu::Device) -> Present {
-        let tex = |binding, filterable| gfx::bgl_tex(binding, wgpu::TextureSampleType::Float { filterable }, false);
         let layout = gfx::bgl(
             device,
             "edr present",
-            &[tex(0, false), tex(1, false), tex(2, true), gfx::bgl_uniform(3, wgpu::ShaderStages::FRAGMENT), gfx::bgl_sampler(4, wgpu::SamplerBindingType::Filtering)],
+            &[gfx::bgl_float(0, false), gfx::bgl_float(1, false), gfx::bgl_float(2, true), gfx::bgl_uniform(3, wgpu::ShaderStages::FRAGMENT), gfx::bgl_sampler(4, wgpu::SamplerBindingType::Filtering)],
         );
         let module = gfx::wgsl_module(device, "edr present", &present_source());
         let pl = gfx::pipeline_layout(device, "edr present", &[&layout]);

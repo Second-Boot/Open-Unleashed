@@ -26,19 +26,20 @@ fn main() {
                 for mm in article_meshes(&g, l, &mut sk) {
                     let src = mm.mesh.indices.len() / 3;
                     let r = |level: u8| -> usize {
-                        if level == 1 && l == 4 {
+                        let rp = round::params(level);
+                        if l > rp.max_lod {
                             return src;
                         }
                         let o = match kind {
-                            round::Kind::Wheel => round::refine_wheel(&mm.mesh, if level == 1 { 32 } else { 64 }, if level == 1 { 4 } else { 6 }),
-                            round::Kind::Smooth => round::refine_pn(&mm.mesh, if level == 1 { 2 } else { 3 }, 0.9998),
+                            round::Kind::Wheel => round::refine_wheel(&mm.mesh, rp.wheel_min_segments, rp.wheel_max_n),
+                            round::Kind::Smooth => round::refine_pn(&mm.mesh, rp.pn_n, rp.crease_cos),
                         };
                         o.map_or(src, |(m, _)| m.indices.len() / 3)
                     };
                     let (a1, a2) = (r(1), r(2));
                     if l == 1 {
                         if let round::Kind::Smooth = kind
-                            && let Some((_, rs)) = round::refine_pn(&mm.mesh, 2, 0.9998)
+                            && let Some((_, rs)) = round::refine_pn(&mm.mesh, round::params(1).pn_n, round::CREASE_COS)
                         {
                             line.push(format!("[{} moves {:.1} mm]", g.name.trim(), rs.moved * 1000.0));
                         }

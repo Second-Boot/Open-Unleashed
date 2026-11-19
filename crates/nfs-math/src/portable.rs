@@ -19,6 +19,11 @@
 
 use glam::{Mat3, Mat4, Quat, Vec3, Vec4};
 
+/// The image's `2π`: the **double** at `[0x5BB2C0]` = 6.28318452835083 (not `TAU`; it is 1.2e-7 relative below 2π),
+/// `fmul qword [0x5BB2C0]` in the helpers 0x5327E0 / 0x5327F0 / 0x532800, the sun's turn (0x5327E0 / 0x5327F0 callers),
+/// the sky rings and the wind direction. The one home of the literal.
+pub const TWO_PI_IMAGE: f64 = 6.28318452835083;
+
 pub use libm::{acos, acosf, asin, asinf, atan, atan2, atan2f, atanf, cos, cosf, sin, sinf, tan, tanf};
 
 /// `(sin x, cos x)`, `f32` — `f32::sin_cos`.

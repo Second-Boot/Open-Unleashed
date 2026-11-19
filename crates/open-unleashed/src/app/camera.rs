@@ -2,6 +2,9 @@
 
 use crate::*;
 
+mod build;
+mod pass;
+
 impl App {
     /// The shadow projector a car at `pos` takes, 0x43A6F1 → 0x456160 (`crp-geometry.md` §8),
     /// only while `[0x6197CA]` is set — `Graphics.CarChrome` = High (0x44EF19…0x44EF33; Low and
@@ -47,7 +50,7 @@ impl App {
         if let Some(v) = self.replay_view() {
             return v;
         }
-        if self.anim_cam != AnimCamSlot::Off {
+        if self.cam.anim_cam != AnimCamSlot::Off {
             return 0x0E;
         }
         self.camera_cycle
@@ -82,6 +85,11 @@ impl App {
         if self.fe0 && self.registry.get("fe").is_some_and(|v| v.trim().parse::<u32>() == Ok(0)) {
             return self.registry.u32("linear_track", 0) != 0;
         }
+        self.track_is_linear()
+    }
+
+    /// The track's own record says point-to-point (`!circuit`; a track with no record is a circuit).
+    pub(crate) fn track_is_linear(&self) -> bool {
         !self.records.track(&self.track.name).map(|t| t.circuit).unwrap_or(true)
     }
 
@@ -146,16 +154,16 @@ impl App {
     /// nothing moved it off 0x0E.
     pub(crate) fn camera_anim_step(&mut self, tick: u64, car_pos: Vec3, car_rot: Quat) -> Option<(Vec3, glam::Mat3)> {
         let held = nfs_game::config::cfg().nfs_view.as_str().and_then(|v| v.parse::<u16>().ok()) == Some(0x0E);
-        if held && self.anim_cam == AnimCamSlot::Off {
-            self.anim_cam = AnimCamSlot::Start;
+        if held && self.cam.anim_cam == AnimCamSlot::Off {
+            self.cam.anim_cam = AnimCamSlot::Start;
         }
-        if self.anim_cam == AnimCamSlot::Start {
+        if self.cam.anim_cam == AnimCamSlot::Start {
             self.anim_cam_pick(0);
         }
         if !held && self.replay_view().is_some() {
-            self.anim_cam = AnimCamSlot::Off;
+            self.cam.anim_cam = AnimCamSlot::Off;
         }
-        let AnimCamSlot::Playing { index, start } = self.anim_cam else { return None };
+        let AnimCamSlot::Playing { index, start } = self.cam.anim_cam else { return None };
         // `tick` is the count of ticks done: the update of the count's last tick runs at `gGameTick = tick − 1`
         // (0x414FF0 counts at its end; its Sc64 dispatch reads the pre-increment value). PA-SCENES: the original's
         // slot 0 per tick (gdb, eye `0x627EA4`) leaves the animation on the update at gGameTick 273 (the first
@@ -174,7 +182,7 @@ impl App {
                     self.anim_cam_pick(tick);
                     return self.camera_anim_step(tick, car_pos, car_rot);
                 }
-                self.anim_cam = AnimCamSlot::Off;
+                self.cam.anim_cam = AnimCamSlot::Off;
                 None
             }
         }
@@ -182,33 +190,127 @@ impl App {
 
     /// 0x462F58…0x462F64: the next `CmAn` player into the slot, started at game tick `start`.
     fn anim_cam_pick(&mut self, start: u64) {
-        self.anim_cam = match nfs_game::camera::anim_cam::pick(&mut self.anim_cam_counter, self.cam_anims.len()) {
+        self.cam.anim_cam = match nfs_game::camera::anim_cam::pick(&mut self.cam.anim_cam_counter, self.cam_anims.len()) {
             Some(index) => AnimCamSlot::Playing { index, start },
             None => AnimCamSlot::Off,
         };
-        tracing::debug!(state = ?self.anim_cam, "AnimCam pick (0x471A50)");
+        tracing::debug!(state = ?self.cam.anim_cam, "AnimCam pick (0x471A50)");
     }
 
     pub(crate) fn camera_slot_reset(&mut self) {
         let forced = nfs_game::config::cfg().nfs_camera.as_str().and_then(|v| v.parse::<u8>().ok());
         self.camera_mode = forced.unwrap_or(0);
-        self.anim_cam = if forced.is_some() { AnimCamSlot::Off } else { AnimCamSlot::Start };
-        self.chase_offset = None;
-        self.cam_follow = None;
-        self.slot_view = None;
-        self.chase_settle = 0;
-        self.look_yaw = None;
-        self.orbit = Orbit::default();
-        self.camera_tick = 0;
+        self.cam.anim_cam = if forced.is_some() { AnimCamSlot::Off } else { AnimCamSlot::Start };
+        self.cam.chase_offset = None;
+        self.cam.cam_follow = None;
+        self.cam.slot_view = None;
+        self.cam.chase_settle = 0;
+        self.cam.look_yaw = None;
+        self.cam.orbit = Orbit::default();
+        self.cam.camera_tick = 0;
         self.audio_cam = None;
-        self.cam_hist.clear();
-        self.flip_side = None;
-        self.slope_wrong = None;
-        self.slot_eye = None;
+        self.cam.cam_hist.clear();
+        self.cam.flip_side = None;
+        self.cam.slope_wrong = None;
+        self.cam.slot_eye = None;
         // the pass's SetSlotView zeroes the wander too (0x4657A0…0x4657F3)
-        self.replay_wander = Default::default();
-        self.circle = (nfs_game::camera::CircleCam::default(), 0xFFFF, 0);
+        self.cam.replay_wander = Default::default();
+        self.cam.circle = (nfs_game::camera::CircleCam::default(), 0xFFFF, 0);
         self.cam_slice = None;
+    }
+}
+
+/// The state of the camera slot (the original's slot 0 and what `SetSlotView` 0x465790, `AnimCam` 0x462F30 and the views' updates keep
+/// in it, apart from the camera matrix [`App::camera`] and the trackside cameras' TV slot): the part [`CamSlotState`] swaps for the audio
+/// listener's second copy of the slot.
+#[derive(Debug, Clone)]
+pub(crate) struct CameraSlot {
+    /// Camera slot 0 on **`AnimCam`** (view 0x0E), the race's opening animation
+    /// (`nfs_game::camera::anim_cam`): 0x4640B0 puts every pass's slot on it, 0x462F30 plays one
+    /// of the track's `CmAn` paths and gives the slot `car[n].camera[0]` when it is over.
+    pub(crate) anim_cam: AnimCamSlot,
+    /// `[0x62893C]`, the `CmAn` rotation counter 0x471A50 steps before each pick — a `.bss` word
+    /// nothing resets, so it runs on across races and sessions.
+    pub(crate) anim_cam_counter: u32,
+    /// The chase camera's slot state (0x461E80): the eye's offset from the car `+0x08`, the view it
+    /// was built for, and the `+0xC1` settle count SetSlotView starts at 0x32 (0x465848).
+    pub(crate) chase_offset: Option<(Vec3, u16)>,
+    pub(crate) chase_settle: u8,
+    /// PORT-DEVIATION D8 (camera followers): the follower views' offset from the car as of the previous and the
+    /// latest game tick, and the latest tick's pose; the draw interpolates between them ([`CamFollow`]).
+    pub(crate) cam_follow: Option<CamFollow>,
+    /// The view slot 0 was on at the last camera pass: a change is a SetSlotView, whose seed 0x465CF0 of the
+    /// offset `+0x08` (`chase_offset`) the pass applies. `None` until the first pass (the race's init).
+    pub(crate) slot_view: Option<u16>,
+    pub(crate) slot_seen: (u32, u32),
+    /// The bumper / driver slot's look-around yaw `+0xC6` in degrees (0x4611C0,
+    /// `camera::look_step`) and the view it belongs to; a view switch starts it again at 0
+    /// (SetSlotView 0x4658B2).
+    pub(crate) look_yaw: Option<(i16, u16, bool)>,
+    /// Look left, right and forward — input bits 0x14 / 0x15 / 0x16 as `RaceFrame` last read them
+    /// (`[0x5E99B4]` / `[0x5E99AC]` / `[0x5E99A8]`, 0x415AFA…0x415B2C): held levels, not read
+    /// while the pause is on (0x415982), so they keep their value through it.
+    pub(crate) look_held: [bool; 3],
+    /// The pause orbit (0x4617C0): slot 0's yaw `+0xC6` / step `+0xC8` and its offset.
+    pub(crate) orbit: Orbit,
+    /// The game tick the camera slot was last updated for. The dispatcher 0x463C30 is a **64 Hz**
+    /// scheduler entry (`Sched_insert(Sc64, 0x463C30, 0)` at 0x414F8C, run by every `GameTick`
+    /// 0x414FF0), so the slot's followers (the chase / heli offset, the driver's head lag, the
+    /// look-around yaw, BlimpCam, CircleCam, SplineCam, 0x462B80's zoom) step once per game tick,
+    /// not once per drawn frame: a frame applies `tick − camera_tick` updates.
+    pub(crate) camera_tick: u64,
+    /// The last game ticks' [`CamTick`]s: a frame that spans several ticks steps the
+    /// chase / heli follower once per tick against that tick's own pose, as `Sc64` does. Not capped:
+    /// 0x4152E0's catch-up loop (0x415BD4, `[0x606AA0] <= [0x606A9C]`) has no bound on the ticks a
+    /// frame runs, so every tick the camera has not stepped yet stays (trimmed after each camera pass).
+    pub(crate) cam_hist: std::collections::VecDeque<CamTick>,
+    /// The roll-over camera's side, `+0xC3` bit 0 (0x463CC6…0x463CFB), latched on the first
+    /// tilted update and dropped once the car is upright again (`+0xC2` = 0, 0x463D03).
+    pub(crate) flip_side: Option<bool>,
+    /// ENHANCEMENT E48: the wrong-way side the chase / heli slope lift sampled by last (`camera::steady_slope_wrong`);
+    /// `None` with E48 off or outside a lifted view. Camera state only.
+    pub(crate) slope_wrong: Option<bool>,
+    /// The chase / heli slot's eye `+0x24` as its update left it (before the build's clamps, which
+    /// work on a copy, 0x4651BF…0x4651DB) — the "old eye" of the next update's ceiling test.
+    pub(crate) slot_eye: Option<Vec3>,
+    /// The playback's wander of the aim point (`camera::ReplayWander`, 0x464C2B…0x464E42) and the
+    /// (chosen camera, view word, trackside switch count) it was started under: SetSlotView
+    /// 0x465790 zeroes it, which the port takes as a change of that key, and at a pass's start
+    /// (`camera_slot_reset`). Read 2026-09-30: 0x465790 has five callers, all covered —
+    /// 0x413960 twice (the trackside switch: the count; and the mode-3 cop view 0x0B → 0x0A, guarded
+    /// by `[0x627F3C] == 10`, a word change), 0x4659E0 from 0x413EA0 (a replay's start) and 0x414850
+    /// (a race's start: `camera_slot_reset`), and 0x462F30's two (`AnimCam`, view 0x0E, ending in
+    /// SetSlotView(0x0A): the view word changes). So every SetSlotView either starts a pass or
+    /// changes one of the three — CONFIRMED, no approximation left.
+    pub(crate) replay_wander: (nfs_game::camera::ReplayWander, (u16, u16, u32)),
+    /// CircleCam's slot words (`camera::CircleCam`), the view they belong to and the trackside
+    /// switch count they were started under: SetSlotView resets the count on a view change and on
+    /// every enabled switch.
+    pub(crate) circle: (nfs_game::camera::CircleCam, u16, u32),
+}
+
+impl CameraSlot {
+    /// A fresh slot: the race's start state before `camera_slot_reset`.
+    pub(crate) fn new() -> Self {
+        CameraSlot {
+            anim_cam: AnimCamSlot::Off,
+            anim_cam_counter: 0,
+            chase_offset: None,
+            chase_settle: 0,
+            cam_follow: None,
+            slot_view: None,
+            slot_seen: (0, 0),
+            look_yaw: None,
+            look_held: [false; 3],
+            orbit: Orbit::default(),
+            camera_tick: 0,
+            cam_hist: Default::default(),
+            flip_side: None,
+            slope_wrong: None,
+            slot_eye: None,
+            replay_wander: Default::default(),
+            circle: (nfs_game::camera::CircleCam::default(), 0xFFFF, 0),
+        }
     }
 }
 
@@ -218,23 +320,7 @@ impl App {
 #[derive(Debug, Clone)]
 pub(crate) struct CamSlotState {
     pub(crate) camera: Camera,
-    pub(crate) anim_cam: AnimCamSlot,
-    pub(crate) anim_cam_counter: u32,
-    pub(crate) chase_offset: Option<(Vec3, u16)>,
-    pub(crate) chase_settle: u8,
-    pub(crate) cam_follow: Option<CamFollow>,
-    pub(crate) slot_view: Option<u16>,
-    pub(crate) slot_seen: (u32, u32),
-    pub(crate) look_yaw: Option<(i16, u16, bool)>,
-    pub(crate) look_held: [bool; 3],
-    pub(crate) orbit: Orbit,
-    pub(crate) camera_tick: u64,
-    pub(crate) cam_hist: std::collections::VecDeque<CamTick>,
-    pub(crate) flip_side: Option<bool>,
-    pub(crate) slope_wrong: Option<bool>,
-    pub(crate) slot_eye: Option<Vec3>,
-    pub(crate) replay_wander: (nfs_game::camera::ReplayWander, (u16, u16, u32)),
-    pub(crate) circle: (nfs_game::camera::CircleCam, u16, u32),
+    pub(crate) slot: CameraSlot,
     pub(crate) tv: Option<nfs_game::cameras::TvSlot>,
 }
 

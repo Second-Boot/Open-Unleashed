@@ -22,7 +22,7 @@ impl App {
         let zones = self.vehicle.as_ref().map(|v| v.damage).unwrap_or([0.0; 10]);
         Some(match &self.skill {
             Some(sk) => {
-                let (pass, _) = sk.evaluate(&ms.mission, position, self.hud_cones.changes, &zones);
+                let (pass, _) = sk.evaluate(&ms.mission, position, self.hud_state.hud_cones.changes, &zones);
                 (pass, sk.time_ticks.unwrap_or(99_999), self.smackables.knocked_count())
             }
             None => {
@@ -118,7 +118,7 @@ impl App {
             return;
         }
         let clock = self.hud_clock();
-        let k = &mut self.hud_keys;
+        let k = &mut self.hud_state.hud_keys;
         match a {
             Action::ToggleHud => {
                 if k.live {
@@ -126,14 +126,14 @@ impl App {
                     k.map_at_hide = k.map != 0;
                     if k.map_at_hide {
                         k.suspend_map();
-                        self.slides.map = (2, clock);
+                        self.hud_state.slides.map = (2, clock);
                     }
                     k.mirror_at_hide = k.rearview;
                     if k.mirror_at_hide {
                         k.rearview = false;
-                        self.slides.mirror = (2, clock);
+                        self.hud_state.slides.mirror = (2, clock);
                     }
-                    for s in [&mut self.slides.tray, &mut self.slides.time] {
+                    for s in [&mut self.hud_state.slides.tray, &mut self.hud_state.slides.time] {
                         if s.0 != 2 {
                             *s = (2, clock);
                         }
@@ -142,32 +142,32 @@ impl App {
                     k.live = true;
                     if k.map_at_hide {
                         k.restore_map();
-                        self.slides.map = (1, clock);
+                        self.hud_state.slides.map = (1, clock);
                     }
                     if k.mirror_at_hide {
                         k.rearview = true;
-                        self.slides.mirror = (1, clock);
+                        self.hud_state.slides.mirror = (1, clock);
                     }
-                    self.slides.tray = (1, clock);
-                    self.slides.time = (1, clock);
+                    self.hud_state.slides.tray = (1, clock);
+                    self.hud_state.slides.time = (1, clock);
                 }
             }
             Action::ToggleRearView => {
                 if k.rearview {
                     k.rearview = false;
-                    self.slides.mirror = (2, clock);
+                    self.hud_state.slides.mirror = (2, clock);
                 } else if k.live {
                     k.rearview = true;
-                    self.slides.mirror = (1, clock);
+                    self.hud_state.slides.mirror = (1, clock);
                 }
             }
             Action::ToggleMap => {
                 if k.map != 0 {
                     k.suspend_map();
-                    self.slides.map = (2, clock);
+                    self.hud_state.slides.map = (2, clock);
                 } else if k.live {
                     k.restore_map();
-                    self.slides.map = (1, clock);
+                    self.hud_state.slides.map = (1, clock);
                 }
             }
             Action::CycleMap => {
@@ -184,7 +184,7 @@ impl App {
             Action::ZoomOutMap => k.zoom_out_map(),
             _ => {}
         }
-        tracing::info!(?a, keys = ?self.hud_keys, "HUD key");
+        tracing::info!(?a, keys = ?self.hud_state.hud_keys, "HUD key");
     }
 
     /// Which billboard is up this race frame (`billboard_key`): the pause menu (1), its quit
@@ -192,7 +192,7 @@ impl App {
     /// closing plays sound 4 (0x41ADD0).
     pub(crate) fn billboard_key_frame(&mut self) {
         let key = if self.paused {
-            if self.pause_confirm.is_some() { 2 } else { 1 }
+            if self.hud_state.pause_confirm.is_some() { 2 } else { 1 }
         } else {
             self.results_billboard.map_or(0, |p| 10 + p)
         };
@@ -207,7 +207,7 @@ impl App {
             || self.net_notice.is_some()
             || self.replay_save.up
             || self.billboard_key != 0
-            || (self.results.is_some() && self.result_pages().get(self.pages.page as usize).is_some())
+            || (self.results.is_some() && self.result_pages().get(self.hud_state.pages.page as usize).is_some())
     }
 
     /// The post-race pages this race queues, in order.
@@ -239,7 +239,7 @@ impl App {
         }
         // game type 3 skips the records page (0x4272F7 `cmp [0x6573E8], ebp; je 0x427345`, `ebp = 3` from
         // 0x426CCF): the queue goes on to the summary's timeout and nothing else
-        if self.hud_records.is_some() && self.block_game_type() != Some(game_type::NETWORK) {
+        if self.hud_state.hud_records.is_some() && self.block_game_type() != Some(game_type::NETWORK) {
             pages.push(ResultPage::Records);
         }
         pages
@@ -290,25 +290,25 @@ impl App {
     /// frame down to the 40-px floor, then state 0), and only then does the queue show the next
     /// page ([`App::advance_results_page`]). The tournament `HCongrats` just goes.
     pub(crate) fn close_results_page(&mut self) {
-        let page = self.result_pages().get(self.pages.page as usize).copied();
+        let page = self.result_pages().get(self.hud_state.pages.page as usize).copied();
         if matches!(page, Some(ResultPage::TournamentPlace(_)) | None) {
             self.advance_results_page();
-        } else if self.pages.closing.is_none() {
-            self.pages.closing = Some(0);
+        } else if self.hud_state.pages.closing.is_none() {
+            self.hud_state.pages.closing = Some(0);
         }
     }
 
     pub(crate) fn advance_results_page(&mut self) {
-        self.pages.closing = None;
-        self.pages.page += 1;
-        self.pages.tick = self.tick;
-        match self.result_pages().get(self.pages.page as usize) {
+        self.hud_state.pages.closing = None;
+        self.hud_state.pages.page += 1;
+        self.hud_state.pages.tick = self.tick;
+        match self.result_pages().get(self.hud_state.pages.page as usize) {
             // the tournament `HCongrats` speaks as it opens; with no top-three page the
             // standings may say "tournament leader"
             Some(ResultPage::TournamentPlace(_)) => self.tournament_speech(),
             Some(ResultPage::Standings)
                 if !matches!(
-                    self.result_pages().get(self.pages.page as usize - 1),
+                    self.result_pages().get(self.hud_state.pages.page as usize - 1),
                     Some(ResultPage::TournamentPlace(_))
                 ) =>
             {
@@ -376,9 +376,9 @@ impl App {
     /// event 3, the restart, only for a failed mission (0x4293BB). The answers do what Enter on the
     /// port's keyboard selection does.
     pub(crate) fn hud_click(&mut self, event_loop: &LoopCtl) -> bool {
-        let Some((dialog, k)) = self.hud_hover else { return false };
+        let Some((dialog, k)) = self.hud_state.hud_hover else { return false };
         match dialog {
-            0 if self.paused && self.pause_confirm.is_none() => {
+            0 if self.paused && self.hud_state.pause_confirm.is_none() => {
                 self.fe_sound(9);
                 match k {
                     0 => self.paused = false,
@@ -393,19 +393,19 @@ impl App {
                     3 => {
                         self.photo_enter();
                     }
-                    _ => self.pause_confirm = Some(1),
+                    _ => self.hud_state.pause_confirm = Some(1),
                 }
             }
-            1 if self.paused && self.pause_confirm.is_some() => {
+            1 if self.paused && self.hud_state.pause_confirm.is_some() => {
                 self.fe_sound(9);
                 if k == 0 {
                     self.paused = false;
-                    self.pause_confirm = None;
+                    self.hud_state.pause_confirm = None;
                     if !self.leave_race() {
                         event_loop.exit();
                     }
                 } else {
-                    self.pause_confirm = None;
+                    self.hud_state.pause_confirm = None;
                 }
             }
             3 if !self.paused && self.replay_save.up && !self.replay_save.overwrite => {
@@ -418,7 +418,7 @@ impl App {
             }
             2 if !self.paused
                 && self.results.is_some()
-                && self.result_pages().get(self.pages.page as usize) == Some(&ResultPage::MissionSummary) =>
+                && self.result_pages().get(self.hud_state.pages.page as usize) == Some(&ResultPage::MissionSummary) =>
             {
                 self.fe_sound(9);
                 if self.mission_result.is_some_and(|(passed, _)| !passed) {
@@ -427,7 +427,7 @@ impl App {
             }
             _ => return false,
         }
-        self.hud_hover = None;
+        self.hud_state.hud_hover = None;
         true
     }
 
@@ -474,17 +474,17 @@ impl App {
         let (place, total, best) = (me.place, me.time as u32, me.best_lap as u32);
         // 0x426D07: under `DERBY` `HCongrats` takes the place `car+0xB50 == 3 ? 8 : 1` of `[0x65741C]`'s car —
         // knocked out, or the winner — and not the ranking's
-        let place = if self.cheat_bits & CHEAT_DERBY != 0 { if self.player_eliminated { 8 } else { 1 } } else { place };
+        let place = if self.cheat_bits & CHEAT_DERBY != 0 { if self.ko.player_eliminated { 8 } else { 1 } } else { place };
         if place == 0 && self.mission.is_none() {
             return;
         }
         // 0x433A20 — not shown for a mission (its queue is the mission summary alone)
-        if self.hud_records.is_none()
+        if self.hud_state.hud_records.is_none()
             && self.mission.is_none()
             && let Some(t) = self.records.track(&self.track.name)
         {
             let circuit = t.circuit;
-            self.hud_records = Some(nfs_game::records::hud_records(&t.entries, !circuit, &self.player_name, &self.player_car_family(), total, best));
+            self.hud_state.hud_records = Some(nfs_game::records::hud_records(&t.entries, !circuit, &self.player_name, &self.player_car_family(), total, best));
             self.records_spoken = false;
         }
         // `HCongrats` heads the queue for game types 0…4 that draw it; the finales, the mission and

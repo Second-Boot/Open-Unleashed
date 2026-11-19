@@ -71,7 +71,7 @@ pub(crate) struct Hud {
     /// [`Hud::billboard`]); set by the caller before a post-race page is drawn
     pub(crate) billboard_h: std::cell::Cell<f32>,
     /// PORT-DEVIATION D64: the pad button icons to draw beside the dialogs' actions (`None` = no standard pad), set each frame
-    pub(crate) pad_icons: std::cell::Cell<Option<crate::pad_glyphs::PadIcons>>,
+    pub(crate) pad_icons: std::cell::Cell<Option<crate::app::pad::glyphs::PadIcons>>,
     /// `[0x606AC8]` now and at the billboard's creation, for its strips' moving split
     pub(crate) billboard_clock: std::cell::Cell<(u64, u64)>,
     /// `DISPLAYCOLORS` (0x4204F0, `Display.DispCols`): 0xCCFAB400 orange, 0xCCFF0606 red, 0xCC1EE605
@@ -717,7 +717,7 @@ impl App {
         self.hud_cfg_ensure();
         // the layout the draw picks (`SCREEN_LAYOUTS`, `Display.ScreenLayout`)
         let layout = self.choice_index(choice::DISPLAY_SCREEN_LAYOUT).map_or(0, |(i, _)| i.min(3));
-        let cache = self.hud_cfg.borrow();
+        let cache = self.hud_state.hud_cfg.borrow();
         let stored = cache.cfg.as_ref().and_then(|c| c.find(layout, w, h).map(|i| c.stored_positions(i)));
         Hud::set_stored(layout, stored);
     }

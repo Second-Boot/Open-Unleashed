@@ -1691,14 +1691,7 @@ mod feeder {
 mod real_data {
     use super::*;
 
-    fn game_root() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("NFS5_GAME_PATH") {
-            return Some(PathBuf::from(p));
-        }
-        let home = PathBuf::from(std::env::var_os("HOME")?);
-        let p = home.join("Games/NFS-Porsche-Unleashed/game_info/data");
-        p.join("GameData").is_dir().then_some(p)
-    }
+    use nfs_devdata::dev_game_root as game_root;
 
     /// The "все треки" total, against the genuine capture (`pass6_options_audio.jpg`, 35:46) —
     /// guards the 2026-09-29 fix (35:52 vs 35:46): the port had been summing the

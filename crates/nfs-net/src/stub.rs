@@ -23,6 +23,9 @@ use crate::session::{Event, Net};
 use crate::socket::CommSocket;
 use std::time::{Duration, Instant};
 
+/// The room's 32 Hz loop: 15 625 µs, half the 64 Hz game tick.
+const ROOM_TICK: Duration = Duration::from_micros(15_625);
+
 /// How many players one game holds (`room::MAX_PLAYERS`).
 const LIMIT: usize = room::MAX_PLAYERS;
 
@@ -173,7 +176,7 @@ impl LobbyStub {
         }
         // the room's 32 Hz loop: the peer records' queues (0x48A4E0)
         self.net.pump_outbox();
-        if self.last_tick.elapsed() >= Duration::from_micros(15_625) {
+        if self.last_tick.elapsed() >= ROOM_TICK {
             for e in self.net.tick() {
                 if let Event::PeerLeft { slot } = e {
                     self.drop_member(slot);
@@ -316,7 +319,7 @@ impl LobbyStub {
                 self.move_in(mi, gi);
             }
             Some(lobby::kind::JOIN_GAME) => {
-                let gid = m.get(1..4).map(|b| u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2])).unwrap_or(0);
+                let gid = m.get(1..).and_then(crate::msg::read_u24).unwrap_or(0);
                 let Some(gi) = self.games.iter().position(|x| x.as_ref().is_some_and(|g| g.id == gid)) else { return };
                 let g = self.games[gi].as_ref().unwrap();
                 if self.members[mi].version != g.desc.version {

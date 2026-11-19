@@ -49,7 +49,7 @@ impl App {
                 renderer.set_enhancements(self.enh);
                 // PERF (PERF-D): a scripted run's frames (a still, an autotest) wait for the pipeline sets their lights want; a live
                 // frame draws a stand-in with the same picture until they are built
-                if self.screenshot.is_some() || self.scripted {
+                if self.glue.screenshot.is_some() || self.glue.scripted {
                     renderer.set_exact_pipelines(true);
                 }
                 // ENHANCEMENT ENH-UPSCALER: the options panel is generated from this set
@@ -174,8 +174,8 @@ impl App {
             nfs_game::camera::set_mode(w, h);
             self.renderer = Some(renderer);
             self.window = Some(window);
-            self.last_frame = Instant::now();
-            self.fps_timer = Instant::now();
+            self.pace.last_frame = Instant::now();
+            self.pace.fps_timer = Instant::now();
             // `--layout serverlist` and friends start straight on a network screen, which needs a
             // browsing socket just as `open_layout` gives one
             if let Some(name) = self.fe.layout_name.as_deref()
@@ -272,7 +272,7 @@ impl App {
                     tracing::info!(dialog = id, "front end: PLAYGAME refused");
                 }
                 // a scripted run has nobody to answer it
-                if self.autotest.is_some() {
+                if self.glue.autotest.is_some() {
                     event_loop.exit();
                     return;
                 }
@@ -289,8 +289,8 @@ impl App {
                     tracing::info!(class = c, source = src, "unbound widget source");
                 }
             }
-            if self.layout_sweep {
-                self.layout_sweep = false;
+            if self.glue.layout_sweep {
+                self.glue.layout_sweep = false;
                 self.run_layout_sweep();
                 event_loop.exit();
                 return;
@@ -298,7 +298,7 @@ impl App {
             // (tooling: `NFS_SHOT_IN_RACE=1` leaves the still for the race that follows, so a
             // network joiner — which the host's `0xB3` starts — can be photographed in its race)
             if !nfs_game::config::cfg().nfs_shot_in_race.is_set()
-                && let Some(path) = self.screenshot.take()
+                && let Some(path) = self.glue.screenshot.take()
             {
                 // a screen fades in over half a second (`RE/notes/controls.md` §6), so a shot taken
                 // on the first frame catches every faded widget at alpha 0 and looks empty. Let the
@@ -373,7 +373,7 @@ impl App {
                 // (`E1:1` MSAA, `E3:-1` render scale) as a click on their rows of the enhancements panel would (`enh_step`: renderer,
                 // `enhancements.json`, the combos' text), so a scripted run can check the live path without a pointer; the token `enh`
                 // is the enhancements' key (`0`, `App::enh_key`)
-                if let Some(v) = std::env::var("NFS_DISPLAY_LIVE").ok().filter(|v| !v.is_empty()) {
+                if let Some(v) = nfs_game::config::cfg().nfs_display_live.as_str().filter(|v| !v.is_empty()) {
                     for part in v.split(',') {
                         if part.trim().eq_ignore_ascii_case("enh") {
                             self.enh_toggle_all();
@@ -505,8 +505,8 @@ impl App {
     /// its `NFS_FE_KEYS` tokens there — a player's way through the menus, ending in `playgame`
     /// (the bottom bar's button); without it `PLAYGAME` is pressed again for the same game type.
     pub(crate) fn session_next_from_fe(&mut self, game_type: u8, event_loop: &LoopCtl) {
-        let k = self.scripted_hud.race_no + 1;
-        if let Ok(spec) = std::env::var(format!("NFS_SESSION_FE_KEYS_{k}")) {
+        let k = self.hud_state.scripted_hud.race_no + 1;
+        if let Some(spec) = nfs_game::config::env_indexed("NFS_SESSION_FE_KEYS_", k) {
             for t in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                 self.fe_scripted_key(t, event_loop);
             }
@@ -517,7 +517,7 @@ impl App {
     }
 
     pub(crate) fn session_step(&mut self, event_loop: &LoopCtl, secs: f32) -> bool {
-        if self.session_races <= 1 {
+        if self.glue.session_races <= 1 {
             return false;
         }
         // the script's own keys are let go, as a player's would be between the runs
@@ -526,16 +526,16 @@ impl App {
         let recorded = self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Recording | nfs_game::replay::Mode::Full));
         if !self.session_replayed && recorded {
             self.session_replayed = true;
-            tracing::info!(left = self.session_races, "session: the automatic replay");
-            self.autotest = Some(secs);
+            tracing::info!(left = self.glue.session_races, "session: the automatic replay");
+            self.glue.autotest = Some(secs);
             self.replay_again(event_loop, true);
             return true;
         }
         self.session_replayed = false;
-        self.session_races -= 1;
-        tracing::info!(left = self.session_races, "session: leave, next race");
+        self.glue.session_races -= 1;
+        tracing::info!(left = self.glue.session_races, "session: leave, next race");
         self.rearm_hud_keys();
-        self.autotest = Some(secs);
+        self.glue.autotest = Some(secs);
         if self.fe.menu_template.is_some() {
             let game_type = self.fe.race_game_type.unwrap_or(self.fe.game_type);
             self.end_finished_race();

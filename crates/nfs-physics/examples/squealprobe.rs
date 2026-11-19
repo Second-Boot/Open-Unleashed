@@ -10,8 +10,7 @@ fn main() {
     let s = 5000.0;
     let (a, b, c, d) = (Vec3::new(-s, 0.0, -s), Vec3::new(s, 0.0, -s), Vec3::new(s, 0.0, s), Vec3::new(-s, 0.0, s));
     let grid = TriangleGrid::build(vec![Triangle::new(a, b, c, 1), Triangle::new(a, c, d, 1)], 200.0);
-    let p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
-        .join("Games/NFS-Porsche-Unleashed/game_info/data/GameData/Simulation/CarData/993coupe36.sim");
+    let p = nfs_devdata::dev_game_root().expect("the game data (NFS5_GAME_PATH)").join("GameData/Simulation/CarData/993coupe36.sim");
     let specs = CarSpecs::from_sim(&nfs_formats::sim::CarSim::parse(&std::fs::read(p).unwrap()).unwrap(), false);
     let mut v = Vehicle::new(Vec3::new(0.0, 0.3, 0.0), Mat3::IDENTITY, &specs, 0.75, 0.3);
     let phases: &[(&str, Controls, f32)] = &[

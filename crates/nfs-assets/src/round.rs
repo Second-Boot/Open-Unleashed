@@ -19,7 +19,7 @@
 //! Nothing here reads or writes the simulation; the caller applies it after the car's measurements (box, tyre radius).
 
 use glam::Vec3;
-use nfs_renderer::{MeshData, Vertex};
+use nfs_gfxdata::{MeshData, Vertex};
 use std::collections::HashMap;
 
 /// How a part is refined.
@@ -29,6 +29,32 @@ pub enum Kind {
     Wheel,
     /// a mirror, lamp lens, exhaust tip, steering wheel: curved PN triangles ([`refine_pn`])
     Smooth,
+}
+
+/// The crease threshold of the PN triangles: neighbours whose normals have a cosine below it keep their crease.
+pub const CREASE_COS: f32 = 0.9998;
+
+/// What an E42 level (1 = low, 2 = high; the level of the switch) asks of the refinement: one place for the numbers
+/// the car loader and the census example used to repeat.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoundParams {
+    /// the LODs refined (`1..=max_lod`)
+    pub max_lod: u8,
+    /// [`refine_wheel`]: the circle's minimum segment count and the cap of the cut
+    pub wheel_min_segments: u32,
+    pub wheel_max_n: usize,
+    /// [`refine_pn`]: the subdivision count and [`CREASE_COS`]
+    pub pn_n: usize,
+    pub crease_cos: f32,
+}
+
+/// The parameters of E42 `level` (level 1 is the low one, anything above is the high one).
+pub fn params(level: u8) -> RoundParams {
+    if level > 1 {
+        RoundParams { max_lod: 4, wheel_min_segments: 64, wheel_max_n: 6, pn_n: 3, crease_cos: CREASE_COS }
+    } else {
+        RoundParams { max_lod: 3, wheel_min_segments: 32, wheel_max_n: 4, pn_n: 2, crease_cos: CREASE_COS }
+    }
 }
 
 /// The whitelist of round parts, by article name with the digit / letter variant suffix stripped (`Light2a` -> `Light`, `SideMirrorLeft`
@@ -393,6 +419,15 @@ pub fn refine_pn(mesh: &MeshData, n: usize, crease_cos: f32) -> Option<(MeshData
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the numbers the car loader had inline: level 1 = (3 LODs, 32 / 4, PN 2), level 2 = (4 LODs, 64 / 6, PN 3), crease 0.9998
+    #[test]
+    fn the_level_parameters_are_the_loaders_old_numbers() {
+        let (lo, hi) = (params(1), params(2));
+        assert_eq!((lo.max_lod, lo.wheel_min_segments, lo.wheel_max_n, lo.pn_n), (3, 32, 4, 2));
+        assert_eq!((hi.max_lod, hi.wheel_min_segments, hi.wheel_max_n, hi.pn_n), (4, 64, 6, 3));
+        assert_eq!((lo.crease_cos.to_bits(), hi.crease_cos.to_bits()), (0.9998f32.to_bits(), 0.9998f32.to_bits()));
+    }
 
     fn grid_count(n: usize) -> usize {
         (n + 1) * (n + 2) / 2

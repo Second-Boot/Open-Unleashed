@@ -42,7 +42,7 @@ impl App {
         if self.cheat_bits & CHEAT_DERBY == 0 {
             return track.to_string();
         }
-        self.quick_knockout = true;
+        self.ko.quick_knockout = true;
         "skidpad".to_string()
     }
 
@@ -446,7 +446,7 @@ impl App {
         }
         self.fe.quit_saved = true;
         // 0x4D52CB…0x4D52D9: `Game.GameType` 2 with no series running starts one, quit or not
-        if self.fe.game_type == game_type::KNOCKOUT && !self.knockout.as_ref().is_some_and(|k| k.state.active) {
+        if self.fe.game_type == game_type::KNOCKOUT && !self.ko.knockout.as_ref().is_some_and(|k| k.state.active) {
             // the draw 0x4E3160 reads `Game.Difficutly`, as at the launch
             if let Some(m) = self.fe.menu.as_ref() {
                 self.race_skill = m.difficulty.min(2);
@@ -567,7 +567,7 @@ impl App {
         let track_name = match game_type {
             game_type::KNOCKOUT => {
                 // 0x4D52CB: a series is started unless one is running (0x4DDF00 / 0x4DDF30)
-                if !self.knockout.as_ref().is_some_and(|k| k.state.active) {
+                if !self.ko.knockout.as_ref().is_some_and(|k| k.state.active) {
                     self.knockout_start();
                 }
                 let Some(t) = self.knockout_round() else { return };
@@ -699,7 +699,7 @@ impl App {
             // **TEST GLUE** `NFS_TEST_CHEAT_PARTS=<ids,...>` (tooling, LOBBY-AC3): this machine's OWN car is built from these parts while
             // the record it sent (and every other machine, and the lobby server, saw) says what `rec` says: a client that lies about
             // its install, for the server's anti-cheat to catch. Not the original's.
-            let ids: Vec<i16> = std::env::var("NFS_TEST_CHEAT_PARTS").ok().map_or(ids, |v| v.split(',').filter_map(|p| p.trim().parse::<i16>().ok()).collect());
+            let ids: Vec<i16> = nfs_game::config::cfg().nfs_test_cheat_parts.as_str().map_or(ids, |v| v.split(',').filter_map(|p| p.trim().parse::<i16>().ok()).collect());
             if !ids.is_empty() && ids != car.stock_parts {
                 let owned: Vec<&nfs_formats::career::Part> = ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect();
                 self.specs.apply_parts(&owned, &car.sim_family);
@@ -831,24 +831,24 @@ impl App {
             // the session's HUD (0x4B6878 → 0x424460 → `HUD_init` 0x41E170): live, the options'
             // MAP / MAPSCALE / REARVIEWMIRRROR, TRANSLUCENCY's box (0x425298), the map's suspend
             // cleared; a pass keeps them (`HudKeys`)
-            self.hud_keys = HudKeys::new(
+            self.hud_state.hud_keys = HudKeys::new(
                 self.choice_index(choice::DISPLAY_MAP).map_or(1, |(i, _)| i),
                 self.choice_index(choice::DISPLAY_MAP_SCALE).map_or(4, |(i, _)| i.min(4)),
                 self.choice_index(choice::DISPLAY_REAR_VIEW).is_some_and(|(i, _)| i != 0),
                 self.choice_index(choice::DISPLAY_TRANSLUCENCY).is_none_or(|(i, _)| i == 0),
             );
-            self.slides.map = (0, 0);
-            self.slides.mirror = (0, 0);
+            self.hud_state.slides.map = (0, 0);
+            self.hud_state.slides.mirror = (0, 0);
             // `HReplay` 0x42C910, built by the same factory (0x424F90 / 0x424FA6)
-            self.replay_bar = nfs_game::replay::BarState::new();
-            self.hud_clock_base = -(self.pause_offset + self.pause_ticks);
+            self.hud_state.replay_bar = nfs_game::replay::BarState::new();
+            self.hud_state.hud_clock_base = -(self.pause_offset + self.pause_ticks);
             // `car+0xB54`, the metres: a session's race init allocates every car afresh and
             // zero-fills it (`Cars_create` 0x411130: `rep stosd` over 0x495 dwords, 0x4111B0…
             // 0x4111B9), and nothing but 0x4170A2 writes it — so they are 0 until the first
             // `tick % 64 == 1` of a new session, and a pass (restart, replay) keeps the last ones
             // (neither `Car_reset` 0x410730 nor the HUD's init 0x424460 touches them). *(Until
             // 2026-09-26 the port showed the last session's until that tick.)*
-            self.hud_metres.clear();
+            self.hud_state.hud_metres.clear();
         }
         // `Cars_resetAll` 0x4110A0 (0x414F12, every pass of the session loop): both race-order
         // arrays `0x5E8B88[]` / `0x5E8BAC[]` back to the registration order `0x5E8B34[]` over
@@ -933,7 +933,7 @@ impl App {
             career_opponent_cars = ?self.career_opponents.as_ref().map(|o| o.iter().map(|o| (o.name.as_str(), o.car.display_name.as_str(), o.grid)).collect::<Vec<_>>()),
             net_seat_grids = ?self.net_launch.seat_grids,
             net_traffic = self.net_launch.traffic.len(),
-            grid = ?self.player_grid_override,
+            grid = ?self.ko.player_grid_override,
             backwards = self.backwards,
             mirror = self.mirror,
             traffic = self.road.traffic_count,
@@ -943,7 +943,7 @@ impl App {
             cops_race = self.road.cops_race,
             damage = self.road.damage_on,
             skill = self.race_skill,
-            quick_knockout = self.quick_knockout,
+            quick_knockout = self.ko.quick_knockout,
             mission = ?self.mission.as_ref().map(|m| m.index),
             skill_test = self.skill.is_some(),
             camera_cycle = ?self.camera_cycle,
@@ -1013,45 +1013,7 @@ impl App {
         // the car shadow projectors' texture, `[0x6115CC]+0x18C` (`crp-geometry.md` §8)
         renderer.set_projector_texture(world.projector_texture);
         self.car.tiny = self.cheat_bits & CHEAT_TINY != 0;
-        // the driven car's catalogue record gives the stripe and interior colours that go with
-        // the paint (0x443DB0, `car-model.md` §5.0a)
-        let player_paint = nfs_formats::fedata::parse_car_catalog(&std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car")).unwrap_or_default())
-            .unwrap_or_default()
-            .iter()
-            .find(|c| c.sim.eq_ignore_ascii_case(&self.sim_name) && c.model.eq_ignore_ascii_case(&self.car.model))
-            .map(|c| Paint::matching(c, self.paint))
-            .unwrap_or(self.paint.into());
-        let player_paint = self.owned_paint.filter(|p| p.exterior == self.paint).unwrap_or(player_paint);
-        // A launch with no front end (`fe = 0`) never runs 0x4EEDA0, so the car's four colours are
-        // the registry's own `car[0].colorconfig` (`.COLORCONFIG` 0x149 → `carinfo+0x218`, the
-        // registry triple 0x4B2FD7…0x4B3013): exterior, stripe 1, stripe 2, **interior** (`+0x224`),
-        // each `0xAARRGGBB` as a signed decimal, and `.STRIPEPACKAGE` (absent: 0). The shipped
-        // fe.txt's `-65536 ×3, -3757195` is a red paint with the interior 0xC6AB75 — the grey-beige
-        // cabin of the original's own frames (`REFERENCE-2026-10-02-SRVF.md`), not the catalogue's
-        // first set's interior the port took (brown).
-        let player_paint = match self.registry.get("car[0].colorconfig").map(|v| v.split(',').filter_map(|x| x.trim().parse::<i64>().ok()).collect::<Vec<_>>()) {
-            Some(cc) if self.fe0 && cc.len() >= 4 => {
-                let rgb = |c: i64| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
-                Paint { exterior: rgb(cc[0]), stripe1: rgb(cc[1]), stripe2: rgb(cc[2]), interior: rgb(cc[3]), package: self.registry.u32("car[0].stripepackage", 0) }
-            }
-            _ => player_paint,
-        };
-        // The HUD reads the same word as the body: the map's blips (0x4333A0 `[[car+0x558]+0x218]`, hud.md
-        // "Audit 2026-09-26") and the opponent list's swatch take `carinfo+0x218`, which in a `fe = 0` launch is
-        // the registry's `car[0].colorconfig` (above), not the catalogue's first set (the port's `self.paint`
-        // default: yellow for the 901 RS 2.7 where the original's blip and body are the fe.txt's red).
-        if self.fe0 && self.registry.get("car[0].colorconfig").is_some() && player_paint.exterior != self.paint {
-            self.paint = player_paint.exterior;
-        }
-        // the plate is `.LICENSE` (0x13C): in a `fe = 0` launch the registry's `car[0].license`, in a
-        // front-end launch the name argument 0x4EEDA0 sends to both (0x4EEDF1 / 0x4EEE7E)
-        let plate = if self.fe0 { self.registry.get("car[0].license").map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) } else { None };
-        let mut text = self.page_text(0, plate.as_deref().unwrap_or(&self.player_name), None);
-        // a garage car brings its own race number (the front end's 0x4D1800 from `DecalNum`)
-        if let (Some(n), true) = (self.owned_decal, self.owned_paint.is_some_and(|p| p.exterior == self.paint)) {
-            text.race_number = n as i32;
-        }
-        self.car.page_text = Some(text);
+        let player_paint = self.race_player_paint();
         // `.DRIVER` 0x23D: 0x4EEDA0 draws `rand() & 7` for every car it launches (0x4EEDAC…
         // 0x4EEDE2), in 0x4ECF00's order — the player (0x4EBA4D), the opponents (0x4EBCBF /
         // 0x4EBF06 / 0x4EC3FF / 0x4DE213), the cops one per car (0x4ED174 / 0x4ED25E), then the
@@ -1116,7 +1078,7 @@ impl App {
         }
         let mph = self.choice_index(choice::DISPLAY_SPEED_UNITS).is_some_and(|(i, _)| i != 0);
         self.hud = Hud::load(&mut renderer, &self.paths, self.dials, night, mph);
-        self.wrong_way_blink = (0, 0, true);
+        self.hud_state.wrong_way_blink = (0, 0, true);
         if let (Some(h), Some(t)) = (
             self.hud.as_mut(),
             SliceTable::from_crp(&self.track.crp, &self.track.crp_data).ok(),
@@ -1331,6 +1293,58 @@ impl App {
             self.start_damage[i + 1] = nfs_game::career::damage_sum(&o.vehicle.damage);
         }
         self.race_stage_pools(&mut renderer);
+        self.race_stage_finish(renderer, window, world, car, race_pass, event_loop);
+    }
+
+    /// The player's paint (the catalogue record's stripe and interior colours, the garage's own paint, an `fe = 0` launch's registry colours),
+    /// the plate and race number on `self.car.page_text`: the block of `start_race` that precedes the car's model upload, moved out whole.
+    fn race_player_paint(&mut self) -> Paint {
+        // the driven car's catalogue record gives the stripe and interior colours that go with
+        // the paint (0x443DB0, `car-model.md` §5.0a)
+        let player_paint = nfs_formats::fedata::parse_car_catalog(&std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car")).unwrap_or_default())
+            .unwrap_or_default()
+            .iter()
+            .find(|c| c.sim.eq_ignore_ascii_case(&self.sim_name) && c.model.eq_ignore_ascii_case(&self.car.model))
+            .map(|c| Paint::matching(c, self.paint))
+            .unwrap_or(self.paint.into());
+        let player_paint = self.owned_paint.filter(|p| p.exterior == self.paint).unwrap_or(player_paint);
+        // A launch with no front end (`fe = 0`) never runs 0x4EEDA0, so the car's four colours are
+        // the registry's own `car[0].colorconfig` (`.COLORCONFIG` 0x149 → `carinfo+0x218`, the
+        // registry triple 0x4B2FD7…0x4B3013): exterior, stripe 1, stripe 2, **interior** (`+0x224`),
+        // each `0xAARRGGBB` as a signed decimal, and `.STRIPEPACKAGE` (absent: 0). The shipped
+        // fe.txt's `-65536 ×3, -3757195` is a red paint with the interior 0xC6AB75 — the grey-beige
+        // cabin of the original's own frames (`REFERENCE-2026-10-02-SRVF.md`), not the catalogue's
+        // first set's interior the port took (brown).
+        let player_paint = match self.registry.get("car[0].colorconfig").map(|v| v.split(',').filter_map(|x| x.trim().parse::<i64>().ok()).collect::<Vec<_>>()) {
+            Some(cc) if self.fe0 && cc.len() >= 4 => {
+                let rgb = |c: i64| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+                Paint { exterior: rgb(cc[0]), stripe1: rgb(cc[1]), stripe2: rgb(cc[2]), interior: rgb(cc[3]), package: self.registry.u32("car[0].stripepackage", 0) }
+            }
+            _ => player_paint,
+        };
+        // The HUD reads the same word as the body: the map's blips (0x4333A0 `[[car+0x558]+0x218]`, hud.md
+        // "Audit 2026-09-26") and the opponent list's swatch take `carinfo+0x218`, which in a `fe = 0` launch is
+        // the registry's `car[0].colorconfig` (above), not the catalogue's first set (the port's `self.paint`
+        // default: yellow for the 901 RS 2.7 where the original's blip and body are the fe.txt's red).
+        if self.fe0 && self.registry.get("car[0].colorconfig").is_some() && player_paint.exterior != self.paint {
+            self.paint = player_paint.exterior;
+        }
+        // the plate is `.LICENSE` (0x13C): in a `fe = 0` launch the registry's `car[0].license`, in a
+        // front-end launch the name argument 0x4EEDA0 sends to both (0x4EEDF1 / 0x4EEE7E)
+        let plate = if self.fe0 { self.registry.get("car[0].license").map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) } else { None };
+        let mut text = self.page_text(0, plate.as_deref().unwrap_or(&self.player_name), None);
+        // a garage car brings its own race number (the front end's 0x4D1800 from `DecalNum`)
+        if let (Some(n), true) = (self.owned_decal, self.owned_paint.is_some_and(|p| p.exterior == self.paint)) {
+            text.race_number = n as i32;
+        }
+        self.car.page_text = Some(text);
+        player_paint
+    }
+
+    /// Stage "finish" — the end of `start_race`: the weather layer a pass keeps, the skid marks' tree, the trackside cameras, the player's
+    /// model and dash, the damage option on every car, the load barrier, the first scene and the scripted run or still that waits for it
+    /// (moved out whole; nothing follows it in `start_race`).
+    fn race_stage_finish(&mut self, mut renderer: Renderer, window: Option<Arc<Window>>, world: TrackWorld, car: CarModel, race_pass: bool, event_loop: &LoopCtl) {
         // **A pass keeps the weather layer.** The session's track load makes it (0x469092 →
         // 0x458B80 → 0x458C90) and the session's end deletes it (0x4690F0 → 0x458BB0); every pass
         // in between — the race, a restart, the automatic replay — only runs 0x4690A0 from 0x414EB0,
@@ -1340,8 +1354,8 @@ impl App {
         // `+0x85C4` / `+0x85C8` and last view `+0x85CC…+0x85FC`, the drops' plane (the car's `Wndo`
         // once attached), their colours, last eye and flags. *(Until 2026-09-26 every pass made
         // the layer afresh.)*
-        self.weather_kept = if race_pass { self.weather.take() } else { None };
-        self.weather = None;
+        self.ambient.weather_kept = if race_pass { self.ambient.weather.take() } else { None };
+        self.ambient.weather = None;
         // the skid marks' cells (0x479900) are cut from the world's fitted tree (`WTrack+0x10`,
         // `nfs_game::fitted_tree`): its root is the union of the eight box corners every placed item
         // answers (`getBounds`, 0x47B6C6…0x47B89C — the corners moved through the item's matrix
@@ -1435,9 +1449,9 @@ impl App {
         self.net_race_go();
         // …and the exchange's own race-frame step (`net_exchange_begin`: the seats are human cars, the state dump)
         self.net_exchange_begin();
-        self.last_frame = Instant::now();
-        self.fps_timer = Instant::now();
-        if let Some(secs) = self.autotest.take()
+        self.pace.last_frame = Instant::now();
+        self.pace.fps_timer = Instant::now();
+        if let Some(secs) = self.glue.autotest.take()
             && self.run_scripted_race(secs, event_loop)
         {
             return;
@@ -1446,7 +1460,7 @@ impl App {
         // automatic replay's pass (started inside that run) does not take it at its first frame
         let results_stop_pass = race_pass && nfs_game::config::cfg().nfs_results_stop.is_set();
         if !results_stop_pass
-            && let Some(path) = self.screenshot.take()
+            && let Some(path) = self.glue.screenshot.take()
         {
             self.take_screenshot(path, event_loop);
         }
@@ -1456,11 +1470,10 @@ impl App {
     /// of a scripted session (`NFS_AUTOTEST_RACES`) — from `NFS_HUD_KEYS_<k>` for race `k`
     /// (1-based) when set, else `NFS_HUD_KEYS` again — so every race of the session is driven alike.
     pub(crate) fn rearm_hud_keys(&mut self) {
-        self.scripted_hud.race_no += 1;
-        let k = self.scripted_hud.race_no + 1;
+        self.hud_state.scripted_hud.race_no += 1;
+        let k = self.hud_state.scripted_hud.race_no + 1;
         // (`NFS_HUD_KEYS_<k>` is a per-race name, read here; the plain `NFS_HUD_KEYS` is the snapshot's)
-        self.hud_key_script = std::env::var(format!("NFS_HUD_KEYS_{k}"))
-            .ok()
+        self.hud_state.hud_key_script = nfs_game::config::env_indexed("NFS_HUD_KEYS_", k)
             .or_else(|| nfs_game::config::cfg().nfs_hud_keys.as_str().map(str::to_owned))
             .map(|s| parse_hud_keys(&s).into())
             .unwrap_or_default();
@@ -1498,7 +1511,7 @@ impl App {
         self.results_billboard = None;
         let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return };
         // `[0x606AC8]` runs on through the pass (`hud_clock_base`)
-        self.hud_clock_base += self.tick as f64;
+        self.hud_state.hud_clock_base += self.tick as f64;
         self.tick = 0;
         self.race_pass = true;
         self.start_race(renderer, Some(window), event_loop);

@@ -34,9 +34,6 @@ fn vs_main(in: VsIn, @builtin(instance_index) inst: u32) -> VsOut {
     return out;
 }
 
-// a channel's top value in bytes (`shadow_on.w` is in bytes)
-const BYTE: f32 = 255.0;
-
 @fragment
 fn fs_cut(in: VsOut) {
     let o = objects[in.obj];

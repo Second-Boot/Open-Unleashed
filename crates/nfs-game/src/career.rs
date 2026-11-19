@@ -960,10 +960,10 @@ impl Career {
     /// migration ([`crate::save::migrate_legacy_json`]) and never written again — the career is
     /// the profile's `.sav`, as in the original.
     pub fn legacy_json_path() -> PathBuf {
-        if crate::config::cfg().nfs5_save_dir.is_set() {
+        if crate::config::save_root_override().is_some() {
             return crate::save::save_dir().join("career.json");
         }
-        nfs_assets::platform::data_dir().join("career.json")
+        crate::config::save_root().join("career.json")
     }
 
     /// Read a retired port JSON career: the career itself and the one key the `.sav` stores in

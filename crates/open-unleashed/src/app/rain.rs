@@ -79,12 +79,12 @@ pub(crate) fn clearance(b: &CarBox, eye: Vec3, lamp: Vec3) -> f32 {
     let t = (-e.dot(d) / d.length_squared().max(1e-9)).clamp(0.0, 1.0);
     let m = (e + d * t).length();
     let k = ((m - 0.8) / 0.3).clamp(0.0, 1.0);
-    k * k * (3.0 - 2.0 * k)
+    nfs_math::smooth01(k)
 }
 
 /// ENHANCEMENT E26: a skid strip's wetness: the field 5 at the slice of the strip's first point (`hint` = the camera's
 /// slice for the search). Returns the item's `csm` bit and `wet`; a dry track or stretch gives wetness 0 (the shader skips it).
-pub(crate) fn strip_wet(table: Option<&SliceTable>, bin: Option<&nfs_formats::sky::SkyBin>, hint: Option<usize>, p: Vec3) -> (u8, f32) {
+pub(crate) fn strip_wet(table: Option<&SliceTable>, bin: Option<&nfs_formats::sky::SkyBin>, hint: Option<usize>, p: Vec3) -> (u16, f32) {
     let (Some(table), Some(bin)) = (table, bin) else { return (0, 0.0) };
     let lap = table.slices.len() as i32;
     if lap == 0 {
@@ -98,15 +98,15 @@ impl App {
     /// items are built; with the switch off, on a dry track or in the front end it only clears `scene.rain`.
     pub(crate) fn rain_frame(&mut self) {
         self.scene.rain = None;
-        let lamps = std::mem::take(&mut *self.rain.lamps.borrow_mut());
-        let cars = std::mem::take(&mut *self.rain.cars.borrow_mut());
+        let lamps = std::mem::take(&mut *self.ambient.rain.lamps.borrow_mut());
+        let cars = std::mem::take(&mut *self.ambient.rain.cars.borrow_mut());
         if !self.enh.is_on(nfs_renderer::E26) || self.vehicle.is_none() {
             return;
         }
         // the classified street lamps (E23's list, `street_lamps.rs`: lamp heads and tunnel lamps, not blinkers or glints)
         // within 100 m are lights the road shows streaks of, besides the lit car lamps
         let mut lamps = lamps;
-        if self.rain.any != Some(false) {
+        if self.ambient.rain.any != Some(false) {
             let eye0 = self.camera.position;
             // PERF: only the lamps that can show a streak in the view (a 30 m sphere round the lamp touches the frustum)
             let cone = self.view_cone();
@@ -119,14 +119,14 @@ impl App {
             lamps.extend(sites);
         }
         let (Some(world), Some(table), Some(bin)) = (self.world.as_ref(), self.slices.as_ref(), self.track.sky_bin.as_ref()) else { return };
-        if self.rain.track != self.track.name {
-            self.rain = RainState { track: self.track.name.clone(), ..Default::default() };
+        if self.ambient.rain.track != self.track.name {
+            self.ambient.rain = RainState { track: self.track.name.clone(), ..Default::default() };
         }
         let lap = table.slices.len() as i32;
         if lap == 0 {
             return;
         }
-        if self.rain.any.is_none() {
+        if self.ambient.rain.any.is_none() {
             // the steps of field 5 between two neighbouring keys (at most 12 slices apart; a longer span is a slow ramp the
             // per-part values follow well enough): the boundary plane stands at the middle slice, normal toward higher slices
             let mut edges = Vec::new();
@@ -139,14 +139,14 @@ impl App {
                     }
                 }
             }
-            self.rain.edges = edges;
+            self.ambient.rain.edges = edges;
         }
-        let any = *self.rain.any.get_or_insert_with(|| (0..lap).step_by(8).any(|s| bin.sample_track_b(5, s, lap) > 0.05));
+        let any = *self.ambient.rain.any.get_or_insert_with(|| (0..lap).step_by(8).any(|s| bin.sample_track_b(5, s, lap) > 0.05));
         if !any {
             return;
         }
         for it in self.scene.items.iter_mut().filter(|it| it.csm & nfs_renderer::CSM_ROAD != 0) {
-            it.wet = *self.rain.wet.entry(it.mesh).or_insert_with(|| world.road_centres.get(&it.mesh).map_or(0.0, |c| bin.sample_track_b(5, table.find_slice(*c, 0) as i32, lap).clamp(0.0, 1.0)));
+            it.wet = *self.ambient.rain.wet.entry(it.mesh).or_insert_with(|| world.road_centres.get(&it.mesh).map_or(0.0, |c| bin.sample_track_b(5, table.find_slice(*c, 0) as i32, lap).clamp(0.0, 1.0)));
         }
         let eye = self.camera.position;
         // AUTOBAHN-LAMPS: a light behind another car (its glare hidden by the depth test) streaks as much as it shows past the
@@ -175,7 +175,7 @@ impl App {
             *d = (l.pos, l.colour, l.reach);
         }
         // the nearest wetness edges within 150 m of the eye
-        let mut near: Vec<(f32, nfs_renderer::RainEdge)> = self.rain.edges.iter().map(|e| ((e.pos - eye).length_squared(), *e)).filter(|(d, _)| *d < 150.0 * 150.0).collect();
+        let mut near: Vec<(f32, nfs_renderer::RainEdge)> = self.ambient.rain.edges.iter().map(|e| ((e.pos - eye).length_squared(), *e)).filter(|(d, _)| *d < 150.0 * 150.0).collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (d, (_, e)) in env.edges.iter_mut().zip(near.iter()) {
             *d = *e;
@@ -194,7 +194,7 @@ impl App {
             return;
         }
         for it in items.iter_mut().filter(|it| it.csm & nfs_renderer::CSM_ROAD != 0) {
-            it.wet = self.rain.wet.get(&it.mesh).copied().unwrap_or(0.0);
+            it.wet = self.ambient.rain.wet.get(&it.mesh).copied().unwrap_or(0.0);
         }
     }
 }

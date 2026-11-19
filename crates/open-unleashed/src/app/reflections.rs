@@ -55,7 +55,7 @@ impl App {
             return;
         }
         let Some((size, per_frame)) = level_params(self.enh.level(nfs_renderer::E8)) else {
-            self.refl_done = 0;
+            self.refl.refl_done = 0;
             return;
         };
         let (Some(pose), true, true) = (self.dyn_pose, self.vehicle.is_some(), self.world.is_some()) else { return };
@@ -66,18 +66,18 @@ impl App {
         // ENHANCEMENT E49: the near objects (the renderer makes the cube again with its twelve layers when this changes)
         let near = self.enh.is_on(nfs_renderer::E49);
         // a new size, or a car that jumped (a new race, a reset): every face again
-        if size != self.refl_size || eye.distance(self.refl_eye) > 300.0 || near != self.refl_near {
-            self.refl_done = 0;
-            self.refl_size = size;
-            self.refl_near = near;
+        if size != self.refl.refl_size || eye.distance(self.refl.refl_eye) > 300.0 || near != self.refl.refl_near {
+            self.refl.refl_done = 0;
+            self.refl.refl_size = size;
+            self.refl.refl_near = near;
         }
-        self.refl_eye = eye;
-        let n = if self.refl_done == 0x3F { per_frame } else { 6 };
+        self.refl.refl_eye = eye;
+        let n = if self.refl.refl_done == 0x3F { per_frame } else { 6 };
         for _ in 0..n {
-            let face = self.refl_next % 6;
-            self.refl_next = (face + 1) % 6;
+            let face = self.refl.refl_next % 6;
+            self.refl.refl_next = (face + 1) % 6;
             self.render_refl_face(eye, face, size, near.then_some(pose));
-            self.refl_done |= 1 << face;
+            self.refl.refl_done |= 1 << face;
         }
         self.scene.refl = 1.0;
         // ENHANCEMENT E49: a night track (the original's night flag) shows the live sky in the sphere-map overlay (NEAR-REFL3),

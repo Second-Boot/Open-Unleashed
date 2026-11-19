@@ -7,7 +7,7 @@
 
 use nfs_formats::crp::{prim_type, ArticleGeometry, Primitive};
 use nfs_physics::collision::PatchKind;
-use nfs_renderer::{MeshData, Vertex};
+use nfs_gfxdata::{MeshData, Vertex};
 use std::collections::BTreeMap;
 
 /// A mesh with the material it uses.

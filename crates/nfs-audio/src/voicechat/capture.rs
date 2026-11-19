@@ -60,14 +60,10 @@ pub struct Capture {
     queue: Arc<Mutex<VecDeque<i16>>>,
 }
 
-fn env_on(k: &str) -> bool {
-    std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0")
-}
-
 impl Capture {
     /// The default input device, or `None` (see the module notes).
     pub fn open() -> Option<Capture> {
-        if !env_on("NFS_MIC") || (!env_on("NFS_SOUND") && (env_on("NFS_MUTE") || env_on("NFS_NO_FOCUS"))) {
+        if !crate::env_flag("NFS_MIC") || (!crate::env_flag("NFS_SOUND") && (crate::env_flag("NFS_MUTE") || crate::env_flag("NFS_NO_FOCUS"))) {
             tracing::info!("voice chat: no capture (off unless NFS_MIC=1, PORT-DEVIATION D39; or a muted run)");
             return None;
         }

@@ -16,8 +16,17 @@ mod fe_cars;
 mod fe_rows;
 mod fe_pictures;
 mod audio;
+mod glue;
+pub(crate) use glue::Glue;
+pub(crate) use glue::pa_trace::fe0_setup as pa_trace_fe0_setup;
+mod knockout;
+pub(crate) use knockout::KnockoutState;
+mod ambient;
+pub(crate) use ambient::Ambient;
+mod hud_state;
+pub(crate) use hud_state::HudState;
+mod race_audio;
 mod net;
-mod net_inet;
 mod race_end;
 mod opponents;
 mod results;
@@ -30,6 +39,8 @@ mod session;
 mod replay;
 pub(crate) mod resim;
 mod render_scene;
+mod lights;
+mod car_draw;
 mod hud_pass;
 mod car_lights;
 mod rain;
@@ -50,14 +61,9 @@ mod fe_flow;
 mod fe_screens;
 mod fe_callbacks;
 mod input;
-mod pad_icons;
-mod pad_menu;
+pub(crate) mod pad;
 mod frame;
 mod events;
-mod scripted;
-mod pa_trace;
-pub(crate) use pa_trace::fe0_setup as pa_trace_fe0_setup;
-mod fe_seq;
 mod idle;
 mod quickfix;
 mod init;
@@ -68,8 +74,8 @@ mod race_shot;
 /// The enhancements' A/B key, the physical `0` (`App::enh_key`; PORT-DEVIATION D63).
 pub(crate) const ENH_KEY: winit::keyboard::KeyCode = winit::keyboard::KeyCode::Digit0;
 pub(crate) use quickfix::*;
-pub(crate) use init::AppInit;
-pub(crate) use scripted::*;
+pub(crate) use init::{AppInit, catalog_by_sim};
+pub(crate) use glue::scripted::*;
 pub(crate) use fe_flow::*;
 pub(crate) use effects::*;
 pub(crate) use car_lights::*;
@@ -228,42 +234,10 @@ pub(crate) struct App {
     /// the pauses so far folded in, so `tick + pause_offset + pause_ticks` is a clock that, like
     /// `[0x606AC8]`, never runs back when a pause ends
     pub(crate) pause_offset: f64,
-    /// **TEST GLUE** (`NFS_SHOT_SETTLE`, a `--screenshot` still): milliseconds added to the lamps' clock, as if that much
-    /// wall time of drawn frames had followed the still's tick; 0 otherwise
-    pub(crate) shot_settle_ms: f64,
-    /// What `hud_clock` adds so that `[0x606AC8]` is **kept across a pass**: the clock it is set
-    /// from, `[0x5E99B8]`, is zeroed only when a session installs the timer (0x4A4700 → 0x4A4752;
-    /// 0x4A4760 removes it at the session's end) and runs on through every pass, and both the pass
-    /// setup (0x414F2B…0x414F3B) and `RaceFrame`'s entry (0x4152EB / 0x415312) set `[0x606AC8]` to
-    /// it. So a restart or the automatic replay goes on from the clock the last pass reached
-    /// (`+= tick` there), and a new session starts it at 0 (`= −pause_offset`). PORT-DEVIATION D13
-    /// (PORT-DEVIATIONS.md) [`[0x5E99B8]` installed at 0x4A4752, before the load 0x468FB0]: the
-    /// timer also counts the wall time the original spends loading the session's track (installed
-    /// before 0x468FB0) and setting a pass up, which this port does not model — its own loading is
-    /// not the original's.
-    pub(crate) hud_clock_base: f64,
-    /// the window's last seen scale factor ([`App::hud_geometry`]): `start_race` takes the renderer AND the window
-    /// out of the `App` for the whole load, and the loading screen drawn meanwhile needs both (LOADSEAM)
-    pub(crate) hud_scale: std::cell::Cell<f32>,
-    /// The race HUD's slide states of its element groups: `(state, [0x606AC8] stamp of the last transition)`
-    pub(crate) slides: HudSlides,
-    /// what the HUD toggle keys F5 / F6 / F7 / F8 / "2" change (`HudKeys`)
-    pub(crate) hud_keys: HudKeys,
-    /// `HReplay`'s own state (`nfs_game::replay::BarState`): built once per session with the HUD
-    /// (0x424F90 / 0x424FA6), kept by a restart and the automatic replay
-    pub(crate) replay_bar: nfs_game::replay::BarState,
-    /// The single input mailbox `[0x610A6C]` (0x435410), as far as the bar is concerned: a
-    /// `WM_LBUTTONDOWN` over the bar latches its position here and nothing more (the port used to
-    /// answer it at once, `replay.md` §18.11's gap); `App::replay_bar_frame`, the pump's once-per-
-    /// `RaceFrame` call (0x415520 → 0x4264CC), is the only reader — it takes the latch and clears
-    /// it every frame, event or none, exactly as 0x435410 does
-    pub(crate) bar_press: Option<(f32, f32)>,
-    /// diagnostic: `NFS_HUD_KEYS=tick:key,…` (key `F5` `F6` `F7` `F8` `2` `pause` or
-    /// `pauserestart`) — the HUD toggle keys pressed on those game ticks (`hud_key`), for a
-    /// `--screenshot` of their effect
-    pub(crate) hud_key_script: std::collections::VecDeque<(u64, ScriptedHudKey)>,
-    /// **TEST GLUE**: the state of the scripted `NFS_HUD_KEYS` / `NFS_AUTOTEST_RACES` runs
-    pub(crate) scripted_hud: ScriptedHud,
+    /// **TEST GLUE** (not in the original): the scripted runs' state - the headless flag, the autotest drive, the screenshot target, the layout sweep, the scripted session.
+    pub(crate) glue: Glue,
+    /// The HUD's state: the slide-in / key / score pages, the scripted key, bar and hover feeds, the pointer, the cones and records.
+    pub(crate) hud_state: HudState,
     /// `0x5E8B88[]` — the race-order array every car is registered in (the human, the opponents,
     /// the cops, the traffic), re-sorted at the end of every even tick (`nfs_game::race_order`)
     pub(crate) race_order: nfs_game::race_order::RaceOrder,
@@ -278,21 +252,8 @@ pub(crate) struct App {
     /// entering state 1 (opening, 0x41ADFA) and state 2 (closing, 0x41AE0E), so every change of
     /// this key is one of those.
     pub(crate) billboard_key: u32,
-    pub(crate) knockout: Option<KnockoutSeries>,
-    /// `FEOpponentCarAccessor`'s seven embedded cars (`this + 0x24 + i·0x760`, `modes.md` §1.1a):
-    /// what the last 0x4F4FA0 drew — each opponent's record and appearance. Refilled by every
-    /// quick race's set-up (0x4EBC2D) and the knockout start (0x4DDF58), loaded with the profile
-    /// (0x4F56F0); a knockout round takes entry `i − 1` for opponent `i` (0x4DE1E7). Empty until
-    /// the first draw: the constructor's own draw (0x4F4EA8, in 0x4F4E50) is not made, and that is
-    /// safe — the only readers of the seven cars are 0x4EBBA0 (0x4EBC8B, after its own draw at
-    /// 0x4EBC2D), the knockout round 0x4DE150 (0x4DE1E7, after the series' draw 0x4DDF58) and the
-    /// profile save 0x4F56C0 (which would write the constructor's clock-seeded random cars where
-    /// the port writes none until a race has drawn them; xrefs read 2026-09-30).
-    pub(crate) opp_cars: Vec<nfs_game::save::OpponentCarSave>,
-    /// the race running is a knockout round (`Game.GameType` 2 at the launch, `[0x690AD4]` at its
-    /// end) — set by `knockout_round`, taken by the race's end
-    pub(crate) knockout_round: bool,
-    pub(crate) player_grid_override: Option<u32>,
+    /// The knockout series' state: the series, the round flag, the quick knockout, the player's elimination, the opponents' cars and the grid override.
+    pub(crate) ko: KnockoutState,
     /// The launch-time state of a network race (the host's `fe.txt` half, seats, cheat flags, the finish sent …) — empty outside one
     pub(crate) net_launch: NetLaunch,
     /// The input-exchange race's controller samples for this tick — what the frame driver latched
@@ -326,9 +287,6 @@ pub(crate) struct App {
     pub(crate) backwards: bool,
     /// `MIRROR`: world drawn x-flipped, steering negated (modes.md §2.1, MEDIUM on the consumers).
     pub(crate) mirror: bool,
-    /// Quick Knockout (`RACE_TYPE 3`): laps = opponents, the last car is out on every lap.
-    pub(crate) quick_knockout: bool,
-    pub(crate) player_eliminated: bool,
     pub(crate) records: Records,
     /// recording and playback of the controller stream — see [`Playback`]
     pub(crate) replay: Playback,
@@ -341,9 +299,6 @@ pub(crate) struct App {
     pub(crate) player_name: String,
     /// `nfs5.car` id of the car being driven, for the replay snapshot's car slot.
     pub(crate) car_id: u16,
-    /// headless run (`--autotest`): the bot may reset itself when stuck
-    pub(crate) scripted: bool,
-    pub(crate) stuck_ticks: u32,
     /// detail level (`[0x657D70]` → 0.5 / 0.67 / 0.83 / 1.0) scaling the `.key` draw distance
     pub(crate) detail: f32,
     /// `ADJUSTABLEVIEWDISTANCE` `[0x657D70]`, 0…3: the launch's `Graphics.ViewDistance` selection, stepped by
@@ -354,13 +309,8 @@ pub(crate) struct App {
     /// `SPLITTIMES` (`[0x657DD8]`): 1 record lap, 2 best lap, 3 last lap — circuits only; the
     /// record time is always shown on point-to-point tracks (`HRecordTime` 0x42A200, hud.md §6.3).
     pub(crate) records_path: std::path::PathBuf,
-    /// The post-race records table (`HTrackRecords`, `nfs_game::records::hud_records`), built as
-    /// the result pages are (0x433A20 at 0x426C4F); `None` when the race has none to show.
-    pub(crate) hud_records: Option<nfs_game::records::HudRecords>,
     /// `HTrackRecords +0x124`: its record speech has been said (0x4339E9…0x4339F9)
     pub(crate) records_spoken: bool,
-    /// `HPauseMenu` 0x42A440: the highlighted button — 0 continue, 1 race again, 2 quit
-    pub(crate) pause_sel: u8,
     /// The result records of the race that reached race over (0x417010 → `Race_finalize(2)`
     /// 0x416AC0), `None` before it. The post-race pages are up while they exist.
     pub(crate) results: Option<RaceResults>,
@@ -371,29 +321,6 @@ pub(crate) struct App {
     /// The mission's verdict and result text, fixed once at the race end as
     /// `HMissionSummary::evaluate` 0x4293F0 does
     pub(crate) mission_result: Option<(bool, Option<u32>)>,
-    /// `HTime +0xE0`: set to 16 on a cone hit (0x431830) and counted down once per HUD draw,
-    /// i.e. per rendered frame (`HTime` draw 0x4316F0, 0x4317C9…0x4317E0 — reached whether or not
-    /// the element is shown); the time shows in the alert colour while it is not 0 (0x431730)
-    pub(crate) cone_flash: u32,
-    /// The mission HUD's cone count, `[0x60CA04]` and `HMissionSummary+0x140` / `HTime+0xE4`
-    /// (`nfs_game::skill::HudCones`, 0x425950)
-    pub(crate) hud_cones: nfs_game::skill::HudCones,
-    /// The post-race page that is up and what its billboard animation counts
-    pub(crate) pages: ResultPages,
-    /// the quit confirmation (`HYesNoOverlay`, 0x426154) when it is up: 0 yes, 1 no
-    pub(crate) pause_confirm: Option<u8>,
-    /// The in-race dialog button under the pointer as the last draw found it — `HButtonVisual`'s
-    /// `+0x100` (0x41B3CE): `(dialog, button)`, dialog 0 the pause menu, 1 the quit question, 2 the
-    /// mission summary. A release reads it (0x41B300), as the original's does.
-    pub(crate) hud_hover: Option<(u8, usize)>,
-    /// diagnostic: `NFS_REPLAY_PRESS=tick:cell,…` — the pointer put on a replay bar cell and pressed
-    /// once the playback reaches that tick, for scripted runs (`App::run_bar_script`); cells 7 and
-    /// 8 are `HReplaySave`'s two buttons, 9 and 10 the overwrite question's yes and no
-    pub(crate) bar_script: Vec<(u64, usize)>,
-    /// diagnostic: `NFS_REPLAY_HOVER=tick:cell,…` — the pointer put in a replay bar cell's middle
-    /// (0…6) without a press, or off the bar (`off`: the screen's top-left corner), once the
-    /// playback reaches that tick — for stills of the bar's hover, tooltip and auto-hide
-    pub(crate) hover_script: Vec<(u64, Option<usize>)>,
     /// `HReplaySave` `[0x60C9B0]` and the overwrite question it raises
     pub(crate) replay_save: ReplaySave,
     /// Every racer's body-damage total at the start, `[0x60C9C8 + i·4]` — taken by the HUD's
@@ -402,15 +329,6 @@ pub(crate) struct App {
     pub(crate) start_damage: [i32; 8],
     pub(crate) track: TrackAssets,
     pub(crate) car: CarAssets,
-    pub(crate) screenshot: Option<String>,
-    /// **TEST GLUE** (not in the original): a still's render target, `(physical W, physical H,
-    /// scale)` from `NFS_SHOT_SIZE=WxH` (default 1280x800) and `NFS_SHOT_SCALE=<s>` (default 1) —
-    /// `Some` in a `--screenshot` / `NFS_RACE_LOADING` / `NFS_LOADING_SHOT` run, where the still is
-    /// rendered at that size whatever the window is. The HUD and the loading picture are built for it.
-    pub(crate) shot_target: Option<(u32, u32, f32)>,
-    /// `--layout-sweep`: load every `.lay` in the game, draw it once, and report every widget that
-    /// produced no sprite at all. The port's own measure of what the front end does not draw.
-    pub(crate) layout_sweep: bool,
     /// `fe.txt`, for the multiple-choice accessors' saved indices.
     pub(crate) registry: nfs_formats::fetxt::Registry,
     /// **0x4B73F0**'s language index, read once from the install's registry exports
@@ -426,11 +344,6 @@ pub(crate) struct App {
     /// The original writes them straight back into the registry slot; the port keeps them here
     /// rather than rewriting the read-only game directory.
     pub(crate) choices: std::collections::HashMap<String, usize>,
-    /// The profile's race-HUD option tables (`<Name>1.hud` / `<Name>2.hud`, [`hud_cfg`]), loaded lazily: the
-    /// 14 Display options live in the record of (`Display.ScreenLayout`, resolution).
-    pub(crate) hud_cfg: std::cell::RefCell<HudCfgCache>,
-    /// scripted drive before the screenshot: seconds of full throttle (steer right for the last third)
-    pub(crate) autotest: Option<f32>,
     /// **0x538040's state** `[0x5DE910…0x5DE924]` — the generator the front end calls "rand" and
     /// the race shares: the sky's jitter (0x45EEA1 / 0x45F3D3), the weather (0x5561D0), the speech
     /// wrappers' variants (0x4A62A0…0x4A6680) and `I_MUSIC`'s pick (0x4AD87E). One state for the
@@ -448,11 +361,6 @@ pub(crate) struct App {
     /// The next `start_race` is another pass of the session loop (0x4B6D9F: "race again", the
     /// automatic replay), not a new session's race load 0x4B67B0.
     pub(crate) race_pass: bool,
-    /// diagnostic: `NFS_AUTOTEST_RACES=n` — a scripted session of `n` races, each `--autotest`
-    /// seconds long: race → the automatic replay over it → leave → the next race (the session
-    /// loop 0x4B6D88 and the front end's round trip), so the second race's `--record` rows can be
-    /// compared with a fresh run's. What is left of the session, this race included.
-    pub(crate) session_races: u32,
     /// the automatic replay of the session's current race has been run
     pub(crate) session_replayed: bool,
     /// The start-up movies while they play (0x4DD600 / 0x4DD4A0 → 0x4DC850): they hold the window
@@ -480,8 +388,9 @@ pub(crate) struct App {
     pub(crate) gamepads: Gamepads,
     /// PORT-DEVIATION D64: the pad button icons' atlas (uploaded on the first frame a pad is connected) and the kind
     /// of the pad they are drawn for now (`None` = no standard pad: nothing is drawn)
-    pub(crate) pad_icons: Option<crate::pad_glyphs::PadIcons>,
-    pub(crate) pad_atlas: Option<nfs_renderer::TextureId>,
+    pub(crate) pad_icons: Option<crate::app::pad::glyphs::PadIcons>,
+    /// the renderer handles the race build makes and the passes draw with ([`DrawHandles`])
+    pub(crate) draws: DrawHandles,
     /// The force-feedback state (`0x5E94xx`, `RE/notes/force-feedback.md`), made at a race's start
     /// (`ff_arm`); output only.
     pub(crate) ff: Option<nfs_physics::force_feedback::ForceFeedback>,
@@ -493,13 +402,8 @@ pub(crate) struct App {
     pub(crate) vehicle: Option<Vehicle>,
     /// Index into `camera_cycle`.
     pub(crate) camera_mode: u8,
-    /// Camera slot 0 on **`AnimCam`** (view 0x0E), the race's opening animation
-    /// (`nfs_game::camera::anim_cam`): 0x4640B0 puts every pass's slot on it, 0x462F30 plays one
-    /// of the track's `CmAn` paths and gives the slot `car[n].camera[0]` when it is over.
-    pub(crate) anim_cam: AnimCamSlot,
-    /// `[0x62893C]`, the `CmAn` rotation counter 0x471A50 steps before each pick — a `.bss` word
-    /// nothing resets, so it runs on across races and sessions.
-    pub(crate) anim_cam_counter: u32,
+    /// The camera slot's own state: what a pass of `App::camera_pass` reads from the last and leaves for the next (see `CameraSlot`).
+    pub(crate) cam: CameraSlot,
     /// The track's `CmAn` animations (0x471850 at the track load).
     pub(crate) cam_anims: Vec<nfs_formats::crp::AnimTrack>,
     /// The views the player cycles through, from the registry's `car[0].camera`
@@ -508,70 +412,18 @@ pub(crate) struct App {
     pub(crate) camera_cycle: Vec<u16>,
     /// the skid marks (`WLineBundle`, `nfs_game::skidmarks`, `RE/notes/particles.md` §0)
     pub(crate) skid: nfs_game::skidmarks::SkidMarks,
-    /// one dynamic mesh per drawn strip, `MAX_CAPACITY` vertices each
-    pub(crate) skid_pool: Vec<nfs_renderer::MeshId>,
-    /// the `SKDP` quad and its material, uploaded with the track
-    pub(crate) particle_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
-    /// the `SHAD` blob every car casts on the ground (0x43B820)
-    pub(crate) shadow_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
-    /// One dynamic four-vertex mesh per shadow on screen — the quad 0x43B5B0 rebuilds every frame.
-    /// the car shadows' dynamic meshes, pooled by the patch's `n` (index 1…6)
-    pub(crate) shadow_meshes: [Vec<nfs_renderer::MeshId>; 7],
-    /// `CARG`, the glare slot 0 of every light kind in the table at 0x5CD73C
-    pub(crate) glare_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
-    /// the glare's second sprite, the table's `+0x10` column: `SPIK` for every kind but 4, `GLNT`
-    pub(crate) glare_star: [Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>; 2],
-    /// the lamp draws' dynamic meshes and materials (`LampPools`)
-    pub(crate) lamp_pools: LampPools,
-    /// `GameData/Render/flare.dat` (0x4522B0) and a sprite for every texture its records name
-    pub(crate) flare_defs: Vec<nfs_formats::flare::FlareDef>,
-    /// ENHANCEMENT E23: the track's street lamps, classified once per race
-    pub(crate) street_lamps: Option<Vec<street_lamps::LampSite>>,
-    /// ENHANCEMENT E9 (ENH-TUNPOOL): the track's covered boxes, built once per race
-    pub(crate) cover: Option<std::sync::Arc<Vec<nfs_renderer::CoverBox>>>,
-    pub(crate) flare_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
-    /// the sun's flare textures (`SUN_FLARE`'s two layers) as sky-pass sprites: additive, no depth
-    /// test (`sun_items`)
-    pub(crate) sun_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
-    /// every flare texture as the same additive, no-depth sprite, for the lens flare's elements
-    /// (`lens_flare.rs`)
-    pub(crate) lens_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
-    /// the sun object's lens-flare state (0x460460), per race
-    pub(crate) lens: lens_flare::LensState,
+    /// The race's surroundings the scene feed keeps between frames: the weather and its kept copy, the drops quad, the rain state, the tunnel / spot / street lamps, the flare definitions, the cover boxes and the lens flare.
+    pub(crate) ambient: Ambient,
     /// the track's particle systems (`nfs_game::track_particles`) and their textures out of
     /// `Render/particle.fsh`
     pub(crate) track_particles: Option<nfs_game::track_particles::TrackParticles>,
     /// 0x488CC0's process-wide walk counter `[0x628C4C]` (0 at process start, never reset).
     pub(crate) walk_calls: u32,
     pub(crate) track_particle_defs: Vec<nfs_formats::particle_dat::ParticleDef>,
-    pub(crate) track_particle_sprites: std::collections::HashMap<(String, u32), (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
     /// every car's `carpart.dat` effects (`nfs_game::car_effects`, `RE/notes/particles.md` §11),
     /// made with the track's systems, whose generator they draw from; their definitions until then
     pub(crate) car_effects: Option<nfs_game::car_effects::CarEffects>,
     pub(crate) car_effect_defs: Vec<nfs_formats::particle_dat::ParticleDef>,
-    /// the weather layer `[0x627E08]` (`nfs_game::weather`, `RE/notes/particles.md` §7): made with
-    /// the track's particle systems, whose generator `[0x5CEAE0]` it draws from too
-    pub(crate) weather: Option<nfs_game::weather::Weather>,
-    /// The layer a restart or the automatic replay carries into its pass, to be primed again
-    /// rather than made (0x4690A0 → 0x459260; it is deleted only at the session's end, 0x4690F0 →
-    /// 0x458BB0).
-    pub(crate) weather_kept: Option<nfs_game::weather::Weather>,
-    /// its draws, snow then rain: a dynamic mesh of `CAPACITY` triangles each and its material
-    pub(crate) weather_draws: [Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>; 2],
-    /// the windscreen drops' draw (the splat object, `particles.md` §7.5): `common.fsh`'s `SPLT`
-    /// and a dynamic mesh of `SPLAT_SLOTS` triangles
-    pub(crate) splat_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
-    /// ENHANCEMENT E40: the windscreen's corners of the car (keyed by model, style and the tiny-car flag) and the clock until
-    /// which the renderer keeps the glass after the rain
-    pub(crate) drops_quad: Option<((String, usize, bool), Option<[Vec3; 4]>)>,
-    pub(crate) drops_until: f64,
-    /// the particle streaks of 0x454EC0 (the cars' sparks, `nfs_game::track_particles::Streak`):
-    /// a pool of dynamic triangle lists of `STREAK_CAP` triangles and an untextured, vertex-coloured
-    /// material per blend mode 0…2
-    pub(crate) streak_draw: Option<(Vec<nfs_renderer::MeshId>, [nfs_renderer::MaterialId; 3])>,
-    /// this frame's track walk over the `ef`-bearing articles (`TrackWorld::article_draws`, by
-    /// `.crp` article index) — what the flares, the effect systems and the projectors run from
-    pub(crate) article_draws: Vec<Option<nfs_game::world::ArticleDraw>>,
     /// the draw distance `[0x6197CC]` for the camera's slice (`keys.far_distance`) — the main view's
     /// `+0x124`, the walk's footprint and its non-mid-ground distance rule; the far plane itself
     /// is the camera object's 700 (0x4677FC)
@@ -591,8 +443,6 @@ pub(crate) struct App {
     pub(crate) temporal_sig: Option<(u16, bool, bool, u64)>,
     /// the scene build's reusable buffers (`scratch.rs`)
     pub(crate) scratch: scratch::SceneScratch,
-    /// ENHANCEMENT E26: the wet road's caches and this frame's lamps (`rain.rs`)
-    pub(crate) rain: rain::RainState,
     /// the even tick's non-player collision events (`simulate::tick_collide_*`), kept between ticks for its capacity; empty outside the tick
     pub(crate) ai_hits_buf: Vec<(AudioCar, nfs_audio::sfx::QueuedSfx)>,
     /// `live_order`'s last answer under the `(progress, tick)` pairs it was ranked from, and the
@@ -605,15 +455,13 @@ pub(crate) struct App {
     /// the main pass's mesh use and pose, from which the mirror's own car pass continues
     pub(crate) pool_used: PoolUse,
     pub(crate) dyn_pose: Option<DynPose>,
-    /// **TEST GLUE**: the interpolation fraction `NFS_SHOT_SEQ` sets for each of its sub-tick frames
-    pub(crate) test_alpha: Option<f32>,
     /// ENHANCEMENTS E27 / E29: the camera effects' memory (previous camera, shake envelope)
     pub(crate) camfx: camfx::CamFxState,
     /// where the sky pass's items sit in `scene.items` (before the track's), for the mirror's own
     /// sky pass to replace
     pub(crate) sky_item_range: (usize, usize),
     /// a particle system drew this frame, leaving the alpha reference at 1 (0x454456)
-    pub(crate) particles_left_ref_one: bool,
+    pub(crate) weather_alpha_ref_one: bool,
     /// trackside cameras and the triggers that switch them (`RE/notes/race-logic.md` §3.3)
     pub(crate) track_cameras: Option<nfs_game::cameras::TrackCameras>,
     pub(crate) slices: Option<SliceTable>,
@@ -625,28 +473,8 @@ pub(crate) struct App {
     pub(crate) net: Network,
     pub(crate) num_opponents: u32,
     pub(crate) player_grid: u32,
-    /// `car+0xB54` per racer (player first): metres covered, `fistp(min(car+0xAF8, NUM_LAPS) ·
-    /// [[0x628BC0]+4] · 6.0)` — refreshed only when `gGameTick % 64 == 1` and there is more than
-    /// one racer (0x417010…0x4170A2); `HPosition`'s distance / time gaps are taken from it
-    pub(crate) hud_metres: Vec<i32>,
-    /// The rear-view mirror's camera for this frame (AUDIT §O), and the texture it renders into.
-    pub(crate) rear_mirror: Option<Camera>,
-    pub(crate) mirror_tex: Option<TextureId>,
-    /// ENHANCEMENT E8: the faces of the player's car's environment map drawn so far (bit per face), the
-    /// next face in the round robin, the face size and the eye the map was last drawn from
-    pub(crate) refl_done: u8,
-    pub(crate) refl_next: u32,
-    pub(crate) refl_size: u32,
-    pub(crate) refl_eye: Vec3,
-    /// ENHANCEMENT E49: the faces were last drawn with the near objects (a change draws every face again)
-    pub(crate) refl_near: bool,
-    /// `HWrongWay`'s blink: `+0x14` ticks counted, `+0x18` the tick of the last draw, `+0x24`
-    /// visible. Every draw adds the ticks since the last one, and the visible half flips off once
-    /// the count passes 64, the hidden half back on once it passes 32, the count restarting
-    /// (0x436F86…0x436FBD). Only the HUD reset 0x426A80 → 0x436F60 zeroes it (visible, 0, 0) —
-    /// nothing does when the car turns round — so the first draw after a reset, at a tick past
-    /// 448, flips straight to hidden. This port blinked on `tick % 96 < 64`.
-    pub(crate) wrong_way_blink: (u64, u64, bool),
+    /// the rear-view mirror and the reflection passes' state ([`Reflect`])
+    pub(crate) refl: Reflect,
     /// `--record path`: per-32Hz-tick CSV of controls and vehicle state (regression fixtures)
     pub(crate) record: Option<std::io::BufWriter<std::fs::File>>,
     /// **Test glue** (`NFS_NET_DUMP=<file>`): every human car's state after every tick of an
@@ -677,16 +505,6 @@ pub(crate) struct App {
     /// ([`nfs_game::ai::AiDriver`], from the player's car's own `.ais`) drives the player's car, for recordings
     pub(crate) player_ai: Option<Box<nfs_game::ai::AiDriver>>,
     pub(crate) car_half_width: f32,
-    /// The chase camera's slot state (0x461E80): the eye's offset from the car `+0x08`, the view it
-    /// was built for, and the `+0xC1` settle count SetSlotView starts at 0x32 (0x465848).
-    pub(crate) chase_offset: Option<(Vec3, u16)>,
-    pub(crate) chase_settle: u8,
-    /// PORT-DEVIATION D8 (camera followers): the follower views' offset from the car as of the previous and the
-    /// latest game tick, and the latest tick's pose; the draw interpolates between them ([`CamFollow`]).
-    pub(crate) cam_follow: Option<CamFollow>,
-    /// The view slot 0 was on at the last camera pass: a change is a SetSlotView, whose seed 0x465CF0 of the
-    /// offset `+0x08` (`chase_offset`) the pass applies. `None` until the first pass (the race's init).
-    pub(crate) slot_view: Option<u16>,
     /// the SetSlotView entries the pass cannot see as a change of the view — the cycle key 0x465A60
     /// (its inline copy of the reset, 0x465848 / 0x465BB1) pressed on a list that lands on the same view, counted
     /// by the key handler; the pass compares it (and the TV slot's `switches`, 0x4139DD) with `slot_seen`.
@@ -707,19 +525,8 @@ pub(crate) struct App {
     /// textures / refined meshes the new levels ask for (`enh_live_step`); the cache is what one pass shares between a car and its instances
     pub(crate) enh_live_dirty: bool,
     pub(crate) enh_live_cache: nfs_game::world::LiveCache,
-    pub(crate) slot_seen: (u32, u32),
-    /// The bumper / driver slot's look-around yaw `+0xC6` in degrees (0x4611C0,
-    /// `camera::look_step`) and the view it belongs to; a view switch starts it again at 0
-    /// (SetSlotView 0x4658B2).
-    pub(crate) look_yaw: Option<(i16, u16, bool)>,
-    /// Look left, right and forward — input bits 0x14 / 0x15 / 0x16 as `RaceFrame` last read them
-    /// (`[0x5E99B4]` / `[0x5E99AC]` / `[0x5E99A8]`, 0x415AFA…0x415B2C): held levels, not read
-    /// while the pause is on (0x415982), so they keep their value through it.
-    pub(crate) look_held: [bool; 3],
     /// The player car's lamp byte `car+0xD87` (`lamp_command`).
     pub(crate) lamp_bits: u8,
-    /// The pause orbit (0x4617C0): slot 0's yaw `+0xC6` / step `+0xC8` and its offset.
-    pub(crate) orbit: Orbit,
     /// `[0x60CA00]`: the whole HUD draw 0x425950 skipped — the dialogs, the pause menu with them.
     /// `I_TOGGLEPAUSEMENU` (F1, bit 0x0E, read on the press at 0x41596E) flips it through
     /// 0x425750, but only while a dialog is up (`[0x60C9C4]` not empty, `hud_dialog_up`); the
@@ -727,18 +534,8 @@ pub(crate) struct App {
     pub(crate) hud_hidden: bool,
     /// The player car's headlight ramp, `[car+0x64]+0x110` (`HeadRamp`).
     pub(crate) head_ramp: HeadRamp,
-    /// ENHANCEMENT E24: the cars' render-side tunnel lamp values (never part of a car's state).
-    pub(crate) tunnel_lamps: std::cell::RefCell<car_lights::TunnelLamps>,
-    /// ENHANCEMENT E15: the same ramp for the spotlights' gain at day (`App::spot_gain`).
-    pub(crate) spot_cover: std::cell::RefCell<car_lights::TunnelLamps>,
     /// ENHANCEMENT E15 (ENH-CONES): the same ramp per beam strip, 1 while E15's spot replaces the original's cone.
     pub(crate) cone_fade: std::cell::RefCell<car_lights::TunnelLamps>,
-    /// The game tick the camera slot was last updated for. The dispatcher 0x463C30 is a **64 Hz**
-    /// scheduler entry (`Sched_insert(Sc64, 0x463C30, 0)` at 0x414F8C, run by every `GameTick`
-    /// 0x414FF0), so the slot's followers (the chase / heli offset, the driver's head lag, the
-    /// look-around yaw, BlimpCam, CircleCam, SplineCam, 0x462B80's zoom) step once per game tick,
-    /// not once per drawn frame: a frame applies `tick − camera_tick` updates.
-    pub(crate) camera_tick: u64,
     /// The camera slot as the audio update reads it: a second copy of the slot's state that
     /// steps once per game tick up to the odd tick's audio update (`App::audio_listener_pass`).
     pub(crate) audio_cam: Option<Box<CamSlotState>>,
@@ -748,34 +545,6 @@ pub(crate) struct App {
     /// the list shrinks to it (0x4BC310) — the paint-shop screen's car sync 0x511220 writes the
     /// colour alone (0x4B9580), so a saved car's colour never becomes a row.
     pub(crate) colour_idx: [std::cell::Cell<usize>; 4],
-    /// The last game ticks' [`CamTick`]s: a frame that spans several ticks steps the
-    /// chase / heli follower once per tick against that tick's own pose, as `Sc64` does. Not capped:
-    /// 0x4152E0's catch-up loop (0x415BD4, `[0x606AA0] <= [0x606A9C]`) has no bound on the ticks a
-    /// frame runs, so every tick the camera has not stepped yet stays (trimmed after each camera pass).
-    pub(crate) cam_hist: std::collections::VecDeque<CamTick>,
-    /// The roll-over camera's side, `+0xC3` bit 0 (0x463CC6…0x463CFB), latched on the first
-    /// tilted update and dropped once the car is upright again (`+0xC2` = 0, 0x463D03).
-    pub(crate) flip_side: Option<bool>,
-    /// ENHANCEMENT E48: the wrong-way side the chase / heli slope lift sampled by last (`camera::steady_slope_wrong`);
-    /// `None` with E48 off or outside a lifted view. Camera state only.
-    pub(crate) slope_wrong: Option<bool>,
-    /// The chase / heli slot's eye `+0x24` as its update left it (before the build's clamps, which
-    /// work on a copy, 0x4651BF…0x4651DB) — the "old eye" of the next update's ceiling test.
-    pub(crate) slot_eye: Option<Vec3>,
-    /// The playback's wander of the aim point (`camera::ReplayWander`, 0x464C2B…0x464E42) and the
-    /// (chosen camera, view word, trackside switch count) it was started under: SetSlotView
-    /// 0x465790 zeroes it, which the port takes as a change of that key, and at a pass's start
-    /// (`camera_slot_reset`). Read 2026-09-30: 0x465790 has five callers, all covered —
-    /// 0x413960 twice (the trackside switch: the count; and the mode-3 cop view 0x0B → 0x0A, guarded
-    /// by `[0x627F3C] == 10`, a word change), 0x4659E0 from 0x413EA0 (a replay's start) and 0x414850
-    /// (a race's start: `camera_slot_reset`), and 0x462F30's two (`AnimCam`, view 0x0E, ending in
-    /// SetSlotView(0x0A): the view word changes). So every SetSlotView either starts a pass or
-    /// changes one of the three — CONFIRMED, no approximation left.
-    pub(crate) replay_wander: (nfs_game::camera::ReplayWander, (u16, u16, u32)),
-    /// CircleCam's slot words (`camera::CircleCam`), the view they belong to and the trackside
-    /// switch count they were started under: SetSlotView resets the count on a view change and on
-    /// every enabled switch.
-    pub(crate) circle: (nfs_game::camera::CircleCam, u16, u32),
     /// the camera slot's tracker slice `[0x627F5C]` (the draw distance keys on it)
     pub(crate) cam_slice: Option<usize>,
     pub(crate) wall_hits: u32,
@@ -796,9 +565,91 @@ pub(crate) struct App {
     pub(crate) sim_name: String,
     /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a command-line race, `Game.Difficutly` (`FeCatalogues::difficulty`) for a layout launch (0x4EB470), the event's in career
     pub(crate) race_skill: u8,
-    pub(crate) last_frame: Instant,
+    /// the frame clock, the pacer and the window state the idle / frame code reads ([`Pacing`])
+    pub(crate) pace: Pacing,
     /// PORT-DEVIATION D63: the race panel and the A/B key's message (`app/race_panel.rs`); render-side, closed at every race start
     pub(crate) panel: race_panel::RacePanel,
+    /// the system pointer's visibility last handed to winit (`None` = never yet)
+    pub(crate) pointer_hidden: Option<bool>,
+    /// `--debug-menu`: the port's own text menu, which draws no `Pointer.fsh`, may be on show
+    pub(crate) debug_menu: bool,
+    /// what the window last showed, for the front end's idle redraw (`idle.rs`)
+    pub(crate) presented: Option<idle::Presented>,
+    /// the image of the last front-end frame rendered, kept under `NFS_FE_IDLE_VERIFY`
+    pub(crate) idle_check: Option<Vec<u8>>,
+    pub(crate) tick: u64,
+    /// The track map's cop blips, `[0x5CD158 + 4·i]` (colour, 0xC00000FF in `.data`) and
+    /// `[0x60FDA8 + 4·i]` (stamp, 0 in `.bss`) by registration index `i` — written only by the
+    /// map loop (0x43333E…0x433377) and never reset, so they carry over from race to race.
+    pub(crate) cop_blips: Vec<(u32, i32)>,
+}
+
+/// The rear-view mirror's camera and texture and the planar / cube reflection passes' progress (`mirror.rs`, `reflections.rs`). Render-side only.
+#[derive(Default)]
+pub(crate) struct Reflect {
+    /// The rear-view mirror's camera for this frame (AUDIT §O), and the texture it renders into.
+    pub(crate) rear_mirror: Option<Camera>,
+    pub(crate) mirror_tex: Option<TextureId>,
+    /// ENHANCEMENT E8: the faces of the player's car's environment map drawn so far (bit per face), the
+    /// next face in the round robin, the face size and the eye the map was last drawn from
+    pub(crate) refl_done: u8,
+    pub(crate) refl_next: u32,
+    pub(crate) refl_size: u32,
+    pub(crate) refl_eye: Vec3,
+    /// ENHANCEMENT E49: the faces were last drawn with the near objects (a change draws every face again)
+    pub(crate) refl_near: bool,
+}
+
+/// The renderer resources the race build uploads (`race_stage_pools`) and the passes draw with: dynamic mesh pools, sprite materials, the
+/// glare / lamp / weather / splat / streak draws, the pad icon atlas. Render-side only.
+#[derive(Default)]
+pub(crate) struct DrawHandles {
+    pub(crate) pad_atlas: Option<nfs_renderer::TextureId>,
+    /// one dynamic mesh per drawn strip, `MAX_CAPACITY` vertices each
+    pub(crate) skid_pool: Vec<nfs_renderer::MeshId>,
+    /// the `SKDP` quad and its material, uploaded with the track
+    pub(crate) particle_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// the `SHAD` blob every car casts on the ground (0x43B820)
+    pub(crate) shadow_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// One dynamic four-vertex mesh per shadow on screen — the quad 0x43B5B0 rebuilds every frame.
+    /// the car shadows' dynamic meshes, pooled by the patch's `n` (index 1…6)
+    pub(crate) shadow_meshes: [Vec<nfs_renderer::MeshId>; 7],
+    /// `CARG`, the glare slot 0 of every light kind in the table at 0x5CD73C
+    pub(crate) glare_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// the glare's second sprite, the table's `+0x10` column: `SPIK` for every kind but 4, `GLNT`
+    pub(crate) glare_star: [Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>; 2],
+    /// the lamp draws' dynamic meshes and materials (`LampPools`)
+    pub(crate) lamp_pools: LampPools,
+    pub(crate) flare_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// the sun's flare textures (`SUN_FLARE`'s two layers) as sky-pass sprites: additive, no depth
+    /// test (`sun_items`)
+    pub(crate) sun_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// every flare texture as the same additive, no-depth sprite, for the lens flare's elements
+    /// (`lens_flare.rs`)
+    pub(crate) lens_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    pub(crate) track_particle_sprites: std::collections::HashMap<(String, u32), (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// its draws, snow then rain: a dynamic mesh of `CAPACITY` triangles each and its material
+    pub(crate) weather_draws: [Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>; 2],
+    /// the windscreen drops' draw (the splat object, `particles.md` §7.5): `common.fsh`'s `SPLT`
+    /// and a dynamic mesh of `SPLAT_SLOTS` triangles
+    pub(crate) splat_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// the particle streaks of 0x454EC0 (the cars' sparks, `nfs_game::track_particles::Streak`):
+    /// a pool of dynamic triangle lists of `STREAK_CAP` triangles and an untextured, vertex-coloured
+    /// material per blend mode 0…2
+    pub(crate) streak_draw: Option<(Vec<nfs_renderer::MeshId>, [nfs_renderer::MaterialId; 3])>,
+    /// this frame's track walk over the `ef`-bearing articles (`TrackWorld::article_draws`, by
+    /// `.crp` article index) — what the flares, the effect systems and the projectors run from
+    pub(crate) article_draws: Vec<Option<nfs_game::world::ArticleDraw>>,
+}
+
+/// The frame clock and the frame pacer: when the last frame was drawn, the fixed-step accumulator, the second's frame count, the
+/// pacer's deadlines (`idle.rs`) and the window's visibility / focus. Nothing here feeds the simulation but the accumulator, which
+/// only decides how many ticks a frame runs.
+pub(crate) struct Pacing {
+    pub(crate) last_frame: Instant,
+    pub(crate) accumulator: Duration,
+    pub(crate) frames: u32,
+    pub(crate) fps_timer: Instant,
     /// ENHANCEMENT E22 / D4: the frame pacer's next deadline, and the display refresh rate it last
     /// read (Hz, when it was read), see `idle.rs`
     pub(crate) pace_next: std::cell::Cell<Option<Instant>>,
@@ -813,22 +664,24 @@ pub(crate) struct App {
     /// **PLATFORM GLUE** (`controls.md` §4.152.1, `App::sync_system_pointer`): the window has the focus — the
     /// original's activation, `WM_ACTIVATEAPP` 0x4B0EE0 / `WM_ACTIVATE` 0x53B050; true from the window's creation
     pub(crate) window_focused: bool,
-    /// the system pointer's visibility last handed to winit (`None` = never yet)
-    pub(crate) pointer_hidden: Option<bool>,
-    /// `--debug-menu`: the port's own text menu, which draws no `Pointer.fsh`, may be on show
-    pub(crate) debug_menu: bool,
-    /// what the window last showed, for the front end's idle redraw (`idle.rs`)
-    pub(crate) presented: Option<idle::Presented>,
-    /// the image of the last front-end frame rendered, kept under `NFS_FE_IDLE_VERIFY`
-    pub(crate) idle_check: Option<Vec<u8>>,
-    pub(crate) accumulator: Duration,
-    pub(crate) tick: u64,
-    /// The track map's cop blips, `[0x5CD158 + 4·i]` (colour, 0xC00000FF in `.data`) and
-    /// `[0x60FDA8 + 4·i]` (stamp, 0 in `.bss`) by registration index `i` — written only by the
-    /// map loop (0x43333E…0x433377) and never reset, so they carry over from race to race.
-    pub(crate) cop_blips: Vec<(u32, i32)>,
-    pub(crate) frames: u32,
-    pub(crate) fps_timer: Instant,
+}
+
+impl Pacing {
+    pub(crate) fn new() -> Self {
+        Pacing {
+            last_frame: Instant::now(),
+            accumulator: Duration::ZERO,
+            frames: 0,
+            fps_timer: Instant::now(),
+            pace_next: std::cell::Cell::new(None),
+            pace_spin: std::cell::Cell::new(Duration::from_millis(1)),
+            pace_refresh: std::cell::Cell::new(None),
+            pace_battery: std::cell::Cell::new(None),
+            frame_times: Vec::new(),
+            occluded: false,
+            window_focused: true,
+        }
+    }
 }
 
 /// The front end's half of [`App`]: the menu and the layout screens it shows, the 3D room and

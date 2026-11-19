@@ -12,4 +12,5 @@ libm.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
+nfs-devdata.workspace = true
 nfs-assets.workspace = true

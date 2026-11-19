@@ -8,7 +8,7 @@ impl App {
     /// modules save the globals as they are, so whatever the front end has is what a save writes.
     pub(crate) fn sync_save_side_state(&mut self) {
         // the block `[0x690410]` as it stands, verbatim
-        let ko = self.knockout.as_ref().map(|k| nfs_game::save::KnockoutProgress::from_state(&k.state));
+        let ko = self.ko.knockout.as_ref().map(|k| nfs_game::save::KnockoutProgress::from_state(&k.state));
         let playlist = self.current_playlist();
         let settings = self.current_settings();
         if let Some(c) = self.career.as_mut() {
@@ -22,9 +22,9 @@ impl App {
             // with none drawn yet, what the profile loaded stays
             let sel = self.fe.menu.as_ref().or(self.fe.menu_template.as_ref()).map(|m| m.opp_car as u32);
             if let Some(sel) = sel
-                && !self.opp_cars.is_empty()
+                && !self.ko.opp_cars.is_empty()
             {
-                c.side.opponent_cars = Some((sel, self.opp_cars.iter().map(|o| nfs_game::save::opponent_car_image(&c.tables, o)).collect()));
+                c.side.opponent_cars = Some((sel, self.ko.opp_cars.iter().map(|o| nfs_game::save::opponent_car_image(&c.tables, o)).collect()));
             }
             c.side.playlist = playlist;
             c.side.settings = settings;
@@ -268,7 +268,7 @@ impl App {
         // option files were written) — port-only migration, [`App::hud_cfg_seed`]; with the file the
         // record is the master and the `.sav`'s values are the echo the original also keeps
         self.hud_cfg_ensure();
-        if !self.hud_cfg.borrow().from_profile {
+        if !self.hud_state.hud_cfg.borrow().from_profile {
             for (slot, v) in display_seed {
                 self.hud_cfg_seed(slot, v);
             }
@@ -279,7 +279,7 @@ impl App {
             if let Some(m) = self.fe.menu.as_mut() {
                 m.opp_car = clamp_index(*sel, 5) as u8;
             }
-            self.opp_cars = cars.iter().map(nfs_game::save::opponent_car_of).collect();
+            self.ko.opp_cars = cars.iter().map(nfs_game::save::opponent_car_of).collect();
         }
         // the CD player's list. *Port-only:* every `.sav` this port wrote before 2026-09-26 has
         // an empty `CDPlayer` module whatever the list was (the module was fed from a copy only a
@@ -295,7 +295,7 @@ impl App {
         // series saved running goes on at its `race_index` with the rows and cars loaded above,
         // as the knockout screen's next launch finds it active (0x4D52CB). *(Until 2026-09-26
         // the port dropped it: it saved neither `OpponentCar.Car` nor `Track1..7.*`.)*
-        self.knockout = side.knockout.as_ref().map(|k| KnockoutSeries { state: k.to_state(), message: String::new() });
+        self.ko.knockout = side.knockout.as_ref().map(|k| KnockoutSeries { state: k.to_state(), message: String::new() });
         if let Some(c) = self.career.as_mut() {
             // `OwnedCars.Car` (0x4F5B70 → 0x4F0A30 → 0x4BC240): the saved index, clamped
             // against the garage's count

@@ -14,9 +14,6 @@ use nfs_renderer::{HAZE_LAMPS, Haze, HazeLamp};
 const LAMP_RADIUS: f32 = 16.0;
 const LAMP_REACH: f32 = 60.0;
 
-/// The key of the camera's covered-stretch value in [`App::tunnel_lamps`] (cars use 0, 1 + i, 0x100 + i, 0x200 + i).
-const COVER_KEY: u32 = 0x400;
-
 impl App {
     /// ENHANCEMENT E36: this frame's `scene.haze`; `None` with the switch (or E7) off, in the front end, or when the air is
     /// clean (no fog, no rain, no covered stretch) so the renderer runs no pass.
@@ -27,16 +24,10 @@ impl App {
         }
         let eye = self.camera.position;
         let lamp_ms = (self.tick as f64 + self.pause_offset + self.pause_ticks) * 1000.0 / 64.0;
-        let covered = self.world.as_ref().is_some_and(|w| w.in_tunnel(eye));
-        let v = self.tunnel_lamps.borrow_mut().value_held(COVER_KEY, covered, lamp_ms);
         // a smoothstep of E24's ramp (350 ms in, 700 ms out): the haze neither starts nor stops with a jump
-        let cover = v * v * (3.0 - 2.0 * v);
+        let cover = self.tunnel_cover_smooth(super::car_lights::cover_key::HAZE, eye, lamp_ms);
         let fog = self.scene.fog.map_or(0.0, |f| f.density);
-        let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
-        let wet = match (self.track.sky_bin.as_ref(), self.cam_slice) {
-            (Some(b), Some(s)) => b.sample_track_b(5, s as i32, lap).clamp(0.0, 1.0),
-            _ => 0.0,
-        };
+        let wet = self.camera_wet().clamp(0.0, 1.0);
         let c = self.scene.clear_color;
         let lum = 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
         let dark = (1.25 - 1.5 * lum).clamp(0.1, 1.0);
@@ -44,8 +35,7 @@ impl App {
         let mut haze = Haze { fog, wet, cover, dark, day: !night, ..Haze::default() };
         let (beam, lamp) = haze.air(self.enh.level(nfs_renderer::E36));
         // TEST GLUE: `NFS_HAZE_LOG=1` logs the air per frame (for stills)
-        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *LOG.get_or_init(|| std::env::var_os("NFS_HAZE_LOG").is_some()) {
+        if nfs_game::config::cfg().nfs_haze_log.is_set() {
             eprintln!("haze tick {} fog {fog:.5} wet {wet:.3} cover {cover:.3} dark {dark:.3} night {night} -> beam {beam:.5} lamp {lamp:.5}", self.tick);
         }
         if beam <= 1e-5 && lamp <= 1e-5 {
@@ -66,7 +56,7 @@ impl App {
             for (d, pos, color, height) in near.into_iter().take(HAZE_LAMPS) {
                 // the far ones fade out toward the reach; a tunnel lamp on a day track also with the covered value
                 let fade = 1.0 - ((d - 0.7 * LAMP_REACH) / (0.3 * LAMP_REACH)).clamp(0.0, 1.0);
-                let k = fade * fade * (3.0 - 2.0 * fade) * if night { 1.0 } else { cover * super::street_lamps::DAY_TUNNEL_GAIN };
+                let k = nfs_math::smooth01(fade) * if night { 1.0 } else { cover * super::street_lamps::DAY_TUNNEL_GAIN };
                 haze.lamps[haze.n as usize] = HazeLamp { pos, color: color.map(|c| c * k), radius: (1.2 * height + 6.0).clamp(9.0, LAMP_RADIUS) };
                 haze.n += 1;
             }
@@ -89,7 +79,8 @@ impl App {
             return;
         }
         let mut beams = nfs_renderer::LBeams::default();
-        for b in world.lbeams() {
+        world.lbeams_into(&mut self.scratch.lbeams);
+        for &b in &self.scratch.lbeams {
             if (beams.n as usize) < nfs_renderer::MAX_LBEAMS && b.apex.distance(eye) < reach {
                 beams.beams[beams.n as usize] = b;
                 beams.n += 1;

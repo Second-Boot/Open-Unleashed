@@ -146,19 +146,15 @@ struct Images {
     blend_bg: wgpu::BindGroup,
 }
 
-fn tex_entry(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
-    gfx::bgl_tex(binding, wgpu::TextureSampleType::Float { filterable }, false)
-}
 
 impl Smaa {
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let module = gfx::wgsl_module(device, "smaa", &source());
-        let layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| gfx::bgl(device, label, entries);
-        let edges_layout = layout("smaa edges", &[tex_entry(0, false)]);
-        let weights_layout = layout("smaa weights", &[tex_entry(0, false), tex_entry(1, false)]);
-        let blend_layout = layout(
+        let edges_layout = gfx::bgl(device, "smaa edges", &[gfx::bgl_float(0, false)]);
+        let weights_layout = gfx::bgl(device, "smaa weights", &[gfx::bgl_float(0, false), gfx::bgl_float(1, false)]);
+        let blend_layout = gfx::bgl(device, 
             "smaa blend",
-            &[tex_entry(0, true), tex_entry(1, false), gfx::bgl_sampler(2, wgpu::SamplerBindingType::Filtering)],
+            &[gfx::bgl_float(0, true), gfx::bgl_float(1, false), gfx::bgl_sampler(2, wgpu::SamplerBindingType::Filtering)],
         );
         let pipe = |label: &str, bgl: &wgpu::BindGroupLayout, entry: &str, target: wgpu::TextureFormat| {
             let pl = gfx::pipeline_layout(device, label, &[bgl]);
@@ -193,20 +189,20 @@ impl Smaa {
             let ldr_view = make("smaa ldr", self.format);
             let edges_view = make("smaa edges", EDGES_FORMAT);
             let weights_view = make("smaa weights", WEIGHTS_FORMAT);
-            let bg = |label: &str, layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupEntry]| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries });
-            let edges_bg = bg("smaa edges", &self.edges_layout, &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&ldr_view) }]);
+            let bg = |label: &str, layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupEntry]| gfx::bind_group(device, label, layout, entries);
+            let edges_bg = bg("smaa edges", &self.edges_layout, &[gfx::bg_view(0, &ldr_view)]);
             let weights_bg = bg(
                 "smaa weights",
                 &self.weights_layout,
-                &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&edges_view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.area_view) }],
+                &[gfx::bg_view(0, &edges_view), gfx::bg_view(1, &self.area_view)],
             );
             let blend_bg = bg(
                 "smaa blend",
                 &self.blend_layout,
                 &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&ldr_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&weights_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    gfx::bg_view(0, &ldr_view),
+                    gfx::bg_view(1, &weights_view),
+                    gfx::bg_sampler(2, &self.sampler),
                 ],
             );
             self.images = Some(Images { size: (width, height), ldr_view, edges_view, weights_view, edges_bg, weights_bg, blend_bg });

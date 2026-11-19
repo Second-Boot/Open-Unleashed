@@ -41,6 +41,7 @@
 
 use glam::Vec3;
 use nfs_assets::track::TrackAssets;
+use nfs_math::portable::TWO_PI_IMAGE;
 use nfs_renderer::{DrawItem, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, Vertex};
 
 pub struct Sky {
@@ -299,7 +300,7 @@ struct StageParams {
 impl StageParams {
     fn of(layer: Option<&nfs_formats::sky::SkyLayer>, move_ratio: f32) -> Self {
         let Some(l) = layer else { return Self::default() };
-        let th = (-l.wind_direction / 360.0) as f64 * 6.28318452835083;
+        let th = (-l.wind_direction / 360.0) as f64 * TWO_PI_IMAGE;
         let k = l.wind_speed * 0.00025;
         let inv = |x: f32| if x != 0.0 { 1.0 / x } else { 0.0 };
         // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
@@ -636,7 +637,7 @@ impl Lightning {
         self.end = self.time.wrapping_add(((r + 1.0) * 60.0).round_ties_even() as i32 as u32);
         let d = ((rand01(fe) * [0.2f32, 0.1, 0.1][self.mode] + [0.4f32, 0.3, 0.2][self.mode]) * half) as f64;
         let turn = rand01(fe);
-        let a = turn as f64 * 6.28318452835083;
+        let a = turn as f64 * TWO_PI_IMAGE;
         // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
         let (s, c) = ((a.sin() * d) as f32, (a.cos() * d) as f32);
         // 0x45CE29…0x45CE38: `fstp` the f32 `turn · 65535`, then `fistp` (to nearest)
@@ -735,7 +736,7 @@ fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, colo
     let mut m = MeshData::default();
     let side = ring.radius;
     let cell = side / N as f32;
-    let t = (ring.angle_turns as f64 * 6.28318452835083) as f32;
+    let t = (ring.angle_turns as f64 * TWO_PI_IMAGE) as f32;
     // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
     let (c, sn) = (t.cos(), t.sin());
     for i in 0..=N {
@@ -789,7 +790,7 @@ fn horizon_ring_quad(bin: &nfs_formats::sky::SkyBin, q: usize, y0: f32, y1: f32,
     // the second set's top-right corner (0x459DDB)
     let top_right = if q >= 16 { (k + 1) % 16 } else { c[1] };
     let p = |j: usize| {
-        let az = ((bin.ring_turn + (k + j) as f32 * 0.0625) as f64 * 6.28318452835083) as f32;
+        let az = ((bin.ring_turn + (k + j) as f32 * 0.0625) as f64 * TWO_PI_IMAGE) as f32;
         // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
         (az.sin() * RING_RADIUS, az.cos() * RING_RADIUS)
     };
@@ -1052,7 +1053,7 @@ impl Sky {
                 g.offset = [(g.offset[0] + p.wind[0] * ticks).rem_euclid(1.0), (g.offset[1] + p.wind[1] * ticks).rem_euclid(1.0)];
             } else if g.parallax_on {
                 // the camera turned by minus the grid's angle (0x45D086…0x45D12A)
-                let a = -(g.angle as f64 * 6.28318452835083) as f32;
+                let a = -(g.angle as f64 * TWO_PI_IMAGE) as f32;
                 // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
                 let (c, s) = (a.cos(), a.sin());
                 let x = c * camera_pos.x + s * camera_pos.z;

@@ -24,6 +24,48 @@ pub(crate) fn elapsed_ms(t0: std::time::Instant) -> f64 {
     t0.elapsed().as_secs_f64() * 1000.0
 }
 
+/// How many frames [`WallTimer`] averages over before it logs.
+const WALL_TIME_FRAMES: u32 = 30;
+
+/// `NFS_GPU_TIME`: the frame's encode + GPU time as wall clock (the device waited for after the submit), averaged over
+/// [`WALL_TIME_FRAMES`] frames and logged. Off unless the variable is set (`on`): then [`WallTimer::start`] gives nothing.
+pub(crate) struct WallTimer {
+    on: bool,
+    /// (sum of ms, frames)
+    acc: (f64, u32),
+}
+
+impl WallTimer {
+    pub(crate) fn new(on: bool) -> Self {
+        Self { on, acc: (0.0, 0) }
+    }
+
+    /// Whether the timing is on.
+    pub(crate) fn on(&self) -> bool {
+        self.on
+    }
+
+    /// The start of a timed stretch (`None` when off).
+    pub(crate) fn start(&self) -> Option<std::time::Instant> {
+        self.on.then(std::time::Instant::now)
+    }
+
+    /// Add the stretch since `t0` to the running sum (a part of a frame: a reflection face).
+    pub(crate) fn add(&mut self, t0: std::time::Instant) {
+        self.acc.0 += elapsed_ms(t0);
+    }
+
+    /// Add the stretch since `t0` and count a frame; every [`WALL_TIME_FRAMES`] frames log the average and start over.
+    pub(crate) fn frame(&mut self, t0: std::time::Instant, enh: impl std::fmt::Display) {
+        self.add(t0);
+        self.acc.1 += 1;
+        if self.acc.1 == WALL_TIME_FRAMES {
+            tracing::info!(avg_ms = self.acc.0 / f64::from(WALL_TIME_FRAMES), enh = %enh, "frame encode + gpu time");
+            self.acc = (0.0, 0);
+        }
+    }
+}
+
 struct Prof {
     qs: &'static wgpu::QuerySet,
     resolve: wgpu::Buffer,

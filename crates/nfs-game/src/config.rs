@@ -14,6 +14,11 @@
 //! calls [`cfg`]; `main` calls [`init`] right after to pin the snapshot. Start-up-only reads
 //! (`main`'s argument block, the save / game paths) stay direct `std::env` calls.
 //!
+//! `nfs-game` itself reads five of these (`NFS_FE_CLOCK` / `NFS_FE_CURSOR` / `NFS_FE_TIME` in the layout and
+//! opponents, `NFS_SKY_LEVEL`, `NFS_DATA_SUN`); the rest are the application's. The file stays here (moving it would
+//! have to thread those values through `LayoutScreen` and the sky for no gain); the save-directory resolution
+//! (`NFS5_SAVE_DIR`) is [`save_root`] / [`save_root_override`].
+//!
 //! Every switch below is a TEST GLUE / diagnostic hook of the port, not a game rule; their
 //! meaning is documented at the call sites.
 
@@ -38,6 +43,16 @@ impl Switch {
     /// What `std::env::var_os(name).is_some()` answered at the snapshot (set, Unicode or not).
     pub fn is_set(&self) -> bool {
         self.0.is_some()
+    }
+
+    /// Set and not `0` (the empty string counts as on): `var_os(name).is_some_and(|v| v != "0")`.
+    pub fn is_on(&self) -> bool {
+        self.0.as_deref().is_some_and(|v| v != "0")
+    }
+
+    /// Unset, empty or `0`: `var_os(name).is_none_or(|v| v.is_empty() || v == "0")` (the switch that is off unless named).
+    pub fn is_off(&self) -> bool {
+        self.0.as_deref().is_none_or(|v| v.is_empty() || v == "0")
     }
 
     /// What `std::env::var_os(name)` answered at the snapshot, borrowed.
@@ -65,16 +80,11 @@ macro_rules! switches {
 
 switches! {
     // the save-data directory override (`save::save_dir`, `Career::legacy_json_path`, `diag`)
-    nfs5_save_dir = "NFS5_SAVE_DIR",
     nfs_ai_trace = "NFS_AI_TRACE",
     nfs_camera = "NFS_CAMERA",
     nfs_cam_at = "NFS_CAM_AT",
-    // TEST GLUE (ENHANCEMENTS E23 / E9 / E51, comparison stills only): the dusk-lamp tracks (`open-unleashed` `app/street_lamps.rs`),
-    // a hand-set data sun and the full frame's radii (`data_sun.rs`)
-    nfs_dusk_tracks = "NFS_DUSK_TRACKS",
+    // TEST GLUE (ENHANCEMENTS E9 / E51, comparison stills only): a hand-set data sun (`data_sun.rs`)
     nfs_data_sun = "NFS_DATA_SUN",
-    nfs_data_sun_full = "NFS_DATA_SUN_FULL",
-    nfs_cars_only_small = "NFS_CARS_ONLY_SMALL",
     nfs_choice = "NFS_CHOICE",
     nfs_fe_clicks = "NFS_FE_CLICKS",
     nfs_fe_clock = "NFS_FE_CLOCK",
@@ -108,6 +118,11 @@ switches! {
     nfs_lens_warmup = "NFS_LENS_WARMUP",
     nfs_loading_shot = "NFS_LOADING_SHOT",
     nfs_loading_wait = "NFS_LOADING_WAIT",
+    // The three network dump switches are three different files (not one feature read twice):
+    //  * `NFS_NET_DUMP=<file>`: the input-exchange race's state dump, one file per run (`app/net.rs` `net_exchange_begin`, rows of
+    //    `simulate.rs` `net_dump_tick`, `<file>.cars`), and, read by `nfs-net`'s socket itself, every datagram (`S` lines);
+    //  * `NFS_REMOTE_DUMP=<file>`: one CSV line per tick for every remote seat after the dead reckoning (`app/net.rs` `remote_dump`);
+    //  * `NFS_NET_REMOTE_DUMP=<file>`: the dead reckoning in the line format of the original's gdb trace (`netplay/remote.rs`).
     nfs_net_dump = "NFS_NET_DUMP",
     nfs_net_pace = "NFS_NET_PACE",
     nfs_net_lockstep = "NFS_NET_LOCKSTEP",
@@ -150,6 +165,59 @@ switches! {
     nfs_smack_ram = "NFS_SMACK_RAM",
     nfs_traffic_seed = "NFS_TRAFFIC_SEED",
     nfs_view = "NFS_VIEW",
+    // the application's remaining direct reads, moved here (REFACTOR-0119 P0): one mechanism for every fixed name
+    // (`NFS_NO_FOCUS`, `NFS_FE_CURSOR` / `NFS_FE_CLOCK` stay raw reads in `main`, which writes them before the snapshot; `NFS_ENH` is the renderer's)
+    nfs5_profile = "NFS5_PROFILE",
+    nfs5_records_save = "NFS5_RECORDS_SAVE",
+    nfs_all_tracks = "NFS_ALL_TRACKS",
+    nfs_autotest_races = "NFS_AUTOTEST_RACES",
+    nfs_cam_log = "NFS_CAM_LOG",
+    nfs_car_id = "NFS_CAR_ID",
+    nfs_cheat_bits = "NFS_CHEAT_BITS",
+    nfs_cops = "NFS_COPS",
+    nfs_display_live = "NFS_DISPLAY_LIVE",
+    nfs_enh_live = "NFS_ENH_LIVE",
+    nfs_fe_keys_after = "NFS_FE_KEYS_AFTER",
+    nfs_fe_loading = "NFS_FE_LOADING",
+    nfs_fe_seq = "NFS_FE_SEQ",
+    nfs_haze_log = "NFS_HAZE_LOG",
+    nfs_hud_keys_1 = "NFS_HUD_KEYS_1",
+    nfs_lens_force = "NFS_LENS_FORCE",
+    nfs_menu_mode = "NFS_MENU_MODE",
+    nfs_oppcar = "NFS_OPPCAR",
+    nfs_pa_fe0 = "NFS_PA_FE0",
+    nfs_pa_rnglog = "NFS_PA_RNGLOG",
+    nfs_play_intro = "NFS_PLAY_INTRO",
+    nfs_race_loading = "NFS_RACE_LOADING",
+    nfs_refl_live = "NFS_REFL_LIVE",
+    nfs_replay_hover = "NFS_REPLAY_HOVER",
+    nfs_replay_press = "NFS_REPLAY_PRESS",
+    nfs_resim_gpu = "NFS_RESIM_GPU",
+    nfs_results_shot = "NFS_RESULTS_SHOT",
+    nfs_teleport_turn = "NFS_TELEPORT_TURN",
+    nfs_test_cheat_parts = "NFS_TEST_CHEAT_PARTS",
+    nfs_test_own_parts = "NFS_TEST_OWN_PARTS",
+    nfs_test_own_setup = "NFS_TEST_OWN_SETUP",
+    nfs_test_speedhack = "NFS_TEST_SPEEDHACK",
+    nfs_traffic = "NFS_TRAFFIC",
+}
+
+/// A per-index variable name (`NFS_HUD_KEYS_<k>`, `NFS_SESSION_FE_KEYS_<k>`): not a fixed name, so not in the snapshot; the one
+/// place that builds and reads such a name (`std::env::var(..).ok()`).
+pub fn env_indexed(prefix: &str, k: impl std::fmt::Display) -> Option<String> {
+    std::env::var(format!("{prefix}{k}")).ok()
+}
+
+/// `NFS5_SAVE_DIR` when it is set (a scripted run owns its directory), read directly from the environment and not through the
+/// snapshot: `diag::init` / `guard::begin` ask before `main`'s `set_var`s, which the snapshot must see.
+pub fn save_root_override() -> Option<std::path::PathBuf> {
+    std::env::var_os("NFS5_SAVE_DIR").map(std::path::PathBuf::from)
+}
+
+/// The directory that holds the port's own files (`enhancements.json`, `gi/`, `career.json`): `NFS5_SAVE_DIR`, else the per-OS
+/// data dir. (The profiles live one level down, in `SaveData`: [`crate::save::save_dir`].)
+pub fn save_root() -> std::path::PathBuf {
+    save_root_override().unwrap_or_else(nfs_assets::platform::data_dir)
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -174,6 +242,12 @@ mod tests {
         assert!(!unset.is_set());
         assert_eq!(unset.as_str(), None);
         assert_eq!(unset.as_os_str(), None);
+
+        assert!(unset.is_off() && !unset.is_on());
+        for (v, on, off) in [("", true, true), ("0", false, true), ("1", true, false)] {
+            let s = Switch(Some(OsString::from(v)));
+            assert_eq!((s.is_on(), s.is_off()), (on, off), "{v:?}");
+        }
 
         // set to the empty string and to "0": both are "set" (presence-only switches stay on)
         for v in ["", "0", "1", "a=b,c"] {

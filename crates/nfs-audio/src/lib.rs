@@ -23,6 +23,11 @@ pub mod speech;
 pub mod voice_loop;
 pub mod voicechat;
 
+/// An environment switch is on: set, non-empty and not `0` (`NFS_MUTE`, `NFS_SOUND`, `NFS_MIC`, `NFS_AUDIO_DUMP_TICKS`, ...).
+pub(crate) fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 pub use mixer::{AudioOutput, PlayArgs, StopHandle, VoiceId};
 
 /// TEST GLUE (not in the original): the game tick the app is running, for the audio's debug lines

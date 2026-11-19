@@ -747,7 +747,7 @@ impl App {
     /// directory, else the shipped `FEData/Data/nfs5-1.hud` / `nfs5-2.hud` (the `XXhud?XX.hud` of
     /// 0x41F7A0).
     pub(crate) fn hud_cfg_ensure(&self) {
-        let mut cache = self.hud_cfg.borrow_mut();
+        let mut cache = self.hud_state.hud_cfg.borrow_mut();
         // (compared in place: this runs on every Display-option lookup, ~20 a frame in a race, and
         // used to clone the save dir and the profile name just to find nothing changed)
         let same = |who: &Option<(std::path::PathBuf, String)>| {
@@ -783,7 +783,7 @@ impl App {
     fn hud_cfg_get(&self, slot: usize) -> Option<usize> {
         self.hud_cfg_ensure();
         let (layout, w, h) = self.hud_cfg_key();
-        let cache = self.hud_cfg.borrow();
+        let cache = self.hud_state.hud_cfg.borrow();
         cache.cfg.as_ref()?.accessor_value(layout, w, h, slot).map(|v| v as usize)
     }
 
@@ -818,7 +818,7 @@ impl App {
             opt("Display.Tach"),
             opt("Display.Speedometer"),
         );
-        let cache = self.hud_cfg.borrow();
+        let cache = self.hud_state.hud_cfg.borrow();
         let Some(pos) = cache.cfg.as_ref().and_then(|c| c.find(layout, w, h).map(|i| c.stored_positions(i))) else {
             return (Vec::new(), 1.0, 1.0);
         };
@@ -879,7 +879,7 @@ impl App {
     /// arrives with the widget not yet told `INUSE` arms it, so it is never lost.
     pub(crate) fn hud_cfg_set(&mut self, slot: usize, v: usize) {
         self.hud_cfg_ensure();
-        let mut cache = self.hud_cfg.borrow_mut();
+        let mut cache = self.hud_state.hud_cfg.borrow_mut();
         let Some(cfg) = cache.cfg.as_mut() else { return };
         cfg.armed = true;
         cfg.staged[slot] = Some(v as u32);
@@ -897,7 +897,7 @@ impl App {
     pub(crate) fn hud_cfg_in_use(&mut self) {
         self.hud_cfg_ensure();
         let (layout, w, h) = self.hud_cfg_key();
-        let mut cache = self.hud_cfg.borrow_mut();
+        let mut cache = self.hud_state.hud_cfg.borrow_mut();
         let who = cache.who.clone();
         let Some(cfg) = cache.cfg.as_mut() else { return };
         cfg.in_use();
@@ -920,7 +920,7 @@ impl App {
     fn hud_cfg_store(&mut self, disarm: bool) {
         self.hud_cfg_ensure();
         let (layout, w, h) = self.hud_cfg_key();
-        let mut cache = self.hud_cfg.borrow_mut();
+        let mut cache = self.hud_state.hud_cfg.borrow_mut();
         let who = cache.who.clone();
         let Some(cfg) = cache.cfg.as_mut() else { return };
         if disarm {
@@ -960,7 +960,7 @@ impl App {
     pub(crate) fn hud_cfg_seed(&mut self, slot: usize, v: usize) {
         self.hud_cfg_ensure();
         let (layout, w, h) = self.hud_cfg_key();
-        let mut cache = self.hud_cfg.borrow_mut();
+        let mut cache = self.hud_state.hud_cfg.borrow_mut();
         if let Some(cfg) = cache.cfg.as_mut() {
             let i = cfg.record(layout, w, h);
             cfg.set_opt(i, slot, v as u32);

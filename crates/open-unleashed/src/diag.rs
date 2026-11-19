@@ -25,8 +25,8 @@ fn log_path() -> Option<PathBuf> {
     }
     // (read directly, not through `nfs_game::config`: `diag::init` runs before `main`'s `set_var`s, which the snapshot must see)
     // `NFS5_SAVE_DIR` replaces `SaveData`; the log then sits beside it, never in the real data dir
-    let dir = std::env::var_os("NFS5_SAVE_DIR")
-        .and_then(|d| PathBuf::from(d).parent().map(|p| p.to_path_buf()))
+    let dir = nfs_game::config::save_root_override()
+        .and_then(|d| d.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(nfs_assets::platform::data_dir);
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("open-unleashed.log");

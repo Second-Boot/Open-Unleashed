@@ -225,7 +225,108 @@ pub(super) struct NearFrame {
 /// take too, asked at most once an item; `contact_receive`).
 pub(super) struct Receivers<'a> {
     pub csm: &'a dyn Fn(&DrawItem) -> f32,
-    pub contact: &'a dyn Fn(&DrawItem) -> bool,
+    /// E43's role of an item given its E9 class (`Core::contact_receive`)
+    pub contact: &'a dyn Fn(&DrawItem, f32) -> bool,
+}
+
+/// `ObjectUniform::env_mix`: `.x` the environment-map mix, `.y` the headlight projector lights the item, `.zw` a uv offset (the sky
+/// layers scroll with it).
+struct EnvSlot {
+    mix: f32,
+    headlit: bool,
+    uv_offset: [f32; 2],
+}
+
+impl EnvSlot {
+    fn pack(self) -> [f32; 4] {
+        [self.mix, self.headlit as u32 as f32, self.uv_offset[0], self.uv_offset[1]]
+    }
+}
+
+/// `ObjectUniform::light`: the item's light colour and its alpha (ENHANCEMENT E9 scales a car's `SHAD` patch's).
+struct LightSlot {
+    rgb: [f32; 3],
+    alpha: f32,
+}
+
+impl LightSlot {
+    fn pack(self) -> [f32; 4] {
+        [self.rgb[0], self.rgb[1], self.rgb[2], self.alpha]
+    }
+}
+
+/// `ObjectUniform::shadow_on`: `.x` the item takes the projector's texture, `.y` `Headlights::LayerUVLight` lays the `HEAD` decal
+/// over it, `.z` the LOD bias, `.w` the alpha test (a material with `device_states`, or the draw's own): its reference + ½ in
+/// bytes, 0 for none.
+struct ShadowOn {
+    projector: bool,
+    uv_lit: bool,
+    lod_bias: f32,
+    alpha_ref: f32,
+}
+
+impl ShadowOn {
+    fn pack(self) -> [f32; 4] {
+        [self.projector as u32 as f32, self.uv_lit as u32 as f32, self.lod_bias, self.alpha_ref]
+    }
+}
+
+/// `ObjectUniform::sky_on`: `.x` the item's sky-map pass has its section map, `.y` the item is drawn in the sky pass (its fog is
+/// the sky's), `.z` its fog weight, `.w` ENHANCEMENT E43: the item receives the contact shadow.
+struct SkyOn {
+    sky_tex: bool,
+    sky_pass: bool,
+    fog_w: f32,
+    contact: bool,
+}
+
+impl SkyOn {
+    fn pack(self) -> [f32; 4] {
+        [self.sky_tex as u32 as f32, self.sky_pass as u32 as f32, self.fog_w, if self.contact { 1.0 } else { 0.0 }]
+    }
+}
+
+/// `ObjectUniform::soft`: `.x` ENHANCEMENT E12's fade distance, `.y` how the fade is laid on the colour (alpha / toward white), `.z`
+/// ENHANCEMENT E15's role of the item for the headlight spots (the receiver class), `.w` ENHANCEMENT ENH-TEMPORAL's role for the
+/// masks (0 opaque-like, 1 a translucent effect, 2 a sky layer).
+struct SoftSlot {
+    fade: f32,
+    mode: f32,
+    spot_role: f32,
+    role: f32,
+}
+
+impl SoftSlot {
+    fn pack(self) -> [f32; 4] {
+        [self.fade, self.mode, self.spot_role, self.role]
+    }
+}
+
+/// `ObjectUniform::hdr`: `.x` ENHANCEMENT E11's HDR boost, `.y` E18's spark gain, `.z` the lit particle kind, `.w` ENH-TEMPORAL's
+/// index of the item's reprojection matrix.
+struct HdrSlot {
+    boost: f32,
+    spark: f32,
+    particle: f32,
+    motion: f32,
+}
+
+impl HdrSlot {
+    fn pack(self) -> [f32; 4] {
+        [self.boost, self.spark, self.particle, self.motion]
+    }
+}
+
+/// ENHANCEMENT E9: the receiver class of an item in the frame's cascades (`ObjectUniform::lit_d.w`): `receives` asks E9's role.
+fn lit_receiver(item: &DrawItem, csm_frame: Option<&CsmFill>, receives: impl Fn() -> f32) -> f32 {
+    match csm_frame {
+        // ENHANCEMENT ENH-DBLSH: 3 = a track `sh80` decal under a caster (the shader fades it out with the shadow)
+        Some(f) if item.csm & crate::CSM_DECAL != 0 && f.decal_fades => classes::RECV_DECAL,
+        // GATE-REL: drivable ground (a track item that receives and does not cast) carries the mark
+        Some(_) if item.csm & (crate::CSM_RECEIVE | crate::CSM_CAST | crate::CSM_ROOM) == crate::CSM_RECEIVE && receives() == classes::RECV_TRACK => classes::RECV_TRACK + classes::RECV_GROUND_MARK,
+        Some(_) => receives(),
+        None => classes::RECV_NONE,
+    }
 }
 
 /// Item `i`'s [`ObjectUniform`]; `sky_tex`: the item's sky-map pass has its section map (`sky_tex_of`).
@@ -261,22 +362,19 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         model: item.transform.to_cols_array_2d(),
         // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
         // .y flags an item the headlight projector lights
-        env_mix: [env_mix, item.headlit as u32 as f32, item.uv_offset[0], item.uv_offset[1]],
+        env_mix: EnvSlot { mix: env_mix, headlit: item.headlit, uv_offset: item.uv_offset }.pack(),
         // ENHANCEMENT E9: the car's `SHAD` patch gives way to the sun's shadow of the car (cover gate; SHADOW-REAL: by the car's own cover)
-        light: [item.light[0], item.light[1], item.light[2], match &csm_frame {
-            Some(f) if item.csm & crate::CSM_CAR_BLOB != 0 => item.alpha * (1.0 - f.car_patch_gate * (1.0 - item.cover.clamp(0.0, 1.0))),
-            _ => item.alpha,
-        }],
+        light: LightSlot {
+            rgb: item.light,
+            alpha: match &csm_frame {
+                Some(f) if item.csm & crate::CSM_CAR_BLOB != 0 => item.alpha * (1.0 - f.car_patch_gate * (1.0 - item.cover.clamp(0.0, 1.0))),
+                _ => item.alpha,
+            },
+        }
+        .pack(),
         lit_a: item.layer_light.map_or([0.0; 4], |l| [l.ambient[0], l.ambient[1], l.ambient[2], 1.0]),
         // .w ENHANCEMENT E9: 1 a car (its direct term takes the sun shadow), 2 a track item (its baked colour does), else 0
-        lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], match &csm_frame {
-            // ENHANCEMENT ENH-DBLSH: 3 = a track `sh80` decal under a caster (the shader fades it out with the shadow)
-            Some(f) if item.csm & crate::CSM_DECAL != 0 && f.decal_fades => classes::RECV_DECAL,
-            // GATE-REL: drivable ground (a track item that receives and does not cast) carries the mark
-            Some(_) if item.csm & (crate::CSM_RECEIVE | crate::CSM_CAST | crate::CSM_ROOM) == crate::CSM_RECEIVE && receives() == classes::RECV_TRACK => classes::RECV_TRACK + classes::RECV_GROUND_MARK,
-            Some(_) => receives(),
-            None => classes::RECV_NONE,
-        }]),
+        lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], lit_receiver(item, csm_frame.as_ref(), receives)]),
         // .w the depth bias's pull, in view depth
         lit_dir: item.layer_light.map_or([0.0, 0.0, 0.0, pull], |l| [l.direction[0], l.direction[1], l.direction[2], pull]),
         shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
@@ -284,11 +382,11 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
         // .w the alpha test (a material with `device_states`, or the draw's own): its
         // reference + ½ in bytes, 0 for none
-        shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, alpha_ref],
+        shadow_on: ShadowOn { projector: item.shadow.is_some(), uv_lit: item.uv_lit, lod_bias, alpha_ref }.pack(),
         sky_u: item.sky.map_or([0.0; 4], |s| s.u),
         sky_v: item.sky.map_or([0.0; 4], |s| s.v),
         // .y the item is drawn in the sky pass (its fog is the sky's)
-        sky_on: [sky_tex as u32 as f32, item.sky_pass as u32 as f32, item.fog_w, if contact_on && (rx.contact)(item) { 1.0 } else { 0.0 }],
+        sky_on: SkyOn { sky_tex, sky_pass: item.sky_pass, fog_w: item.fog_w, contact: contact_on && (rx.contact)(item, receives()) }.pack(),
         // ENHANCEMENT E8
         // .z ENHANCEMENT E16: 1 = the car ambient takes the probe (not the cabin's materials)
         // ENHANCEMENT E17: class 3 = water (a horizontal-water item while the switch and the sky are there)
@@ -297,11 +395,23 @@ pub(super) fn object_uniform(f: &ObjectFrame, i: usize, item: &DrawItem, mat: Op
         // ENHANCEMENT E12: the fade distance; the multiplying pair (3) fades toward white
         // ENHANCEMENT E15: .z the item's role for the headlight spots (1 car, 2 track, 0 none)
         // ENHANCEMENT ENH-TEMPORAL: .w the item's role for the masks (0 opaque-like, 1 a translucent effect, 2 a sky layer)
-        soft: [if soft_split && item.soft > 0.0 { item.soft } else { 0.0 }, if soft_split && item.soft > 0.0 && mat.is_some_and(|m| m.blend_pair == 3) { classes::SOFT_FADE_WHITE } else { classes::SOFT_FADE_ALPHA }, if spots { receives() } else { classes::RECV_NONE }, roles.get(i).copied().unwrap_or(classes::ROLE_OPAQUE)],
+        soft: SoftSlot {
+            fade: if soft_split && item.soft > 0.0 { item.soft } else { 0.0 },
+            mode: if soft_split && item.soft > 0.0 && mat.is_some_and(|m| m.blend_pair == 3) { classes::SOFT_FADE_WHITE } else { classes::SOFT_FADE_ALPHA },
+            spot_role: if spots { receives() } else { classes::RECV_NONE },
+            role: roles.get(i).copied().unwrap_or(classes::ROLE_OPAQUE),
+        }
+        .pack(),
         // ENHANCEMENT E11: only on the float scene with the switch on; 0 = none
         // ENHANCEMENT E18: .y a spark's gain, .z the lit particle kind
         // ENHANCEMENT ENH-TEMPORAL: .w the index of the item's reprojection matrix
-        hdr: [if hdr_boost { item.hdr_boost } else { 0.0 }, if p_fx && item.particle == crate::PARTICLE_SPARK { SPARK_GAIN } else { 0.0 }, if p_fx && item.particle >= crate::PARTICLE_LIT { item.particle as f32 } else { 0.0 }, motion_index.get(i).map_or(0.0, |&k| k as f32)],
+        hdr: HdrSlot {
+            boost: if hdr_boost { item.hdr_boost } else { 0.0 },
+            spark: if p_fx && item.particle == crate::PARTICLE_SPARK { SPARK_GAIN } else { 0.0 },
+            particle: if p_fx && item.particle >= crate::PARTICLE_LIT { item.particle as f32 } else { 0.0 },
+            motion: motion_index.get(i).map_or(0.0, |&k| k as f32),
+        }
+        .pack(),
         // PORT-DEVIATION D37: master's clip transform (with the jitter in `vp_j` only while ENH-TEMPORAL is on)
         mvp: (vp_j * glam::DMat4::from_cols_array(&item.transform.to_cols_array().map(f64::from))).as_mat4().to_cols_array_2d(),
     }
@@ -443,25 +553,10 @@ mod tests {
         assert!(g.refl[0] > 0.0 && g.water[0] == 1.0 && g.rain[0] > 0.0 && g.fogsun[3] > 0.0 && g.temporal[2] == 640.0 && g.ambient[3] == 1.0);
     }
 
-    /// with [`Enhancements::ORIGINAL`] every item's first 12 fields are master's bytes and `soft` / `hdr` are 0;
-    /// `refl` is the material's own class 0..2 and strength, read by the shader only under the globals' `refl.x` (0 above),
-    /// never the water / wet road / skid classes 3..5. The receiver would put 7 into the fields if it were asked.
-    #[test]
-    fn original_objects_are_masters() {
-        let scene = busy_scene();
-        let cam = camera();
-        let enh = Enhancements::ORIGINAL;
-        let env = FrameEnv::new(&scene, &enh, None);
-        let csm = |_: &DrawItem| 7.0;
-        let contact = |_: &DrawItem| true;
-        let rx = Receivers { csm: &csm, contact: &contact };
-        let mats = [
-            None,
-            Some(MatFill { env_mix: 0.3, lod_bias: -0.5, device_states: true, depth_bias: -4, blend_pair: 3, reflect: crate::Reflect { class: 1, strength: 0.6, interior: false } }),
-            Some(MatFill { env_mix: 0.0, lod_bias: 0.0, device_states: false, depth_bias: 2, blend_pair: 0, reflect: crate::Reflect { class: 2, strength: 1.0, interior: true } }),
-        ];
+    /// Items that between them take every branch of the fill (flags, light layers, projector, sky map, particles, ...).
+    fn test_items() -> Vec<DrawItem> {
         let mut items = Vec::new();
-        for flags in [0u8, crate::CSM_CAR_BLOB | crate::CSM_RECEIVE, crate::CSM_DECAL | crate::CSM_ROAD, crate::CSM_SKID | crate::CSM_ROOM] {
+        for flags in [0u16, crate::CSM_CAR_BLOB | crate::CSM_RECEIVE, crate::CSM_DECAL | crate::CSM_ROAD, crate::CSM_SKID | crate::CSM_ROOM] {
             let mut it = DrawItem::new(crate::MeshId(1), crate::MaterialId(0), Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)));
             it.csm = flags;
             it.alpha = 0.75;
@@ -469,7 +564,7 @@ mod tests {
             it.water = flags & crate::CSM_ROAD != 0;
             it.wet = 0.9;
             it.soft = 2.5;
-            it.particle = flags % 4;
+            it.particle = (flags % 4) as u8;
             it.hdr_boost = 3.0;
             it.headlit = true;
             it.uv_lit = flags != 0;
@@ -482,6 +577,27 @@ mod tests {
             it.sky = (flags == 0).then_some(SkyMap { textures: [None; 3], u: [0.1, 0.2, 0.3, 0.4], v: [0.5, 0.6, 0.7, 0.8] });
             items.push(it);
         }
+        items
+    }
+
+    /// with [`Enhancements::ORIGINAL`] every item's first 12 fields are master's bytes and `soft` / `hdr` are 0;
+    /// `refl` is the material's own class 0..2 and strength, read by the shader only under the globals' `refl.x` (0 above),
+    /// never the water / wet road / skid classes 3..5. The receiver would put 7 into the fields if it were asked.
+    #[test]
+    fn original_objects_are_masters() {
+        let scene = busy_scene();
+        let cam = camera();
+        let enh = Enhancements::ORIGINAL;
+        let env = FrameEnv::new(&scene, &enh, None);
+        let csm = |_: &DrawItem| 7.0;
+        let contact = |_: &DrawItem, _: f32| true;
+        let rx = Receivers { csm: &csm, contact: &contact };
+        let mats = [
+            None,
+            Some(MatFill { env_mix: 0.3, lod_bias: -0.5, device_states: true, depth_bias: -4, blend_pair: 3, reflect: crate::Reflect { class: 1, strength: 0.6, interior: false } }),
+            Some(MatFill { env_mix: 0.0, lod_bias: 0.0, device_states: false, depth_bias: 2, blend_pair: 0, reflect: crate::Reflect { class: 2, strength: 1.0, interior: true } }),
+        ];
+        let items = test_items();
         for depth_far in [700.0, 65000.0] {
             let of = ObjectFrame { camera: &cam, depth_far, csm: None, soft_split: false, spots: false, contact_on: false, env, roles: &[], motion_index: &[], vp_j: glam::DMat4::from_cols_array(&cam.view_projection_mirrored(16.0 / 10.0, false).to_cols_array().map(f64::from)), lod_shift: 0.0, near_own: false };
             for (i, item) in items.iter().enumerate() {
@@ -499,5 +615,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The whole fill's bytes over the frames' inputs (switches, cascades, spots, contacts, split pass, temporal roles, upscaler
+    /// shift, near cars) as one hash: a restructuring of the fill keeps every slot's value (`original_objects_are_masters` pins the
+    /// original's frame only).
+    #[test]
+    fn the_object_fill_is_stable() {
+        let scene = busy_scene();
+        let cam = camera();
+        let items = test_items();
+        let mats = [
+            None,
+            Some(MatFill { env_mix: 0.3, lod_bias: -0.5, device_states: true, depth_bias: -4, blend_pair: 3, reflect: crate::Reflect { class: 1, strength: 0.6, interior: false } }),
+            Some(MatFill { env_mix: 0.0, lod_bias: 0.0, device_states: false, depth_bias: 2, blend_pair: 0, reflect: crate::Reflect { class: 2, strength: 1.0, interior: true } }),
+        ];
+        let roles = [classes::ROLE_OPAQUE, classes::ROLE_EFFECT, classes::ROLE_SKY, classes::ROLE_EFFECT];
+        let motion = [0u32, 5, 9, 2];
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut count = 0;
+        for all in [false, true] {
+            let enh = if all { Enhancements::all() } else { Enhancements::ORIGINAL };
+            let env = FrameEnv::new(&scene, &enh, all.then_some(2));
+            for (csm_on, soft_split, spots, contact_on, near_own, lod_shift) in [(false, false, false, false, false, 0.0), (true, false, true, true, true, 0.5), (true, true, false, true, false, 0.0), (false, true, true, false, true, -0.25)] {
+                let csm = |it: &DrawItem| [classes::RECV_NONE, classes::RECV_CAR, classes::RECV_TRACK][it.csm as usize % 3];
+                let contact = |it: &DrawItem, class: f32| it.csm & crate::CSM_ROOM == 0 && class == classes::RECV_TRACK;
+                let rx = Receivers { csm: &csm, contact: &contact };
+                for depth_far in [700.0, 65000.0] {
+                    let of = ObjectFrame { camera: &cam, depth_far, csm: csm_on.then_some(CsmFill { car_patch_gate: 0.6, decal_fades: soft_split }), soft_split, spots, contact_on, env, roles: if all { &roles } else { &[] }, motion_index: if all { &motion } else { &[] }, vp_j: glam::DMat4::from_cols_array(&cam.view_projection_mirrored(16.0 / 10.0, false).to_cols_array().map(f64::from)), lod_shift, near_own };
+                    for (i, item) in items.iter().enumerate() {
+                        for mat in mats {
+                            for sky_tex in [false, true] {
+                                for b in bytemuck::bytes_of(&object_uniform(&of, i, item, mat, sky_tex, &rx)) {
+                                    hash = (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+                                }
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!((count, hash), (384, 3_062_219_809_877_143_485));
+    }
+
+    /// Every slot's components land where the shader reads them.
+    #[test]
+    fn the_slots_pack_in_the_shaders_order() {
+        assert_eq!(EnvSlot { mix: 1.0, headlit: true, uv_offset: [3.0, 4.0] }.pack(), [1.0, 1.0, 3.0, 4.0]);
+        assert_eq!(LightSlot { rgb: [1.0, 2.0, 3.0], alpha: 4.0 }.pack(), [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(ShadowOn { projector: true, uv_lit: false, lod_bias: 3.0, alpha_ref: 4.0 }.pack(), [1.0, 0.0, 3.0, 4.0]);
+        assert_eq!(SkyOn { sky_tex: false, sky_pass: true, fog_w: 3.0, contact: true }.pack(), [0.0, 1.0, 3.0, 1.0]);
+        assert_eq!(SoftSlot { fade: 1.0, mode: 2.0, spot_role: 3.0, role: 4.0 }.pack(), [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(HdrSlot { boost: 1.0, spark: 2.0, particle: 3.0, motion: 4.0 }.pack(), [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// E9's receiver class: a decal under a caster, the ground's mark, the role as asked, none without cascades.
+    #[test]
+    fn the_receiver_class_follows_the_cascades() {
+        let item = |csm: u16| {
+            let mut it = DrawItem::new(crate::MeshId(0), crate::MaterialId(0), Mat4::IDENTITY);
+            it.csm = csm;
+            it
+        };
+        let fades = CsmFill { car_patch_gate: 0.0, decal_fades: true };
+        let keeps = CsmFill { car_patch_gate: 0.0, decal_fades: false };
+        let role = || classes::RECV_TRACK;
+        assert_eq!(lit_receiver(&item(crate::CSM_DECAL), Some(&fades), role), classes::RECV_DECAL);
+        assert_eq!(lit_receiver(&item(crate::CSM_DECAL), Some(&keeps), role), classes::RECV_TRACK);
+        assert_eq!(lit_receiver(&item(crate::CSM_RECEIVE), Some(&keeps), role), classes::RECV_TRACK + classes::RECV_GROUND_MARK);
+        assert_eq!(lit_receiver(&item(crate::CSM_RECEIVE | crate::CSM_CAST), Some(&keeps), role), classes::RECV_TRACK);
+        assert_eq!(lit_receiver(&item(crate::CSM_RECEIVE), None, role), classes::RECV_NONE);
     }
 }

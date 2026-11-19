@@ -24,24 +24,12 @@
 //! The game takes the colour from the pack and re-applies the original's alpha semantics itself (`hdpack::AlphaPolicy`).
 
 use anyhow::{bail, Context, Result};
-use nfs_assets::{car::CarAssets, hdpack, track::TrackAssets, GamePaths};
+use nfs_assets::hdpack::{self, class, AlphaClass, ManifestRow};
+use nfs_assets::{car::CarAssets, track::TrackAssets, GamePaths};
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-struct Row {
-    key: String,
-    class: &'static str,
-    container: String,
-    entry: String,
-    w: u32,
-    h: u32,
-    format: String,
-    alpha: String,
-    wrap: String,
-    hd: bool,
-    note: String,
-}
+type Row = ManifestRow;
 
 struct Export {
     out: PathBuf,
@@ -55,8 +43,13 @@ struct Export {
 }
 
 impl Export {
+    /// `<out>/<key>.png` of the row's pixels.
+    fn write_png(out: &Path, row: &Row, px: &[u8]) -> Result<()> {
+        hdpack::write_rgba_png(&out.join(format!("{}.png", row.key)), row.w, row.h, px).map_err(anyhow::Error::msg)
+    }
+
     fn add(&mut self, row: Row, rgba: Option<&[u8]>) -> Result<()> {
-        if self.only.as_ref().is_some_and(|o| !o.iter().any(|c| c == row.class)) {
+        if self.only.as_ref().is_some_and(|o| !o.contains(&row.class)) {
             return Ok(());
         }
         if let Some((c, e)) = self.seen.get(&row.key) {
@@ -83,17 +76,14 @@ impl Export {
                 }
                 *old = row;
                 if let (true, true, Some(px)) = (self.png, old.hd, rgba) {
-                    let path = self.out.join(format!("{}.png", old.key));
-                    image::save_buffer(&path, px, old.w, old.h, image::ColorType::Rgba8).with_context(|| path.display().to_string())?;
+                    Self::write_png(&self.out, old, px)?;
                 }
                 return Ok(());
             }
         }
         self.seen.insert(row.key.clone(), (row.container.clone(), row.entry.clone()));
         if let (true, true, Some(px)) = (self.png, row.hd, rgba) {
-            let path = self.out.join(format!("{}.png", row.key));
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            image::save_buffer(&path, px, row.w, row.h, image::ColorType::Rgba8).with_context(|| path.display().to_string())?;
+            Self::write_png(&self.out, &row, px)?;
             self.pngs += 1;
         }
         self.rows.push(row);
@@ -102,15 +92,7 @@ impl Export {
 }
 
 fn alpha_kind(rgba: &[u8], tinted: bool) -> String {
-    if tinted {
-        return "slot".into();
-    }
-    match hdpack::AlphaPolicy::of(rgba) {
-        hdpack::AlphaPolicy::Opaque => "none".into(),
-        hdpack::AlphaPolicy::OneBit => "1bit".into(),
-        hdpack::AlphaPolicy::Levels(v) => format!("levels:{}", v.len()),
-        hdpack::AlphaPolicy::Smooth => "smooth".into(),
-    }
+    AlphaClass::of(rgba, tinted).to_manifest()
 }
 
 fn mode(a: u32) -> &'static str {
@@ -172,11 +154,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if all {
         export_listed_only(&paths, &mut ex)?;
     }
-    let mut m = String::from("key\tclass\tcontainer\tentry\tw\th\tformat\talpha\twrap\thd\tnote\n");
-    for r in &ex.rows {
-        writeln!(m, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", r.key, r.class, r.container, r.entry, r.w, r.h, r.format, r.alpha, r.wrap, if r.hd { "yes" } else { "no" }, r.note)?;
-    }
-    std::fs::write(out.join("manifest.tsv"), m)?;
+    std::fs::write(out.join("manifest.tsv"), hdpack::write_manifest(&ex.rows))?;
     let hd = ex.rows.iter().filter(|r| r.hd).count();
     println!("{} PNGs written to {} ({} manifest rows, {} for HD, {} listed only)", ex.pngs, out.display(), ex.rows.len(), hd, ex.rows.len() - hd);
     Ok(())
@@ -200,7 +178,7 @@ fn list_stems(dir: &Path, ext: &str) -> Vec<String> {
 fn export_track(paths: &GamePaths, name: &str, ex: &mut Export) -> Result<()> {
     let t = TrackAssets::load(paths, name)?;
     let mats = t.materials()?;
-    let projectors: std::collections::HashSet<String> = nfs_game::world::track_projectors(&t).iter().map(|p| hdpack::safe(&p.texture)).collect();
+    let projectors: std::collections::HashSet<String> = nfs_assets::track_lights::track_projectors(&t).iter().map(|p| hdpack::safe(&p.texture)).collect();
     let mut n = 0;
     for tex in &t.textures {
         // the address modes of every material that samples it
@@ -217,7 +195,7 @@ fn export_track(paths: &GamePaths, name: &str, ex: &mut Export) -> Result<()> {
         ex.add(
             Row {
                 key: hdpack::key_track(name, &tex.name),
-                class: if excluded { "sprite" } else { "track" },
+                class: if excluded { class::SPRITE } else { class::TRACK }.into(),
                 container: format!("Track/{name}.fsh"),
                 entry: tex.name.trim().to_string(),
                 w: tex.width,
@@ -235,7 +213,7 @@ fn export_track(paths: &GamePaths, name: &str, ex: &mut Export) -> Result<()> {
     // listed only: the track's `.env` (reflection / sky maps, a sphere-mapped lookup, not a surface texture)
     for tex in &t.env_textures {
         ex.add(
-            Row { key: format!("env/{}/{}", hdpack::safe(name), hdpack::safe(&tex.name)), class: "env", container: format!("Track/{name}.env"), entry: tex.name.trim().to_string(), w: tex.width, h: tex.height, format: fmt_name(tex.code), alpha: alpha_kind(&tex.mips[0], false), wrap: "-".into(), hd: false, note: "excluded: reflection / sky-map lookups (spherical UV, 3D-world but low-detail by design)".into() },
+            Row { key: hdpack::key_env(name, &tex.name), class: class::ENV.into(), container: format!("Track/{name}.env"), entry: tex.name.trim().to_string(), w: tex.width, h: tex.height, format: fmt_name(tex.code), alpha: alpha_kind(&tex.mips[0], false), wrap: "-".into(), hd: false, note: "excluded: reflection / sky-map lookups (spherical UV, 3D-world but low-detail by design)".into() },
             None,
         )?;
     }
@@ -254,14 +232,14 @@ fn export_track(paths: &GamePaths, name: &str, ex: &mut Export) -> Result<()> {
         let horizon = n == "horz" || (n.len() == 4 && n.starts_with("hor") && n.as_bytes()[3].is_ascii_digit());
         let cloud = clouds.contains(&n) && n != "none" && !n.starts_with("flat");
         let (class, hd, note) = if horizon {
-            ("sky_detail", true, "the horizon mountain strip: normalized tile UVs, real detail".to_string())
+            (class::SKY_DETAIL, true, "the horizon mountain strip: normalized tile UVs, real detail".to_string())
         } else if cloud {
-            ("sky", true, "a cloud layer: normalized, repeating UVs; a flat gradient (bicubic is enough)".to_string())
+            (class::SKY, true, "a cloud layer: normalized, repeating UVs; a flat gradient (bicubic is enough)".to_string())
         } else {
-            ("sky", false, "excluded: a colour map the game reads on the CPU (the layers' vertex colours / the ring's tint / the lightning's)".to_string())
+            (class::SKY, false, "excluded: a colour map the game reads on the CPU (the layers' vertex colours / the ring's tint / the lightning's)".to_string())
         };
         ex.add(
-            Row { key: hdpack::key_sky(name, &tex.name), class, container: format!("Track/Sky/{name}.fsh"), entry: tex.name.trim().to_string(), w: tex.width, h: tex.height, format: fmt_name(tex.code), alpha: alpha_kind(&tex.mips[0], false), wrap: if hd { "wrap/wrap".into() } else { "-".into() }, hd, note },
+            Row { key: hdpack::key_sky(name, &tex.name), class: class.into(), container: format!("Track/Sky/{name}.fsh"), entry: tex.name.trim().to_string(), w: tex.width, h: tex.height, format: fmt_name(tex.code), alpha: alpha_kind(&tex.mips[0], false), wrap: if hd { "wrap/wrap".into() } else { "-".into() }, hd, note },
             Some(&tex.mips[0]),
         )?;
     }
@@ -289,8 +267,8 @@ fn export_car(paths: &GamePaths, model: &str, ex: &mut Export) -> Result<()> {
         if e.page_bpp == 565 && e.tinted && e.format == "Indexed8" {
             note.push_str("excluded: tinted palette entry on a 565 page (the original writes nothing)");
         }
-        let hd = !e.has_text && !(e.page_bpp == 565 && e.tinted && e.format == "Indexed8");
-        ex.add(Row { key: e.key.clone(), class: "car",container: e.container.clone(), entry: e.entry.clone(), w: e.width, h: e.height, format: e.format.clone(), alpha: alpha_kind(&e.rgba, e.tinted), wrap: "-".into(), hd, note: note.trim_end_matches("; ").to_string() }, Some(&e.rgba))?;
+        let hd = e.hd_eligible;
+        ex.add(Row { key: e.key.clone(), class: class::CAR.into(), container: e.container.clone(), entry: e.entry.clone(), w: e.width, h: e.height, format: e.format.clone(), alpha: alpha_kind(&e.rgba, e.tinted), wrap: "-".into(), hd, note: note.trim_end_matches("; ").to_string() }, Some(&e.rgba))?;
         n += 1;
     }
     // the damage decals of `<model>D.fsh` (dark paint) and `<model>L.fsh` (light paint)
@@ -300,7 +278,7 @@ fn export_car(paths: &GamePaths, model: &str, ex: &mut Export) -> Result<()> {
             ex.add(
                 Row {
                     key: hdpack::key_car_damage(model, light, p.index, &img.name),
-                    class: "car-damage",
+                    class: class::CAR_DAMAGE.into(),
                     container: format!("CarModel/{model}{}.fsh", if light { "L" } else { "D" }),
                     entry: img.name.trim().to_string(),
                     w: img.width,
@@ -323,9 +301,9 @@ fn export_car(paths: &GamePaths, model: &str, ex: &mut Export) -> Result<()> {
 /// `--all`: the 3D-world packs that are not part of the pack (listed in the manifest only, with the reason).
 fn export_listed_only(paths: &GamePaths, ex: &mut Export) -> Result<()> {
     for (dir, file, class, why) in [
-        (paths.render_dir(), "common.fsh", "sprite", "particles, flares, sun, splashes, skid dust: sprite sheets addressed in texel / atlas units, drawn as screen / billboard sprites"),
-        (paths.render_dir(), "particle.fsh", "sprite", "particle atlas: sub-rectangles in texels (particle.ini)"),
-        (paths.car_model_dir(), "carcmn.fsh", "car-env", "the cars' shared environment / specular maps (spherical lookups, low-detail by design)"),
+        (paths.render_dir(), "common.fsh", class::SPRITE, "particles, flares, sun, splashes, skid dust: sprite sheets addressed in texel / atlas units, drawn as screen / billboard sprites"),
+        (paths.render_dir(), "particle.fsh", class::SPRITE, "particle atlas: sub-rectangles in texels (particle.ini)"),
+        (paths.car_model_dir(), "carcmn.fsh", class::CAR_ENV, "the cars' shared environment / specular maps (spherical lookups, low-detail by design)"),
     ] {
         let Some(p) = GamePaths::find_file(&dir, file) else { continue };
         let Ok(raw) = std::fs::read(&p) else { continue };
@@ -335,7 +313,7 @@ fn export_listed_only(paths: &GamePaths, ex: &mut Export) -> Result<()> {
         let folder = dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         for tex in pack {
             ex.add(
-                Row { key: format!("{class}/{}/{}", hdpack::safe(stem), hdpack::safe(&tex.name)), class, container: format!("{folder}/{file}"), entry: tex.name.trim().to_string(), w: tex.width, h: tex.height, format: fmt_name(tex.code), alpha: alpha_kind(&tex.mips[0], false), wrap: "-".into(), hd: false, note: format!("excluded: {why}") },
+                Row { key: hdpack::key_listed(class, stem, &tex.name), class: class.into(), container: format!("{folder}/{file}"), entry: tex.name.trim().to_string(), w: tex.width, h: tex.height, format: fmt_name(tex.code), alpha: alpha_kind(&tex.mips[0], false), wrap: "-".into(), hd: false, note: format!("excluded: {why}") },
                 None,
             )?;
         }

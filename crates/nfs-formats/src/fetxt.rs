@@ -150,8 +150,8 @@ impl<'a> Scan<'a> {
                     if al != b'\n' {
                         while al != 0 && cur < n {
                             al = al.wrapping_add(1);
+                            // the original stores the byte and reloads it; the reload gives back `al`
                             buf[cur] = al;
-                            al = buf[cur];
                             if al == b'\n' {
                                 break;
                             }
@@ -509,14 +509,7 @@ mod tests {
     use std::cell::RefCell;
 
     fn game_dir() -> Option<std::path::PathBuf> {
-        let mut dirs = Vec::new();
-        if let Some(p) = std::env::var_os("NFS5_GAME_PATH") {
-            dirs.push(std::path::PathBuf::from(p));
-        }
-        if let Some(h) = std::env::var_os("HOME") {
-            dirs.push(std::path::PathBuf::from(h).join("Games/NFS-Porsche-Unleashed/game_info/data"));
-        }
-        dirs.into_iter().find(|d| d.join("fe.txt").is_file())
+        nfs_devdata::dev_game_root().filter(|d| d.join("fe.txt").is_file())
     }
 
     /// `text` parsed with `files` as the only readable files, and the names asked for.

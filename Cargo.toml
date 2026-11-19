@@ -4,6 +4,8 @@ members = [
     "crates/nfs-formats",
     "crates/nfs-assets",
     "crates/nfs-math",
+    "crates/nfs-devdata",
+    "crates/nfs-gfxdata",
     "crates/nfs-physics",
     "crates/nfs-renderer",
     "crates/nfs-audio",
@@ -23,12 +25,13 @@ members = [
 version = "0.1.5"
 edition = "2024"
 license = "GPL-3.0-or-later"
-rust-version = "1.95"
 
 [workspace.dependencies]
 nfs-formats = { path = "crates/nfs-formats" }
 nfs-assets = { path = "crates/nfs-assets" }
 nfs-math = { path = "crates/nfs-math" }
+nfs-devdata = { path = "crates/nfs-devdata" }
+nfs-gfxdata = { path = "crates/nfs-gfxdata" }
 nfs-physics = { path = "crates/nfs-physics" }
 nfs-renderer = { path = "crates/nfs-renderer" }
 nfs-audio = { path = "crates/nfs-audio" }
@@ -38,7 +41,7 @@ nfs-game = { path = "crates/nfs-game" }
 
 thiserror = "2"
 anyhow = "1"
-glam = "0.33"
+glam = "0.34"
 bytemuck = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -20,7 +20,7 @@
 use crate::race::SliceTable;
 use glam::{Mat3, Vec3};
 use nfs_formats::trafcfg::{AiPhysics, TrafficConfig};
-use nfs_physics::vehicle::x87::dot_x87;
+use nfs_physics::x87::dot_x87;
 
 /// The state of one AI-driven car the model reads and writes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,7 +146,7 @@ fn fistp(v: f32) -> i32 {
 /// `0x408F20` — the heading error in **turns**, in −0.5..0.5. Positive means the car points to the
 /// right of where it wants to go.
 pub fn heading_error(car: &AiCarState, aim: Vec3) -> f32 {
-    use nfs_physics::vehicle::TURN_PER_RAD_IMAGE;
+    use nfs_physics::x87::TURN_PER_RAD_IMAGE;
     let fwd = car.orientation.row(2);
     // 0x408FFD…0x40903D: `0x532860(x, z)` = `fpatan · [0x5BB2C8]` (the **double** 0.1591549515724182 = 1 / 6.28318452835083, not
     // 1/τ — PORT-DEVIATION D1: portable atan2), the heading's copy stored to `f32` (`fst [esp+0x28]`, `fstp car+0x1054`)
@@ -447,7 +447,7 @@ pub fn grip_factor(car: &AiCarState) -> f32 {
 pub fn in_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f32, aim: Vec3, grip: f32, boost: f32, accel_rate: f32, brake_force: f32) -> DriveCommand {
     // 0x409C93…0x409CE5: `car+0x102C` normalised by 0x5328D0 (the reciprocal in the register, one rounding per component), the
     // perpendicular `(z, y, −x)` and `velocity · perp` through 0x532910, `· dir` (`fimul car+0xEB0`) stored to `f32` (0x409D06)
-    let d = nfs_physics::vehicle::x87::normalize_x87(aim);
+    let d = nfs_physics::x87::normalize_x87(aim);
     // the desired direction rotated a quarter turn in the ground plane
     let perp = Vec3::new(d.z, d.y, -d.x);
     let k = if boost > 1.0 { f64::from(boost) } else { 1.0 };

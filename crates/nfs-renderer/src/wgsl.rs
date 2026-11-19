@@ -43,6 +43,11 @@ const TAU: f32 = 6.2831853;
 const GOLDEN_ANGLE: f32 = 2.3999632;
 "#;
 
+/// A colour channel's top value in bytes: the original's 8-bit colours and the alpha test's reference (`shadow_on.w`) are bytes.
+pub(crate) const BYTE: &str = r#"
+const BYTE: f32 = 255.0;
+"#;
+
 /// `linear_z(d, near, far)`: the distance in front of the camera of a depth-buffer value `d` of a projection with these planes
 /// (the scene-depth passes: light shafts, haze, lighthouse beam).
 pub(crate) const LINEAR_Z: &str = r#"
@@ -56,6 +61,25 @@ pub(crate) const NDC_UV: &str = r#"
 fn ndc_uv(p: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
 }
+"#;
+
+/// `ndc_of_uv(uv)`: a uv (0..1 over the target, y down) as a clip-space xy (-1..1, y up), the inverse of [`NDC_UV`].
+pub(crate) const NDC_OF_UV: &str = r#"
+fn ndc_of_uv(uv: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+}
+"#;
+
+/// `ndc_of_px(p, size)`: a pixel position `p` of a target `size` in size as a clip-space xy (-1..1, y up).
+pub(crate) const NDC_OF_PX: &str = r#"
+fn ndc_of_px(p: vec2<f32>, size: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0);
+}
+"#;
+
+/// Pi, as the passes wrote it.
+pub(crate) const PI: &str = r#"
+const PI: f32 = 3.14159265;
 "#;
 
 /// `proj_dist(z, r, near)`: the same distance from the projection's own terms, `r = far / (near - far)` (the post chain's
@@ -142,6 +166,14 @@ impl DepthKind {
         let sample_type = if self == DepthKind::Soft { wgpu::TextureSampleType::Float { filterable: false } } else { wgpu::TextureSampleType::Depth };
         crate::gfx::bgl_tex(self.binding(), sample_type, self == DepthKind::Multi)
     }
+}
+
+/// A scene-depth pass's shader (light shafts, haze, lighthouse beam): the full-screen triangle, `ign`, the depth access of
+/// `kind`, `linear_z`, then `rest` (the pass's own pieces and body), in order.
+pub(crate) fn compose_scene_depth(kind: DepthKind, rest: &[&str]) -> String {
+    let mut parts = vec![FULLSCREEN_VS, IGN, kind.wgsl(), LINEAR_Z];
+    parts.extend_from_slice(rest);
+    compose(&parts)
 }
 
 /// A shader from its parts, in order.
@@ -245,7 +277,7 @@ mod tests {
     #[test]
     fn each_piece_is_in_a_shader_once() {
         for (name, src) in every_source() {
-            for f in ["fn vs(", "fn ign(", "fn dload(", "fn depth_at(", "fn depth_dims(", "fn linear_z(", "fn proj_dist(", "fn view_dir(", "fn ndc_uv(", "const LUMA_709:", "const LUMA:", "const TAU:", "const GOLDEN_ANGLE:", "struct Object {", "fn face_of("] {
+            for f in ["fn vs(", "fn ign(", "fn dload(", "fn depth_at(", "fn depth_dims(", "fn linear_z(", "fn proj_dist(", "fn view_dir(", "fn ndc_uv(", "fn ndc_of_uv(", "fn ndc_of_px(", "const PI:", "const LUMA_709:", "const LUMA:", "const TAU:", "const GOLDEN_ANGLE:", "const BYTE:", "struct Object {", "fn face_of("] {
                 assert!(src.matches(f).count() <= 1, "{name}: `{f}` twice");
             }
         }

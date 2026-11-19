@@ -5,14 +5,7 @@
 use nfs_formats::{bigf::Bigf, bnk::Bnk, crp::Crp, fsh::Fsh, mad::{MadTables, PeImage}, refpack};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-
-fn game_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NFS5_GAME_PATH") {
-        return Some(PathBuf::from(p));
-    }
-    let p = PathBuf::from(std::env::var_os("HOME")?).join("Games/NFS-Porsche-Unleashed/game_info/data");
-    p.join("GameData").is_dir().then_some(p)
-}
+use nfs_devdata::dev_game_root as game_root;
 
 fn real(rel: &str) -> Option<Vec<u8>> {
     let r = game_root()?;

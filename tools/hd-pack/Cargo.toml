@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 nfs-assets.workspace = true
 # the game's own mip chain generator (E2's), so a pack file's levels are the ones the game would have made from the PNG
-nfs-renderer.workspace = true
+nfs-gfxdata.workspace = true
 anyhow.workspace = true
 image.workspace = true
 # OFFLINE ONLY: the BC7 encoder (Intel's ISPC texture compressor, kernels precompiled and shipped in the crate: no ispc needed;

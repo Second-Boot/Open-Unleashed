@@ -1,6 +1,6 @@
 //! Materials and the bind groups they draw with: create / duplicate, the headlight / projector maps, the globals bind group,
 //! the section maps' sky bind groups, the per-material bind groups and their rebuilds (ENHANCEMENT E2 anisotropy, trilinear),
-//! the draw-state setters (mirror view, FakeSort mode, gamma). Moved out of gpu.rs as it was.
+//! the draw-state setters (mirror view, FakeSort mode, gamma).
 
 use crate::gfx;
 use super::*;
@@ -44,12 +44,12 @@ impl SamplerKey {
 
 impl Core {
     pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
-        let texture = desc.texture.unwrap_or(self.white);
-        let env = desc.env_texture.unwrap_or(self.white);
+        let texture = desc.texture.unwrap_or(self.res.white);
+        let env = desc.env_texture.unwrap_or(self.res.white);
         let sampler = SamplerKey { clamp: desc.clamp, point_mips: false }.address();
         let bind_group = self.material_bind_group(texture, sampler, env);
         let bind_group_point = desc.false_sort.then(|| self.material_bind_group_point(texture, sampler, env));
-        self.materials.push(GpuMaterial {
+        self.res.materials.push(GpuMaterial {
             bind_group,
             bind_group_point,
             alpha_blend: desc.alpha_blend,
@@ -69,7 +69,7 @@ impl Core {
             env,
             reflect: desc.reflect,
         });
-        MaterialId(self.materials.len() as u32 - 1)
+        MaterialId(self.res.materials.len() as u32 - 1)
     }
 
     /// A new material identical to `id` but sampling `texture` in its place — same blend/cull/lod
@@ -80,19 +80,19 @@ impl Core {
     /// each `MeshId`/`TextureId`/`MaterialId` once at `render()`, unlike the original's per-car
     /// synchronous blit 0x572B40).
     pub fn duplicate_material_texture(&mut self, id: MaterialId, texture: TextureId) -> MaterialId {
-        let Some(m) = self.materials.get(id.0 as usize) else { return id };
+        let Some(m) = self.res.materials.get(id.0 as usize) else { return id };
         let bind_group = self.material_bind_group(texture, m.sampler, m.env);
         let bind_group_point = m.false_sort.then(|| self.material_bind_group_point(texture, m.sampler, m.env));
         let copy = GpuMaterial { bind_group, bind_group_point, texture, ..m.clone() };
-        self.materials.push(copy);
-        MaterialId(self.materials.len() as u32 - 1)
+        self.res.materials.push(copy);
+        MaterialId(self.res.materials.len() as u32 - 1)
     }
 
     /// Point every reflective material at another environment map — the original re-binds the car's
     /// environment layers whenever the `.map` section under it changes (`RE/notes/lighting.md` §3).
     /// `night.psh`'s `nght` bitmap, 128 × 128 bytes, for the headlight projector.
     pub fn set_headlight_map(&mut self, map: &[u8]) {
-        if map.len() == 128 * 128 {
+        if map.len() == NIGHT_MAP_BYTES {
             self.queue.write_buffer(&self.headlight_map_buf, 0, map);
         }
     }
@@ -118,25 +118,25 @@ impl Core {
     /// The globals bind group; `soft` is ENHANCEMENT E12's depth image of the pass about to be drawn
     /// (`None`: the 1 x 1 dummy).
     pub(super) fn make_globals_bg(&self, soft: Option<&wgpu::TextureView>) -> wgpu::BindGroup {
-        let pick = |t: Option<TextureId>| match t.and_then(|t| self.textures.get(t.0 as usize)) {
+        let pick = |t: Option<TextureId>| match t.and_then(|t| self.res.textures.get(t.0 as usize)) {
             Some(t) => &t.view,
-            None => &self.proj_default_view,
+            None => &self.dummies.proj_default_view,
         };
         GlobalsSet {
             globals: &self.globals_buf,
             night_map: &self.headlight_map_buf,
             proj: pick(self.proj_tex),
-            proj_sampler: &self.proj_samplers[!self.trilinear as usize],
+            proj_sampler: &self.samplers.proj[!self.modes.trilinear as usize],
             head: pick(self.head_tex),
-            refl: self.refl.as_ref().map_or(&self.refl_dummy_view, |c| &c.array_view),
+            refl: self.env.cube.as_ref().map_or(&self.dummies.refl_view, |c| &c.array_view),
             csm: &self.csm,
-            soft: soft.unwrap_or(&self.soft_dummy_view),
-            probe_sh: self.probe.as_ref().map_or(&self.probe_dummy, |p| &p.uniform),
+            soft: soft.unwrap_or(&self.dummies.soft_view),
+            probe_sh: self.env.probe.as_ref().map_or(&self.dummies.probe, |p| &p.uniform),
             spot: &self.spot,
             lamp: &self.lamp,
             contacts: &self.contact.buf,
         }
-        .bind_group(&self.device, &self.globals_layout)
+        .bind_group(&self.device, &self.layouts.globals)
     }
 
     /// The view about to be drawn is the rear-view mirror's: `[0x6115CC]+0x190` is set from the
@@ -145,7 +145,7 @@ impl Core {
     /// passes (0x445578, 0x445B69).
     /// The same flag keeps out the draws only the main view makes (`DrawItem::main_view_only`).
     pub fn set_mirror_view(&mut self, on: bool) {
-        self.no_reflections = on;
+        self.modes.no_reflections = on;
     }
 
     /// The bind group for a section map, made the first time a car binds it.
@@ -154,7 +154,7 @@ impl Core {
         if self.sky_bgs.get(i).is_some_and(|b| b.is_some()) {
             return;
         }
-        let bg = gfx::view_bg(&self.device, "sky map", &self.sky_layout, &self.textures[tex.0 as usize].view);
+        let bg = gfx::view_bg(&self.device, "sky map", &self.layouts.sky, &self.res.textures[tex.0 as usize].view);
         if self.sky_bgs.len() <= i {
             self.sky_bgs.resize_with(i + 1, || None);
         }
@@ -169,13 +169,13 @@ impl Core {
         // ENHANCEMENT E2: on, trilinear + anisotropic for every material; off, a texture with a
         // generated chain keeps to level 0 (what the original has), the rest is master's sampler
         let e2 = self.enhancements.is_on(crate::E2);
-        let generated = self.textures.get(texture.0 as usize).is_some_and(|t| t.generated.is_some());
+        let generated = self.res.textures.get(texture.0 as usize).is_some_and(|t| t.generated.is_some());
         let sampler = if e2 {
-            &self.aniso_samplers[sampler]
+            &self.samplers.aniso[sampler]
         } else if generated {
-            &self.level0_samplers[sampler]
+            &self.samplers.level0[sampler]
         } else {
-            &self.samplers[SamplerKey { point_mips: !self.trilinear, ..SamplerKey::of_address(sampler) }.index()]
+            &self.samplers.scene[SamplerKey { point_mips: !self.modes.trilinear, ..SamplerKey::of_address(sampler) }.index()]
         };
         self.material_bind_group_with(texture, sampler, env)
     }
@@ -185,21 +185,21 @@ impl Core {
     pub(super) fn material_bind_group_point(&self, texture: TextureId, sampler: usize, env: TextureId) -> wgpu::BindGroup {
         let texture = self.shown_texture(texture); // ENHANCEMENT ENH-LIVETEX
         // ENHANCEMENT E2 off: a generated chain is not sampled (see `material_bind_group`)
-        let generated = self.textures.get(texture.0 as usize).is_some_and(|t| t.generated.is_some());
-        let s = if generated && !self.enhancements.is_on(crate::E2) { &self.point_level0_samplers[sampler] } else { &self.point_samplers[sampler] };
+        let generated = self.res.textures.get(texture.0 as usize).is_some_and(|t| t.generated.is_some());
+        let s = if generated && !self.enhancements.is_on(crate::E2) { &self.samplers.point_level0[sampler] } else { &self.samplers.point[sampler] };
         self.material_bind_group_with(texture, s, env)
     }
 
     pub(super) fn material_bind_group_with(&self, texture: TextureId, sampler: &wgpu::Sampler, env: TextureId) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material"),
-            layout: &self.material_layout,
+            layout: &self.layouts.material,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.textures[texture.0 as usize].view) },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.res.textures[texture.0 as usize].view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.textures[env.0 as usize].view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.res.textures[env.0 as usize].view) },
                 // `WRAP` / `WRAP`; sampled at level 0, so the mip half is moot
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[SamplerKey::WRAP.index()]) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers.scene[SamplerKey::WRAP.index()]) },
             ],
         })
     }
@@ -214,31 +214,31 @@ impl Core {
             2 => 8,
             _ => 16,
         };
-        let clamp = if self.aniso_supported { want } else { 1 };
-        if clamp != self.aniso_clamp {
-            self.aniso_clamp = clamp;
-            self.aniso_samplers = std::array::from_fn(|i| {
+        let clamp = if self.samplers.aniso_supported { want } else { 1 };
+        if clamp != self.samplers.aniso_clamp {
+            self.samplers.aniso_clamp = clamp;
+            self.samplers.aniso = std::array::from_fn(|i| {
                 let k = SamplerKey::of_address(i);
                 make_scene_sampler(&self.device, k.clamp[0], k.clamp[1], wgpu::MipmapFilterMode::Linear, clamp, None)
             });
         }
-        tracing::info!(level, anisotropy = clamp, supported = self.aniso_supported, "ENHANCEMENT E2");
+        tracing::info!(level, anisotropy = clamp, supported = self.samplers.aniso_supported, "ENHANCEMENT E2");
         self.rebuild_material_bind_groups(None);
     }
 
     /// Every material's bind groups made again (E2's samplers changed, or ENHANCEMENT ENH-LIVETEX flipped the textures E41 shows).
     /// `only`: just the materials whose own (original) texture is this one.
     pub(super) fn rebuild_material_bind_groups(&mut self, only: Option<TextureId>) {
-        for i in 0..self.materials.len() {
-            let m = &self.materials[i];
+        for i in 0..self.res.materials.len() {
+            let m = &self.res.materials[i];
             if only.is_some_and(|t| t != m.texture) {
                 continue;
             }
             let (texture, sampler, env, point) = (m.texture, m.sampler, m.env, m.bind_group_point.is_some());
             let bind_group = self.material_bind_group(texture, sampler, env);
             let bind_group_point = point.then(|| self.material_bind_group_point(texture, sampler, env));
-            self.materials[i].bind_group = bind_group;
-            self.materials[i].bind_group_point = bind_group_point;
+            self.res.materials[i].bind_group = bind_group;
+            self.res.materials[i].bind_group_point = bind_group_point;
         }
     }
 
@@ -247,26 +247,26 @@ impl Core {
     /// 0x44ED10 sets it only at `SPECIALFX` 3 on a card that took `setstate(0x0B, 3)`
     /// (`[0x6197A6]`, taken as accepted); the front end's 0x44F020 clears it.
     pub fn set_trilinear(&mut self, on: bool) {
-        if self.trilinear == on {
+        if self.modes.trilinear == on {
             return;
         }
-        self.trilinear = on;
-        for i in 0..self.materials.len() {
-            let m = &self.materials[i];
-            self.materials[i].bind_group = self.material_bind_group(m.texture, m.sampler, m.env);
+        self.modes.trilinear = on;
+        for i in 0..self.res.materials.len() {
+            let m = &self.res.materials[i];
+            self.res.materials[i].bind_group = self.material_bind_group(m.texture, m.sampler, m.env);
         }
         self.rebuild_globals_bg();
     }
 
     /// `LayerFalseSort1`/`2`'s per-frame pick (`main.rs`'s `App::fakesort_mode`, [`FakeSortMode`]).
     pub fn set_fakesort_mode(&mut self, mode: FakeSortMode) {
-        self.fakesort_mode = mode;
+        self.modes.fakesort_mode = mode;
     }
 
     /// State 0x2E's value as the game passes it; `dx7z.dll` 0x600051EE…0x6000522E: `≤ 0` → 0,
     /// not `< 4` → 4 ([`GAMMA_MAX`]).
     pub fn set_gamma(&mut self, g: f32) {
-        self.gamma = if g <= 0.0 { 0.0 } else if g < GAMMA_MAX { g } else { GAMMA_MAX };
+        self.modes.gamma = if g <= 0.0 { 0.0 } else if g < GAMMA_MAX { g } else { GAMMA_MAX };
     }
 }
 

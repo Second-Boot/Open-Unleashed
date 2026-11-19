@@ -14,8 +14,7 @@ fn flat() -> TriangleGrid {
 }
 
 fn specs_993() -> Option<CarSpecs> {
-    let home = std::env::var_os("HOME")?;
-    let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/GameData/Simulation/CarData/993coupe36.sim");
+    let p = nfs_devdata::dev_game_root()?.join("GameData/Simulation/CarData/993coupe36.sim");
     let sim = nfs_formats::sim::CarSim::parse(&std::fs::read(p).ok()?).ok()?;
     Some(CarSpecs::from_sim(&sim, false))
 }
@@ -64,8 +63,8 @@ fn scenario_brake_from_speed() {
 
 #[test]
 fn scenario_gt1_full_throttle() {
-    let home = std::env::var_os("HOME").unwrap();
-    let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/GameData/Simulation/CarData/GT1race.sim");
+    let Some(root) = nfs_devdata::dev_game_root() else { return };
+    let p = root.join("GameData/Simulation/CarData/GT1race.sim");
     let Ok(d) = std::fs::read(p) else { return };
     let sim = nfs_formats::sim::CarSim::parse(&d).unwrap();
     let specs = CarSpecs::from_sim(&sim, true);
@@ -221,14 +220,12 @@ fn a_manual_gearbox_is_worth_five_per_cent() {
 }
 
 fn parts() -> Option<Vec<nfs_formats::career::Part>> {
-    let home = std::env::var_os("HOME")?;
-    let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/FEData/Data/nfs5.prt");
+    let p = nfs_devdata::dev_game_root()?.join("FEData/Data/nfs5.prt");
     nfs_formats::career::parse_parts(&std::fs::read(p).ok()?).ok()
 }
 
 fn catalog() -> Option<Vec<nfs_formats::fedata::CarCatalogEntry>> {
-    let home = std::env::var_os("HOME")?;
-    let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/FEData/Data/nfs5.car");
+    let p = nfs_devdata::dev_game_root()?.join("FEData/Data/nfs5.car");
     nfs_formats::fedata::parse_car_catalog(&std::fs::read(p).ok()?).ok()
 }
 
@@ -417,8 +414,7 @@ struct Image {
 
 impl Image {
     fn open() -> Option<Self> {
-        let home = std::env::var_os("HOME")?;
-        let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/nfs5.exe");
+        let p = nfs_devdata::dev_game_root()?.join("nfs5.exe");
         let bytes = std::fs::read(p).ok()?;
         let u16at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize;
         let u32at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);

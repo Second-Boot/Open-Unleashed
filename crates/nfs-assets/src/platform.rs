@@ -56,23 +56,14 @@ pub fn game_data_candidates() -> Vec<PathBuf> {
         }
     }
     if let Some(home) = home_dir() {
-        v.push(home.join("Games/NFS-Porsche-Unleashed/game_info/data"));
-        v.push(home.join("Games/NFS-Porsche-Unleashed"));
+        v.extend(nfs_devdata::HOME_FALLBACKS.iter().map(|r| home.join(r)));
     }
     v
 }
 
-/// The developer's install, for tests and examples (`$NFS5_GAME_PATH`, else the home fallbacks);
-/// `None` when absent.
-pub fn dev_game_root() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("NFS5_GAME_PATH").map(PathBuf::from)
-        && p.join("GameData").is_dir()
-    {
-        return Some(p);
-    }
-    let home = home_dir()?;
-    ["Games/NFS-Porsche-Unleashed/game_info/data", "Games/NFS-Porsche-Unleashed"].iter().map(|r| home.join(r)).find(|p| p.join("GameData").is_dir())
-}
+/// The developer's install, for tests and examples (`$NFS5_GAME_PATH`, else the home fallbacks); `None` when absent.
+/// One rule for every crate: [`nfs_devdata::dev_game_root`].
+pub use nfs_devdata::dev_game_root;
 
 /// PORT-DEVIATION D46 (photo mode): the folder the stills go to, `<the user's Pictures>/PorscheUnleashed`.
 ///

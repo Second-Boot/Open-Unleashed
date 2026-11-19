@@ -9,9 +9,6 @@
 
 use super::*;
 
-/// The key of the car's covered-stretch value in [`App::tunnel_lamps`] (E36 uses 0x400, the cars 0, 1 + i, 0x100 + i, 0x200 + i).
-const COVER_KEY: u32 = 0x500;
-
 impl App {
     /// ENHANCEMENT E40: this frame's `scene.drops` (it is `None` already: `rebuild_scene` clears it). Called from the car's
     /// draw, right after the original's own drops (`splat_items`), with the car's drawn pose.
@@ -21,21 +18,13 @@ impl App {
         }
         let Some(v) = self.vehicle.as_ref() else { return };
         let speed = v.velocity.length();
-        let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
-        let wet = match (self.track.sky_bin.as_ref(), self.cam_slice) {
-            (Some(b), Some(s)) => b.sample_track_b(5, s as i32, lap).clamp(0.0, 1.0),
-            _ => 0.0,
-        };
-        // **TEST GLUE** (not in the original) `NFS_DROPS_WET=<0..1>`: holds the wetness, to look at the drops on a dry track
-        let wet = std::env::var("NFS_DROPS_WET").ok().and_then(|v| v.parse::<f32>().ok()).map_or(wet, |w| w.clamp(0.0, 1.0));
+        let wet = self.camera_wet().clamp(0.0, 1.0);
         let t = (self.tick as f64 + alpha as f64) / 64.0;
-        let covered = self.world.as_ref().is_some_and(|w| w.in_tunnel(self.camera.position));
-        let v = self.tunnel_lamps.borrow_mut().value_held(COVER_KEY, covered, t * 1000.0);
-        let cover = v * v * (3.0 - 2.0 * v);
+        let cover = self.tunnel_cover_smooth(super::car_lights::cover_key::DROPS, self.camera.position, t * 1000.0);
         // a dry track: nothing on the glass; after the rain the renderer is kept running a few seconds so the wipe clears it
         if wet > 0.0 {
-            self.drops_until = t + 4.0;
-        } else if t > self.drops_until {
+            self.ambient.drops_until = t + 4.0;
+        } else if t > self.ambient.drops_until {
             return;
         }
         let Some(quad) = self.windscreen_quad_cached() else {
@@ -50,13 +39,13 @@ impl App {
     /// The `Wndo` corners, parsed once per car (the model and its style).
     fn windscreen_quad_cached(&mut self) -> Option<[Vec3; 4]> {
         let key = (self.car.model.clone(), self.car.style_index, self.cheat_bits & (1 << 1) != 0);
-        if let Some((k, q)) = &self.drops_quad
+        if let Some((k, q)) = &self.ambient.drops_quad
             && *k == key
         {
             return *q;
         }
         let q = self.windscreen_quad();
-        self.drops_quad = Some((key, q));
+        self.ambient.drops_quad = Some((key, q));
         q
     }
 }

@@ -15,7 +15,7 @@ impl App {
     /// pulled to the main near plane, so the glints sat beside the car and flew with it.)*
     /// The streaks' meshes hold world positions, the same in both passes, so the mirror rewrites the
     /// pool with what the main pass wrote and only the entries' bias differs.
-    /// `main` also sets the alpha-test state the weather draw inherits (`particles_left_ref_one`)
+    /// `main` also sets the alpha-test state the weather draw inherits (`weather_alpha_ref_one`)
     /// — the weather draw is the main view's alone.
     pub(crate) fn effect_items(&mut self, fwd: Vec3, right: Vec3, up: Vec3, draws: &[Option<nfs_game::world::ArticleDraw>], main: bool, out: &mut Vec<nfs_renderer::DrawItem>) {
         out.clear();
@@ -46,7 +46,7 @@ impl App {
             // 0x454844) alike, all under `GREATER 1` — and nothing after it in the scene draw
             // puts 10 back but the sun's pass (0x45D249): what the weather's draw inherits
             if main {
-                self.particles_left_ref_one = p.any_particles() || self.car_effects.as_ref().is_some_and(|fx| fx.any_particles());
+                self.weather_alpha_ref_one = p.any_particles() || self.car_effects.as_ref().is_some_and(|fx| fx.any_particles());
             }
             self.streak_items(out, &streaks, main);
             let z_near = self.camera.near;
@@ -57,7 +57,7 @@ impl App {
             let spray_dups = if main && self.enh.is_on(nfs_renderer::E26) && self.weather_strengths().1 > 0.05 { self.enh.level(nfs_renderer::E26).min(2) as usize } else { 0 };
             for (i, sp) in sprites.into_iter().enumerate() {
                 if spray_dups > 0 && i >= n_track && sp.blend == 0 && sp.argb & 0xFF_FFFF == 0x59_5959 {
-                    let Some(&(mesh, material)) = self.track_particle_sprites.get(&(sp.material.clone(), sp.blend)) else { continue };
+                    let Some(&(mesh, material)) = self.draws.track_particle_sprites.get(&(sp.material.clone(), sp.blend)) else { continue };
                     for k in 0..spray_dups {
                         // a fixed jitter from the puff's own place (no random state): the copies fan out sideways and up
                         let h = ((sp.position.x * 12.9898 + sp.position.z * 78.233 + k as f32 * 37.7).sin() * 43758.547).fract();
@@ -84,7 +84,7 @@ impl App {
                         });
                     }
                 }
-                let Some(&(mesh, material)) = self.track_particle_sprites.get(&(sp.material.clone(), sp.blend)) else { continue };
+                let Some(&(mesh, material)) = self.draws.track_particle_sprites.get(&(sp.material.clone(), sp.blend)) else { continue };
                 let (s, c) = sp.degrees.to_radians().sin_cos();
                 let (r, u) = (right * c + up * s, up * c - right * s);
                 let d2 = sp.sqd.max(1e-6);
@@ -118,7 +118,7 @@ impl App {
     /// cam[+0xC] / d²)` (0x45446B…0x454491, as the billboards') on `DrawItem::depth_bias`; one
     /// draw per system (a run of equal blend, bias and `d²`), `STREAK_CAP` triangles each.
     fn streak_items(&mut self, out: &mut Vec<nfs_renderer::DrawItem>, streaks: &[nfs_game::track_particles::Streak], main: bool) {
-        let Some((pool, materials)) = self.streak_draw.as_ref() else { return };
+        let Some((pool, materials)) = self.draws.streak_draw.as_ref() else { return };
         let Some(r) = self.renderer.as_mut() else { return };
         let z_near = self.camera.near;
         let far = self.view_far;
@@ -165,7 +165,7 @@ impl App {
     /// the origin, 0x466220 / 0x466280) — additive, unlit, no depth writes, the view's depth test,
     /// no bias, and the alpha test the scene draw left (below).
     pub(crate) fn weather_items(&mut self) {
-        if self.weather.is_none() {
+        if self.ambient.weather.is_none() {
             return;
         }
         let frozen = self.weather_frozen();
@@ -173,7 +173,7 @@ impl App {
         let fwd = (self.camera.target - self.camera.position).normalize_or_zero();
         let view = nfs_game::weather::View::new(self.camera.position, fwd, self.camera.up);
         let tick = self.tick as u32;
-        let (Some(w), Some(p)) = (self.weather.as_mut(), self.track_particles.as_mut()) else { return };
+        let (Some(w), Some(p)) = (self.ambient.weather.as_mut(), self.track_particles.as_mut()) else { return };
         w.frame(tick, snow, rain, view, frozen, p.rng_mut(), &mut self.fe_rng);
         if !w.visible() {
             return;
@@ -187,10 +187,10 @@ impl App {
         // 0x454430's own gate, the system's particle count `+0x20` (`any_particles`; until
         // 2026-09-30 "had a sprite or a streak", which misses a system whose sprites are off).
         let sun_on = self.track.sky_bin.as_ref().is_some_and(|b| b.sun_active());
-        let alpha_ref = if !sun_on && self.particles_left_ref_one { 1 } else { 10 };
+        let alpha_ref = if !sun_on && self.weather_alpha_ref_one { 1 } else { 10 };
         let Some(r) = self.renderer.as_mut() else { return };
         for (k, e) in [(1, &w.rain), (0, &w.snow)] {
-            let Some((mesh, material)) = self.weather_draws[k] else { continue };
+            let Some((mesh, material)) = self.draws.weather_draws[k] else { continue };
             let tris = e.triangles();
             if tris.is_empty() {
                 continue;
@@ -220,7 +220,7 @@ impl App {
     /// page on screen) outside a replay (`[0x5E99F4] < 2`).
     pub(crate) fn weather_frozen(&self) -> bool {
         let replaying = self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
-        let page_up = self.results.is_some() && self.result_pages().get(self.pages.page as usize).is_some();
+        let page_up = self.results.is_some() && self.result_pages().get(self.hud_state.pages.page as usize).is_some();
         (self.billboard_key != 0 || page_up) && !replaying
     }
 
@@ -260,8 +260,8 @@ impl App {
         if self.camera_view() != 1 || self.vehicle.is_none() {
             return;
         }
-        let Some((mesh, material)) = self.splat_draw else { return };
-        let Some(w) = self.weather.as_ref() else { return };
+        let Some((mesh, material)) = self.draws.splat_draw else { return };
+        let Some(w) = self.ambient.weather.as_ref() else { return };
         if w.splat.count() == 0 {
             return;
         }
@@ -272,7 +272,7 @@ impl App {
         } else {
             None
         };
-        let Some(w) = self.weather.as_mut() else { return };
+        let Some(w) = self.ambient.weather.as_mut() else { return };
         if let Some(q) = quad {
             w.splat.attach(q);
         }
@@ -342,7 +342,7 @@ impl App {
         // *(until 2026-09-30 it read the quad's 2 m, ≤ 2 % of the fog mix)*.
         let ahead = if cam.near < 1.0 { 1.0 } else { cam.near * 2.0 };
         let centre = cam.position + pt.rel * (ahead / pt.depth);
-        self.flare_quads(&mut out, cam, aspect, view, FlareQuad { def, at: (pt.px, pt.py), centre, ahead, scale: 1.0, sprites: &self.sun_sprites, overlay: false });
+        self.flare_quads(&mut out, cam, aspect, view, FlareQuad { def, at: (pt.px, pt.py), centre, ahead, scale: 1.0, sprites: &self.draws.sun_sprites, overlay: false });
         out
     }
 
@@ -350,7 +350,7 @@ impl App {
     /// record has a texture.
     fn sun_def(&self) -> Option<&nfs_formats::flare::FlareDef> {
         self.track.sky_bin.as_ref().filter(|b| b.sun_active())?;
-        self.flare_defs.iter().find(|d| d.id == SUN_FLARE && d.textures.iter().any(|t| t.is_some()))
+        self.ambient.flare_defs.iter().find(|d| d.id == SUN_FLARE && d.textures.iter().any(|t| t.is_some()))
     }
 
     /// The view's basis as the flare quads lay it: forward, right (the data's frame is left-handed:
@@ -432,7 +432,7 @@ impl App {
         });
         let (virt_w, virt_h) = nfs_game::world::virtual_screen(w, h);
         let turns = if def.flags & 4 != 0 { ((px / 640.0 * w + py / 480.0 * h) as f64 * 0.000_694_444_444_444_444_5) as f32 } else { 0.0 };
-        let a = (turns as f64 * 6.28318452835083) as f32;
+        let a = (turns as f64 * nfs_math::portable::TWO_PI_IMAGE) as f32;
         let (sn, cs) = a.sin_cos();
         // `x' = x cos + y sin` with y down turns the quad's axes by the angle counter-clockwise
         let (r, u) = (right * cs + up * sn, up * cs - right * sn);
@@ -489,13 +489,15 @@ impl App {
     /// camera's forward and the turn's sense as the axis-angle build's (0x539BD0).
     pub(crate) fn flare_items(&self, out: &mut Vec<nfs_renderer::DrawItem>, fwd: Vec3, right: Vec3, up: Vec3, draws: &[Option<nfs_game::world::ArticleDraw>]) {
         let Some(w) = self.world.as_ref() else { return };
-        if self.flare_defs.is_empty() {
+        if self.ambient.flare_defs.is_empty() {
             return;
         }
         let tick = self.tick as u32;
         let cam = self.camera.position;
-        for f in &w.running_flares(draws) {
-            let Some(def) = self.flare_defs.iter().find(|d| d.id == f.id) else { continue };
+        let mut flares = self.scratch.flares.borrow_mut();
+        w.running_flares_into(draws, &mut flares);
+        for f in flares.iter() {
+            let Some(def) = self.ambient.flare_defs.iter().find(|d| d.id == f.id) else { continue };
             if !def.lit(f.phase, tick) {
                 continue;
             }
@@ -519,7 +521,7 @@ impl App {
             let pos = f.position;
             for k in 0..2 {
                 let Some(name) = def.textures[k].as_ref() else { continue };
-                let Some(&(mesh, material)) = self.flare_sprites.get(name) else { continue };
+                let Some(&(mesh, material)) = self.draws.flare_sprites.get(name) else { continue };
                 let size = def.sizes[k] * 0.1;
                 let argb = def.colours[k];
                 let m = Mat4::from_cols((r * size).extend(0.0), (u * size).extend(0.0), right.cross(up).extend(0.0), pos.extend(1.0));
@@ -618,6 +620,17 @@ impl App {
     /// for the rain (0x45D000 → 0x45A8E0).
     pub(crate) fn weather_strengths(&self) -> (f32, f32) {
         self.weather_strengths_at(self.cam_slice.unwrap_or(0) as i32)
+    }
+
+    /// The sky's field 5 (the rain wetness, track B) at `slice`, unclamped; `None` without a sky `.bin`.
+    pub(crate) fn track_wet_at(&self, slice: i32) -> Option<f32> {
+        let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
+        self.track.sky_bin.as_ref().map(|b| b.sample_track_b(5, slice, lap))
+    }
+
+    /// [`Self::track_wet_at`] at the camera's slice, unclamped; 0 with no sky `.bin` or no camera slice yet.
+    pub(crate) fn camera_wet(&self) -> f32 {
+        self.cam_slice.and_then(|s| self.track_wet_at(s as i32)).unwrap_or(0.0)
     }
 
     /// The same two fields at `slice`. The pass's prime 0x459260 (0x4690AF) reads them at slice

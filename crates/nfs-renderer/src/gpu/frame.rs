@@ -1,6 +1,6 @@
 //! One frame: `render` (the window's frame), `encode_frame` (the items' stages, the globals and object uniforms, the
 //! shadow / spot / lamp / contact pre-passes, the main pass variants), the bucket / run draws, the 2-D sprites and the
-//! shafts / haze / lighthouse-beam draws. Moved out of gpu.rs as it was.
+//! shafts / haze / lighthouse-beam draws.
 
 use crate::wgsl::DepthKind;
 use super::pipelines::{Cull, Group, PipelineKey};
@@ -97,7 +97,7 @@ impl Core {
         let aspect = self.aspect();
         let depth = self.depth_view.clone();
         let (w, h) = (frame.texture.width(), frame.texture.height());
-        let can_copy = self.lens_enabled;
+        let can_copy = self.lens.enabled;
         // ENHANCEMENT E33: the EDR output draws the byte path into an 8-bit frame image of its own and presents it
         // (gamma ramp, sRGB decode, the highlight gain) into the extended-range surface (macOS only: elsewhere `edr.on` is never
         // set, so the branch is compiled out instead of calling a no-op twin)
@@ -152,13 +152,13 @@ impl Core {
     /// are one instanced draw. `draws`: the frame's per-item records ([`Self::bucket_items`]); `st` is what the pass already
     /// has bound.
     pub(super) fn draw_bucket(&self, pass: &mut wgpu::RenderPass<'_>, draws: &[ItemDraw], bucket: &[u32], st: &mut DrawState) {
-        let ms = self.multisampled_set;
+        let ms = self.pipes.multisampled;
         // consecutive items of one mesh under one state are one instanced draw
         let mut run: Option<Run> = None;
         for &idx in bucket {
             let d = &draws[idx as usize];
             // PERF (PERF-B): an item that can take a per-item part draws with a set that has it (`ensure_pipelines`)
-            let var = (self.var_set[self.item_var.get(idx as usize).copied().unwrap_or(fill::ItemVariant::Both) as usize] as usize) << SET_SHIFT;
+            let var = (self.pipes.var_set[self.item_var.get(idx as usize).copied().unwrap_or(fill::ItemVariant::Both) as usize] as usize) << SET_SHIFT;
             let next = Run { first: idx, count: 1, pipeline: d.group.index(ms) | var, material: d.material, sky: d.sky, mesh: d.mesh };
             if d.twice {
                 // two pipelines in turn on one item: never merged, and the run before it
@@ -189,13 +189,13 @@ impl Core {
     pub(super) fn draw_run(&self, pass: &mut wgpu::RenderPass<'_>, st: &mut DrawState, r: &Run) {
         if st.pipeline != r.pipeline {
             let set = match r.pipeline >> SET_SHIFT {
-                0 => &self.pipelines,
-                k => &self.pipeline_vars[k - 1],
+                0 => &self.pipes.pipelines,
+                k => &self.pipes.vars[k - 1],
             };
             pass.set_pipeline(&set[r.pipeline & ((1 << SET_SHIFT) - 1)]);
             st.pipeline = r.pipeline;
         }
-        let m = &self.materials[(r.material >> 1) as usize];
+        let m = &self.res.materials[(r.material >> 1) as usize];
         let point = r.material & 1 == 1 && m.bind_group_point.is_some();
         let key = bind_key(m, point);
         if st.material != key {
@@ -207,7 +207,7 @@ impl Core {
             pass.set_bind_group(3, self.sky_bgs[r.sky as usize].as_ref().expect("sky bind group made"), &[]);
             st.sky = r.sky;
         }
-        let mesh = &self.meshes[r.mesh as usize];
+        let mesh = &self.res.meshes[r.mesh as usize];
         if self.base_vertex {
             // the whole buffer bound once per arena; the mesh is its range of indices and its first
             // vertex — the same vertices and indices as a bind of its own slices
@@ -225,8 +225,7 @@ impl Core {
             return;
         }
         if st.mesh != r.mesh {
-            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(mesh.vertex_offset..mesh.vertex_offset + mesh.vertex_len.max(4)));
-            pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
+            mesh.bind(pass);
             st.mesh = r.mesh;
         }
         crate::prof::count_draw(u64::from(mesh.index_count / 3) * u64::from(r.count));
@@ -300,7 +299,7 @@ impl Core {
         let mut run: Option<(usize, usize, u32, Option<SpriteCompare>)> = None;
         let mut flush = |pass: &mut wgpu::RenderPass<'_>, r: (usize, usize, u32, Option<SpriteCompare>)| {
             let (first, end, tex, pipeline) = r;
-            let Some(bg) = self.textures[tex as usize].sprite_bg.as_ref() else { return };
+            let Some(bg) = self.res.textures[tex as usize].sprite_bg.as_ref() else { return };
             if bound_pipeline != Some(pipeline) {
                 pass.set_pipeline(match pipeline {
                     None if !depth => &self.sprite_flat_pipeline,
@@ -318,7 +317,7 @@ impl Core {
             pass.draw((first * 6) as u32..(end * 6) as u32, 0..1);
         };
         for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
-            if self.textures[sp.texture.0 as usize].sprite_bg.is_none() {
+            if self.res.textures[sp.texture.0 as usize].sprite_bg.is_none() {
                 continue;
             }
             let pipeline = sp.depth.map(|d| d.compare);
@@ -349,7 +348,7 @@ impl Core {
         scratch.draws.clear();
         let (mut soft_blended, mut blended_zwrite) = (false, false);
         for (i, item) in scene.items.iter().take(n).enumerate() {
-            let mat = &self.materials[item.material.0 as usize];
+            let mat = &self.res.materials[item.material.0 as usize];
             let stage = if item.overlay {
                 DrawStage::Overlay
             } else if !mat.depth_test {
@@ -359,18 +358,18 @@ impl Core {
             } else {
                 DrawStage::Opaque
             };
-            let skip = (item.main_view_only && self.no_reflections) || item.shadow_only;
-            let sky_texture = sky_tex_of(&self.materials, self.no_reflections, item);
+            let skip = (item.main_view_only && self.modes.no_reflections) || item.shadow_only;
+            let sky_texture = sky_tex_of(&self.res.materials, self.modes.no_reflections, item);
             // a blended material with the specular, sky-map or projector pass draws them over its
             // own blend, not mixed into its colour (`fs_layers`); the plain alpha pair only
-            let layered = mat.alpha_blend && mat.blend_pair == 0 && (sky_texture.is_some() || item.shadow.is_some() || (mat.env_mix > 0.0 && !self.no_reflections));
+            let layered = mat.alpha_blend && mat.blend_pair == 0 && (sky_texture.is_some() || item.shadow.is_some() || (mat.env_mix > 0.0 && !self.modes.no_reflections));
             let (plain, group) = item_pipelines(mat, item, scene.mirror, layered);
             // `LayerFalseSort1` / `2`: at `SPECIALFX` 3, always, and at 2 by the runtime
             // pick (`FakeSortMode`, `RE/notes/thrash.md` §6d.4), the same draw first with
             // depth writes off, then on (0x449ADB / 0x449B2A). Otherwise (below 2, or 2's
             // `Single` pick) the other arm never draws twice: one draw, `MAG`/`MINFILTER`
             // forced `POINT` for it (0x449ABE), depth writes untouched.
-            let fakesort_single = match self.fakesort_mode {
+            let fakesort_single = match self.modes.fakesort_mode {
                 FakeSortMode::Single => true,
                 FakeSortMode::Double => false,
                 // `LayerFalseSort1`/`2`'s own fold, per drawn item (0x449AB2, `[0x61975C]
@@ -386,7 +385,7 @@ impl Core {
                 group,
                 twice,
                 material: (item.material.0 * 2) | point as u32,
-                sky: sky_texture.unwrap_or(self.white).0,
+                sky: sky_texture.unwrap_or(self.res.white).0,
                 sky_on: sky_texture.is_some(),
                 mesh: self.shown_mesh(item.mesh.0),
             });
@@ -423,8 +422,8 @@ impl Core {
             vp_j: f.vp_j,
             enh: &self.enhancements,
             hdr: self.cur_hdr,
-            no_reflections: self.no_reflections,
-            refl_faces_done: self.refl.as_ref().is_some_and(|c| c.faces_done == ALL_FACES),
+            no_reflections: self.modes.no_reflections,
+            refl_faces_done: self.env.cube.as_ref().is_some_and(|c| c.faces_done == ALL_FACES),
             probe_strength: self.probe_strength(f.scene),
             soft_split: f.soft_split,
             env: f.env,
@@ -436,12 +435,17 @@ impl Core {
     }
 
     /// The first `f.n` items' object uniforms into their buffer (nothing for none), built in `scratch.objects` (refilled) from
-    /// the walk's records (`scratch.draws`) and, for a temporal pass, the items' roles (`scratch.roles`, empty otherwise).
+    /// the walk's records (`scratch.draws`) and, for a temporal pass, the items' roles (`scratch.roles`, empty otherwise). The same
+    /// walk gives each item's per-item parts ([`fill::ItemVariant`], `self.item_var`) and whether its alpha test can never fail
+    /// (`self.solid`).
     fn write_objects(&mut self, encoder: &mut wgpu::CommandEncoder, f: &FrameIn, camera: &Camera, lights: &Lights, scratch: &mut FrameScratch) {
         let FrameScratch { objects, roles, draws, .. } = scratch;
         let n = f.n;
-        self.item_var.clear();
+        let (mut item_var, mut solid) = (std::mem::take(&mut self.item_var), std::mem::take(&mut self.solid));
+        item_var.clear();
+        solid.clear();
         if n == 0 {
+            (self.item_var, self.solid) = (item_var, solid);
             return;
         }
         let size = wgpu::BufferSize::new((n * std::mem::size_of::<ObjectUniform>()) as u64).expect("objects size");
@@ -463,39 +467,36 @@ impl Core {
                 lod_shift: self.cur_lod_shift,
                 near_own: f.near.is_some_and(|n| n.own),
             };
-            let (csm, contact) = (|it: &crate::DrawItem| self.csm_receive(it), |it: &crate::DrawItem| self.contact_receive(it));
+            let (csm, contact) = (|it: &crate::DrawItem| self.csm_receive(it), Core::contact_receive);
             let rx = fill::Receivers { csm: &csm, contact: &contact };
-            objects.extend(f.scene.items.iter().take(n).enumerate().map(|(i, item)| {
-                let mat = self.materials.get(item.material.0 as usize).map(GpuMaterial::fill);
-                fill::object_uniform(&of, i, item, mat, draws[i].sky_on, &rx)
-            }));
+            for (i, item) in f.scene.items.iter().take(n).enumerate() {
+                let mat = self.res.materials.get(item.material.0 as usize);
+                let o = fill::object_uniform(&of, i, item, mat.map(GpuMaterial::fill), draws[i].sky_on, &rx);
+                // PERF (PERF-B): which items draw with the set that has the per-item parts
+                item_var.push(fill::ItemVariant::of(&o));
+                solid.push(mat.is_some_and(|m| self.alpha_test_never_fails(m, &o, &draws[i])));
+                objects.push(o);
+            }
         }
         self.belt.write_buffer(encoder, &self.object_buf, 0, size).copy_from_slice(bytemuck::cast_slice(objects));
-        // PERF (PERF-B): which items draw with the set that has the per-item parts
-        self.item_var.extend(objects.iter().map(fill::ItemVariant::of));
-        self.solid_draws(f.scene, objects, draws);
+        (self.item_var, self.solid) = (item_var, solid);
     }
 
-    /// ENHANCEMENT E1 (FOLIAGE-OVERDRAW): which items' alpha test can never fail, into `self.solid`: the object's own opacity is 1,
+    /// ENHANCEMENT E1 (FOLIAGE-OVERDRAW): whether the alpha test of an item (material `m`, object uniform `o`, draw record `d`) can
+    /// never fail (`self.solid`): the object's own opacity is 1,
     /// its final alpha is `shade`'s base alpha (no glass / water / wet road / skid, no ground decal: the shader's `alpha_is_base`),
     /// the mesh drawn has vertex alpha 1 everywhere, and its texture (the original's and the one the material shows, ENH-LIVETEX's
     /// twin) has no texel whose alpha comes near the test's reference (`solid::solid_alpha`). Such a draw's base alpha is the
     /// texel's: `fs_opaque_a2c` gives it full coverage at every fragment, `fs_opaque` and the shadow pass's `fs_cut` never discard
     /// it.
-    fn solid_draws(&mut self, scene: &Scene, objects: &[ObjectUniform], draws: &[ItemDraw]) {
+    fn alpha_test_never_fails(&self, m: &GpuMaterial, o: &ObjectUniform, d: &ItemDraw) -> bool {
         use crate::classes::{RECV_DECAL, REFL_GLASS};
-        let mut solid = std::mem::take(&mut self.solid);
-        solid.clear();
-        let min_alpha = |t: TextureId| self.textures.get(t.0 as usize).map_or(0, |g| g.min_alpha);
-        solid.extend(scene.items.iter().zip(objects).zip(draws).map(|((item, o), d)| {
-            let Some(m) = self.materials.get(item.material.0 as usize) else { return false };
-            o.light[3] == 1.0
-                && o.refl[0] < REFL_GLASS - 0.5
-                && o.lit_d[3] < RECV_DECAL - 0.5
-                && crate::solid::solid_alpha(min_alpha(m.texture).min(min_alpha(self.shown_texture(m.texture))), o.shadow_on[3])
-                && self.meshes.get(d.mesh as usize).is_some_and(|mesh| mesh.alpha_one)
-        }));
-        self.solid = solid;
+        let min_alpha = |t: TextureId| self.res.textures.get(t.0 as usize).map_or(0, |g| g.min_alpha);
+        o.light[3] == 1.0
+            && o.refl[0] < REFL_GLASS - 0.5
+            && o.lit_d[3] < RECV_DECAL - 0.5
+            && crate::solid::solid_alpha(min_alpha(m.texture).min(min_alpha(self.shown_texture(m.texture))), o.shadow_on[3])
+            && self.res.meshes.get(d.mesh as usize).is_some_and(|mesh| mesh.alpha_one)
     }
 
     /// Which passes over the finished scene this frame has (E13 shafts, E36 haze, E44 lighthouse beam) and so which images
@@ -516,7 +517,7 @@ impl Core {
         });
         // ENHANCEMENT E36: the haze and the visible headlight beams of the main race view in the float image (E7 on, some
         // air in the scene: the pass is not run on a clear dry open road); the depth is kept for it like for the shafts
-        let haze = scene.haze.filter(|_| self.enhancements.is_on(crate::E36) && self.cur_hdr.is_some() && !with_sprites && depth_far == VIEW_FAR && !self.no_reflections).and_then(|h| {
+        let haze = scene.haze.filter(|_| self.enhancements.is_on(crate::E36) && self.cur_hdr.is_some() && !with_sprites && depth_far == VIEW_FAR && !self.modes.no_reflections).and_then(|h| {
             let (beam, lamp) = h.air(self.enhancements.level(crate::E36));
             // PERF (picture identical): the march adds light only from E15's lit spots (`n_spots = spots.params.x`, the beams' term
             // is skipped without them) and from the tunnel lamps (`n_lamps = haze.n`, the glow's loop runs over them); with neither
@@ -531,7 +532,7 @@ impl Core {
         // PERF: the shafts go over the multisampled colour only when the overlay pass (the lens flare) draws after them
         // ENHANCEMENT E44: the lighthouse beam of the main race view in the float image (E7 on), after the blended pass; the depth is
         // kept for it like for the haze
-        let lbeam = scene.lbeam.filter(|b| b.n > 0 && self.enhancements.is_on(crate::E44) && self.cur_hdr.is_some() && !with_sprites && depth_far == VIEW_FAR && !self.no_reflections).map(|b| {
+        let lbeam = scene.lbeam.filter(|b| b.n > 0 && self.enhancements.is_on(crate::E44) && self.cur_hdr.is_some() && !with_sprites && depth_far == VIEW_FAR && !self.modes.no_reflections).map(|b| {
             let fwd = (camera.target - camera.position).normalize_or_zero();
             crate::lbeam::Frame { inv_vp: inv_vp(), eye: camera.position, fwd, planes: [camera.near, camera.far], beams: b }
         });
@@ -599,7 +600,8 @@ impl Core {
         // ENHANCEMENT E14: the occlusion from that depth, multiplied over the opaque colour
         if ao_level > 0 {
             let ssao = self.ssao.get_or_insert_with(|| crate::ao::Ssao::new(&self.device));
-            ssao.run(&self.device, &mut self.belt, encoder, ao_level, camera, aspect, tg.color(), tg.target.format(), ms.map_or(1, |m| m.samples), &sv, ms.map(|m| &m.depth), (tg.target.width(), tg.target.height()));
+            let over = crate::ao::AoTarget { camera, aspect, colour: tg.color(), format: tg.target.format(), samples: ms.map_or(1, |m| m.samples), soft: &sv, depth_ms: ms.map(|m| &m.depth), size: (tg.target.width(), tg.target.height()) };
+            ssao.run(&self.device, &mut self.belt, encoder, ao_level, &over);
         }
         sv
     }
@@ -667,7 +669,7 @@ impl Core {
         // ENHANCEMENT ENH-TEMPORAL: ... and for the temporal set (vector / mask targets) in a temporal main view
         // ENHANCEMENT ENH-COAT: the environment cube's prefiltered mips are brought up to date before any frame that reads them
         let mut encoder = self.frame_cmds.take(&self.device);
-        if !self.refl_building {
+        if !self.env.building {
             self.refl_prefilter(&mut encoder);
         }
         let tcur = self.cur_temporal.clone();
@@ -676,7 +678,7 @@ impl Core {
         scratch.sky_flags.clear();
         scratch.roles.clear();
         let n = scene.items.len().min(MAX_OBJECTS as usize);
-        let white = self.white;
+        let white = self.res.white;
         self.sky_bind_group(white);
         let Buckets { lists: buckets, soft_blended, blended_zwrite } = self.bucket_items(scene, n, tcur.is_some(), &mut scratch);
 
@@ -692,22 +694,18 @@ impl Core {
         let soft_split = self.enhancements.is_on(crate::E12) && soft_blended;
         // ENHANCEMENT E14: the corner shading (the race's main view, not the mirror) also splits the pass
         // after the opaque stages: it multiplies the opaque colour, the blended stage comes after it
-        let ao_level = if scene.ao && !self.no_reflections && n > 0 { self.enhancements.level(crate::E14) } else { 0 };
+        let ao_level = if scene.ao && !self.modes.no_reflections && n > 0 { self.enhancements.level(crate::E14) } else { 0 };
         let split = soft_split || ao_level > 0;
         self.seal_arena();
         // ENHANCEMENT E49: an environment face's near-cars pass first keeps the face without them (`refl.rs`)
-        if let (Some(layer), Some(c)) = (self.refl_pre_copy.take(), self.refl.as_ref()) {
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo { texture: &c.face, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::TexelCopyTextureInfo { texture: &c.array, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
-                wgpu::Extent3d { width: c.size, height: c.size, depth_or_array_layers: 1 },
-            );
+        if let (Some(layer), Some(c)) = (self.env.pre_copy.take(), self.env.cube.as_ref()) {
+            kit::copy_layer(&mut encoder, &c.face, 0, &c.array, layer, 0, c.size);
         }
         self.flush_texture_writes(&mut encoder);
         self.flush_mesh_writes(&mut encoder);
         // ENHANCEMENT ENH-TEMPORAL: the matrices into their buffer (the object pass's second binding)
         if let (Some(g), true) = (self.temporal_gpu.as_ref(), tcur.is_some()) {
-            let size = wgpu::BufferSize::new((self.motion.mats.len() * 64) as u64).expect("motion size");
+            let size = wgpu::BufferSize::new(std::mem::size_of_val(self.motion.mats.as_slice()) as u64).expect("motion size");
             self.belt.write_buffer(&mut encoder, &g.motion_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&self.motion.mats));
         }
         let lights = Lights {
@@ -721,15 +719,7 @@ impl Core {
             contact_on: self.contact_on(scene),
         };
         // PERF (PERF-B): the parts whose light is off this frame (their uniform is cleared: the code would run for nothing)
-        let shut = {
-            use crate::classes::feat;
-            (if lights.csm.is_none() { feat::CSM } else { 0 }) | (if lights.spot.is_none() { feat::SPOT } else { 0 }) | (if lights.lamps_on { 0 } else { feat::LAMPS | feat::LSHAD }) | (if lights.contact_on { 0 } else { feat::CONTACT })
-                // ENHANCEMENT E50 / E51: the moon's part only in a moon frame, the cars-only layers' only in a frame that has them
-                | (if lights.csm.as_ref().is_some_and(|c| c.is_moon()) { 0 } else { feat::MOON })
-                | (if lights.csm.as_ref().is_some_and(|c| c.has_car_layers()) { 0 } else { feat::CARSH })
-                // (SHADOW-REFACTOR: the front end's focus shadow's kernel only in its own frames)
-                | (if lights.csm.as_ref().is_some_and(|c| c.is_focus()) { 0 } else { feat::FOCUS })
-        };
+        let shut = lights.shut_mask();
         // PERF (PERF-D): a frame without a 3-D item (a loading screen, a 2-D front-end screen) draws no mesh: it needs no set (its
         // family, the 8-bit one of a sprite-only scene, was built in such a frame for nothing)
         if n > 0 {
@@ -750,7 +740,7 @@ impl Core {
         self.write_objects(&mut encoder, &f, camera, &lights, &mut scratch);
         // ENHANCEMENT E1 (FOLIAGE-OVERDRAW): an alpha-tested opaque draw whose test can never fail takes the plain opaque pipeline
         // instead of the alpha-to-coverage one: the same picture, the GPU's hidden-surface removal kept. The draw order is the original's.
-        if self.multisampled_set && self.enhancements.is_on(crate::E1) {
+        if self.pipes.multisampled && self.enhancements.is_on(crate::E1) {
             for &i in &buckets[DrawStage::Opaque as usize] {
                 let d = &mut scratch.draws[i as usize];
                 if d.group.group == pipelines::Group::AlphaToCoverage && !d.twice && self.solid.get(i as usize).copied().unwrap_or(false) {
@@ -791,7 +781,7 @@ impl Core {
         let tcur = f.tcur.as_ref();
         // ENHANCEMENT ENH-TEMPORAL: the object bind group that has the matrices; master's in master's frame
         let object_bg = tcur.map_or_else(|| self.object_bg.clone(), |t| t.objects_bg.clone());
-        let facts = PassFacts { overlay, split, shafts_ms: post.shafts_ms, post_depth: post.post_depth, keep_depth: post.keep_depth, near: self.refl_near_pass };
+        let facts = PassFacts { overlay, split, shafts_ms: post.shafts_ms, post_depth: post.post_depth, keep_depth: post.keep_depth, near: self.env.near_pass };
         let cx = StageCtx { tg, tcur, object_bg: &object_bg, draws: &scratch.draws, buckets: &buckets, clear, facts };
         let tg = &cx.tg;
         // The lens flare's reference (0x460290 at 0x4603FF): the block as the sky pass leaves it with
@@ -928,6 +918,20 @@ struct Lights {
     spot: Option<spot::SpotFrame>,
     lamps_on: bool,
     contact_on: bool,
+}
+
+impl Lights {
+    /// PERF (PERF-B): the `feat` parts of the mesh shader whose light is off this frame.
+    fn shut_mask(&self) -> u32 {
+        use crate::classes::feat;
+        let csm = self.csm.as_ref();
+        (if csm.is_none() { feat::CSM } else { 0 }) | (if self.spot.is_none() { feat::SPOT } else { 0 }) | (if self.lamps_on { 0 } else { feat::LAMPS | feat::LSHAD }) | (if self.contact_on { 0 } else { feat::CONTACT })
+            // ENHANCEMENT E50 / E51: the moon's part only in a moon frame, the cars-only layers' only in a frame that has them
+            | (if csm.is_some_and(|c| c.is_moon()) { 0 } else { feat::MOON })
+            | (if csm.is_some_and(|c| c.has_car_layers()) { 0 } else { feat::CARSH })
+            // (SHADOW-REFACTOR: the front end's focus shadow's kernel only in its own frames)
+            | (if csm.is_some_and(|c| c.is_focus()) { 0 } else { feat::FOCUS })
+    }
 }
 
 /// ENHANCEMENTS E13 / E36 / E44 and the depth they keep, from [`Core::post_flags`].

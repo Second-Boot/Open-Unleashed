@@ -1,5 +1,5 @@
 //! Reading the GPU back: the lens flare's probe reads (ENHANCEMENT E7's half-float decode), the offscreen renders, stills and
-//! images (`render_offscreen`, `render_to_image`, `render_still`). Moved out of gpu.rs as it was;
+//! images (`render_offscreen`, `render_to_image`, `render_still`) and the size a still gets on a device (`still_size`);
 //! the macOS EDR probe diagnostics (`NFS_EDR_PROBE`) are in `diag.rs`.
 
 use crate::gfx;
@@ -9,36 +9,36 @@ impl Core {
     /// Let the surface be copied from, for the lens flare's frame read-back. Off (the default) the
     /// surface is a render attachment alone.
     pub fn set_lens_enabled(&mut self, on: bool) {
-        if self.lens_enabled == on {
+        if self.lens.enabled == on {
             return;
         }
-        self.lens_enabled = on;
+        self.lens.enabled = on;
         self.config.usage = if on { wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::RENDER_ATTACHMENT };
         self.configure_surface();
         if !on {
-            self.lens_pending.clear();
+            self.lens.pending.clear();
         }
     }
 
     /// Collect the lens-flare read-backs that have finished (their copies ran and their buffers are
     /// mapped) into [`Self::lens_done`]; the cost of each is what this takes, in whole milliseconds.
     pub(super) fn collect_lens(&mut self) {
-        if self.lens_pending.is_empty() {
+        if self.lens.pending.is_empty() {
             return;
         }
         let t0 = std::time::Instant::now();
         let _ = self.device.poll(wgpu::PollType::Poll);
         // (in place: the pending list keeps its storage)
         let mut i = 0;
-        while i < self.lens_pending.len() {
-            match self.lens_pending[i].rx.try_recv() {
+        while i < self.lens.pending.len() {
+            match self.lens.pending[i].rx.try_recv() {
                 Ok(Ok(())) => {
-                    let p = self.lens_pending.remove(i);
+                    let p = self.lens.pending.remove(i);
                     let mut pixels = [0u32; 16];
                     {
                         let data = p.buf.slice(..).get_mapped_range().expect("mapped range");
                         let bgra = is_bgra(self.config.format);
-                        for (row, chunk) in pixels.chunks_exact_mut(4).enumerate() {
+                        for (row, chunk) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                             for (i, px) in chunk.iter_mut().enumerate() {
                                 if p.half {
                                     // ENHANCEMENT E7: the float image's texel as the 8-bit surface would store it
@@ -54,27 +54,27 @@ impl Core {
                         }
                     }
                     p.buf.unmap();
-                    if self.lens_free.len() < LENS_POOL {
-                        self.lens_free.push(p.buf);
+                    if self.lens.free.len() < LENS_POOL {
+                        self.lens.free.push(p.buf);
                     }
-                    self.lens_done.push(LensRead { reference: p.reference, pixels, cost_ms: t0.elapsed().as_millis() as u32 });
+                    self.lens.done.push(LensRead { reference: p.reference, pixels, cost_ms: t0.elapsed().as_millis() as u32 });
                 }
                 Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.lens_pending.remove(i);
+                    self.lens.pending.remove(i);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
             }
         }
         // a read-back that never completes does not pile up
-        let n = self.lens_pending.len();
+        let n = self.lens.pending.len();
         if n > LENS_PENDING_MAX {
-            self.lens_pending.drain(..n - LENS_PENDING_MAX);
+            self.lens.pending.drain(..n - LENS_PENDING_MAX);
         }
     }
 
     /// The finished read-backs, taken.
     pub(crate) fn take_lens(&mut self) -> Vec<LensRead> {
-        std::mem::take(&mut self.lens_done)
+        std::mem::take(&mut self.lens.done)
     }
 
     /// PORT-DEVIATION D9 (PORT-DEVIATIONS.md) [0x460460 / dx7z 0x60003990, a blocking lock in the frame]:
@@ -95,24 +95,24 @@ impl Core {
             if v + 4 >= size { size - 5 } else { v }
         };
         let (x, y) = (clamp(px, w), clamp(py, h));
-        let buf = self.lens_free.pop().unwrap_or_else(|| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("lens read-back"), size: LENS_ROW * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false }));
+        let buf = self.lens.free.pop().unwrap_or_else(|| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("lens read-back"), size: LENS_ROW * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false }));
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(LENS_ROW as u32), rows_per_image: Some(4) } },
-            wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 },
+            kit::extent(4, 4),
         );
         // mapped after the frame's submit ([`Self::lens_map_staged`])
-        self.lens_staged.push((buf, reference, target.format() == HDR_FORMAT));
+        self.lens.staged.push((buf, reference, target.format() == HDR_FORMAT));
     }
 
     /// Ask for the mapping of every block copied this frame; call after the submit.
     pub(super) fn lens_map_staged(&mut self) {
-        for (buf, reference, half) in std::mem::take(&mut self.lens_staged) {
+        for (buf, reference, half) in std::mem::take(&mut self.lens.staged) {
             let (tx, rx) = std::sync::mpsc::channel();
             buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
-            self.lens_pending.push(LensPending { buf, reference, half, rx });
+            self.lens.pending.push(LensPending { buf, reference, half, rx });
         }
     }
 
@@ -144,17 +144,17 @@ impl Core {
             None => {
                 let texture = gfx::texture_2d(&self.device, "offscreen 3d", width, height, self.config.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
                 let view = texture.create_view(&Default::default());
-                let sprite_bg = Some(gfx::tex_sampler_bg(&self.device, "offscreen tex", &self.sprite_layout, &view, &self.sprite_sampler));
-                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg, generated: None, size: (width, height), min_alpha: 0 });
-                let id = TextureId(self.textures.len() as u32 - 1);
+                let sprite_bg = Some(gfx::tex_sampler_bg(&self.device, "offscreen tex", &self.layouts.sprite, &view, &self.samplers.sprite));
+                self.res.textures.push(GpuTexture { _texture: texture, view, sprite_bg, generated: None, size: (width, height), min_alpha: 0 });
+                let id = TextureId(self.res.textures.len() as u32 - 1);
                 self.offscreen.insert(id.0, (width, height));
                 id
             }
         };
         let depth = self.depth_for(width, height);
-        let view = self.textures[id.0 as usize].view.clone();
+        let view = self.res.textures[id.0 as usize].view.clone();
         // the scene's items and lights as they are, its own clear colour replaced and no sprites
-        let target = self.textures[id.0 as usize]._texture.clone();
+        let target = self.res.textures[id.0 as usize]._texture.clone();
         // ENHANCEMENT E7: the rear-view mirror (the pass with an opaque clear colour — a front-end car
         // view is a part of the 2D screen and stays as it was) is drawn into a float image and
         // tone-mapped like the main view, but only for the non-neutral tone map: "as the original"
@@ -167,9 +167,9 @@ impl Core {
         if let Some(mode) = hdr {
             let mut blit = match self.scale_blit_mirror.take() {
                 Some(b) if b.key == ToneKey::float(mode) => b,
-                _ => ScaleBlit::new(&self.device, self.config.format, &self.sprite_layout, ToneKey::float(mode), None, None),
+                _ => ScaleBlit::new(&self.device, self.config.format, &self.layouts.sprite, ToneKey::float(mode), None, None),
             };
-            let (rt_tex, rt_view) = blit.target(&self.device, &self.sprite_layout, &self.sprite_sampler, width, height);
+            let (rt_tex, rt_view) = blit.target(&self.device, &self.layouts.sprite, &self.samplers.sprite, width, height);
             let ms = self.ms_targets(width, height, self.enh_samples(true), true);
             self.cur_hdr = hdr;
             self.encode_frame(FrameDesc { scene, clear, with_sprites: false, camera, view: &rt_view, target: &rt_tex, can_copy: false, depth: &depth, aspect, depth_far: far, ms: ms.as_ref() });
@@ -193,7 +193,7 @@ impl Core {
         let view = target.create_view(&Default::default());
         let depth = self.depth_for(width, height);
         // `NFS_GPU_TIME`: the same frame again 60 times, so a still has a timing (diagnostic only)
-        for _ in 0..if self.gpu_time_log { 60 } else { 0 } {
+        for _ in 0..if self.diag.gpu_time.on() { 60 } else { 0 } {
             self.encode_with_gamma(scene, camera, FrameOut::of(&view, &target, &depth));
         }
         self.encode_with_gamma(scene, camera, FrameOut::of(&view, &target, &depth));
@@ -217,7 +217,7 @@ impl Core {
     /// TEST GLUE (`--perf-bench`): the bench is over (the marks off, its target dropped).
     pub fn bench_end(&mut self) {
         crate::prof::marks_end();
-        self.bench_target = None;
+        self.diag.bench_target = None;
     }
 
     /// TEST GLUE (`--perf-bench`): a bench frame's start (before the mirror and the environment faces of the frame).
@@ -229,12 +229,12 @@ impl Core {
     /// `encode_with_gamma` into a `width x height` image of the surface's format) but into a target kept between frames
     /// and with no read-back.
     pub fn bench_frame(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) {
-        if !self.bench_target.as_ref().is_some_and(|t| t.0 == width && t.1 == height) {
+        if !self.diag.bench_target.as_ref().is_some_and(|t| t.0 == width && t.1 == height) {
             let target = gfx::texture_2d(&self.device, "bench target", width, height, self.config.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
             let view = target.create_view(&Default::default());
-            self.bench_target = Some((width, height, target, view));
+            self.diag.bench_target = Some((width, height, target, view));
         }
-        let (_, _, target, view) = self.bench_target.clone().expect("bench target");
+        let (_, _, target, view) = self.diag.bench_target.clone().expect("bench target");
         let depth = self.depth_for(width, height);
         self.encode_with_gamma(scene, camera, FrameOut::of(&view, &target, &depth));
     }
@@ -302,7 +302,7 @@ impl Core {
     pub(super) fn readback(&self, target: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<u8>> {
         let mut px = self.read_texture(target, width, height, 4)?;
         if is_bgra(self.config.format) {
-            for p in px.chunks_exact_mut(4) {
+            for p in px.as_chunks_mut::<4>().0 {
                 p.swap(0, 2);
             }
         }
@@ -338,5 +338,43 @@ impl Core {
         drop(data);
         buf.unmap();
         Ok(out)
+    }
+}
+
+/// PORT-DEVIATION D46 (photo mode): the most pixels a still has (an 8-bit target, its depth and the read-back buffer of
+/// 40 MP are ~0.5 GB; ENHANCEMENT E7's float image and its post chain at that size fit a 6 GB device).
+pub const STILL_MAX_PIXELS: u64 = 40_000_000;
+
+/// PORT-DEVIATION D46: the size a still of `width x height` gets on a device whose largest 2D texture is `max_dim` and
+/// largest buffer `max_buffer` bytes — the request itself when it fits, else scaled down with its aspect kept.
+pub fn still_size(width: u32, height: u32, max_dim: u32, max_buffer: u64) -> (u32, u32) {
+    let (w, h) = (width.max(1), height.max(1));
+    // the read-back buffer's rows are padded to 256 bytes: keep a margin under the limit
+    let max_px = (STILL_MAX_PIXELS as f64).min(max_buffer as f64 / 4.0 * 0.85);
+    let k = (max_dim as f64 / w.max(h) as f64).min((max_px / (w as f64 * h as f64)).sqrt()).min(1.0);
+    if k < 1.0 { (((w as f64 * k).floor() as u32).max(1), ((h as f64 * k).floor() as u32).max(1)) } else { (w, h) }
+}
+
+#[cfg(test)]
+mod still_tests {
+    use super::{still_size, STILL_MAX_PIXELS};
+
+    #[test]
+    fn a_still_fits_the_device() {
+        // a 1x / 2x still of a 1280 x 800 window fits as asked
+        assert_eq!(still_size(1280, 800, 8192, 1 << 28), (1280, 800));
+        assert_eq!(still_size(2560, 1600, 8192, 1 << 28), (2560, 1600));
+        // 4x of 1920 x 1080 fits the 8192 side and the pixel cap
+        assert_eq!(still_size(7680, 4320, 8192, 1 << 28), (7680, 4320));
+        // 4x of 2560 x 1600 is past the 8192 texture side and the 40 MP cap: scaled down, the aspect kept
+        let (w, h) = still_size(10240, 6400, 8192, 1 << 28);
+        assert!(w <= 8192 && w as u64 * h as u64 <= STILL_MAX_PIXELS && (w as f32 / h as f32 - 1.6).abs() < 0.01, "{w}x{h}");
+        // the buffer limit: 256 MB at 4 bytes a pixel, less the margin
+        let (w, h) = still_size(8000, 5000, 16384, 1 << 28);
+        assert!((w as u64 * h as u64 * 4) as f64 <= (1u64 << 28) as f64 * 0.85 && (w as f32 / h as f32 - 1.6).abs() < 0.01, "{w}x{h}");
+        // the pixel cap
+        let (w, h) = still_size(16000, 10000, 16384, 1 << 34);
+        assert!(w as u64 * h as u64 <= STILL_MAX_PIXELS, "{w}x{h}");
+        assert_eq!(still_size(0, 0, 8192, 1 << 28), (1, 1));
     }
 }

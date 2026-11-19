@@ -1,7 +1,9 @@
 //! The post chain of the float scene: the motion blur (E27), the depth of field (the photo mode, D46 / E31), the
 //! windscreen drops (E40), the bloom (E10) and the eye adaptation's measure (E21), in that order, each taking the scene
 //! image the passes before it left ([`PostChain`]) and the frame's [`PostCtx`]. Which of them run this frame is decided
-//! first ([`PostPlan`], from the switches and the scene); the tone map after them reads [`PostChain::current`].
+//! first ([`PostPlan`], from the switches and the scene: the selectors `enh_blur`, `enh_dof`, `bloom_key` and `post_plan`
+//! below); the tone map after them reads [`PostChain::current`]. `PostPasses::ensure_tone_layouts` builds the bloom and eye
+//! passes early when the tone map needs their layouts.
 
 use crate::gfx::{self, DepthSrc, PostCtx, RtImage};
 use super::*;
@@ -90,7 +92,62 @@ pub(super) fn depth_src<'a>(ms: Option<&'a Ms>, depth: &'a wgpu::TextureView) ->
     }
 }
 
+impl Core {
+    /// ENHANCEMENT E27: the motion blur's level, the previous frame and whether this frame can have it (the float
+    /// scene of the race's main view, the switch on).
+    pub(super) fn enh_blur(&self, scene: &Scene, hdr: bool) -> Option<(u8, crate::MotionPrev)> {
+        if !hdr || !self.enhancements.is_on(crate::E27) || scene.items.is_empty() {
+            return None;
+        }
+        scene.motion.map(|m| (self.enhancements.level(crate::E27), m))
+    }
+
+    /// ENHANCEMENTS E7 / E31: this frame's depth of field, when the scene brings a lens (the float scene only): the photo
+    /// mode's (PORT-DEVIATION D46, set by the application only with E7 on) or a replay's (E31).
+    pub(super) fn enh_dof(&self, scene: &Scene, hdr: bool) -> Option<crate::Dof> {
+        if !hdr || scene.items.is_empty() {
+            return None;
+        }
+        scene.dof
+    }
+
+    /// ENHANCEMENTS E10 / E28: the bloom's level and the lens dirt on its last add (the tone map's key), `None` = no bloom
+    /// (`hdr`: the float scene; `dbg_only`: a temporal debug view, no chain).
+    pub(super) fn bloom_key(&self, hdr: bool, dbg_only: bool) -> Option<(u8, bool)> {
+        let level = if hdr && !dbg_only { self.enhancements.level(crate::E10) } else { 0 };
+        (level > 0).then(|| (level, self.enhancements.is_on(crate::E28)))
+    }
+
+    /// ENHANCEMENTS E27 / the depth of field (photo mode, E31) / E40 / E10 / E28: which passes of the post chain run this frame (`size`: the chain's;
+    /// `hdr`: the float scene; `dbg_only`: a temporal debug view, no chain). The eye adaptation (E21) is the caller's.
+    pub(super) fn post_plan(&self, scene: &Scene, camera: &Camera, aspect: f32, hdr: bool, dbg_only: bool, size: (u32, u32)) -> chain::PostPlan {
+        // ENHANCEMENT E40: the driver view's windscreen of a rainy track, its glass on the screen
+        let drops = scene.drops.filter(|_| self.enhancements.is_on(crate::E40) && hdr && !scene.mirror && !scene.items.is_empty() && !dbg_only).and_then(|dr| {
+            let look = crate::drops::Look { strength: 1.0, sky: [scene.clear_color[0] as f32, scene.clear_color[1] as f32, scene.clear_color[2] as f32], width: size.0, height: size.1 };
+            crate::drops::glass(&dr, camera, aspect).map(|gl| (dr, gl, look))
+        });
+        chain::PostPlan {
+            blur: self.enh_blur(scene, hdr).filter(|_| !dbg_only),
+            dof: self.enh_dof(scene, hdr).filter(|_| !dbg_only),
+            drops,
+            bloom_level: self.bloom_key(hdr, dbg_only).map_or(0, |b| b.0),
+            dirt: self.enhancements.is_on(crate::E28),
+            eye: false,
+        }
+    }
+}
+
 impl PostPasses {
+    /// ENHANCEMENT E21 / E10 (PERF): the eye adaptation and the bloom made ahead of the tone map, which takes their groups' layouts.
+    pub fn ensure_tone_layouts(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, eye: bool, bloom: bool) {
+        if eye && self.eye.is_none() {
+            self.eye = Some(crate::adapt::EyePass::new(device, layout));
+        }
+        if bloom && self.bloom.is_none() {
+            self.bloom = Some(crate::bloom::BloomPass::new(device, layout));
+        }
+    }
+
     /// Run the planned passes in order over `chain`; `scene` / `scene_view`: the scaled 3-D image itself (the drops draw
     /// into it in place while no pass before them made an image of its own).
     pub fn run(&mut self, cx: &mut PostCtx, plan: PostPlan, chain: &mut PostChain, scene: &wgpu::Texture, scene_view: &wgpu::TextureView) {
@@ -103,7 +160,7 @@ impl PostPasses {
         // bloom, the eye adaptation and the tone map then take as the scene
         // PERF: not while the camera stands still (every pixel would come out as it went in)
         if let (Some((level, prev)), Some(src)) = (plan.blur, chain.src())
-            && !crate::camfx::camera_still(cx.camera, &prev.camera, cx.aspect, cx.mirror)
+            && !crate::camera::camera_still(cx.camera, &prev.camera, cx.aspect, cx.mirror)
         {
             let m = self.mblur.get_or_insert_with(|| crate::camfx::MotionBlur::new(cx.device, cx.layout));
             let out = pool_target(&mut self.pool, chain, cx, cx.size);

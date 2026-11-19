@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nfs-gfxdata.workspace = true
+nfs-math.workspace = true
 wgpu.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
@@ -24,4 +26,4 @@ objc2-metal-fx = "0.3"
 [dev-dependencies]
 # the WGSL test runs every composed shader through naga's front end and validator: the version and
 # the front end wgpu 30 already builds (no new feature reaches the game's build)
-naga = { version = "=30.0.1", features = ["wgsl-in"] }
+naga = { version = "=30.0.2", features = ["wgsl-in"] }

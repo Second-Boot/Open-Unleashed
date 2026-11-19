@@ -26,7 +26,6 @@ struct Params {
 @group(0) @binding(2) var t_ao: texture_2d<f32>;
 @group(0) @binding(3) var t_ms: texture_depth_multisampled_2d;
 
-const PI: f32 = 3.14159265;
 const HALF_PI: f32 = 1.57079633;
 const BAYER = array<u32, 16>(0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u, 3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
 

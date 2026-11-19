@@ -81,7 +81,7 @@ impl Fsr3 {
             return Err(format!("the device lacks features FSR 3 needs: {:?}", need - device.features()));
         }
         let mut flags = FsrContextFlags::AUTO_EXPOSURE | FsrContextFlags::HIGH_DYNAMIC_RANGE;
-        if device.features().contains(wgpu::Features::PASSTHROUGH_SHADERS) && !super::fsr_naga_forced() {
+        if device.features().contains(wgpu::Features::PASSTHROUGH_SHADERS) {
             flags |= FsrContextFlags::SPIRV_PASSTHROUGH;
         }
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);

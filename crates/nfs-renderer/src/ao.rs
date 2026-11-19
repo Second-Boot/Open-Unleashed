@@ -49,7 +49,21 @@ type Bgs = [wgpu::BindGroup; 4];
 
 /// The pass's shader: `ao.wgsl` with the full-screen triangle (`wgsl.rs`).
 pub(crate) fn source() -> String {
-    wgsl::compose(&[wgsl::FULLSCREEN_VS, wgsl::LINEAR_Z, include_str!("ao.wgsl")])
+    wgsl::compose(&[wgsl::FULLSCREEN_VS, wgsl::LINEAR_Z, wgsl::PI, include_str!("ao.wgsl")])
+}
+
+/// What the occlusion is made for: the frame's `camera` (`aspect`) and what it is multiplied over: the opaque `colour` (`format`, `samples`), the converted depth image `soft`, the pass's
+/// multisampled depth when `samples > 1`, and the frame's `size`.
+#[derive(Clone, Copy)]
+pub(crate) struct AoTarget<'a> {
+    pub camera: &'a crate::Camera,
+    pub aspect: f32,
+    pub colour: &'a wgpu::TextureView,
+    pub format: wgpu::TextureFormat,
+    pub samples: u32,
+    pub soft: &'a wgpu::TextureView,
+    pub depth_ms: Option<&'a wgpu::TextureView>,
+    pub size: (u32, u32),
 }
 
 pub(crate) struct Ssao {
@@ -68,22 +82,15 @@ pub(crate) struct Ssao {
     bgs: Keyed<BgKey, Bgs>,
 }
 
-fn view(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
-}
-fn tex(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    gfx::bgl_tex(binding, wgpu::TextureSampleType::Float { filterable: false }, false)
-}
 
 impl Ssao {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
         let module = gfx::wgsl_module(device, "ao", &source());
         let uniform = gfx::bgl_uniform(0, wgpu::ShaderStages::FRAGMENT);
-        let layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| gfx::bgl(device, label, entries);
-        let layout_ao = layout("ao", &[uniform, tex(1)]);
-        let layout_blur = layout("ao blur", &[uniform, tex(1), tex(2)]);
-        let ms_depth = gfx::bgl_tex(3, wgpu::TextureSampleType::Depth, true);
-        let layout_ms = layout("ao apply ms", &[uniform, tex(1), tex(2), ms_depth]);
+        let layout_ao = gfx::bgl(device, "ao", &[uniform, gfx::bgl_float(1, false)]);
+        let layout_blur = gfx::bgl(device, "ao blur", &[uniform, gfx::bgl_float(1, false), gfx::bgl_float(2, false)]);
+        let ms_depth = gfx::bgl_depth(3, true);
+        let layout_ms = gfx::bgl(device, "ao apply ms", &[uniform, gfx::bgl_float(1, false), gfx::bgl_float(2, false), ms_depth]);
         let buf = UniformBuf::new(device, "ao params");
         let pipe_ao = Self::pipeline(device, &module, &layout_ao, "fs_ao", AO_FORMAT, 1, None);
         let pipe_blur = Self::pipeline(device, &module, &layout_blur, "fs_blur", AO_FORMAT, 1, None);
@@ -99,8 +106,8 @@ impl Ssao {
     /// Record the occlusion passes and the multiply over `colour` (`format`, `samples`; the
     /// multisampled colour of the pass when MSAA is on). `soft` is the converted depth image
     /// (`SoftDepth::convert`), `depth_ms` the pass's multisampled depth when `samples > 1`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run(&mut self, device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, level: u8, camera: &crate::Camera, aspect: f32, colour: &wgpu::TextureView, format: wgpu::TextureFormat, samples: u32, soft: &wgpu::TextureView, depth_ms: Option<&wgpu::TextureView>, size: (u32, u32)) {
+    pub(crate) fn run(&mut self, device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, level: u8, over: &AoTarget) {
+        let AoTarget { camera, aspect, colour, format, samples, soft, depth_ms, size } = *over;
         let Some([radius, strength, slices, steps]) = level_params(level) else { return };
         let half = |slot: &mut Option<PostTarget>, label| PostTarget::ensure(slot, device, label, size, PostTarget::HALF, AO_FORMAT).view.clone();
         let (a, b) = (half(&mut self.images.a, "ao half a"), half(&mut self.images.b, "ao half b"));
@@ -120,17 +127,17 @@ impl Ssao {
         let (buf, layout_ao) = (&self.buf.buf, &self.layout_ao);
         let bgs = self.bgs.get((soft.clone(), a.clone(), depth_ms.cloned()), || {
             let bind = |layout: &wgpu::BindGroupLayout, extra: &[wgpu::BindGroupEntry]| {
-                let mut e = vec![wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }, view(1, soft)];
+                let mut e = vec![gfx::bg_buf(0, buf), gfx::bg_view(1, soft)];
                 e.extend_from_slice(extra);
-                device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("ao"), layout, entries: &e })
+                gfx::bind_group(device, "ao", layout, &e)
             };
             [
                 bind(layout_ao, &[]),
-                bind(layout_blur, &[view(2, &a)]),
-                bind(layout_blur, &[view(2, &b)]),
+                bind(layout_blur, &[gfx::bg_view(2, &a)]),
+                bind(layout_blur, &[gfx::bg_view(2, &b)]),
                 match depth_ms {
-                    Some(d) => bind(layout_ms, &[view(2, &a), view(3, d)]),
-                    None => bind(layout_blur, &[view(2, &a)]),
+                    Some(d) => bind(layout_ms, &[gfx::bg_view(2, &a), gfx::bg_view(3, d)]),
+                    None => bind(layout_blur, &[gfx::bg_view(2, &a)]),
                 },
             ]
         });

@@ -172,7 +172,7 @@ impl HostSide {
                 out
             }
             Some(kind::RACE_TIME) => {
-                let head = m.get(1..4).map_or(0, |b| crate::msg::sign_extend_24(u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2])));
+                let head = m.get(1..).and_then(crate::msg::read_u24).map_or(0, crate::msg::sign_extend_24);
                 let best = m.get(4..8).map_or(0, |w| i32::from_be_bytes([w[0], w[1], w[2], w[3]]));
                 match head {
                     -2 => {

@@ -80,16 +80,16 @@ impl App {
     /// ENHANCEMENT E22 «auto»: whether the machine runs on its battery, asked of the OS every five seconds (a
     /// platform that cannot say counts as mains power).
     fn on_battery(&self) -> bool {
-        if let Some((at, b)) = self.pace_battery.get()
+        if let Some((at, b)) = self.pace.pace_battery.get()
             && at.elapsed() < Duration::from_secs(5)
         {
             return b;
         }
         let b = crate::power::on_battery().unwrap_or(false);
-        if self.pace_battery.get().is_none_or(|(_, old)| old != b) {
+        if self.pace.pace_battery.get().is_none_or(|(_, old)| old != b) {
             tracing::info!(battery = b, "power source (E22 auto)");
         }
-        self.pace_battery.set(Some((Instant::now(), b)));
+        self.pace.pace_battery.set(Some((Instant::now(), b)));
         b
     }
 
@@ -97,7 +97,7 @@ impl App {
     /// `refresh_rate_millihertz`), 60 when the platform does not say. Re-read every two seconds so
     /// a window dragged to another display follows.
     fn display_refresh_hz(&self) -> f64 {
-        if let Some((at, hz)) = self.pace_refresh.get()
+        if let Some((at, hz)) = self.pace.pace_refresh.get()
             && at.elapsed() < Duration::from_secs(2)
         {
             return hz;
@@ -110,10 +110,10 @@ impl App {
             .map(|mhz| mhz as f64 / 1000.0)
             .filter(|hz| *hz >= 1.0)
             .unwrap_or(60.0);
-        if self.pace_refresh.get().is_none_or(|(_, old)| old != hz) {
+        if self.pace.pace_refresh.get().is_none_or(|(_, old)| old != hz) {
             tracing::info!(hz, "display refresh rate (E22)");
         }
-        self.pace_refresh.set(Some((Instant::now(), hz)));
+        self.pace.pace_refresh.set(Some((Instant::now(), hz)));
         hz
     }
 
@@ -130,22 +130,22 @@ impl App {
         // with E22's cap the slower of the two
         let hidden = self.vehicle.is_some() && self.window_hidden();
         let Some(period) = frame_floor(self.fps_cap(), hidden) else {
-            self.pace_next.set(None);
+            self.pace.pace_next.set(None);
             return;
         };
         let now = Instant::now();
-        let mut target = self.pace_next.get().map_or(now, |t| t + period);
+        let mut target = self.pace.pace_next.get().map_or(now, |t| t + period);
         if now > target + period {
             target = now;
         }
-        self.pace_next.set(Some(target));
+        self.pace.pace_next.set(Some(target));
         // the spin margin follows how far the OS sleep overshot lately (1 ms to start; 0.3..3 ms,
         // decaying 2 % a frame), so the spin is as short as the timer allows
-        let spin = self.pace_spin.get();
+        let spin = self.pace.pace_spin.get();
         if let Some(sleep) = target.checked_duration_since(now).and_then(|d| d.checked_sub(spin)) {
             std::thread::sleep(sleep);
             let over = Instant::now().saturating_duration_since(target.checked_sub(spin).unwrap_or(now));
-            self.pace_spin.set(spin.mul_f64(0.98).max(over.mul_f64(1.5)).clamp(Duration::from_micros(300), Duration::from_millis(3)));
+            self.pace.pace_spin.set(spin.mul_f64(0.98).max(over.mul_f64(1.5)).clamp(Duration::from_micros(300), Duration::from_millis(3)));
         }
         while Instant::now() < target {
             std::hint::spin_loop();
@@ -156,7 +156,7 @@ impl App {
     /// entirely, another Space, a hidden app) or minimised. A window that is only unfocused, or
     /// partly covered, is visible and not counted.
     pub(crate) fn window_hidden(&self) -> bool {
-        self.occluded || self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true))
+        self.pace.occluded || self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true))
     }
 
     /// **The front end's idle redraw.** `true` when this frame would put exactly the pixels on the
@@ -173,7 +173,7 @@ impl App {
         let eligible = self.vehicle.is_none()
             && self.race.is_none()
             && self.fe.menu.is_some()
-            && (self.shot_target.is_none() || nfs_game::config::cfg().nfs_fe_idle_verify.is_set())
+            && (self.glue.shot_target.is_none() || nfs_game::config::cfg().nfs_fe_idle_verify.is_set())
             && self.scene.items.is_empty()
             && self.fe.room.is_empty()
             && self.fe.cars.is_empty()
@@ -241,7 +241,7 @@ impl App {
             return;
         }
         let want = Duration::from_millis(8);
-        let spent = self.last_frame.elapsed();
+        let spent = self.pace.last_frame.elapsed();
         if spent < want {
             std::thread::sleep(want - spent);
         }

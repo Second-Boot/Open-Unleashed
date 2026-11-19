@@ -89,15 +89,15 @@ impl App {
         self.photo_after_frame();
         self.mirror_sky_update();
         self.mirror_weather_step();
-        self.frames += 1;
+        self.pace.frames += 1;
         // TEST GLUE NFS_FRAME_STATS=1: this frame's time, for the mean / p99 / max below
         if nfs_game::config::cfg().nfs_frame_stats.is_set() {
-            self.frame_times.push(self.frame_dt * 1000.0);
+            self.pace.frame_times.push(self.frame_dt * 1000.0);
         }
-        if self.fps_timer.elapsed() >= Duration::from_secs(1) {
-            tracing::info!(fps = self.frames, tick = self.tick, "frame stats");
-            if !self.frame_times.is_empty() {
-                let t = &mut self.frame_times;
+        if self.pace.fps_timer.elapsed() >= Duration::from_secs(1) {
+            tracing::info!(fps = self.pace.frames, tick = self.tick, "frame stats");
+            if !self.pace.frame_times.is_empty() {
+                let t = &mut self.pace.frame_times;
                 t.sort_by(|a, b| a.total_cmp(b));
                 let mean = t.iter().sum::<f32>() / t.len() as f32;
                 let p99 = t[((t.len() as f32 * 0.99) as usize).min(t.len() - 1)];
@@ -112,10 +112,10 @@ impl App {
                 let gpu = nfs_renderer::ADAPTER_LABEL.get().map_or("", String::as_str);
                 let os = match std::env::consts::OS { "macos" => "macOS", "windows" => "Windows", "linux" => "Linux", o => o };
                 let arch = match std::env::consts::ARCH { "aarch64" => "arm64", a => a };
-                w.set_title(&format!("{} — {} fps · {gpu} · {os} {arch}", crate::brand::TITLE, self.frames));
+                w.set_title(&format!("{} — {} fps · {gpu} · {os} {arch}", crate::brand::TITLE, self.pace.frames));
             }
-            self.frames = 0;
-            self.fps_timer = Instant::now();
+            self.pace.frames = 0;
+            self.pace.fps_timer = Instant::now();
         }
         if idle {
             self.idle_wait();

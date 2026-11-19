@@ -135,7 +135,7 @@ impl App {
         // finishes: the local car's `race`, a seat's progress; `finish = tick - 0x1C0` as 0x4168A9 sends it
         let mut fin: Vec<(u32, Option<u64>)> = Vec::new();
         if let Some(r) = self.race.as_ref().filter(|r| r.finished) {
-            fin.push((local, (!self.player_eliminated).then(|| r.tick.saturating_sub(0x1C0))));
+            fin.push((local, (!self.ko.player_eliminated).then(|| r.tick.saturating_sub(0x1C0))));
         }
         for (k, o) in self.road.opponents.iter().enumerate() {
             if let Some(&i) = seats.get(k).filter(|i| **i != u32::MAX)

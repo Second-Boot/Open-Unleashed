@@ -280,7 +280,7 @@ impl App {
             // window's event loop takes over (`start_idle_movie`, `finish_idle_movie`)
             self.fe_music(|m, a, _| m.stop_fade(a, 200));
             let scripted = NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) && !PLAY_INTRO.load(std::sync::atomic::Ordering::Relaxed);
-            if scripted || self.screenshot.is_some() || self.window.is_none() {
+            if scripted || self.glue.screenshot.is_some() || self.window.is_none() {
                 // a scripted run plays no movies (as at the start-up)
                 self.finish_idle_movie();
             } else {
@@ -322,7 +322,7 @@ impl App {
     /// — nothing in a screenshot run. `f` gets the picks' draw, `0x538040() + GetTickCount()`
     /// (0x4AE4D0): the shared generator `fe_rng` and [`tick_count_ms`].
     pub(crate) fn fe_music(&mut self, f: impl FnOnce(&mut nfs_audio::music::MusicPlayer, &nfs_audio::AudioOutput, &mut dyn FnMut() -> u32)) {
-        if self.screenshot.is_some() {
+        if self.glue.screenshot.is_some() {
             return;
         }
         if self.snd.audio.is_none() {
@@ -458,7 +458,7 @@ impl App {
     /// `nfs_audio::fesfx::level` gives, silent at sound detail 3. The output opens and the bank
     /// loads on the first call; a screenshot run plays nothing.
     pub(crate) fn fe_sound(&mut self, slot: usize) {
-        if self.screenshot.is_some() {
+        if self.glue.screenshot.is_some() {
             return;
         }
         if self.snd.audio.is_none() {

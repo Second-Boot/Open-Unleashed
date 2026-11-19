@@ -2,6 +2,12 @@
 
 use super::*;
 
+mod live;
+pub use live::*;
+
+mod morph;
+use morph::*;
+
 /// GPU-resident car model at one LOD, split into body parts (with their pivots applied) and
 /// wheels (kept separate so they can spin/steer). Model space (RE/notes/car-model.md §3) is
 /// +Y up, −Z front, +X left; `MODEL_TO_BODY` rotates it into the physics body frame (+Z forward).
@@ -128,62 +134,6 @@ pub struct CarModel {
     /// the original's, as master's; the renderer shows a twin while its switch is on), and how to load the car again for a live change
     live: LiveTwins,
     source: Option<std::sync::Arc<CarSource>>,
-}
-
-/// ENHANCEMENT ENH-LIVETEX: the levels a load builds twins for (0: none). A first load builds what the switches say; a live sync builds
-/// only what the model lacks.
-#[derive(Clone, Copy, Debug)]
-pub struct LiveWant {
-    pub e41: u8,
-    pub e42: u8,
-    /// ENHANCEMENT ENH-LIVELEAK: a live build for the twins alone - the load's own copies of the originals (meshes, pages, materials) are
-    /// not uploaded: they would be thrown away, and a mesh arena cannot give its memory back
-    pub twins_only: bool,
-}
-
-/// ENHANCEMENT ENH-LIVETEX: a car's twins (E41 pages, E42 meshes) and what was last looked up.
-#[derive(Clone, Default)]
-struct LiveTwins {
-    /// the pack scale the pages were last looked up at (0: never - E41 was off); set even when the pack held nothing for this car
-    hd_tried: u32,
-    hd: Option<HdCar>,
-    /// the E42 level the refined meshes were last built for (0: never)
-    round_tried: u8,
-    /// (original mesh, refined mesh) of the parts refined, in the renderer's twin table
-    round_static: Vec<(MeshId, MeshId)>,
-    /// the refined sibling of each [`DeformPart`] (parallel to `CarModel::deform`): the same part's crush on the refined vertices
-    round_deform: Vec<Option<DeformPart>>,
-}
-
-/// ENHANCEMENT ENH-LIVETEX: the HD twins of a car's pages. `pages` / `tex` are parallel to `CarModel::page_textures`; the pixels of a page
-/// no damage decal lands on are not kept (as `damage_pages`), `patches` are the decals taken to the HD scale.
-#[derive(Clone)]
-struct HdCar {
-    pages: Vec<Option<nfs_assets::car::TexturePage>>,
-    patches: Vec<nfs_assets::car::DamagePatch>,
-    tex: Vec<Option<nfs_renderer::TextureId>>,
-}
-
-/// ENHANCEMENT ENH-LIVETEX: the arguments a car was loaded with, kept (with the [`nfs_assets::car::CarRecipe`] that reads its files again) so a
-/// live change of the HD textures / rounded parts can build the missing twins later. `id` names the load: instances made from a model keep it.
-#[derive(Debug)]
-pub struct CarSource {
-    id: u64,
-    recipe: nfs_assets::car::CarRecipe,
-    room: bool,
-    lod: u8,
-    paint: nfs_assets::car::Paint,
-    env: CarEnv,
-    night: bool,
-    race_roof: Option<u32>,
-    skidpad: Option<bool>,
-}
-
-/// ENHANCEMENT ENH-LIVETEX: what one pass of live syncs shares between the models of one load (a template and its instances): the twins the
-/// first of them took, and its page ids.
-#[derive(Default)]
-pub struct LiveCache {
-    by_source: HashMap<u64, (LiveTwins, Vec<nfs_renderer::TextureId>)>,
 }
 
 /// One mesh of a crushable part (0x43E390): its undamaged vertices (`vt#lod`), each vertex's crush
@@ -1432,12 +1382,13 @@ impl CarAccum {
             // (`nfs_assets::round`). The crush vectors / zones follow by the same barycentric recipe. Off (level 0) this block
             // does nothing: master's path.
             let mut refined_twin: Option<(MeshData, Option<(Vec<[f32; 3]>, Vec<u8>)>)> = None;
-            if e42 > 0 && l <= if e42 > 1 { 4 } else { 3 } && roof_frames.is_empty() {
+            let round = nfs_assets::round::params(e42);
+            if e42 > 0 && l <= round.max_lod && roof_frames.is_empty() {
                 if let Some(kind) = nfs_assets::round::part_kind(&g.name, is_wheel) {
                     let started = std::time::Instant::now();
                     let refined = match kind {
-                        nfs_assets::round::Kind::Wheel => nfs_assets::round::refine_wheel(&mesh, if e42 > 1 { 64 } else { 32 }, if e42 > 1 { 6 } else { 4 }),
-                        nfs_assets::round::Kind::Smooth => nfs_assets::round::refine_pn(&mesh, if e42 > 1 { 3 } else { 2 }, 0.9998),
+                        nfs_assets::round::Kind::Wheel => nfs_assets::round::refine_wheel(&mesh, round.wheel_min_segments, round.wheel_max_n),
+                        nfs_assets::round::Kind::Smooth => nfs_assets::round::refine_pn(&mesh, round.pn_n, round.crease_cos),
                     };
                     round_stats.2 += started.elapsed();
                     if let Some((m, rs)) = refined {
@@ -1500,12 +1451,6 @@ impl CarAccum {
             lists.body.extend(parts);
             lists.body_channel.extend(part_channels);
         }
-    }
-}
-
-impl CarSource {
-    fn recipe_model(&self) -> String {
-        self.recipe.model().to_string()
     }
 }
 
@@ -1602,7 +1547,7 @@ impl CarModel {
         // ENHANCEMENT E2: the page gets a generated mip chain (sampled at level 0 while E2 is
         // off); blended pages average alpha, the rest keep the alpha test's coverage
         // (`GREATER 10`, `thrash.md` §6d.4)
-        let page_alpha = |p: &nfs_assets::car::TexturePage| if p.is_window || p.is_alpha { nfs_renderer::MipAlpha::Blend } else { nfs_renderer::MipAlpha::Test(10) };
+        let page_alpha = |p: &nfs_assets::car::TexturePage| nfs_renderer::MipAlpha::for_texture(!(p.is_window || p.is_alpha));
         // ENHANCEMENT ENH-LIVELEAK: a twins-only build uploads no original page (the model it is for has its own); the ids are placeholders
         let twins_only = want.twins_only;
         let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages.iter().map(|p| (if twins_only { nfs_renderer::TextureId::default() } else { r.upload_texture_generated(p.width, p.height, &p.cache_rgba(), page_alpha(p)) }, p.is_window || p.is_alpha)).collect();
@@ -1785,7 +1730,7 @@ impl CarModel {
                 let (Some(base), Some(&old_tex)) = (c.damage_pages.get(page_index), c.page_textures.get(page_index)) else { continue };
                 // ENHANCEMENT E2: as the first upload of the page (the page's kind is not kept; `Test(10)`
                 // is the car pages' draw state, a blended page's alpha is only rarely under 11)
-                let new_tex = r.upload_texture_generated(base.width, base.height, &base.cache_rgba(), nfs_renderer::MipAlpha::Test(10));
+                let new_tex = r.upload_texture_generated(base.width, base.height, &base.cache_rgba(), nfs_renderer::MipAlpha::for_texture(true));
                 c.page_textures[page_index] = new_tex;
                 tex_remap.insert(old_tex, new_tex);
                 // ENHANCEMENT ENH-LIVETEX: and the HD twin of the page, pristine too
@@ -1793,7 +1738,7 @@ impl CarModel {
                     && let Some(Some(hp)) = hd.pages.get(page_index)
                     && !hp.rgba.is_empty()
                 {
-                    let alpha = if hp.is_window || hp.is_alpha { nfs_renderer::MipAlpha::Blend } else { nfs_renderer::MipAlpha::Test(10) };
+                    let alpha = nfs_renderer::MipAlpha::for_texture(!(hp.is_window || hp.is_alpha));
                     let twin = r.upload_texture_generated(hp.width, hp.height, &hp.rgba, alpha);
                     r.set_texture_twin(new_tex, Some(twin));
                     hd.tex[page_index] = Some(twin);
@@ -1834,169 +1779,6 @@ impl CarModel {
     /// ENHANCEMENT ENH-LIVETEX: the meshes of every body and wheel part, in order (what a twin pairs by position).
     fn part_meshes(&self) -> Vec<MeshId> {
         self.body.iter().map(|b| b.0).chain(self.wheels.iter().flat_map(|w| w.parts.iter().map(|p| p.0))).collect()
-    }
-
-    /// ENHANCEMENT ENH-LIVETEX: the model still lacks twins for the levels E41 / E42 are at now (never built, or built for another scale /
-    /// level). Flipping a switch to 0 or back to a level whose twins are resident needs nothing.
-    pub fn live_pending(&self, r: &Renderer) -> bool {
-        let Some(src) = &self.source else { return false };
-        let e = r.enhancements();
-        let want41 = nfs_assets::hdpack::scale_of_level(e.level(nfs_renderer::E41)).unwrap_or(0);
-        let want42 = e.level(nfs_renderer::E42);
-        (want41 != 0 && !src.room && self.live.hd_tried != want41) || (want42 != 0 && self.live.round_tried != want42)
-    }
-
-    /// ENHANCEMENT ENH-LIVETEX: bring this model's twins to the levels E41 / E42 are at now (see [`Self::live_pending`]). The first model of
-    /// a load builds them by loading the car again (`CarSource`) with only the missing kinds asked for and adopts the result; the others of
-    /// the load (traffic / police instances) copy from it through `cache`. A short hitch, once per change of level, never per A/B flip.
-    pub fn sync_live(&mut self, r: &mut Renderer, paths: &nfs_assets::GamePaths, cache: &mut LiveCache) {
-        if !self.live_pending(r) {
-            return;
-        }
-        let Some(src) = self.source.clone() else { return };
-        let e = r.enhancements();
-        let want41 = nfs_assets::hdpack::scale_of_level(e.level(nfs_renderer::E41)).unwrap_or(0);
-        let want42 = e.level(nfs_renderer::E42);
-        let need_hd = want41 != 0 && !src.room && self.live.hd_tried != want41;
-        let need_round = want42 != 0 && self.live.round_tried != want42;
-        if let Some((tw, pages)) = cache.by_source.get(&src.id) {
-            let (tw, pages) = (tw.clone(), pages.clone());
-            self.adopt(r, tw, None, Some(&pages), need_hd, need_round);
-            return;
-        }
-        let started = std::time::Instant::now();
-        let mut load_ms = 0;
-        let fresh = src.recipe.load().map_err(anyhow::Error::from).and_then(|assets| {
-            load_ms = started.elapsed().as_millis() as u64;
-            let want = LiveWant { e41: if need_hd { e.level(nfs_renderer::E41) } else { 0 }, e42: if need_round { want42 } else { 0 }, twins_only: true };
-            Self::upload_inner(r, &assets, paths, src.lod, src.paint, CarUpload { env: src.env, night: src.night, race_roof: src.race_roof, skidpad: src.skidpad }, want)
-        });
-        match fresh {
-            Ok(fresh) => {
-                let parts = fresh.part_meshes();
-                self.adopt(r, fresh.live, Some(&parts), None, need_hd, need_round);
-                tracing::info!(model = %src.recipe_model(), hd = need_hd, round = need_round, load_ms, ms = started.elapsed().as_millis() as u64, "car twins built live (ENHANCEMENT ENH-LIVETEX)");
-            }
-            Err(err) => {
-                tracing::warn!(model = %src.recipe_model(), error = %err, "car twins could not be built live (ENHANCEMENT ENH-LIVETEX)");
-                // not tried again for these levels
-                if need_hd {
-                    self.live.hd_tried = want41;
-                }
-                if need_round {
-                    self.live.round_tried = want42;
-                }
-            }
-        }
-        cache.by_source.insert(src.id, (self.live.clone(), self.page_textures.clone()));
-    }
-
-    /// ENHANCEMENT ENH-LIVETEX: make `new`'s twins this model's. `fresh_parts`: `new` is a fresh load's own (its ids are taken over, the parts
-    /// paired by position with this model's); `None` with `template_pages`: `new` is a template's (this instance's private page / crush
-    /// resources get copies of their own, everything shared is the template's twin already).
-    fn adopt(&mut self, r: &mut Renderer, new: LiveTwins, fresh_parts: Option<&[MeshId]>, template_pages: Option<&[nfs_renderer::TextureId]>, need_hd: bool, need_round: bool) {
-        if need_hd {
-            self.live.hd_tried = new.hd_tried;
-            let old = self.live.hd.take();
-            if let Some(nh) = new.hd {
-                let mut tex: Vec<Option<nfs_renderer::TextureId>> = vec![None; self.page_textures.len()];
-                for (i, slot) in tex.iter_mut().enumerate() {
-                    let Some(nt) = nh.tex.get(i).copied().flatten() else { continue };
-                    let base = self.page_textures[i];
-                    match template_pages {
-                        None => {
-                            r.set_texture_twin(base, Some(nt));
-                            *slot = Some(nt);
-                        }
-                        Some(tp) if tp.get(i) == Some(&base) => *slot = Some(nt),
-                        Some(_) => {
-                            // a page of this instance's own (a damage decal page): a copy of the HD base page
-                            if let Some(Some(pg)) = nh.pages.get(i).filter(|p| p.as_ref().is_some_and(|p| !p.rgba.is_empty())) {
-                                let alpha = if pg.is_window || pg.is_alpha { nfs_renderer::MipAlpha::Blend } else { nfs_renderer::MipAlpha::Test(10) };
-                                let id = r.upload_texture_generated(pg.width, pg.height, &pg.rgba, alpha);
-                                r.set_texture_twin(base, Some(id));
-                                *slot = Some(id);
-                            }
-                        }
-                    }
-                }
-                self.live.hd = Some(HdCar { pages: nh.pages, patches: nh.patches, tex });
-            }
-            if let Some(old) = old {
-                for (i, o) in old.tex.iter().enumerate() {
-                    let Some(o) = o else { continue };
-                    let now = self.live.hd.as_ref().and_then(|h| h.tex.get(i).copied().flatten());
-                    if now.is_none() {
-                        r.set_texture_twin(self.page_textures[i], None);
-                    }
-                    if now != Some(*o) {
-                        r.release_texture(*o);
-                    }
-                }
-            }
-        }
-        if need_round {
-            self.live.round_tried = new.round_tried;
-            let old_static = std::mem::take(&mut self.live.round_static);
-            let mut now_static: Vec<(MeshId, MeshId)> = Vec::new();
-            match fresh_parts {
-                Some(fp) => {
-                    let map: HashMap<MeshId, MeshId> = new.round_static.iter().copied().collect();
-                    let mine = self.part_meshes();
-                    if mine.len() == fp.len() {
-                        for (m, f) in mine.iter().zip(fp) {
-                            if let Some(&rid) = map.get(f) {
-                                r.set_mesh_twin(*m, Some(rid));
-                                now_static.push((*m, rid));
-                            }
-                        }
-                    } else {
-                        tracing::warn!(mine = mine.len(), fresh = fp.len(), "car twins: the part lists differ, the refined meshes are not adopted");
-                    }
-                }
-                // an instance shares every non-crush mesh with its template: the template's pairs are this model's
-                None => now_static = new.round_static.clone(),
-            }
-            for (b, _) in &old_static {
-                if !now_static.iter().any(|(nb, _)| nb == b) {
-                    r.set_mesh_twin(*b, None);
-                }
-            }
-            // ENHANCEMENT ENH-LIVELEAK: the replaced refined meshes (the previous level's) give their memory back once no twin entry names them.
-            // The static ones are shared with the instances of the same load, which take the new ones from the cache: only the model that
-            // built them (`fresh_parts`) releases them; the crush siblings are private to each model.
-            let old_deform: Vec<MeshId> = self.live.round_deform.iter().flatten().map(|d| d.mesh).collect();
-            let mut dead: Vec<MeshId> = old_deform;
-            if fresh_parts.is_some() {
-                dead.extend(old_static.iter().map(|(_, t)| *t));
-            }
-            self.live.round_static = now_static;
-            // the crush siblings
-            let mut round_deform: Vec<Option<DeformPart>> = Vec::with_capacity(self.deform.len());
-            for (j, p) in self.deform.iter().enumerate() {
-                let mut nd = new.round_deform.get(j).cloned().flatten();
-                if let Some(d) = nd.as_mut() {
-                    if template_pages.is_some() {
-                        d.mesh = r.upload_mesh(&MeshData { vertices: d.base.clone(), indices: d.indices.clone() });
-                    }
-                    r.set_mesh_twin(p.mesh, Some(d.mesh));
-                } else if self.live.round_deform.get(j).is_some_and(|d| d.is_some()) {
-                    r.set_mesh_twin(p.mesh, None);
-                }
-                round_deform.push(nd);
-            }
-            // the twin entries now name the new meshes: the old ones can go (a mesh the new set still holds stays)
-            let keep: std::collections::HashSet<MeshId> = self.live.round_static.iter().map(|(_, t)| *t).chain(round_deform.iter().flatten().map(|d| d.mesh)).collect();
-            let mut done: std::collections::HashSet<MeshId> = std::collections::HashSet::new();
-            for m in dead.into_iter().filter(|m| !keep.contains(m)) {
-                if done.insert(m) {
-                    r.release_mesh(m);
-                }
-            }
-            self.live.round_deform = round_deform;
-        }
-        // the new twins start pristine: the next `update_damage` redraws the crush / decals of every damaged zone on them
-        self.damage_shown = [0.0; 10];
     }
 
     /// **0x438230(0)**, which `R3DCar` slot 7 runs every frame (0x4383CC): when any of the ten
@@ -2624,110 +2406,6 @@ impl CarModel {
     }
 }
 
-/// One mesh of a morphing article: its frame-0 vertices and every frame's positions.
-#[derive(Clone)]
-struct MorphPart {
-    mesh: MeshId,
-    /// The vertices last blended and queued for the mesh (the frame-0 vertices at first, which is
-    /// what the upload holds): the next blend rewrites only the positions, in place.
-    scratch: Vec<Vertex>,
-    /// `Renderer::mesh_writes` of the mesh right after this part's last write (0 at the upload):
-    /// the mesh still holds `scratch` while the count is the same.
-    seen: u32,
-    frames: Vec<Vec<[f32; 3]>>,
-}
-
-fn mm_positions(m: &MeshData) -> Vec<[f32; 3]> {
-    m.vertices.iter().map(|v| v.position).collect()
-}
-
-impl CarModel {
-    /// **0x4D1990(1, state)**: the roof animation to `length · state / 255` frames (0x4D199F…
-    /// 0x4D19BA), which 0x4380D0 splits as `frame = fistp(t − 0.5)`, the fraction the rest, and
-    /// the draw (0x43E2FD…0x43E35B) blends each vertex `A + (B − A)·frac` between that frame and
-    /// the next — the frame alone where there is no next. Past the last frame the part keeps it.
-    pub fn set_roof(&mut self, r: &mut Renderer, state: i32) {
-        if self.anim_length[1] == 0 || state == self.roof_state {
-            return;
-        }
-        self.roof_state = state;
-        let t = self.anim_length[1] as f32 * state as f32 * (1.0 / 255.0);
-        self.set_anim(r, 1, t);
-    }
-
-    /// The roof state [`set_roof`](Self::set_roof) last took — what the front end's car object
-    /// keeps at `+4` and 0x4D19E0(1) answers.
-    pub fn roof_state(&self) -> i32 {
-        self.roof_state
-    }
-
-    /// `0x438190(n)`: animation `n`'s length in frames, 0 when the car has none.
-    pub fn anim_length(&self, n: usize) -> u32 {
-        self.anim_length.get(n).copied().unwrap_or(0)
-    }
-
-    /// **0x4380D0(n, t)**: animation `n` to time `t` frames, clamped to `[0, length]`.
-    pub fn set_anim(&mut self, r: &mut Renderer, n: usize, t: f32) {
-        let len = self.anim_length(n);
-        if len == 0 {
-            return;
-        }
-        let t = t.clamp(0.0, len as f32);
-        if t == self.anim_time[n] {
-            return;
-        }
-        self.anim_time[n] = t;
-        let frame = (t - 0.5).round_ties_even().max(0.0) as usize;
-        let frac = t - frame as f32;
-        self.blend(r, n, frame, frame + 1, frac);
-    }
-
-    /// Write animation `n`'s `{frame, next, frac}` straight into its record, as slot 9's keyframe
-    /// copies do (0x439035…0x43908D for the right arm, 0x4392F1…0x43933C for the body): the draw
-    /// (0x43E2FD…0x43E35B) blends each vertex from `frame` toward `next` by `frac`.
-    fn set_anim_keys(&mut self, r: &mut Renderer, n: usize, frame: u32, next: u32, frac: f32) {
-        if self.anim_length(n) == 0 {
-            return;
-        }
-        // a key write is not a time: forget the last one so a later 0x4380D0 re-uploads
-        self.anim_time[n] = -1.0;
-        self.blend(r, n, frame as usize, next as usize, frac);
-    }
-
-    /// The draw's blend of animation `n`'s parts (0x43E2FD…0x43E35B). Each part keeps the vertices it
-    /// last queued: the positions are blended in place (the same `A + (B − A)·frac` per vertex, the
-    /// other fields are the frame-0 ones, which nothing rewrites) and the mesh is rewritten only when
-    /// a position changed bit for bit or someone else (the crush, another instance sharing the mesh)
-    /// has written it since — a write of the bytes the mesh already holds is not made.
-    fn blend(&mut self, r: &mut Renderer, n: usize, frame: usize, next: usize, frac: f32) {
-        if self.blended[n] == Some((frame, next, frac)) {
-            return;
-        }
-        self.blended[n] = Some((frame, next, frac));
-        for p in &mut self.morph[n] {
-            let Some(a) = p.frames.get(frame.min(p.frames.len() - 1)) else { continue };
-            let b = p.frames.get(next);
-            let frac = if frame >= p.frames.len() { 0.0 } else { frac };
-            let mut changed = p.seen != r.mesh_writes(p.mesh);
-            for (i, out) in p.scratch.iter_mut().enumerate() {
-                let pa = Vec3::from(a[i]);
-                let position = match b {
-                    Some(b) => (pa + (Vec3::from(b[i]) - pa) * frac).to_array(),
-                    None => a[i],
-                };
-                if position.map(f32::to_bits) != out.position.map(f32::to_bits) {
-                    out.position = position;
-                    changed = true;
-                }
-            }
-            if changed {
-                r.update_mesh_vertices(p.mesh, &p.scratch);
-                p.seen = r.mesh_writes(p.mesh);
-            }
-        }
-    }
-}
-
 /// A render object's light block, `obj+0x2F4` (`RE/notes/lighting.md` §6): seven colour slots —
 /// slot 3 is the direction — and the material colour at `+0x74` that scales the directional half.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2871,6 +2549,170 @@ mod anim_clock_tests {
                     eprintln!("  {secs:4.2} | {fps:3} | {name:5} | {c:8} | {s:10.4} | {w:11.3} | {l:.3}");
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+
+    /// The car draw's calls (the dll's 0x10001090): the driver from the dll's `0x10005094` below
+    /// effective class 4, the body from LOD `eff` (`0x100050E0[7·detail + class]`), the wheels from
+    /// `0x1000516C[class]` (or the traffic's `0x10005188`), none with the flag.
+    #[test]
+    fn race_passes_follow_the_tables() {
+        let p = |lod, mask| CarPass { lod, mask, flag: false };
+        assert_eq!(race_passes(2, 2, false), vec![p(2, 0x80), p(3, 0x50), p(1, 0x20)]);
+        assert_eq!(race_passes(3, 0, false), vec![p(3, 0x80), p(4, 0x50), p(2, 0x20)]);
+        assert_eq!(race_passes(5, 1, false), vec![p(6, 0x50), p(3, 0x20)]);
+        assert_eq!(race_passes(3, 2, true), vec![p(3, 0x80), p(4, 0x50), p(1, 0x20)]);
+        // the finer tiers draw a lower LOD for the same class: effective class 2 at tier 3, 1 at tier 4
+        assert_eq!(race_passes(3, 3, false), vec![p(2, 0x80), p(3, 0x50), p(2, 0x20)]);
+        assert_eq!(race_passes(3, 4, false), vec![p(1, 0x80), p(2, 0x50), p(2, 0x20)]);
+        // the driver view: the cabin pass from LOD 2 (tiers 0 … 2) with the flag at class 2 and up,
+        // the steering wheel, the hands from tier 2 up
+        let f = |lod, mask| CarPass { lod, mask, flag: true };
+        let c = |lod, flag| CarPass { lod, mask: 0x10, flag };
+        assert_eq!(in_car_passes(0, 0, false), vec![c(2, false), f(1, 0x40)]);
+        assert_eq!(in_car_passes(0, 1, false), vec![c(2, false), f(1, 0x40)]);
+        assert_eq!(in_car_passes(3, 2, false), vec![c(2, true), f(1, 0x40), f(2, 0x80)]);
+        assert_eq!(in_car_passes(3, 2, true), vec![c(2, true), f(1, 0x40)]);
+        assert_eq!(in_car_passes(1, 4, false), vec![c(1, false), f(1, 0x40), f(1, 0x80)]);
+    }
+
+    /// `nfs5.dll`'s virtual 2-D screen (dll 0x10003840): (640, 480) at 4:3, (480 · r, 480) above,
+    /// (640, 640 / r) below.
+    #[test]
+    fn virtual_screen_follows_the_aspect() {
+        assert_eq!(virtual_screen(640.0, 480.0), (640.0, 480.0));
+        assert_eq!(virtual_screen(1024.0, 768.0), (640.0, 480.0));
+        let (w, h) = virtual_screen(1280.0, 800.0);
+        assert!((w - 768.0).abs() < 1e-3 && h == 480.0);
+        let (w, h) = virtual_screen(1280.0, 1024.0);
+        assert!(w == 640.0 && (h - 512.0).abs() < 1e-3);
+    }
+
+    /// `nfs5.dll`'s virtual 2-D width (dll 0x10003840): 640 up to 4:3, `480 · w / h` above.
+    #[test]
+    fn virtual_width_follows_the_aspect() {
+        assert_eq!(virtual_width(640.0, 480.0), 640.0);
+        assert_eq!(virtual_width(1024.0, 768.0), 640.0);
+        assert_eq!(virtual_width(800.0, 800.0), 640.0);
+        assert!((virtual_width(1280.0, 800.0) - 768.0).abs() < 1e-3);
+        assert!((virtual_width(1920.0, 1080.0) - 853.3333).abs() < 1e-2);
+    }
+
+    /// 0x43C8AC…0x43C8E9: the LOD, `Base+78 & mask & 0xF0`, and the two flag bytes — the hands
+    /// (`Base+81` and `+82`) only ever in a flagged call.
+    #[test]
+    fn a_part_meets_a_pass_by_its_bytes() {
+        let hand = PartInfo { lod: 1, mask: 0x81, inside: true, inside_only: true, move_channel: -1 };
+        let driver = PartInfo { inside: false, inside_only: false, ..hand };
+        let body = PartInfo { lod: 3, mask: 0x1A, inside: true, inside_only: false, move_channel: -1 };
+        assert!(!hand.in_pass(&CarPass { lod: 1, mask: 0x80, flag: false }));
+        assert!(hand.in_pass(&CarPass { lod: 1, mask: 0x80, flag: true }));
+        assert!(driver.in_pass(&CarPass { lod: 1, mask: 0x80, flag: false }));
+        assert!(!driver.in_pass(&CarPass { lod: 1, mask: 0x80, flag: true }));
+        assert!(body.in_pass(&CarPass { lod: 3, mask: 0x50, flag: false }));
+        assert!(!body.in_pass(&CarPass { lod: 3, mask: 0x20, flag: false }));
+        assert!(!body.in_pass(&CarPass { lod: 2, mask: 0x50, flag: false }));
+    }
+
+    /// 0x445B10's coordinates: `1 / size` on the lateral axis, `aspect / size` on the forward one,
+    /// and the offsets `0.5 + 0.1 · lat / 6`, `0.5 + fwd / 6` of the car against its slice centre.
+    #[test]
+    fn sky_planes_follow_the_layer() {
+        let at = |pl: [f32; 4], p: Vec3| pl[0] * p.x + pl[1] * p.y + pl[2] * p.z + pl[3];
+        let c = Vec3::new(100.0, 5.0, -40.0);
+        let (lat, fwd) = (Vec3::X, Vec3::Z);
+        let (u, v) = sky_planes(c, c, lat, fwd, 6.0, 0.5);
+        assert!((at(u, c) - 0.5).abs() < 1e-5 && (at(v, c) - 0.5).abs() < 1e-5);
+        assert!((at(u, c + Vec3::new(3.0, 7.0, 0.0)) - 1.0).abs() < 1e-5);
+        assert!((at(v, c + Vec3::new(0.0, 0.0, 6.0)) - 1.0).abs() < 1e-5);
+        let o = c + Vec3::new(6.0, 0.0, 6.0);
+        let (u, v) = sky_planes(o, c, lat, fwd, 6.0, 0.5);
+        assert!((at(u, o) - 0.6).abs() < 1e-5);
+        assert!((at(v, o) - 1.5).abs() < 1e-5);
+    }
+
+    /// 0x470E90 for a one-shot piece: 31 frames at `playbackrate=5` run 1.28 ticks a frame and stop
+    /// once frame 29 is reached; the drift grows as `ticks · rate`.
+    #[test]
+    fn piece_sampler_runs_out_and_drifts() {
+        use nfs_formats::crp::{AnimFrame, AnimTrack};
+        let frames = (0..31).map(|k| AnimFrame { rotation: [0.0, 0.0, 0.0, 1.0], position: [0.0, k as f32, 0.0], scale: [1.0; 3] }).collect();
+        let track = AnimTrack { frames };
+        let flags = nfs_formats::animdefs::PieceFlags::default();
+        let (m, playing) = sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::X, 0);
+        assert!(playing && m.w_axis.truncate().length() < 1e-6);
+        // 16 ticks = 12.5 frames: y halfway between 12 and 13, x drift 16 · 1.28
+        let (m, playing) = sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::X, 16);
+        assert!(playing);
+        assert!((m.w_axis.y - 12.5).abs() < 1e-4 && (m.w_axis.x - 16.0 * 1.28).abs() < 1e-3, "{m:?}");
+        // 29 frames = 37.12 ticks: the last frame, held, and the player done
+        let (m, playing) = sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::ZERO, 38);
+        assert!(!playing && (m.w_axis.y - 30.0).abs() < 1e-6);
+        assert!(sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::ZERO, 37).1);
+    }
+
+    /// `AnimatedSound::eval_pair` (`engine-audio.md` §7.4's `p1`/`p2`, the autobahn train's own
+    /// ambient-sound path source): a straight-line 5-frame stand-in track, the real
+    /// `WANIM_BUNDLE_DEFAULT_*` rate/loop rule — `p2` is one 0x20-tick (0.5 s) sample ahead of `p1`.
+    #[test]
+    fn animated_sound_samples_p1_and_p2_a_half_second_apart() {
+        let frames = (0..5).map(|k| nfs_formats::crp::AnimFrame { rotation: [0.0, 0.0, 0.0, 1.0], position: [k as f32 * 10.0, 0.0, 0.0], scale: [1.0; 3] }).collect();
+        let sound = AnimatedSound {
+            def: nfs_formats::animdefs::SoundDef { patch_id: 833, range: 300.0, fade_in: 17.0, trigger: 0, fade_out: 0, min_repeat: 0, random_repeat: 0, volume: 100 },
+            label: "Locomotive".to_string(),
+            track: nfs_formats::crp::AnimTrack { frames },
+            seconds_per_frame: WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME,
+            looping: WANIM_BUNDLE_DEFAULT_LOOPING,
+            ambience_index: None,
+        };
+        // tick 0: p1 at t=0 (frame 0, x=0), p2 at t=0x20/64=0.5 s = 5 frames in, wraps `% (5-2)=%3`
+        let (p1, p2) = sound.eval_pair(0);
+        assert_eq!(p1, [0.0, 0.0, 0.0]);
+        assert_ne!(p1, p2, "p2 is a genuinely later sample, not a repeat of p1");
+        // a full tick later, both samples have advanced
+        let (p1b, _p2b) = sound.eval_pair(64);
+        assert_ne!(p1, p1b);
+    }
+
+    /// 0x438B73…0x438C30: a player walks its table over the duration — frame, next and the
+    /// fraction between — and stops, keeping its last frame, once the duration is out.
+    #[test]
+    fn key_player_walks_its_table() {
+        let mut p = KeyPlayer::default();
+        p.start(GEAR_GESTURES[0], 1000, 500);
+        assert_eq!((p.frame, p.next, p.frac), (0, 10, 0.0));
+        // half way: p = 0.5 · 10 = 5 → table[fistp(4.5)] = table[4], table[fistp(5.5)] = table[6]
+        p.step(1250);
+        assert_eq!((p.frame, p.next), (GEAR_GESTURES[0][4], GEAR_GESTURES[0][6]));
+        assert!((p.frac - 1.0).abs() < 1e-6);
+        p.step(1499);
+        assert!(p.active());
+        p.step(1500);
+        assert!(!p.active());
+        assert_eq!(p.frame, GEAR_GESTURES[0][9]);
+    }
+
+    /// Every gesture starts and ends on its steering frame, and the handbrake and reverse tables
+    /// meet in the held frame (19 / 7) — the tables as the image has them.
+    #[test]
+    fn gesture_tables_round_trip() {
+        for (i, g) in GEAR_GESTURES.iter().enumerate() {
+            assert_eq!((g[0], *g.last().unwrap()), (i as u32, i as u32));
+        }
+        for i in 0..10 {
+            assert_eq!(HANDBRAKE_ON[i][0], i as u32);
+            assert_eq!(HANDBRAKE_ON[i][2], 19);
+            assert_eq!(HANDBRAKE_OFF[i][0], 19);
+            assert_eq!(HANDBRAKE_OFF[i][2], i as u32);
+        }
+        for i in 0..5 {
+            assert_eq!(*REVERSE_ON[i].last().unwrap(), 7);
+            assert_eq!(REVERSE_OFF[i][0], 7);
         }
     }
 }

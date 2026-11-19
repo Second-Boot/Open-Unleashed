@@ -45,7 +45,7 @@ impl App {
                     self.apply_saved_profile(true);
                     // 0x4DE040 after the load (0x510701): a series the file carried is cancelled here —
                     // only the start-up and after-race loads (0x4D3B52) keep it running
-                    if let Some(k) = self.knockout.as_mut() {
+                    if let Some(k) = self.ko.knockout.as_mut() {
                         k.state.active = false;
                     }
                     self.fe_back_callback(event_loop);
@@ -98,7 +98,7 @@ impl App {
                     // 0x4DE040 (the series cancelled). *(Until 2026-09-26 the options of the
                     // profile that was up stayed.)*
                     self.apply_saved_profile(true);
-                    if let Some(k) = self.knockout.as_mut() {
+                    if let Some(k) = self.ko.knockout.as_mut() {
                         k.state.active = false;
                     }
                     // 0x4D23F0(−1): the layer's whole history, sound 4 (inside `fe_back`)

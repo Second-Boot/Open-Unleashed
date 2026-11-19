@@ -8,7 +8,6 @@ license.workspace = true
 nfs-formats.workspace = true
 nfs-assets.workspace = true
 nfs-renderer.workspace = true
-nfs-input.workspace = true
 anyhow.workspace = true
 glam.workspace = true
 winit.workspace = true

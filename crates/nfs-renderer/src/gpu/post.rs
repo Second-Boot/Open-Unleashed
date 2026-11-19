@@ -1,6 +1,6 @@
 //! The full-screen passes at the end of the frame: `GammaPass` (the display gamma of the 8-bit path) and `ScaleBlit` (ENHANCEMENT
 //! E3 / E7: the scaled image laid over the window, the ACES tone map, the dither, the eye adaptation and the EDR gain), with
-//! their WGSL. Moved out of gpu.rs as it was.
+//! their WGSL.
 
 use crate::gfx::{self, Fullscreen, RtImage};
 use crate::wgsl;
@@ -65,7 +65,7 @@ const GAMMA_WGSL: &str = r#"
 
 impl GammaPass {
     pub(super) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let layout = gfx::bgl(device, "gamma", &[gfx::bgl_tex(0, wgpu::TextureSampleType::Float { filterable: false }, false), gfx::bgl_uniform(1, wgpu::ShaderStages::FRAGMENT)]);
+        let layout = gfx::bgl(device, "gamma", &[gfx::bgl_float(0, false), gfx::bgl_uniform(1, wgpu::ShaderStages::FRAGMENT)]);
         let module = gfx::wgsl_module(device, "gamma", &gamma_source());
         let pl = gfx::pipeline_layout(device, "gamma", &[&layout]);
         let pipeline = Fullscreen::new("gamma", &pl, &module).build(device, &[gfx::target(format, None)]);

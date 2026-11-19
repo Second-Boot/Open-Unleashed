@@ -17,6 +17,7 @@
 //!   dark round patch at night between the street lamps);
 //! * each of the four tyres adds a tight patch under the tyre with a short halo (the crease where the rubber meets the road);
 //! * the receiver must face up in the car's frame (a wall or a kerb face beside the car is not darkened).
+//!
 //! The result is the sky's occlusion: it multiplies the light of the track item where there is no sun (under cover, at night, E9
 //! off, beyond the cascades); where E9 draws the sun's shadow the shader splits the baked light by E9's sun share `s` and the
 //! occlusion takes only the ambient part, the sun's shadow only the direct part (`light ((1 - s) ao + s vis)`, SHADOW-REAL), and
@@ -72,7 +73,7 @@ pub(super) fn layout_entry() -> wgpu::BindGroupLayoutEntry {
 impl Core {
     /// Whether this frame has contact shadows (E43 on, some car, not the rear-view mirror / an offscreen view).
     pub(super) fn contact_on(&self, scene: &Scene) -> bool {
-        self.enhancements.is_on(crate::E43) && !self.no_reflections && scene.contacts.n > 0
+        self.enhancements.is_on(crate::E43) && !self.modes.no_reflections && scene.contacts.n > 0
     }
 
     /// Write this frame's uniform; without cars it is zeroed once if it was on. (SHADOW-REAL: no frame-wide weakening where E9's
@@ -97,9 +98,10 @@ impl Core {
     }
 
     /// Whether an item is a receiver of the contact shadow: a track item the E9 receiving also takes (drivable ground, walls ...; the
-    /// shader keeps only faces that look up in the car's frame), never a front-end room's piece.
-    pub(super) fn contact_receive(&self, item: &crate::DrawItem) -> bool {
-        item.csm & crate::CSM_ROOM == 0 && !item.car_lit() && self.csm_receive(item) == crate::classes::RECV_TRACK
+    /// shader keeps only faces that look up in the car's frame), never a front-end room's piece. `class`: the item's E9 role
+    /// ([`Core::csm_receive`], which the fill has asked already).
+    pub(super) fn contact_receive(item: &crate::DrawItem, class: f32) -> bool {
+        item.csm & crate::CSM_ROOM == 0 && !item.car_lit() && class == crate::classes::RECV_TRACK
     }
 }
 

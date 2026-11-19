@@ -3,6 +3,36 @@
 use crate::*;
 use nfs_game::world::CarUpload;
 
+/// What the grid stage hands to its later steps (the traffic and the police): the slice table, the start slice, the grid rule, the number of
+/// cars, the car catalogue, the `NFS_PA_FE0` flag and the opponents' personalities.
+#[derive(Clone, Copy)]
+struct GridCtx<'a> {
+    t: &'a SliceTable,
+    start: usize,
+    grid_rule: nfs_game::race::GridRule,
+    n_cars: u32,
+    catalog: &'a [nfs_formats::fedata::CarCatalogEntry],
+    fe0: bool,
+    plan_pers: &'a [i16],
+    car_env: nfs_game::world::CarEnv,
+    factory_driver: bool,
+}
+
+/// The opponents' plan the grid stage built, for [`App::race_stage_opponents`]: per slot the catalogue entry, paint, name, skill pair, grid
+/// position and decal, the liveries and personalities, the remote seats' records and the recorded parts.
+#[derive(Clone, Copy)]
+struct OpponentPlan<'a> {
+    plan: &'a [OpponentRow],
+    plan_liv: &'a [Option<Paint>],
+    seat_recs: &'a [Option<nfs_net::launchcar::CarSlot>],
+    rec_parts: Option<&'a [Vec<nfs_formats::career::Part>]>,
+    rec_plan_none: bool,
+    parts_table: &'a [nfs_formats::career::Part],
+}
+
+/// One grid slot of the opponents' plan: (catalogue entry, paint, name, bend-speed factor and its table, grid slot, `.RACENUMBER` decal).
+type OpponentRow = (nfs_formats::fedata::CarCatalogEntry, [u8; 3], String, Option<(f32, [[f32; 2]; 4])>, Option<u32>, i32);
+
 impl App {
     /// Stage "audio" — steps 6 → 7 of the load: the output, the engine, the ambience, the banks, the speech and the race music.
     pub(super) fn race_stage_audio(&mut self, playing: bool, world: &mut TrackWorld) {
@@ -97,7 +127,7 @@ impl App {
             // (0x4D5295) and `[0x65B928]` cleared (0x4D559A) — the next entry starts afresh
             self.fe.music_current.clear();
             self.fe.list_current.clear();
-            if self.autotest.is_none() && self.screenshot.is_none() {
+            if self.glue.autotest.is_none() && self.glue.screenshot.is_none() {
                 // `AudioLoadTrack` 0x4A88A0: `MusicStop(1500)`, the saved playlist, then
                 // `MusicPlay(NULL, 0)` — any entry of it but the current one. In a playback
                 // (`[0x5E99F4] >= 2`, 0x4A8A4A…0x4A8A56 `jge 0x4A8A75`) the playlist and the play
@@ -163,25 +193,25 @@ impl App {
         } else {
             self.track.start_forward.as_ref()
         };
-        self.player_eliminated = false;
+        self.ko.player_eliminated = false;
         self.net_launch.time_sent = false;
         self.net_launch.pad_buttons = 0;
         // the port's own counters for the autotest log (the opponents' start at 0 with their cars)
         // and the autotest bot's stuck count
         self.wall_hits = 0;
         self.resets = 0;
-        self.stuck_ticks = 0;
+        self.glue.stuck_ticks = 0;
         // the HUD's init builds `HReplaySave` afresh (0x424EA4)
         self.replay_save = ReplaySave::default();
-        self.hud_records = None;
-        self.pages.page = 0;
-        self.pages.seen = None;
-        self.pages.open_tick = None;
+        self.hud_state.hud_records = None;
+        self.hud_state.pages.page = 0;
+        self.hud_state.pages.seen = None;
+        self.hud_state.pages.open_tick = None;
         self.results = None;
         self.mission_result = None;
         // 0x426B20…0x426B3B: `[0x60CA04] = 0`, `HTime` reset (0x431850), `HMissionSummary+0x140 = 0`
-        self.hud_cones = Default::default();
-        self.cone_flash = 0;
+        self.hud_state.hud_cones = Default::default();
+        self.hud_state.cone_flash = 0;
         // network play: the others are the seats (0x4B4DA0 gives every player of the race an index,
         // `player+0x4C`, and the launch's `NUMOPPONENTRACECARS` is 0 — 0x4ECF00 for `FEGAME_TYPE` 3, the
         // stream's `(0x28, 0)` — so the fix-up loop 0x4B5081…0x4B50AB that numbers opponent slots after
@@ -195,12 +225,12 @@ impl App {
         // grid order: `.STARTINGPOS` (`[0x658200 + slot·0x580]`, 1 = pole) — 0x4ECF00 gives slot
         // `i` `(nPlayers + nOpp) − i` outside the knockout and the tournament (`modes.md` §1), so
         // the player (slot 0) starts last; the port keeps `STARTINGPOS − 1`
-        self.player_grid = self.player_grid_override.unwrap_or_else(|| {
+        self.player_grid = self.ko.player_grid_override.unwrap_or_else(|| {
             // TEST GLUE `NFS_PA_FE0` (`pa_trace.rs`, PA-SCENES): an `fe = 0` race never runs 0x4ECF00, so the
             // grid is `fe.txt`'s `car[0].startingpos` (shipped 0: one row AHEAD of the pole, `grid_slot`'s `g = 0`
             // = `3·n + 1` slices) — measured on the original's Monaco 1 start (the four cars at slots 0, 1, 2, 3)
-            if std::env::var_os("NFS_PA_FE0").is_some() {
-                return (super::pa_trace::fe0_startingpos(&self.paths.root, 0) as u32).wrapping_sub(1);
+            if nfs_game::config::cfg().nfs_pa_fe0.is_set() {
+                return (super::glue::pa_trace::fe0_startingpos(&self.paths.root, 0) as u32).wrapping_sub(1);
             }
             n_cars - 1
         });
@@ -280,9 +310,9 @@ impl App {
                 });
                 let mut plan_pers: Vec<i16> = self.career_opponents.as_ref().map(|l| l.iter().map(|o| o.personality).collect()).unwrap_or_default();
                 // TEST GLUE `NFS_PA_FE0` (`pa_trace.rs`): an `fe = 0` race's opponents, `fe.txt`'s `car[k].*`
-                let fe0 = std::env::var_os("NFS_PA_FE0").is_some() && rec_plan.is_none() && self.career_opponents.is_none();
+                let fe0 = nfs_game::config::cfg().nfs_pa_fe0.is_set() && rec_plan.is_none() && self.career_opponents.is_none();
                 if fe0 {
-                    let list = super::pa_trace::fe0_opponents(&self.paths.root, &catalog, self.num_opponents as usize);
+                    let list = super::glue::pa_trace::fe0_opponents(&self.paths.root, &catalog, self.num_opponents as usize);
                     plan_pers = list.iter().map(|o| o.personality).collect();
                     plan_liv = list.iter().map(|o| o.livery).collect();
                     self.career_opponents = Some(list);
@@ -330,7 +360,7 @@ impl App {
                         // them, 0x4DE1E7), and `[0x6907D8]` is this draw now (0x4EBC63 → 0x4E3160
                         // clears it at 0x4E3176 and pushes each id at 0x4E32B5) — what the next
                         // save's `Personalities` module writes
-                        self.opp_cars = Self::opp_car_saves(&catalog, &picks);
+                        self.ko.opp_cars = Self::opp_car_saves(&catalog, &picks);
                         if let Some(c) = self.career.as_mut() {
                             c.side.personalities = Some(drawn.iter().map(|p| *p as u16).collect());
                         }
@@ -440,214 +470,8 @@ impl App {
                             .collect(),
                     );
                 }
-                for (g, (entry, paint, name, skill, grid, decal)) in plan.iter().enumerate() {
-                    // the opponent record's parts (0x4ED880), for a career opponent
-                    let parts: Vec<nfs_formats::career::Part> = match &rec_parts {
-                        Some(l) => l.get(g).cloned().unwrap_or_default(),
-                        None => self.career_opponents.as_ref().and_then(|l| l.get(g)).map(|o| o.parts.clone()).unwrap_or_default(),
-                    };
-                    let swaps: Vec<[i16; 3]> = parts.iter().flat_map(|p| p.geometry_swaps.iter().copied()).collect();
-                    // opponent slot `g + 1` → `STARTINGPOS = n − (g + 1)` (0x4ECF00) unless the
-                    // career set one (knockout 0x4DE150, tournament ranks 0x503660)
-                    let slot = g;
-                    let g = grid.unwrap_or((n_cars - 1).saturating_sub(g as u32 + 1));
-                    // a remote player's car is what its own machine sent (`.SPECNAME` already holds the
-                    // sender's `evenstvn` code): this machine's cheat bits are not applied to it
-                    let seat_rec = seat_recs.get(slot).and_then(|r| r.as_ref());
-                    let entry_993 = if seat_rec.is_some() { entry.clone() } else { self.cheat_993(entry.clone()) };
-                    let entry = &entry_993;
-                    // `.TINYCAR` 0x24F is per car: a remote player's car is tiny when *its* record says so (its own
-                    // machine's Gulliver code, sent only when set), every other car by this machine's own bit
-                    let car_tiny = seat_rec.map_or(self.cheat_bits & CHEAT_TINY != 0, |r| r.num(nfs_net::launchcar::id::TINYCAR).is_some_and(|v| v != 0));
-                    let (Ok(assets), Ok(sim)) = (
-                        CarAssets::load(&self.paths, &entry.model).map(|c| {
-                            let mut c = c.with_style(entry.variant).with_cabrio(entry.cabrio).with_style_overlay(swaps);
-                            c.tiny = car_tiny;
-                            c
-                        }),
-                        CarAssets::load_sim(&self.paths, &entry.sim),
-                    ) else {
-                        continue;
-                    };
-                    let mut paint = plan_liv.get(slot).copied().flatten().unwrap_or_else(|| Paint::matching(entry, *paint));
-                    // `.COLORCONFIG` (exterior, stripe 1, stripe 2, interior) and `.STRIPEPACKAGE`
-                    if let Some(rec) = seat_rec
-                        && let Some(cc) = rec.array(nfs_net::launchcar::id::COLORCONFIG).filter(|a| a.len() == 4)
-                    {
-                        let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
-                        paint = Paint { exterior: rgb(cc[0]), stripe1: rgb(cc[1]), stripe2: rgb(cc[2]), interior: rgb(cc[3]), package: rec.num(nfs_net::launchcar::id::STRIPEPACKAGE).unwrap_or(0) };
-                    }
-                    let mut assets = assets;
-                    // the plate is `.LICENSE` (0x13C, 0x4EEE7E); a `fe = 0` launch has the registry's
-                    // `car[k].license` (none in the shipped fe.txt: the empty `.bss` string), not the name
-                    let plate = if self.fe0 && seat_rec.is_none() && rec_plan.is_none() { self.registry.get(&format!("car[{}].license", slot + 1)).map_or("", str::trim) } else { name.as_str() };
-                    assets.page_text = Some(self.page_text(slot + 1, plate, Some(*decal)));
-                    // the draw stays (the seat order of the shared generator is the same), a remote
-                    // player's own `.DRIVER` (its profile picture, 0x4EEDBD) replaces the value
-                    let drawn = (driver_rand.next() & 7) as u32;
-                    let driver = seat_rec.and_then(|r| r.num(nfs_net::launchcar::id::DRIVER)).unwrap_or(drawn);
-                    assets.driver = nfs_assets::car::DriverSeat { driver, no_driver: false, factory_driver };
-                    let Ok(model) = CarModel::upload_with_env(
-                        renderer,
-                        &assets,
-                        &self.paths,
-                        1,
-                        paint,
-                        CarUpload {
-                            env: car_env,
-                            night: self.track.is_night(),
-                            // `.CABRIODOWN` 0x24B: 0 for every car but a player's (0x4EEF0C), whose own
-                            // machine sent `Car.Roof` through 0x4F1E40's predicate
-                            race_roof: Some(seat_rec.and_then(|r| r.num(nfs_net::launchcar::id::CABRIODOWN)).unwrap_or(0)),
-                            skidpad: self.skidpad_rule(),
-                        },
-                    ) else {
-                        continue;
-                    };
-                    let mut specs = CarSpecs::from_sim(
-                        &sim,
-                        entry.sim.to_lowercase().starts_with("gt") || entry.sim.starts_with("935"),
-                    );
-                    if car_tiny {
-                        specs.apply_tinycar();
-                    }
-                    // `CarSim_applyParts` 0x49CB50 on the opponent's installed list, whose grip ratio the
-                    // `.ais` loader then reads (0x49CAD7, `ai.md` §2.1). Which list: a remote player's
-                    // record (0x4EEDA0, kind 1) sends `.PARTINDEX` — its installed parts, used when they
-                    // are not the car's stock ones; a career opponent brings its own parts (`opp+0x04`);
-                    // every other FE car is `FECar::init`'s unconditional 0x4EE9A0 stock fit
-                    // (0x4EED28) — the record's stock parts, **folded** here since 0x49CB50 walks
-                    // `car+0x768` for every car of the race, whoever it belongs to.
-                    let seat_parts: Option<Vec<&nfs_formats::career::Part>> = seat_rec.and_then(|rec| {
-                        let ids: Vec<i16> = rec.parts().into_iter().map(|p| p as i16).collect();
-                        (!ids.is_empty() && ids != entry.stock_parts).then(|| ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect())
-                    });
-                    let fold_list: Vec<&nfs_formats::career::Part> = match (&seat_parts, parts.is_empty()) {
-                        (Some(o), _) => o.clone(),
-                        (None, false) => parts.iter().collect(),
-                        (None, true) => entry.stock_parts.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect(),
-                    };
-                    let block_before = (specs.grip, specs.transfer_div, specs.roll_gain, specs.top_speed);
-                    let grip_ratio = specs.apply_parts(&fold_list, &entry.sim_family);
-                    // the installed-part list `car+0x768`: the list just folded, at its carried state
-                    // (a career opponent's ids, else the record's stock ones — `specs.rs:49`, `stock_parts`)
-                    specs.parts = match (&seat_parts, parts.is_empty()) {
-                        (Some(o), _) => nfs_game::career::installed_parts(o, None),
-                        (None, false) => nfs_game::career::installed_parts(&parts.iter().collect::<Vec<_>>(), None),
-                        (None, true) => nfs_physics::specs::stock_parts(&entry.stock_parts, &parts_table),
-                    };
-                    // then the seventeen car-setup sliders (0x49CB50 folds them in after the parts,
-                    // 0x49D290): a remote player's own (`.CARSETUP` records), else the constructor's
-                    // neutral ones (0x4EED2D — every FECar carries them and 0x4EEDA0 streams them for
-                    // every kind, 0x4EF179…0x4EF32F). `carinfo+0xC` is `.TRANSMISSION` 0x221: the
-                    // record's, else the gearbox option (0x4EEDA0 writes it for every kind whose
-                    // `param_7` is 0 — the opponents' callers 0x4EBCBF / 0x4EBF06 / 0x4EC3FF and 0x4DE213 pass 0)
-                    let mut seat_setup = None;
-                    // (TEST GLUE `NFS_PA_FE0`: `fe.txt`'s `car[k].transmission`, absent = 0, manual)
-                    let automatic = seat_rec
-                        .and_then(|rec| rec.num(nfs_net::launchcar::id::TRANSMISSION))
-                        .map(|v| v == 1)
-                        .or_else(|| fe0.then(|| super::pa_trace::fe0_automatic(&self.paths.root, slot + 1)))
-                        .unwrap_or_else(|| self.option_automatic());
-                    // (TEST GLUE `NFS_PA_FE0`: the sliders of `fe.txt`'s `car[k].*`)
-                    let setup = seat_rec.and_then(|rec| rec.setup()).or_else(|| fe0.then(|| super::pa_trace::fe0_setup(&self.paths.root, slot + 1)));
-                    if let Some(setup) = setup {
-                        seat_setup = Some(setup);
-                    }
-                    specs.apply_setup(&setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
-                    tracing::info!(
-                        seat = slot, model = entry.model, parts = fold_list.len(), grip_ratio,
-                        grip_before = block_before.0, grip = specs.grip, transfer_div_before = block_before.1, transfer_div = specs.transfer_div,
-                        roll_gain_before = block_before.2, roll_gain = specs.roll_gain, top_speed_before = block_before.3, top_speed = specs.top_speed,
-                        "opponent's stock parts / own parts and set-up folded (0x49CB50)"
-                    );
-                    let (p, r, sl, grid_off) = grid_pose_with_offset(t, start_scene, g, n_cars, &grid_rule);
-                    let (linear, finish) = (self.linear_track(), nfs_game::race::finish_slice(t, start_scene));
-                    let mut vehicle = Vehicle::new(p, r, &specs, model.half_track, model.wheel_radius);
-                    vehicle.race_started = false;
-                    vehicle.traction_control = true; // AI cars never spin their wheels (Tyre 0x4A20D0)
-                    vehicle.ai_driven = true;
-                    // its own `carinfo+0xC` (0x4EEDA0's `.TRANSMISSION`: `Car.Transmission` — the opponents' callers pass 0
-                    // for the mission flag): the reset gear 0x49E228; AutoShift runs for an AI car either way (0x49E885)
-                    vehicle.automatic = automatic;
-                    // the remote car's `carinfo` options: `.TRACTION` 0x23B → `carinfo+0x20` (`Vehicle::tcs`),
-                    // `.TRANSMISSION` 0x221 → `+0xC`, `.ABS` 0x23A → `+0x24` (no field of the port's
-                    // vehicle: the ABS arm 0x4A2308 / 0x4A23CC is not ported, `physics.md` §5.4)
-                    if let Some(rec) = seat_rec {
-                        use nfs_net::launchcar::id as cid;
-                        vehicle.tcs = rec.num(cid::TRACTION).is_some_and(|v| v != 0);
-                        vehicle.automatic = rec.num(cid::TRANSMISSION).is_none_or(|v| v == 1);
-                        tracing::info!(
-                            seat = slot, abs = rec.num(cid::ABS), traction = rec.num(cid::TRACTION), roof = rec.num(cid::CABRIODOWN),
-                            transmission = rec.num(cid::TRANSMISSION), driver = rec.num(cid::DRIVER), body_style = rec.num(cid::BODYSTYLE),
-                            package = rec.num(cid::STRIPEPACKAGE), race_number = rec.num(cid::RACENUMBER).map(|v| v as i32),
-                            parts = ?rec.parts(), setup = ?seat_setup.map(|s| s.map(|v| (v * 100.0).round() / 100.0)),
-                            "network race setup: the remote car carries its owner's carinfo (0x4EEDA0 kind 1)"
-                        );
-                    }
-                    // the body `RCar::load` builds: 0x445090's model box, `BndP` less `car+0x3AC`
-                    let (pts, half) = nfs_game::world::car_body(&assets, car_tiny);
-                    vehicle.set_car_body(pts, half);
-                    // `Car_raceInit` 0x410730: `Grid_slot` 0x410580's slice and offset into
-                    // `Car_placeAtSlice` 0x49B090 (0x41095C) — run in `start_race`, after the human's:
-                    // `Cars_resetAll` 0x4110A0 resets the racers in registration order, and the
-                    // placement's two `Susp_update`s draw their roughness from the shared word
-                    opp_places.push((self.road.opponents.len(), sl, p, grid_off));
-                    let mut model = model;
-                    if car_tiny {
-                        model.scale = 0.4;
-                    }
-                    // its dash needles' calibration (0x4EF331…0x4EF37B, per car)
-                    let dash = seat_rec
-                        .and_then(|r| {
-                            use nfs_net::launchcar::id as cid;
-                            Some([r.num(cid::TACH0RPM)?, r.num(cid::TACH1000RPM)?, r.num(cid::SPEEDO0KM)?, r.num(cid::SPEEDO100KM)?].map(f32::from_bits))
-                        })
-                        .unwrap_or(entry.dash);
-                    model.set_dash(dash[0], dash[1], dash[2], dash[3]);
-                    self.road.opponent_models.push(model);
-                    // 0x49CA30: the `.ais` of the car-info record's `.AISPECNAME`, the catalogue family
-                    let controller = match CarAssets::load_ais(&self.paths, &entry.sim_family) {
-                        Ok(ais) => {
-                            let mut d = nfs_game::ai::AiDriver::new(ais, &sim.unknown_tail);
-                            d.grip_ratio = grip_ratio;
-                            // the family key `nfs5.car` +0x115 the steering table is keyed on
-                            d.set_track(&self.track.name, self.backwards, &entry.sim_family);
-                            if let Some((difficulty, pairs)) = skill {
-                                d.set_skill(*difficulty, *pairs);
-                            }
-                            Controller::Ai(Box::new(d))
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, model = entry.model, "no .ais: opponent parked");
-                            Controller::Parked
-                        }
-                    };
-                    self.road.opponent_sets.push(entry.sound_set.clone());
-                    self.road.opponent_paints.push(paint.exterior);
-                    self.road.opponent_families.push(entry.family.clone());
-                    self.road.opponents.push(RaceCar {
-                        name: name.clone(),
-                        vehicle,
-                        specs,
-                        progress: {
-                            let mut p = RaceProgress::new(sl, t);
-                            if linear {
-                                p.set_linear(t, finish);
-                            }
-                            p
-                        },
-                        controller,
-                        grid_pos: g,
-                        model: self.road.opponent_models.len() - 1,
-                        wall_hits: 0,
-                        resets: 0,
-                        eliminated: false,
-                        // `Car_init` 0x410C74: the night flag
-                        lamp_bits: if self.track.is_night() { 3 } else { 0 },
-                        tiny: car_tiny,
-                    });
-                }
+                let start = nfs_game::race::start_slice(t, start_scene, grid_rule.linear);
+                self.race_stage_opponents(renderer, driver_rand, GridCtx { t, start, grid_rule, n_cars, catalog: &catalog, fe0, plan_pers: &plan_pers, car_env, factory_driver }, OpponentPlan { plan: &plan, plan_liv: &plan_liv, seat_recs: &seat_recs, rec_parts: rec_parts.as_deref(), rec_plan_none: rec_plan.is_none(), parts_table: &parts_table }, &mut opp_places);
                 // network play: every opponent seat belongs to a remote player. Their cars sit on
                 // the grid until the first 0xBE arrives and are driven by it afterwards, so their
                 // controllers never run.
@@ -678,412 +502,8 @@ impl App {
                     }
                     tracing::info!(seats = self.road.opponents.len(), "network replay: the seats' cars are fed from the stream");
                 }
-                // traffic (`traffic.md` §1, §8, §9): the track's seven traffic car ids are
-                // `nfs5.trk +0x7C`; their `nfs5.car` records carry only a display name, a model and a
-                // sound set (`Sbus`/`Tbus` mark the buses, which respawn five times less often).
-                // Which of the race's car slots take which id is not in the notes (§8, UNKNOWN), so
-                // the ids are handed out in table order and cycled when more cars than ids are asked
-                // for (the heavy career setting wants eight).
-                // the host's per-slot colours are for this launch only (set by `net_race_apply`)
-                let net_colours = std::mem::take(&mut self.road.traffic_colours);
-                self.road.traffic = None;
-                self.road.traffic_models.clear();
-                self.road.traffic_sets.clear();
-                self.road.traffic_paints.clear();
-                self.road.traffic_prev.clear();
-                // **Nine cars at most.** 0x4ED382…0x4ED399 add cops, players, opponents and traffic
-                // and, when that exceeds 9, cut the traffic to `9 − players − opponents − cops` —
-                // so a full grid of eight leaves room for one traffic car, and with the four cops
-                // of a cops race none; a police mission's two count likewise.
-                let cops: u32 = if self.road.cops_enabled { self.road.cop_count } else { 0 };
-                let room = 9u32.saturating_sub(1 + self.num_opponents + cops);
-                let traffic_count = self.road.traffic_count.min(room);
-                if traffic_count > 0 {
-                    let trk = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.trk"))
-                        .ok()
-                        .and_then(|d| nfs_formats::career::parse_track_table(&d).ok())
-                        .unwrap_or_default();
-                    let ids: Vec<u16> = match &self.road.traffic_ids {
-                        Some(v) => v.clone(),
-                        None => trk
-                            .iter()
-                            .find(|r| r.file.eq_ignore_ascii_case(&self.track.name))
-                            .map(|r| r.traffic_cars.iter().copied().filter(|i| *i != 0).collect())
-                            .unwrap_or_default(),
-                    };
-                    let mut plan: Vec<TrafficSpec> = Vec::new();
-                    // id -> the *first* car's slot of that catalogue id (the template every repeat
-                    // instantiates its own damage resources from, `car-model.md` §13.1)
-                    let mut template_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
-                    // per model slot: half the LOD-1 box 0x445090 takes for traffic, and the
-                    // `BndP` body points `RCar::load` builds (`car_body`) for its `RigidBody`
-                    let mut boxes: Vec<Vec3> = Vec::new();
-                    let mut points: Vec<Vec<Vec3>> = Vec::new();
-                    // each traffic car's own block: `default.sim` (its sim name is empty, §21.1) with
-                    // its record's stock parts (0x4EE9A0) and the neutral sliders (0x4EED2D) folded in
-                    // by 0x49CB50 — a traffic car is a racer slot below `NUMCARS`, so 0x411130 builds
-                    // its parts (0x49C4C0) and 0x410D60 its block (0x49C6C0 → 0x49CB50) like any car's
-                    let traffic_parts_table = self.fe_parts_table();
-                    let traffic_automatic = self.option_automatic();
-                    let traffic_sim = CarAssets::load_sim(&self.paths, "default").ok();
-                    let mut traffic_car_specs: Vec<CarSpecs> = Vec::new();
-                    for k in 0..traffic_count as usize {
-                        let Some(id) = ids.get(k % ids.len().max(1)).copied() else {
-                            break;
-                        };
-                        let Some(entry) = catalog.iter().find(|c| c.id == id) else {
-                            continue;
-                        };
-                        let bus = entry.sound_set.eq_ignore_ascii_case("sbus")
-                            || entry.sound_set.eq_ignore_ascii_case("tbus");
-                        let slot: usize = match template_slot.get(&id) {
-                            // a repeat of a shared catalogue model: this car's own crush meshes
-                            // and decal-page materials, a cheap clone of the template's GPU ids —
-                            // everything else (body/wheel/light geometry) stays shared with it
-                            Some(&t) => {
-                                let inst = self.road.traffic_models[t].instantiate(renderer);
-                                self.road.traffic_models.push(inst);
-                                boxes.push(boxes[t]);
-                                points.push(points[t].clone());
-                                self.road.traffic_models.len() - 1
-                            }
-                            None => {
-                                let assets = match CarAssets::load(&self.paths, &entry.model) {
-                                    Ok(a) => a,
-                                    Err(e) => {
-                                        tracing::warn!(id, model = entry.model, error = %e, "traffic car assets missing");
-                                        continue;
-                                    }
-                                };
-                                let paint = match net_colours.get(k).copied().flatten() {
-                                    // the host's `.COLOUR` for this slot, where it differs (network race)
-                                    Some(c) => Paint::from(c),
-                                    None if entry.paint_sets.is_empty() => Paint::from([0x8C, 0x8C, 0x90]),
-                                    None => Paint::from_catalogue(entry, 0),
-                                };
-                                // a traffic car (`car+0x52C & 0x10`) has no driver: slot 9 = 0 (0x43AED4)
-                                let mut assets = assets;
-                                assets.driver = nfs_assets::car::DriverSeat { driver: 0, no_driver: true, factory_driver };
-                                let model = match CarModel::upload_with_env(
-                                    renderer,
-                                    &assets,
-                                    &self.paths,
-                                    1,
-                                    paint,
-                                    CarUpload { env: car_env, night: self.track.is_night(), race_roof: Some(0), skidpad: self.skidpad_rule() },
-                                ) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        tracing::warn!(id, model = entry.model, error = %e, "traffic car upload failed");
-                                        continue;
-                                    }
-                                };
-                                self.road.traffic_models.push(model);
-                                // 0x445090: a traffic car (`car+0x52C & 0x10`, 0x4450CC) takes the
-                                // box of `[this+0xB0][0]`, LOD 1, origin included (0x43DE90)
-                                // the `BndP` points are lowered by that same `car+0x3AC` (0x4421BE,
-                                // `traffic_body`) — not by LOD 5's, which a traffic model lacks: they
-                                // sat at the origin's own height and the car stood `half.y` too low
-                                let (pts, half) = nfs_game::world::traffic_body(&assets);
-                                boxes.push(half);
-                                points.push(pts);
-                                let slot = self.road.traffic_models.len() - 1;
-                                template_slot.insert(id, slot);
-                                slot
-                            }
-                        };
-                        // the collision box is half the model's LOD-1 box (`traffic.md` §21.4,
-                        // `car-model.md` §12) — `car+0x3AC` is also how far the body origin sits
-                        // above the model's ground (`TrafficCar::draw_origin`)
-                        self.road.traffic_sets.push(entry.sound_set.clone());
-                        self.road.traffic_paints.push(net_colours.get(k).copied().flatten().unwrap_or_else(|| {
-                            entry.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x8C, 0x8C, 0x90])
-                        }));
-                        plan.push(TrafficSpec {
-                            model: slot,
-                            bus,
-                            half_extents: boxes[slot],
-                        });
-                        if let Some(sim) = &traffic_sim {
-                            // (`.TINYCAR` is on every car but traffic — `CarSpecs::apply_tinycar`)
-                            let mut cs = CarSpecs::from_sim(sim, false);
-                            // (TEST GLUE `NFS_PA_FE0`: an `fe = 0` race's traffic slot is a racer slot whose
-                            // record holds `fe.txt`'s `car[k].*` sliders — live, slot 2's `specs[0xF4]` came out
-                            // 1.963333 = 1.9 · (35/30 · 2 + 8) · 0.1, its 35 psi tyres; `k` = 1 + the opponents
-                            // + this car's index, the slot `TrafficSet::slot_base` gives it)
-                            let fe0_slot = 1 + self.num_opponents as usize + traffic_car_specs.len();
-                            let setup = if fe0 { super::pa_trace::fe0_setup(&self.paths.root, fe0_slot) } else { nfs_game::career::CAR_SETUP_DEFAULT };
-                            nfs_game::career::fold_fresh_car_with(&mut cs, &entry.stock_parts, &traffic_parts_table, &entry.sim_family, &setup, traffic_automatic);
-                            traffic_car_specs.push(cs);
-                        }
-                    }
-                    if self.road.traffic_specs.is_none() {
-                        self.road.traffic_specs = traffic_sim.as_ref().map(|sim| {
-                            let mut cs = CarSpecs::from_sim(sim, false);
-                            nfs_game::career::fold_fresh_car(&mut cs, &[], &traffic_parts_table, "", traffic_automatic);
-                            cs
-                        });
-                    }
-                    if !plan.is_empty() {
-                        // the table is already reversed for a backwards race, so the route direction
-                        // is always +1 here; `linear` = a point-to-point track (`LINEAR_TRACK`)
-                        let linear = !self
-                            .records
-                            .track(&self.track.name)
-                            .map(|r| r.circuit)
-                            .unwrap_or(false);
-                        // `NFS_TRAFFIC_SEED` makes a run repeatable (the original seeds from the clock)
-                        let seed = self.traffic_seed;
-                        let mut set = TrafficSet::new(&plan, t, 1.0, linear, seed);
-                        // `RigidBody_init` 0x49B510 for each car with `default.sim` (§21.1)
-                        let specs = self.road.traffic_specs.clone().unwrap_or_else(|| self.specs.clone());
-                        set.set_bodies_each(&traffic_car_specs, &specs, &points);
-                        for b in &mut set.bodies {
-                            b.automatic = traffic_automatic; // its own `carinfo+0xC` (0x4ED460 / 0x4ED56E pass 0)
-                        }
-                        set.cops_race = self.road.cops_race;
-                        // the racer slots' `.PERSONALITY` (0x65808C + 0x580·i + 0x14C): slot 0 the human, then
-                        // the opponents' — a traffic car's registration index lies past them, where the
-                        // original reads what the array last held (`TrafficSet::slot_personalities`)
-                        set.slot_personalities = std::iter::once(0).chain(plan_pers.iter().map(|&p| i32::from(p))).collect();
-                        if fe0 {
-                            set.slot_personalities = super::pa_trace::fe0_slot_personalities(&self.paths.root);
-                        }
-                        // `TRACK_NAME` for the spawn gate's canyon / industrial windows (0x40E0AD)
-                        set.set_track(&self.track.name);
-                        // `[0x5E8BF8]` for the §5.2 rule 3 early-race boost
-                        set.opponents = self.num_opponents;
-                        // The ×0.9 is gated on `[0x657A24]`, which the option registry names
-                        // **`WEATHER`** (id 0x1E at 0x5D1F90) — not the track's night flag (the
-                        // port used to pass the night flag here; corrected 2026-09-21). It is not
-                        // `registry.u32("weather")` either: the race load's 0x414DB0 stores 0 into
-                        // it (0x414DF9) after the track load's spec-index read and before any
-                        // in-race reader, so a race always sees 0 (`traffic.md` §33.4).
-                        set.weather = false;
-                        // `[0x657A30]`, the registry's `TIME` (the time-of-day slot: `traffic.md`
-                        // §33.3) gates the human-honk trigger (0x40172E). Only `fe.txt` sets it —
-                        // no race-setup message carries id 0x21 and the track spec `Tr00.bin` that
-                        // 0x475C80 would overwrite it from is not shipped
-                        set.time_mode = self.net_launch.fe_txt.get("time").copied().unwrap_or_else(|| self.registry.u32("time", 0)) != 0;
-                        // `scripts.bin` drives the reactions of `traffic.md` §12.3 / §12.9 / §30
-                        if let Some(p) = GamePaths::find_file(
-                            &self.paths.game_data().join("Simulation").join("AI"),
-                            "scripts.bin",
-                        ) && let Ok(d) = std::fs::read(&p)
-                        {
-                            match nfs_formats::scripts::Scripts::parse(&d) {
-                                Ok(sc) => set.scripts = sc,
-                                Err(e) => tracing::warn!(error = %e, "scripts.bin unreadable"),
-                            }
-                        }
-                        // `Cars_resetAll`'s placement of the traffic slots (`Grid_slot` 0x410580): the start slice
-                        // the human's grid uses, the racers `[0x5E8AE8]`, each slot's `.STARTINGPOS` — what a
-                        // slot 0x4ECF00 never wrote holds: 0 (a fresh process; an `fe = 0` race reads `fe.txt`)
-                        let first_slot = 1 + self.num_opponents as usize + cops as usize;
-                        let startingpos: Vec<i32> = (0..plan.len()).map(|k| if fe0 { super::pa_trace::fe0_startingpos(&self.paths.root, first_slot + k) } else { 0 }).collect();
-                        set.grid_init = Some(nfs_game::race::GridInit { start: nfs_game::race::start_slice(t, start_scene, grid_rule.linear), n: n_cars, rule: grid_rule, startingpos });
-                        self.road.traffic = Some(set);
-                        for sp in &plan {
-                            tracing::debug!(model = sp.model, bus = sp.bus, half = ?sp.half_extents, mass = sp.mass(), "traffic body");
-                        }
-                        tracing::info!(
-                            cars = plan.len(),
-                            models = self.road.traffic_models.len(),
-                            linear,
-                            "traffic placed"
-                        );
-                    }
-                }
-                // police (`traffic.md` §17.1, §25): the track's five cop car ids are `nfs5.trk +0x8A`
-                // and the spawn points `GameData/Track/Cops/<track>.cop`; a single race gets four cars.
-                self.road.police = None;
-                self.road.police_models.clear();
-                self.road.police_sets.clear();
-                self.road.police_specs.clear();
-                self.road.police_prev.clear();
-                self.road.human_ed = Default::default();
-                // TEST GLUE `NFS_PA_FE0` (`pa_trace.rs`): an `fe = 0` race's cops are the racer slots whose
-                // `car[k].class` is `cop`; the `cops` key sets `COPS` [0x657414]
-                let fe0_cops: Vec<(usize, String)> = if fe0 { super::pa_trace::fe0_cops(&self.paths.root) } else { Vec::new() };
-                if fe0 {
-                    self.road.cops_enabled = !fe0_cops.is_empty() && nfs_formats::fetxt::Registry::load(&self.paths.root).u32("cops", 0) != 0;
-                    self.road.cop_count = fe0_cops.len() as u32;
-                }
-                if self.road.cops_enabled {
-                    let trk = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.trk"))
-                        .ok()
-                        .and_then(|d| nfs_formats::career::parse_track_table(&d).ok())
-                        .unwrap_or_default();
-                    let ids: Vec<u16> = trk
-                        .iter()
-                        .find(|r| r.file.eq_ignore_ascii_case(&self.track.name))
-                        .map(|r| r.police_cars.iter().copied().filter(|i| *i != 0).collect())
-                        .unwrap_or_default();
-                    let cop_file = GamePaths::find_file(
-                        &self.paths.game_data().join("Track").join("Cops"),
-                        &format!("{}.cop", self.track.name),
-                    )
-                    .and_then(|p| std::fs::read(p).ok())
-                    .and_then(|d| {
-                        nfs_formats::cop::CopFile::parse(&d)
-                            .map_err(|e| tracing::warn!(error = %e, "cop file unreadable"))
-                            .ok()
-                    });
-                    if let Some(file) = cop_file
-                        && !ids.is_empty()
-                    {
-                        let mut cars = Vec::new();
-                        // (id, driver) -> the *first* cop's slot of that combination (the
-                        // template every repeat instantiates its own damage resources from,
-                        // `car-model.md` §13.1)
-                        let mut template_slot: std::collections::HashMap<(u16, u32), usize> = std::collections::HashMap::new();
-                        // per model slot: half the LOD-5 box 0x445090 takes for a cop
-                        let mut boxes: Vec<Vec3> = Vec::new();
-                        let mut probe_sets: Vec<Vec<Vec3>> = Vec::new();
-                        for k in 0..self.road.cop_count as usize {
-                            let mut id = ids[k % ids.len()];
-                            if let Some((_, model)) = fe0_cops.get(k)
-                                && let Some(c) = catalog.iter().find(|c| c.model.eq_ignore_ascii_case(model))
-                            {
-                                id = c.id;
-                            }
-                            // a cop's `.DRIVER`: 0x4ED0BC / 0x4ED1A5 launch each cop car through
-                            // 0x4EEDA0 (kind 8, 0x4ED174 / 0x4ED25E), so every cop record draws
-                            // its own `rand() & 7` (0x4EEDAC), cop 0 first, right after the
-                            // opponents' — made before the model is looked up, as the original
-                            // calls 0x4EEDA0 whatever 0x4F43A0 returned. Cops that share a model
-                            // share it only when they drew the same driver
-                            let driver = (driver_rand.next() & 7) as u32;
-                            let Some(entry) = catalog.iter().find(|c| c.id == id) else {
-                                continue;
-                            };
-                            let entry_993 = self.cheat_993(entry.clone());
-                            let entry = &entry_993;
-                            let slot = match template_slot.get(&(id, driver)) {
-                                // a repeat (id, driver): this cop's own crush meshes and
-                                // decal-page materials, a cheap clone of the template's GPU ids
-                                Some(&t) => {
-                                    let inst = self.road.police_models[t].instantiate(renderer);
-                                    self.road.police_models.push(inst);
-                                    boxes.push(boxes[t]);
-                                    probe_sets.push(probe_sets[t].clone());
-                                    self.road.police_models.len() - 1
-                                }
-                                None => {
-                                    let Ok(assets) = CarAssets::load(&self.paths, &entry.model)
-                                    else {
-                                        continue;
-                                    };
-                                    let paint = if entry.paint_sets.is_empty() { Paint::from([0xE0, 0xE0, 0xE0]) } else { Paint::from_catalogue(entry, 0) };
-                                    let mut assets = assets;
-                                    assets.driver = nfs_assets::car::DriverSeat { driver, no_driver: false, factory_driver };
-                                    let Ok(model) = CarModel::upload_with_env(
-                                        renderer,
-                                        &assets,
-                                        &self.paths,
-                                        1,
-                                        paint,
-                                        CarUpload { env: car_env, night: self.track.is_night(), race_roof: Some(0), skidpad: self.skidpad_rule() },
-                                    ) else {
-                                        continue;
-                                    };
-                                    let mut model = model;
-                                    if self.cheat_bits & CHEAT_TINY != 0 {
-                                        model.scale = 0.4;
-                                    }
-                                    self.road.police_models.push(model);
-                                    // 0x445090: a cop (`car+0x52C` 0x22 / 0x62, bit 0x10 clear at
-                                    // 0x4450D2) takes `[this+0xB0][4]`, LOD 5, as a racer does;
-                                    // `× 0.4` for `.TINYCAR` (0x445140)
-                                    let (points, half) = nfs_game::world::car_body(&assets, self.cheat_bits & CHEAT_TINY != 0);
-                                    boxes.push(half);
-                                    // the body points, the first four being `Susp_update`'s
-                                    // wheel probes (0x499AD4, `CopCar::probes`)
-                                    probe_sets.push(points);
-                                    let slot = self.road.police_models.len() - 1;
-                                    template_slot.insert((id, driver), slot);
-                                    slot
-                                }
-                            };
-                            // `car+0x3A8…`: also how far the body origin sits above the model's
-                            // ground (`CopCar::draw_origin`)
-                            let half = boxes[slot];
-                            // a cop car has a real `.sim` (§17.1), so its mass is the sim's
-                            // …folded by 0x49CB50 like every racer's: the record's stock parts (0x4EE9A0) and
-                            // the neutral sliders (0x4EED2D), `.TRANSMISSION` the gearbox option (0x4ED174's
-                            // `param_7` is 0)
-                            let cop_automatic = self.option_automatic();
-                            let cop_parts_table = self.fe_parts_table();
-                            let specs = CarAssets::load_sim(&self.paths, &entry.sim)
-                                .ok()
-                                .map(|s| {
-                                    let mut cs = CarSpecs::from_sim(&s, false);
-                                    // (TEST GLUE `NFS_PA_FE0`: the cop's racer slot holds `fe.txt`'s `car[k].*` sliders)
-                                    let setup = match fe0_cops.get(k) {
-                                        Some(&(slot, _)) => super::pa_trace::fe0_setup(&self.paths.root, slot),
-                                        None => nfs_game::career::CAR_SETUP_DEFAULT,
-                                    };
-                                    nfs_game::career::fold_fresh_car_with(&mut cs, &entry.stock_parts, &cop_parts_table, &entry.sim_family, &setup, cop_automatic);
-                                    cs
-                                })
-                                .unwrap_or_else(|| self.specs.clone());
-                            self.road.police_sets.push(entry.sound_set.clone());
-                            self.road.police_specs.push(specs.clone());
-                            // §17.2: the cop's chase level is the heat record's `level[role]`, not
-                            // the race skill — role 0 is always level 2
-                            let mut cop = nfs_game::police::CopCar::new(
-                                slot,
-                                half,
-                                &specs,
-                                nfs_game::police::COP_LEVEL[0],
-                            );
-                            // the body `RCar::load` builds: the `BndP` points less `car+0x3AC`, the
-                            // first four being `Susp_update`'s probes (0x499AD4)
-                            if let Some(p) = probe_sets.get(slot).filter(|p| p.len() >= 4) {
-                                cop.set_body(p.clone(), half);
-                            }
-                            cop.body.automatic = cop_automatic; // its own `carinfo+0xC` (0x4ED174 / 0x4ED25E pass 0)
-                            cop.body.tiny = self.cheat_bits & CHEAT_TINY != 0;
-                            // `DERBY` `[0x657400]`, which only the Smash Up code sets (cheat bit 7): `Damage` takes ×1.5, not ×0.5 (0x49452F)
-                            cop.body.derby = self.cheat_bits & CHEAT_DERBY != 0;
-                            cop.body.rally = self.cheat_bits & CHEAT_RALLY != 0;
-                            cars.push(cop);
-                        }
-                        if !cars.is_empty() {
-                            let one_way = nfs_game::police::one_way_road(t);
-                            tracing::info!(
-                                cars = cars.len(),
-                                models = self.road.police_models.len(),
-                                points = file.records.len(),
-                                "police on duty"
-                            );
-                            let mut pol =
-                                nfs_game::police::Police::new(file, cars, self.race_skill, one_way);
-                            // the same `WEATHER` the traffic set gets — `[0x657A24]`, which the
-                            // race load zeroes (0x414DF9, `traffic.md` §33.4), and 0x4081B0 scales
-                            // every AI car's rate by it
-                            pol.weather = false;
-                            pol.budget = nfs_game::police::duty_budget(
-                                1 + self.num_opponents as usize,
-                                false,
-                            );
-                            // `Cars_resetAll`'s placement of the cop slots (right after the racers): see
-                            // `Police::place_at_race_init`; `.STARTINGPOS` of a cop slot = `fe.txt`'s key in an `fe = 0` race
-                            // (TEST GLUE), else what 0x4ECF00 left (0)
-                            let startingpos: Vec<i32> = (0..pol.cars.len()).map(|k| if fe0 { fe0_cops.get(k).map_or(0, |&(slot, _)| super::pa_trace::fe0_startingpos(&self.paths.root, slot)) } else { 0 }).collect();
-                            pol.grid_init = Some(nfs_game::race::GridInit { start: nfs_game::race::start_slice(t, start_scene, grid_rule.linear), n: n_cars, rule: grid_rule, startingpos });
-                            pol.linear = grid_rule.linear;
-                            pol.slot_base = 1 + self.num_opponents as usize;
-                            pol.slot_personalities = if fe0 {
-                                super::pa_trace::fe0_slot_personalities(&self.paths.root)
-                            } else {
-                                std::iter::once(0).chain(plan_pers.iter().map(|&p| i32::from(p))).collect()
-                            };
-                            pol.traffic_count = self.road.traffic.as_ref().map_or(0, |s| s.cars.len());
-                            self.road.police = Some(pol);
-                        }
-                    }
-                }
+                self.race_stage_traffic(renderer, GridCtx { t, start, grid_rule, n_cars, catalog: &catalog, fe0, plan_pers: &plan_pers, car_env, factory_driver });
+                self.race_stage_police(renderer, driver_rand, GridCtx { t, start, grid_rule, n_cars, catalog: &catalog, fe0, plan_pers: &plan_pers, car_env, factory_driver });
                 self.racing_line = self.track.racing_line(&self.paths, self.backwards);
                 tracing::info!(
                     opponents = self.road.opponents.len(),
@@ -1098,6 +518,644 @@ impl App {
             }
         };
         (table, rot, grid_place, opp_places)
+    }
+
+    /// Stage "cars", the opponents: one car per grid slot of the plan (assets, paint, parts and set-up folded, the vehicle on its grid slice,
+    /// the AI driver) — the loop of `race_stage_grid` between the seat records and the network seats, moved out whole.
+    fn race_stage_opponents(&mut self, renderer: &mut Renderer, driver_rand: &mut nfs_game::movie_overlay::CRand, g: GridCtx<'_>, o: OpponentPlan<'_>, opp_places: &mut Vec<(usize, usize, Vec3, Vec3)>) {
+        let GridCtx { t, grid_rule, n_cars, fe0, car_env, factory_driver, .. } = g;
+        let OpponentPlan { plan, plan_liv, seat_recs, rec_parts, rec_plan_none, parts_table } = o;
+        let start_scene = if self.backwards {
+            self.track.start_backward.as_ref().or(self.track.start_forward.as_ref())
+        } else {
+            self.track.start_forward.as_ref()
+        };
+        for (g, (entry, paint, name, skill, grid, decal)) in plan.iter().enumerate() {
+            // the opponent record's parts (0x4ED880), for a career opponent
+            let parts: Vec<nfs_formats::career::Part> = match &rec_parts {
+                Some(l) => l.get(g).cloned().unwrap_or_default(),
+                None => self.career_opponents.as_ref().and_then(|l| l.get(g)).map(|o| o.parts.clone()).unwrap_or_default(),
+            };
+            let swaps: Vec<[i16; 3]> = parts.iter().flat_map(|p| p.geometry_swaps.iter().copied()).collect();
+            // opponent slot `g + 1` → `STARTINGPOS = n − (g + 1)` (0x4ECF00) unless the
+            // career set one (knockout 0x4DE150, tournament ranks 0x503660)
+            let slot = g;
+            let g = grid.unwrap_or((n_cars - 1).saturating_sub(g as u32 + 1));
+            // a remote player's car is what its own machine sent (`.SPECNAME` already holds the
+            // sender's `evenstvn` code): this machine's cheat bits are not applied to it
+            let seat_rec = seat_recs.get(slot).and_then(|r| r.as_ref());
+            let entry_993 = if seat_rec.is_some() { entry.clone() } else { self.cheat_993(entry.clone()) };
+            let entry = &entry_993;
+            // `.TINYCAR` 0x24F is per car: a remote player's car is tiny when *its* record says so (its own
+            // machine's Gulliver code, sent only when set), every other car by this machine's own bit
+            let car_tiny = seat_rec.map_or(self.cheat_bits & CHEAT_TINY != 0, |r| r.num(nfs_net::launchcar::id::TINYCAR).is_some_and(|v| v != 0));
+            let (Ok(assets), Ok(sim)) = (
+                CarAssets::load(&self.paths, &entry.model).map(|c| {
+                    let mut c = c.with_style(entry.variant).with_cabrio(entry.cabrio).with_style_overlay(swaps);
+                    c.tiny = car_tiny;
+                    c
+                }),
+                CarAssets::load_sim(&self.paths, &entry.sim),
+            ) else {
+                continue;
+            };
+            let mut paint = plan_liv.get(slot).copied().flatten().unwrap_or_else(|| Paint::matching(entry, *paint));
+            // `.COLORCONFIG` (exterior, stripe 1, stripe 2, interior) and `.STRIPEPACKAGE`
+            if let Some(rec) = seat_rec
+                && let Some(cc) = rec.array(nfs_net::launchcar::id::COLORCONFIG).filter(|a| a.len() == 4)
+            {
+                let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+                paint = Paint { exterior: rgb(cc[0]), stripe1: rgb(cc[1]), stripe2: rgb(cc[2]), interior: rgb(cc[3]), package: rec.num(nfs_net::launchcar::id::STRIPEPACKAGE).unwrap_or(0) };
+            }
+            let mut assets = assets;
+            // the plate is `.LICENSE` (0x13C, 0x4EEE7E); a `fe = 0` launch has the registry's
+            // `car[k].license` (none in the shipped fe.txt: the empty `.bss` string), not the name
+            let plate = if self.fe0 && seat_rec.is_none() && rec_plan_none { self.registry.get(&format!("car[{}].license", slot + 1)).map_or("", str::trim) } else { name.as_str() };
+            assets.page_text = Some(self.page_text(slot + 1, plate, Some(*decal)));
+            // the draw stays (the seat order of the shared generator is the same), a remote
+            // player's own `.DRIVER` (its profile picture, 0x4EEDBD) replaces the value
+            let drawn = (driver_rand.next() & 7) as u32;
+            let driver = seat_rec.and_then(|r| r.num(nfs_net::launchcar::id::DRIVER)).unwrap_or(drawn);
+            assets.driver = nfs_assets::car::DriverSeat { driver, no_driver: false, factory_driver };
+            let Ok(model) = CarModel::upload_with_env(
+                renderer,
+                &assets,
+                &self.paths,
+                1,
+                paint,
+                CarUpload {
+                    env: car_env,
+                    night: self.track.is_night(),
+                    // `.CABRIODOWN` 0x24B: 0 for every car but a player's (0x4EEF0C), whose own
+                    // machine sent `Car.Roof` through 0x4F1E40's predicate
+                    race_roof: Some(seat_rec.and_then(|r| r.num(nfs_net::launchcar::id::CABRIODOWN)).unwrap_or(0)),
+                    skidpad: self.skidpad_rule(),
+                },
+            ) else {
+                continue;
+            };
+            let mut specs = CarSpecs::from_sim(
+                &sim,
+                entry.sim.to_lowercase().starts_with("gt") || entry.sim.starts_with("935"),
+            );
+            if car_tiny {
+                specs.apply_tinycar();
+            }
+            // `CarSim_applyParts` 0x49CB50 on the opponent's installed list, whose grip ratio the
+            // `.ais` loader then reads (0x49CAD7, `ai.md` §2.1). Which list: a remote player's
+            // record (0x4EEDA0, kind 1) sends `.PARTINDEX` — its installed parts, used when they
+            // are not the car's stock ones; a career opponent brings its own parts (`opp+0x04`);
+            // every other FE car is `FECar::init`'s unconditional 0x4EE9A0 stock fit
+            // (0x4EED28) — the record's stock parts, **folded** here since 0x49CB50 walks
+            // `car+0x768` for every car of the race, whoever it belongs to.
+            let seat_parts: Option<Vec<&nfs_formats::career::Part>> = seat_rec.and_then(|rec| {
+                let ids: Vec<i16> = rec.parts().into_iter().map(|p| p as i16).collect();
+                (!ids.is_empty() && ids != entry.stock_parts).then(|| ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect())
+            });
+            let fold_list: Vec<&nfs_formats::career::Part> = match (&seat_parts, parts.is_empty()) {
+                (Some(o), _) => o.clone(),
+                (None, false) => parts.iter().collect(),
+                (None, true) => entry.stock_parts.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect(),
+            };
+            let block_before = (specs.grip, specs.transfer_div, specs.roll_gain, specs.top_speed);
+            let grip_ratio = specs.apply_parts(&fold_list, &entry.sim_family);
+            // the installed-part list `car+0x768`: the list just folded, at its carried state
+            // (a career opponent's ids, else the record's stock ones — `specs.rs:49`, `stock_parts`)
+            specs.parts = match (&seat_parts, parts.is_empty()) {
+                (Some(o), _) => nfs_game::career::installed_parts(o, None),
+                (None, false) => nfs_game::career::installed_parts(&parts.iter().collect::<Vec<_>>(), None),
+                (None, true) => nfs_physics::specs::stock_parts(&entry.stock_parts, parts_table),
+            };
+            // then the seventeen car-setup sliders (0x49CB50 folds them in after the parts,
+            // 0x49D290): a remote player's own (`.CARSETUP` records), else the constructor's
+            // neutral ones (0x4EED2D — every FECar carries them and 0x4EEDA0 streams them for
+            // every kind, 0x4EF179…0x4EF32F). `carinfo+0xC` is `.TRANSMISSION` 0x221: the
+            // record's, else the gearbox option (0x4EEDA0 writes it for every kind whose
+            // `param_7` is 0 — the opponents' callers 0x4EBCBF / 0x4EBF06 / 0x4EC3FF and 0x4DE213 pass 0)
+            let mut seat_setup = None;
+            // (TEST GLUE `NFS_PA_FE0`: `fe.txt`'s `car[k].transmission`, absent = 0, manual)
+            let automatic = seat_rec
+                .and_then(|rec| rec.num(nfs_net::launchcar::id::TRANSMISSION))
+                .map(|v| v == 1)
+                .or_else(|| fe0.then(|| super::glue::pa_trace::fe0_automatic(&self.paths.root, slot + 1)))
+                .unwrap_or_else(|| self.option_automatic());
+            // (TEST GLUE `NFS_PA_FE0`: the sliders of `fe.txt`'s `car[k].*`)
+            let setup = seat_rec.and_then(|rec| rec.setup()).or_else(|| fe0.then(|| super::glue::pa_trace::fe0_setup(&self.paths.root, slot + 1)));
+            if let Some(setup) = setup {
+                seat_setup = Some(setup);
+            }
+            specs.apply_setup(&setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
+            tracing::info!(
+                seat = slot, model = entry.model, parts = fold_list.len(), grip_ratio,
+                grip_before = block_before.0, grip = specs.grip, transfer_div_before = block_before.1, transfer_div = specs.transfer_div,
+                roll_gain_before = block_before.2, roll_gain = specs.roll_gain, top_speed_before = block_before.3, top_speed = specs.top_speed,
+                "opponent's stock parts / own parts and set-up folded (0x49CB50)"
+            );
+            let (p, r, sl, grid_off) = grid_pose_with_offset(t, start_scene, g, n_cars, &grid_rule);
+            let (linear, finish) = (self.linear_track(), nfs_game::race::finish_slice(t, start_scene));
+            let mut vehicle = Vehicle::new(p, r, &specs, model.half_track, model.wheel_radius);
+            vehicle.race_started = false;
+            vehicle.traction_control = true; // AI cars never spin their wheels (Tyre 0x4A20D0)
+            vehicle.ai_driven = true;
+            // its own `carinfo+0xC` (0x4EEDA0's `.TRANSMISSION`: `Car.Transmission` — the opponents' callers pass 0
+            // for the mission flag): the reset gear 0x49E228; AutoShift runs for an AI car either way (0x49E885)
+            vehicle.automatic = automatic;
+            // the remote car's `carinfo` options: `.TRACTION` 0x23B → `carinfo+0x20` (`Vehicle::tcs`),
+            // `.TRANSMISSION` 0x221 → `+0xC`, `.ABS` 0x23A → `+0x24` (no field of the port's
+            // vehicle: the ABS arm 0x4A2308 / 0x4A23CC is not ported, `physics.md` §5.4)
+            if let Some(rec) = seat_rec {
+                use nfs_net::launchcar::id as cid;
+                vehicle.tcs = rec.num(cid::TRACTION).is_some_and(|v| v != 0);
+                vehicle.automatic = rec.num(cid::TRANSMISSION).is_none_or(|v| v == 1);
+                tracing::info!(
+                    seat = slot, abs = rec.num(cid::ABS), traction = rec.num(cid::TRACTION), roof = rec.num(cid::CABRIODOWN),
+                    transmission = rec.num(cid::TRANSMISSION), driver = rec.num(cid::DRIVER), body_style = rec.num(cid::BODYSTYLE),
+                    package = rec.num(cid::STRIPEPACKAGE), race_number = rec.num(cid::RACENUMBER).map(|v| v as i32),
+                    parts = ?rec.parts(), setup = ?seat_setup.map(|s| s.map(|v| (v * 100.0).round() / 100.0)),
+                    "network race setup: the remote car carries its owner's carinfo (0x4EEDA0 kind 1)"
+                );
+            }
+            // the body `RCar::load` builds: 0x445090's model box, `BndP` less `car+0x3AC`
+            let (pts, half) = nfs_game::world::car_body(&assets, car_tiny);
+            vehicle.set_car_body(pts, half);
+            // `Car_raceInit` 0x410730: `Grid_slot` 0x410580's slice and offset into
+            // `Car_placeAtSlice` 0x49B090 (0x41095C) — run in `start_race`, after the human's:
+            // `Cars_resetAll` 0x4110A0 resets the racers in registration order, and the
+            // placement's two `Susp_update`s draw their roughness from the shared word
+            opp_places.push((self.road.opponents.len(), sl, p, grid_off));
+            let mut model = model;
+            if car_tiny {
+                model.scale = 0.4;
+            }
+            // its dash needles' calibration (0x4EF331…0x4EF37B, per car)
+            let dash = seat_rec
+                .and_then(|r| {
+                    use nfs_net::launchcar::id as cid;
+                    Some([r.num(cid::TACH0RPM)?, r.num(cid::TACH1000RPM)?, r.num(cid::SPEEDO0KM)?, r.num(cid::SPEEDO100KM)?].map(f32::from_bits))
+                })
+                .unwrap_or(entry.dash);
+            model.set_dash(dash[0], dash[1], dash[2], dash[3]);
+            self.road.opponent_models.push(model);
+            // 0x49CA30: the `.ais` of the car-info record's `.AISPECNAME`, the catalogue family
+            let controller = match CarAssets::load_ais(&self.paths, &entry.sim_family) {
+                Ok(ais) => {
+                    let mut d = nfs_game::ai::AiDriver::new(ais, &sim.unknown_tail);
+                    d.grip_ratio = grip_ratio;
+                    // the family key `nfs5.car` +0x115 the steering table is keyed on
+                    d.set_track(&self.track.name, self.backwards, &entry.sim_family);
+                    if let Some((difficulty, pairs)) = skill {
+                        d.set_skill(*difficulty, *pairs);
+                    }
+                    Controller::Ai(Box::new(d))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, model = entry.model, "no .ais: opponent parked");
+                    Controller::Parked
+                }
+            };
+            self.road.opponent_sets.push(entry.sound_set.clone());
+            self.road.opponent_paints.push(paint.exterior);
+            self.road.opponent_families.push(entry.family.clone());
+            self.road.opponents.push(RaceCar {
+                name: name.clone(),
+                vehicle,
+                specs,
+                progress: {
+                    let mut p = RaceProgress::new(sl, t);
+                    if linear {
+                        p.set_linear(t, finish);
+                    }
+                    p
+                },
+                controller,
+                grid_pos: g,
+                model: self.road.opponent_models.len() - 1,
+                wall_hits: 0,
+                resets: 0,
+                eliminated: false,
+                // `Car_init` 0x410C74: the night flag
+                lamp_bits: if self.track.is_night() { 3 } else { 0 },
+                tiny: car_tiny,
+            });
+        }
+    }
+
+    /// Stage "cars", the traffic: the track's traffic models, their specs and the `TrafficSet` (`traffic.md` §1, §8, §9) — the block of
+    /// `race_stage_grid` between the opponents and the police, moved out whole.
+    fn race_stage_traffic(&mut self, renderer: &mut Renderer, g: GridCtx<'_>) {
+        let GridCtx { t, start, grid_rule, n_cars, catalog, fe0, plan_pers, car_env, factory_driver } = g;
+        // traffic (`traffic.md` §1, §8, §9): the track's seven traffic car ids are
+        // `nfs5.trk +0x7C`; their `nfs5.car` records carry only a display name, a model and a
+        // sound set (`Sbus`/`Tbus` mark the buses, which respawn five times less often).
+        // Which of the race's car slots take which id is not in the notes (§8, UNKNOWN), so
+        // the ids are handed out in table order and cycled when more cars than ids are asked
+        // for (the heavy career setting wants eight).
+        // the host's per-slot colours are for this launch only (set by `net_race_apply`)
+        let net_colours = std::mem::take(&mut self.road.traffic_colours);
+        self.road.traffic = None;
+        self.road.traffic_models.clear();
+        self.road.traffic_sets.clear();
+        self.road.traffic_paints.clear();
+        self.road.traffic_prev.clear();
+        // **Nine cars at most.** 0x4ED382…0x4ED399 add cops, players, opponents and traffic
+        // and, when that exceeds 9, cut the traffic to `9 − players − opponents − cops` —
+        // so a full grid of eight leaves room for one traffic car, and with the four cops
+        // of a cops race none; a police mission's two count likewise.
+        let cops: u32 = if self.road.cops_enabled { self.road.cop_count } else { 0 };
+        let room = 9u32.saturating_sub(1 + self.num_opponents + cops);
+        let traffic_count = self.road.traffic_count.min(room);
+        if traffic_count > 0 {
+            let trk = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.trk"))
+                .ok()
+                .and_then(|d| nfs_formats::career::parse_track_table(&d).ok())
+                .unwrap_or_default();
+            let ids: Vec<u16> = match &self.road.traffic_ids {
+                Some(v) => v.clone(),
+                None => trk
+                    .iter()
+                    .find(|r| r.file.eq_ignore_ascii_case(&self.track.name))
+                    .map(|r| r.traffic_cars.iter().copied().filter(|i| *i != 0).collect())
+                    .unwrap_or_default(),
+            };
+            let mut plan: Vec<TrafficSpec> = Vec::new();
+            // id -> the *first* car's slot of that catalogue id (the template every repeat
+            // instantiates its own damage resources from, `car-model.md` §13.1)
+            let mut template_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+            // per model slot: half the LOD-1 box 0x445090 takes for traffic, and the
+            // `BndP` body points `RCar::load` builds (`car_body`) for its `RigidBody`
+            let mut boxes: Vec<Vec3> = Vec::new();
+            let mut points: Vec<Vec<Vec3>> = Vec::new();
+            // each traffic car's own block: `default.sim` (its sim name is empty, §21.1) with
+            // its record's stock parts (0x4EE9A0) and the neutral sliders (0x4EED2D) folded in
+            // by 0x49CB50 — a traffic car is a racer slot below `NUMCARS`, so 0x411130 builds
+            // its parts (0x49C4C0) and 0x410D60 its block (0x49C6C0 → 0x49CB50) like any car's
+            let traffic_parts_table = self.fe_parts_table();
+            let traffic_automatic = self.option_automatic();
+            let traffic_sim = CarAssets::load_sim(&self.paths, "default").ok();
+            let mut traffic_car_specs: Vec<CarSpecs> = Vec::new();
+            for k in 0..traffic_count as usize {
+                let Some(id) = ids.get(k % ids.len().max(1)).copied() else {
+                    break;
+                };
+                let Some(entry) = catalog.iter().find(|c| c.id == id) else {
+                    continue;
+                };
+                let bus = entry.sound_set.eq_ignore_ascii_case("sbus")
+                    || entry.sound_set.eq_ignore_ascii_case("tbus");
+                let slot: usize = match template_slot.get(&id) {
+                    // a repeat of a shared catalogue model: this car's own crush meshes
+                    // and decal-page materials, a cheap clone of the template's GPU ids —
+                    // everything else (body/wheel/light geometry) stays shared with it
+                    Some(&t) => {
+                        let inst = self.road.traffic_models[t].instantiate(renderer);
+                        self.road.traffic_models.push(inst);
+                        boxes.push(boxes[t]);
+                        points.push(points[t].clone());
+                        self.road.traffic_models.len() - 1
+                    }
+                    None => {
+                        let assets = match CarAssets::load(&self.paths, &entry.model) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(id, model = entry.model, error = %e, "traffic car assets missing");
+                                continue;
+                            }
+                        };
+                        let paint = match net_colours.get(k).copied().flatten() {
+                            // the host's `.COLOUR` for this slot, where it differs (network race)
+                            Some(c) => Paint::from(c),
+                            None if entry.paint_sets.is_empty() => Paint::from([0x8C, 0x8C, 0x90]),
+                            None => Paint::from_catalogue(entry, 0),
+                        };
+                        // a traffic car (`car+0x52C & 0x10`) has no driver: slot 9 = 0 (0x43AED4)
+                        let mut assets = assets;
+                        assets.driver = nfs_assets::car::DriverSeat { driver: 0, no_driver: true, factory_driver };
+                        let model = match CarModel::upload_with_env(
+                            renderer,
+                            &assets,
+                            &self.paths,
+                            1,
+                            paint,
+                            CarUpload { env: car_env, night: self.track.is_night(), race_roof: Some(0), skidpad: self.skidpad_rule() },
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::warn!(id, model = entry.model, error = %e, "traffic car upload failed");
+                                continue;
+                            }
+                        };
+                        self.road.traffic_models.push(model);
+                        // 0x445090: a traffic car (`car+0x52C & 0x10`, 0x4450CC) takes the
+                        // box of `[this+0xB0][0]`, LOD 1, origin included (0x43DE90)
+                        // the `BndP` points are lowered by that same `car+0x3AC` (0x4421BE,
+                        // `traffic_body`) — not by LOD 5's, which a traffic model lacks: they
+                        // sat at the origin's own height and the car stood `half.y` too low
+                        let (pts, half) = nfs_game::world::traffic_body(&assets);
+                        boxes.push(half);
+                        points.push(pts);
+                        let slot = self.road.traffic_models.len() - 1;
+                        template_slot.insert(id, slot);
+                        slot
+                    }
+                };
+                // the collision box is half the model's LOD-1 box (`traffic.md` §21.4,
+                // `car-model.md` §12) — `car+0x3AC` is also how far the body origin sits
+                // above the model's ground (`TrafficCar::draw_origin`)
+                self.road.traffic_sets.push(entry.sound_set.clone());
+                self.road.traffic_paints.push(net_colours.get(k).copied().flatten().unwrap_or_else(|| {
+                    entry.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x8C, 0x8C, 0x90])
+                }));
+                plan.push(TrafficSpec {
+                    model: slot,
+                    bus,
+                    half_extents: boxes[slot],
+                });
+                if let Some(sim) = &traffic_sim {
+                    // (`.TINYCAR` is on every car but traffic — `CarSpecs::apply_tinycar`)
+                    let mut cs = CarSpecs::from_sim(sim, false);
+                    // (TEST GLUE `NFS_PA_FE0`: an `fe = 0` race's traffic slot is a racer slot whose
+                    // record holds `fe.txt`'s `car[k].*` sliders — live, slot 2's `specs[0xF4]` came out
+                    // 1.963333 = 1.9 · (35/30 · 2 + 8) · 0.1, its 35 psi tyres; `k` = 1 + the opponents
+                    // + this car's index, the slot `TrafficSet::slot_base` gives it)
+                    let fe0_slot = 1 + self.num_opponents as usize + traffic_car_specs.len();
+                    let setup = if fe0 { super::glue::pa_trace::fe0_setup(&self.paths.root, fe0_slot) } else { nfs_game::career::CAR_SETUP_DEFAULT };
+                    nfs_game::career::fold_fresh_car_with(&mut cs, &entry.stock_parts, &traffic_parts_table, &entry.sim_family, &setup, traffic_automatic);
+                    traffic_car_specs.push(cs);
+                }
+            }
+            if self.road.traffic_specs.is_none() {
+                self.road.traffic_specs = traffic_sim.as_ref().map(|sim| {
+                    let mut cs = CarSpecs::from_sim(sim, false);
+                    nfs_game::career::fold_fresh_car(&mut cs, &[], &traffic_parts_table, "", traffic_automatic);
+                    cs
+                });
+            }
+            if !plan.is_empty() {
+                // the table is already reversed for a backwards race, so the route direction
+                // is always +1 here; `linear` = a point-to-point track (`LINEAR_TRACK`)
+                let linear = !self
+                    .records
+                    .track(&self.track.name)
+                    .map(|r| r.circuit)
+                    .unwrap_or(false);
+                // `NFS_TRAFFIC_SEED` makes a run repeatable (the original seeds from the clock)
+                let seed = self.traffic_seed;
+                let mut set = TrafficSet::new(&plan, t, 1.0, linear, seed);
+                // `RigidBody_init` 0x49B510 for each car with `default.sim` (§21.1)
+                let specs = self.road.traffic_specs.clone().unwrap_or_else(|| self.specs.clone());
+                set.set_bodies_each(&traffic_car_specs, &specs, &points);
+                for b in &mut set.bodies {
+                    b.automatic = traffic_automatic; // its own `carinfo+0xC` (0x4ED460 / 0x4ED56E pass 0)
+                }
+                set.cops_race = self.road.cops_race;
+                // the racer slots' `.PERSONALITY` (0x65808C + 0x580·i + 0x14C): slot 0 the human, then
+                // the opponents' — a traffic car's registration index lies past them, where the
+                // original reads what the array last held (`TrafficSet::slot_personalities`)
+                set.slot_personalities = std::iter::once(0).chain(plan_pers.iter().map(|&p| i32::from(p))).collect();
+                if fe0 {
+                    set.slot_personalities = super::glue::pa_trace::fe0_slot_personalities(&self.paths.root);
+                }
+                // `TRACK_NAME` for the spawn gate's canyon / industrial windows (0x40E0AD)
+                set.set_track(&self.track.name);
+                // `[0x5E8BF8]` for the §5.2 rule 3 early-race boost
+                set.opponents = self.num_opponents;
+                // The ×0.9 is gated on `[0x657A24]`, which the option registry names
+                // **`WEATHER`** (id 0x1E at 0x5D1F90) — not the track's night flag (the
+                // port used to pass the night flag here; corrected 2026-09-21). It is not
+                // `registry.u32("weather")` either: the race load's 0x414DB0 stores 0 into
+                // it (0x414DF9) after the track load's spec-index read and before any
+                // in-race reader, so a race always sees 0 (`traffic.md` §33.4).
+                set.weather = false;
+                // `[0x657A30]`, the registry's `TIME` (the time-of-day slot: `traffic.md`
+                // §33.3) gates the human-honk trigger (0x40172E). Only `fe.txt` sets it —
+                // no race-setup message carries id 0x21 and the track spec `Tr00.bin` that
+                // 0x475C80 would overwrite it from is not shipped
+                set.time_mode = self.net_launch.fe_txt.get("time").copied().unwrap_or_else(|| self.registry.u32("time", 0)) != 0;
+                // `scripts.bin` drives the reactions of `traffic.md` §12.3 / §12.9 / §30
+                if let Some(p) = GamePaths::find_file(
+                    &self.paths.game_data().join("Simulation").join("AI"),
+                    "scripts.bin",
+                ) && let Ok(d) = std::fs::read(&p)
+                {
+                    match nfs_formats::scripts::Scripts::parse(&d) {
+                        Ok(sc) => set.scripts = sc,
+                        Err(e) => tracing::warn!(error = %e, "scripts.bin unreadable"),
+                    }
+                }
+                // `Cars_resetAll`'s placement of the traffic slots (`Grid_slot` 0x410580): the start slice
+                // the human's grid uses, the racers `[0x5E8AE8]`, each slot's `.STARTINGPOS` — what a
+                // slot 0x4ECF00 never wrote holds: 0 (a fresh process; an `fe = 0` race reads `fe.txt`)
+                let first_slot = 1 + self.num_opponents as usize + cops as usize;
+                let startingpos: Vec<i32> = (0..plan.len()).map(|k| if fe0 { super::glue::pa_trace::fe0_startingpos(&self.paths.root, first_slot + k) } else { 0 }).collect();
+                set.grid_init = Some(nfs_game::race::GridInit { start, n: n_cars, rule: grid_rule, startingpos });
+                self.road.traffic = Some(set);
+                for sp in &plan {
+                    tracing::debug!(model = sp.model, bus = sp.bus, half = ?sp.half_extents, mass = sp.mass(), "traffic body");
+                }
+                tracing::info!(
+                    cars = plan.len(),
+                    models = self.road.traffic_models.len(),
+                    linear,
+                    "traffic placed"
+                );
+            }
+        }
+    }
+
+    /// Stage "cars", the police: the cops' models, specs and the `Police` set (`traffic.md` §17.1, §25) — the block of `race_stage_grid`
+    /// after the traffic, moved out whole. Draws the cops' drivers from `driver_rand` in the order the original does.
+    fn race_stage_police(&mut self, renderer: &mut Renderer, driver_rand: &mut nfs_game::movie_overlay::CRand, g: GridCtx<'_>) {
+        let GridCtx { t, start, grid_rule, n_cars, catalog, fe0, plan_pers, car_env, factory_driver } = g;
+        // police (`traffic.md` §17.1, §25): the track's five cop car ids are `nfs5.trk +0x8A`
+        // and the spawn points `GameData/Track/Cops/<track>.cop`; a single race gets four cars.
+        self.road.police = None;
+        self.road.police_models.clear();
+        self.road.police_sets.clear();
+        self.road.police_specs.clear();
+        self.road.police_prev.clear();
+        self.road.human_ed = Default::default();
+        // TEST GLUE `NFS_PA_FE0` (`pa_trace.rs`): an `fe = 0` race's cops are the racer slots whose
+        // `car[k].class` is `cop`; the `cops` key sets `COPS` [0x657414]
+        let fe0_cops: Vec<(usize, String)> = if fe0 { super::glue::pa_trace::fe0_cops(&self.paths.root) } else { Vec::new() };
+        if fe0 {
+            self.road.cops_enabled = !fe0_cops.is_empty() && nfs_formats::fetxt::Registry::load(&self.paths.root).u32("cops", 0) != 0;
+            self.road.cop_count = fe0_cops.len() as u32;
+        }
+        if self.road.cops_enabled {
+            let trk = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.trk"))
+                .ok()
+                .and_then(|d| nfs_formats::career::parse_track_table(&d).ok())
+                .unwrap_or_default();
+            let ids: Vec<u16> = trk
+                .iter()
+                .find(|r| r.file.eq_ignore_ascii_case(&self.track.name))
+                .map(|r| r.police_cars.iter().copied().filter(|i| *i != 0).collect())
+                .unwrap_or_default();
+            let cop_file = GamePaths::find_file(
+                &self.paths.game_data().join("Track").join("Cops"),
+                &format!("{}.cop", self.track.name),
+            )
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|d| {
+                nfs_formats::cop::CopFile::parse(&d)
+                    .map_err(|e| tracing::warn!(error = %e, "cop file unreadable"))
+                    .ok()
+            });
+            if let Some(file) = cop_file
+                && !ids.is_empty()
+            {
+                let mut cars = Vec::new();
+                // (id, driver) -> the *first* cop's slot of that combination (the
+                // template every repeat instantiates its own damage resources from,
+                // `car-model.md` §13.1)
+                let mut template_slot: std::collections::HashMap<(u16, u32), usize> = std::collections::HashMap::new();
+                // per model slot: half the LOD-5 box 0x445090 takes for a cop
+                let mut boxes: Vec<Vec3> = Vec::new();
+                let mut probe_sets: Vec<Vec<Vec3>> = Vec::new();
+                for k in 0..self.road.cop_count as usize {
+                    let mut id = ids[k % ids.len()];
+                    if let Some((_, model)) = fe0_cops.get(k)
+                        && let Some(c) = catalog.iter().find(|c| c.model.eq_ignore_ascii_case(model))
+                    {
+                        id = c.id;
+                    }
+                    // a cop's `.DRIVER`: 0x4ED0BC / 0x4ED1A5 launch each cop car through
+                    // 0x4EEDA0 (kind 8, 0x4ED174 / 0x4ED25E), so every cop record draws
+                    // its own `rand() & 7` (0x4EEDAC), cop 0 first, right after the
+                    // opponents' — made before the model is looked up, as the original
+                    // calls 0x4EEDA0 whatever 0x4F43A0 returned. Cops that share a model
+                    // share it only when they drew the same driver
+                    let driver = (driver_rand.next() & 7) as u32;
+                    let Some(entry) = catalog.iter().find(|c| c.id == id) else {
+                        continue;
+                    };
+                    let entry_993 = self.cheat_993(entry.clone());
+                    let entry = &entry_993;
+                    let slot = match template_slot.get(&(id, driver)) {
+                        // a repeat (id, driver): this cop's own crush meshes and
+                        // decal-page materials, a cheap clone of the template's GPU ids
+                        Some(&t) => {
+                            let inst = self.road.police_models[t].instantiate(renderer);
+                            self.road.police_models.push(inst);
+                            boxes.push(boxes[t]);
+                            probe_sets.push(probe_sets[t].clone());
+                            self.road.police_models.len() - 1
+                        }
+                        None => {
+                            let Ok(assets) = CarAssets::load(&self.paths, &entry.model)
+                            else {
+                                continue;
+                            };
+                            let paint = if entry.paint_sets.is_empty() { Paint::from([0xE0, 0xE0, 0xE0]) } else { Paint::from_catalogue(entry, 0) };
+                            let mut assets = assets;
+                            assets.driver = nfs_assets::car::DriverSeat { driver, no_driver: false, factory_driver };
+                            let Ok(model) = CarModel::upload_with_env(
+                                renderer,
+                                &assets,
+                                &self.paths,
+                                1,
+                                paint,
+                                CarUpload { env: car_env, night: self.track.is_night(), race_roof: Some(0), skidpad: self.skidpad_rule() },
+                            ) else {
+                                continue;
+                            };
+                            let mut model = model;
+                            if self.cheat_bits & CHEAT_TINY != 0 {
+                                model.scale = 0.4;
+                            }
+                            self.road.police_models.push(model);
+                            // 0x445090: a cop (`car+0x52C` 0x22 / 0x62, bit 0x10 clear at
+                            // 0x4450D2) takes `[this+0xB0][4]`, LOD 5, as a racer does;
+                            // `× 0.4` for `.TINYCAR` (0x445140)
+                            let (points, half) = nfs_game::world::car_body(&assets, self.cheat_bits & CHEAT_TINY != 0);
+                            boxes.push(half);
+                            // the body points, the first four being `Susp_update`'s
+                            // wheel probes (0x499AD4, `CopCar::probes`)
+                            probe_sets.push(points);
+                            let slot = self.road.police_models.len() - 1;
+                            template_slot.insert((id, driver), slot);
+                            slot
+                        }
+                    };
+                    // `car+0x3A8…`: also how far the body origin sits above the model's
+                    // ground (`CopCar::draw_origin`)
+                    let half = boxes[slot];
+                    // a cop car has a real `.sim` (§17.1), so its mass is the sim's
+                    // …folded by 0x49CB50 like every racer's: the record's stock parts (0x4EE9A0) and
+                    // the neutral sliders (0x4EED2D), `.TRANSMISSION` the gearbox option (0x4ED174's
+                    // `param_7` is 0)
+                    let cop_automatic = self.option_automatic();
+                    let cop_parts_table = self.fe_parts_table();
+                    let specs = CarAssets::load_sim(&self.paths, &entry.sim)
+                        .ok()
+                        .map(|s| {
+                            let mut cs = CarSpecs::from_sim(&s, false);
+                            // (TEST GLUE `NFS_PA_FE0`: the cop's racer slot holds `fe.txt`'s `car[k].*` sliders)
+                            let setup = match fe0_cops.get(k) {
+                                Some(&(slot, _)) => super::glue::pa_trace::fe0_setup(&self.paths.root, slot),
+                                None => nfs_game::career::CAR_SETUP_DEFAULT,
+                            };
+                            nfs_game::career::fold_fresh_car_with(&mut cs, &entry.stock_parts, &cop_parts_table, &entry.sim_family, &setup, cop_automatic);
+                            cs
+                        })
+                        .unwrap_or_else(|| self.specs.clone());
+                    self.road.police_sets.push(entry.sound_set.clone());
+                    self.road.police_specs.push(specs.clone());
+                    // §17.2: the cop's chase level is the heat record's `level[role]`, not
+                    // the race skill — role 0 is always level 2
+                    let mut cop = nfs_game::police::CopCar::new(
+                        slot,
+                        half,
+                        &specs,
+                        nfs_game::police::COP_LEVEL[0],
+                    );
+                    // the body `RCar::load` builds: the `BndP` points less `car+0x3AC`, the
+                    // first four being `Susp_update`'s probes (0x499AD4)
+                    if let Some(p) = probe_sets.get(slot).filter(|p| p.len() >= 4) {
+                        cop.set_body(p.clone(), half);
+                    }
+                    cop.body.automatic = cop_automatic; // its own `carinfo+0xC` (0x4ED174 / 0x4ED25E pass 0)
+                    cop.body.tiny = self.cheat_bits & CHEAT_TINY != 0;
+                    // `DERBY` `[0x657400]`, which only the Smash Up code sets (cheat bit 7): `Damage` takes ×1.5, not ×0.5 (0x49452F)
+                    cop.body.derby = self.cheat_bits & CHEAT_DERBY != 0;
+                    cop.body.rally = self.cheat_bits & CHEAT_RALLY != 0;
+                    cars.push(cop);
+                }
+                if !cars.is_empty() {
+                    let one_way = nfs_game::police::one_way_road(t);
+                    tracing::info!(
+                        cars = cars.len(),
+                        models = self.road.police_models.len(),
+                        points = file.records.len(),
+                        "police on duty"
+                    );
+                    let mut pol =
+                        nfs_game::police::Police::new(file, cars, self.race_skill, one_way);
+                    // the same `WEATHER` the traffic set gets — `[0x657A24]`, which the
+                    // race load zeroes (0x414DF9, `traffic.md` §33.4), and 0x4081B0 scales
+                    // every AI car's rate by it
+                    pol.weather = false;
+                    pol.budget = nfs_game::police::duty_budget(
+                        1 + self.num_opponents as usize,
+                        false,
+                    );
+                    // `Cars_resetAll`'s placement of the cop slots (right after the racers): see
+                    // `Police::place_at_race_init`; `.STARTINGPOS` of a cop slot = `fe.txt`'s key in an `fe = 0` race
+                    // (TEST GLUE), else what 0x4ECF00 left (0)
+                    let startingpos: Vec<i32> = (0..pol.cars.len()).map(|k| if fe0 { fe0_cops.get(k).map_or(0, |&(slot, _)| super::glue::pa_trace::fe0_startingpos(&self.paths.root, slot)) } else { 0 }).collect();
+                    pol.grid_init = Some(nfs_game::race::GridInit { start, n: n_cars, rule: grid_rule, startingpos });
+                    pol.linear = grid_rule.linear;
+                    pol.slot_base = 1 + self.num_opponents as usize;
+                    pol.slot_personalities = if fe0 {
+                        super::glue::pa_trace::fe0_slot_personalities(&self.paths.root)
+                    } else {
+                        std::iter::once(0).chain(plan_pers.iter().map(|&p| i32::from(p))).collect()
+                    };
+                    pol.traffic_count = self.road.traffic.as_ref().map_or(0, |s| s.cars.len());
+                    self.road.police = Some(pol);
+                }
+            }
+        }
     }
 
     /// Stage "pools" — after step 9: the sprite, beam, skid, flare, particle and weather draws out of `common.fsh` / `particle.fsh`.
@@ -1147,12 +1205,12 @@ impl App {
             });
         }
         quad.indices = vec![0, 1, 2, 0, 2, 3];
-        self.particle_draw = sprite(renderer, &quad, "SKDP", 0);
-        self.shadow_draw = sprite(renderer, &quad, "SHAD", 0);
-        self.glare_draw = sprite(renderer, &quad, "CARG", 1);
-        self.glare_star = [sprite(renderer, &quad, "SPIK", 1), sprite(renderer, &quad, "GLNT", 1)];
+        self.draws.particle_draw = sprite(renderer, &quad, "SKDP", 0);
+        self.draws.shadow_draw = sprite(renderer, &quad, "SHAD", 0);
+        self.draws.glare_draw = sprite(renderer, &quad, "CARG", 1);
+        self.draws.glare_star = [sprite(renderer, &quad, "SPIK", 1), sprite(renderer, &quad, "GLNT", 1)];
         // the beams: 16 meshes of the strip's 18 vertices as a triangle list
-        self.lamp_pools.beam_material = Some(renderer.create_material(nfs_renderer::MaterialDesc {
+        self.draws.lamp_pools.beam_material = Some(renderer.create_material(nfs_renderer::MaterialDesc {
             alpha_blend: true,
             cull_back: false,
             depth_test: true,
@@ -1164,7 +1222,7 @@ impl App {
             let (n0, f0, n1, f1) = (2 * k, 2 * k + 1, 2 * k + 2, 2 * k + 3);
             strip.indices.extend([n0, f0, n1, f0, f1, n1]);
         }
-        self.lamp_pools.beam = (0..32).map(|_| renderer.upload_dynamic_mesh(&strip)).collect();
+        self.draws.lamp_pools.beam = (0..32).map(|_| renderer.upload_dynamic_mesh(&strip)).collect();
         // the glare's road reflection 0x451D60: the track flares' four-vertex object `[0x61BCB0]`
         // (0x468240(0xE, 4, 1, 0, 4) at 0x4514AD), their state object `[0x61BCB4]` — 0x5379F0's
         // gouraud, blending on, with the pair set to 1, additive (0x4514E7) — and the texture
@@ -1173,23 +1231,23 @@ impl App {
         let mut refl = nfs_renderer::MeshData::default();
         refl.vertices = vec![nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [0.0; 4] }; 4];
         refl.indices = vec![0, 1, 2, 0, 2, 3];
-        self.lamp_pools.reflection_material = sprite(renderer, &quad, "BLUR", 1).map(|(_, m)| m);
-        self.lamp_pools.reflection = (0..64).map(|_| renderer.upload_dynamic_mesh(&refl)).collect();
+        self.draws.lamp_pools.reflection_material = sprite(renderer, &quad, "BLUR", 1).map(|(_, m)| m);
+        self.draws.lamp_pools.reflection = (0..64).map(|_| renderer.upload_dynamic_mesh(&refl)).collect();
         // the skid marks' strips: MAX_CAPACITY vertices each, a triangle strip as a list
         let cap = nfs_game::skidmarks::MAX_CAPACITY as u32;
         let mut skid = nfs_renderer::MeshData::default();
         skid.vertices = vec![nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [0.0; 4] }; cap as usize];
         skid.indices = (0..cap - 2).flat_map(|k| [k, k + 1, k + 2]).collect();
         // a first pool; the draw adds meshes when more strips are in range
-        self.skid_pool = (0..160).map(|_| renderer.upload_dynamic_mesh(&skid)).collect();
+        self.draws.skid_pool = (0..160).map(|_| renderer.upload_dynamic_mesh(&skid)).collect();
         // the track flares' definitions and their textures, out of `common.fsh` by the exact
         // name the loader swapped into place (the pack has both `spik` and `SPIK`)
-        self.flare_defs = std::fs::read(self.paths.render_dir().join("flare.dat")).map(|d| nfs_formats::flare::parse(&d)).unwrap_or_default();
-        self.flare_sprites.clear();
-        self.street_lamps = None;
-        self.cover = None;
-        self.sun_sprites.clear();
-        self.lens_sprites.clear();
+        self.ambient.flare_defs = std::fs::read(self.paths.render_dir().join("flare.dat")).map(|d| nfs_formats::flare::parse(&d)).unwrap_or_default();
+        self.draws.flare_sprites.clear();
+        self.ambient.street_lamps = None;
+        self.ambient.cover = None;
+        self.draws.sun_sprites.clear();
+        self.draws.lens_sprites.clear();
         // the lens flare's per-race object (0x4601F0 → 0x460780): its element positions
         // `flarepos.dat`, the `LENSFLARE` option, and the surface copy its read-back needs
         self.lens_reset();
@@ -1203,9 +1261,9 @@ impl App {
             self.view_distance = i.min(3);
             self.detail = super::race_stages::VIEW_DISTANCE_SCALE[self.view_distance];
         }
-        renderer.set_lens_probe(self.lens.enabled);
+        renderer.set_lens_probe(self.ambient.lens.enabled);
         if let Some(images) = common.as_ref() {
-            let mut names: Vec<String> = self.flare_defs.iter().flat_map(|d| d.textures.iter().flatten().cloned()).collect();
+            let mut names: Vec<String> = self.ambient.flare_defs.iter().flat_map(|d| d.textures.iter().flatten().cloned()).collect();
             names.sort();
             names.dedup();
             for name in names {
@@ -1236,11 +1294,11 @@ impl App {
                     blend_pair: 1,
                     ..nfs_renderer::MaterialDesc::textured(tex)
                 });
-                if self.flare_defs.iter().any(|d| d.id == SUN_FLARE && d.textures.iter().flatten().any(|t| *t == name)) {
-                    self.sun_sprites.insert(name.clone(), (mesh, sun));
+                if self.ambient.flare_defs.iter().any(|d| d.id == SUN_FLARE && d.textures.iter().flatten().any(|t| *t == name)) {
+                    self.draws.sun_sprites.insert(name.clone(), (mesh, sun));
                 }
-                self.lens_sprites.insert(name.clone(), (mesh, sun));
-                self.flare_sprites.insert(name, (mesh, material));
+                self.draws.lens_sprites.insert(name.clone(), (mesh, sun));
+                self.draws.flare_sprites.insert(name, (mesh, material));
             }
         }
         // `HEAD` — what `Headlights::LayerUVLight` projects (0x452645 fetches it by that
@@ -1255,7 +1313,7 @@ impl App {
         // `[0x613E04]` = `common.fsh` (0x448B10's first of two, 0x5CDEAC); the state object
         // 0x5379F0 with the pair set to 1, additive (0x4578B4); the draw object 0x468240(9, 3, 1,
         // 0, 0) over 201 triangles; no depth writes (0x459200 turns them off around the draw)
-        self.splat_draw = None;
+        self.draws.splat_draw = None;
         if let Some(images) = common.as_ref()
             && let Some(img) = images.iter().find(|t| t.name.trim() == "SPLT")
         {
@@ -1271,7 +1329,7 @@ impl App {
             let mut mesh = nfs_renderer::MeshData::default();
             mesh.vertices = vec![nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4] }; n];
             mesh.indices = (0..n as u32).collect();
-            self.splat_draw = Some((renderer.upload_dynamic_mesh(&mesh), material));
+            self.draws.splat_draw = Some((renderer.upload_dynamic_mesh(&mesh), material));
         }
         // the particle streaks (0x454EC0): untextured (`[0x6221D8]+0x40 = 0`, 0x454ECC), a triangle
         // list (0x59F1D0 type 3) in the particle's colour, under the definition's blend
@@ -1285,7 +1343,7 @@ impl App {
                 renderer.create_material(nfs_renderer::MaterialDesc { alpha_blend: true, cull_back: false, depth_test: true, blend_pair: pair, ..nfs_renderer::MaterialDesc::flat() })
             };
             let materials = [material(0), material(1), material(2)];
-            self.streak_draw = Some((pool, materials));
+            self.draws.streak_draw = Some((pool, materials));
         }
         // the track's particle systems, started by its kind-3 `ef` parts (`particles.md` §6); their
         // budget `[0x6197E0]` is set at 0x44ED10 by `SPECIALFX` `[0x657D6C]` (the registry record
@@ -1294,7 +1352,7 @@ impl App {
         // 0x455570 then loads `carpart.dat` the same way into the same map — the cars' own nine
         // systems (`particles.md` §11), with their textures in the same `particle.fsh`
         let car_defs = std::fs::read(self.paths.render_dir().join("carpart.dat")).map(|d| nfs_formats::particle_dat::parse(&d)).unwrap_or_default();
-        self.track_particle_sprites.clear();
+        self.draws.track_particle_sprites.clear();
         if let Some(path) = nfs_assets::GamePaths::find_file(&self.paths.render_dir(), "particle.fsh")
             && let Ok(data) = std::fs::read(&path)
             && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
@@ -1324,7 +1382,7 @@ impl App {
                     blend_pair: blend.min(3) as u8,
                     ..nfs_renderer::MaterialDesc::textured(tex)
                 });
-                self.track_particle_sprites.insert((name, blend), (mesh, material));
+                self.draws.track_particle_sprites.insert((name, blend), (mesh, material));
             }
             // the weather's two draws (0x458C90): the texture `sno<F4>` / `ran<F4>` of the particle
             // bundle `[0x613E08]`, else `snow` / `rain` (no shipped pack has the first); the state
@@ -1334,7 +1392,7 @@ impl App {
             let level = self.special_fx_level();
             for (k, params) in [nfs_game::weather::Params::snow(0.0), nfs_game::weather::Params::rain(0.0)].iter().enumerate() {
                 let img = params.texture_names(level).iter().find_map(|n| images.iter().find(|t| t.name.trim() == n.as_str()));
-                self.weather_draws[k] = img.map(|img| {
+                self.draws.weather_draws[k] = img.map(|img| {
                     let tex = upload_sprite_texture(renderer, img, &img.cache_mips());
                     let material = renderer.create_material(nfs_renderer::MaterialDesc {
                         alpha_blend: true,

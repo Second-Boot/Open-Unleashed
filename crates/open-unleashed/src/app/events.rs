@@ -58,24 +58,24 @@ impl App {
     /// only, 0x41B3BA…0x41B3CE).
     pub(crate) fn pause_menu_key(&mut self, key: MenuKey, event_loop: &LoopCtl) {
         match key {
-            MenuKey::Up | MenuKey::Left => match self.pause_confirm.as_mut() {
+            MenuKey::Up | MenuKey::Left => match self.hud_state.pause_confirm.as_mut() {
                 Some(c) => *c = 0,
-                None => self.pause_sel = self.pause_sel.saturating_sub(1),
+                None => self.hud_state.pause_sel = self.hud_state.pause_sel.saturating_sub(1),
             },
-            MenuKey::Down | MenuKey::Right => match self.pause_confirm.as_mut() {
+            MenuKey::Down | MenuKey::Right => match self.hud_state.pause_confirm.as_mut() {
                 Some(c) => *c = 1,
                 // PORT-DEVIATION D46: down to the photo-mode item when the menu has it
-                None => self.pause_sel = (self.pause_sel + 1).min(self.pause_items() as u8 - 1),
+                None => self.hud_state.pause_sel = (self.hud_state.pause_sel + 1).min(self.pause_items() as u8 - 1),
             },
-            MenuKey::Enter => match (self.pause_confirm, self.pause_sel) {
+            MenuKey::Enter => match (self.hud_state.pause_confirm, self.hud_state.pause_sel) {
                 (Some(0), _) => {
                     self.paused = false;
-                    self.pause_confirm = None;
+                    self.hud_state.pause_confirm = None;
                     if !self.leave_race() {
                         event_loop.exit();
                     }
                 }
-                (Some(_), _) => self.pause_confirm = None,
+                (Some(_), _) => self.hud_state.pause_confirm = None,
                 (None, 0) => self.paused = false,
                 (None, 1) => {
                     // 0x426011…0x42602B: no restart in game types 2, 4, 10 — the menu stays up
@@ -88,11 +88,11 @@ impl App {
                     // PORT-DEVIATION D46: the pause menu's photo-mode item
                     self.photo_enter();
                 }
-                _ => self.pause_confirm = Some(1),
+                _ => self.hud_state.pause_confirm = Some(1),
             },
             // PAD-END2 (D10), the pad's B: the quit question's "no", the menu's "continue"
-            MenuKey::Back => match self.pause_confirm {
-                Some(_) => self.pause_confirm = None,
+            MenuKey::Back => match self.hud_state.pause_confirm {
+                Some(_) => self.hud_state.pause_confirm = None,
                 None => self.paused = false,
             },
             // the front end's pad keys (D54) are not the race's
@@ -118,7 +118,7 @@ impl App {
             self.net_notice_space = false;
             return true;
         }
-        if self.results.is_some() && (self.pages.page as usize) + 1 < self.result_pages().len() {
+        if self.results.is_some() && (self.hud_state.pages.page as usize) + 1 < self.result_pages().len() {
             self.close_results_page();
             return true;
         }
@@ -151,13 +151,13 @@ impl App {
             return if self.replay_save.overwrite { self.pad_overwrite_key(k) } else { self.pad_replay_save_key(k) };
         }
         let notice = self.vehicle.is_some() && self.net_notice.is_some() && self.net_notice_space;
-        let page = self.results.is_some() && (self.pages.page as usize) < self.result_pages().len();
+        let page = self.results.is_some() && (self.hud_state.pages.page as usize) < self.result_pages().len();
         if notice || page {
             return match k {
                 N::Select => self.race_accept(event_loop),
                 // `HMissionSummary`'s "race again" (0x429390 → event 3, only for a failed mission, 0x4293BB)
                 N::Alt if page
-                    && self.result_pages().get(self.pages.page as usize) == Some(&ResultPage::MissionSummary)
+                    && self.result_pages().get(self.hud_state.pages.page as usize) == Some(&ResultPage::MissionSummary)
                     && self.mission_result.is_some_and(|(passed, _)| !passed) =>
                 {
                     self.restart_race(event_loop);
@@ -217,7 +217,7 @@ impl App {
         // 0x426154 does. *(Until 2026-09-26 the port's pause key backed out of the
         // question or resumed — an approximation of a key the original does not have.)*
         // Once the pages have closed it opens the menu, whose quit leaves
-        let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.pages.page as usize).is_some());
+        let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.hud_state.pages.page as usize).is_some());
         if self.vehicle.is_some() && self.fe.race_game_type == Some(game_type::NETWORK) {
             // a network race (`[0x6573E8] == 3`): 0x415110's own rules, not the single-player pause
             if self.input.take_pressed(Action::Pause) {
@@ -229,9 +229,9 @@ impl App {
             if self.vehicle.is_some() {
                 self.paused = true;
                 // 0x4151E3 → 0x461740: the orbit's yaw and step start at 0
-                self.orbit = Orbit::default();
-                self.pause_sel = 0;
-                self.pause_confirm = None;
+                self.cam.orbit = Orbit::default();
+                self.hud_state.pause_sel = 0;
+                self.hud_state.pause_confirm = None;
             } else {
                 event_loop.exit();
             }
@@ -246,7 +246,7 @@ impl App {
         {
             for (a, step) in [(Action::RotCamCounter, 3), (Action::RotCamClock, -3), (Action::RotCamStop, 0)] {
                 if self.input.take_pressed(a) {
-                    self.orbit.step = step;
+                    self.cam.orbit.step = step;
                 }
             }
         }
@@ -335,7 +335,7 @@ impl App {
             return;
         }
         let text_menu = self.debug_menu && self.intro.is_none() && self.race.is_none() && self.fe.layout_preview.is_none();
-        let hidden = self.window_focused && !text_menu;
+        let hidden = self.pace.window_focused && !text_menu;
         if self.pointer_hidden == Some(hidden) {
             return;
         }
@@ -367,7 +367,7 @@ impl ApplicationHandler for App {
         // PLATFORM GLUE: Cmd+Q, the Dock's Quit, a log-out — the host ends the program without a
         // window event; on the front end that is the quit, which saves (0x4D52EA, `fe_quit_save`).
         // A scripted run's own exits are tooling, not a quit: they save nothing.
-        if !NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) && self.autotest.is_none() {
+        if !NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) && self.glue.autotest.is_none() {
             self.host_quit_save();
         }
         // PORT-DEVIATION D46: a photo-mode still still being written
@@ -394,13 +394,13 @@ impl ApplicationHandler for App {
             self.sync_gamma();
         }
         if let WindowEvent::Occluded(o) = event {
-            if o != self.occluded {
+            if o != self.pace.occluded {
                 tracing::info!(occluded = o, "window occlusion changed (race frame cap 30 fps while hidden)");
             }
-            self.occluded = o;
+            self.pace.occluded = o;
         }
         if let WindowEvent::Focused(f) = event {
-            self.window_focused = f;
+            self.pace.window_focused = f;
         }
         self.sync_system_pointer();
         if self.intro.is_some() {
@@ -675,7 +675,7 @@ impl ApplicationHandler for App {
                     && event.physical_key
                         == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter)
                     && self.results.is_some()
-                    && self.result_pages().get(self.pages.page as usize) == Some(&ResultPage::MissionSummary)
+                    && self.result_pages().get(self.hud_state.pages.page as usize) == Some(&ResultPage::MissionSummary)
                     && self.mission_result.is_some_and(|(passed, _)| !passed)
                 {
                     self.restart_race(event_loop);
@@ -712,10 +712,7 @@ impl ApplicationHandler for App {
                     let size = w.inner_size();
                     let (sw, sh) = (size.width.max(1) as f32, size.height.max(1) as f32);
                     let (u, v) = (position.x as f32 / sw, position.y as f32 / sh);
-                    let design_aspect = 640.0 / 480.0;
-                    let aspect = sw / sh;
-                    let (fw, x0) = if aspect > design_aspect { (design_aspect / aspect, (1.0 - design_aspect / aspect) * 0.5) } else { (1.0, 0.0) };
-                    ((u - x0) / fw * 640.0, v * 480.0)
+                    nfs_game::layout::design_unplace(sw / sh, u, v)
                 }) };
                 // the widgets' side of a pointer move: `fe_pointer_moved` (the pad's virtual pointer runs it too, D54)
                 self.fe.pad_target = None;
@@ -750,7 +747,7 @@ impl ApplicationHandler for App {
                 // timers, so the `b` of 0x4D2970 comes from the keyboard only and no pad button
                 // goes back on a layout screen. (The pad's other keys are the port's own on both.)
                 let text_menu = self.fe.layout_preview.is_none();
-                // PORT-DEVIATION D54 (the layout screens' pad scheme, `pad_menu.rs`): B backs, Y is the bottom
+                // PORT-DEVIATION D54 (the layout screens' pad scheme, `pad/menu.rs`): B backs, Y is the bottom
                 // bar's options, Start its race, View the exit question, LB / RB the tabs. The text menu keeps
                 // D10's d-pad, A and B; X is nobody's here
                 let mut keys: Vec<MenuKey> = self
@@ -842,8 +839,8 @@ impl ApplicationHandler for App {
                 // animating between key presses
                 self.pace_frame();
                 let now = Instant::now();
-                self.frame_dt = (now - self.last_frame).as_secs_f32();
-                self.last_frame = now;
+                self.frame_dt = (now - self.pace.last_frame).as_secs_f32();
+                self.pace.last_frame = now;
                 self.draw_frame();
                 if std::mem::take(&mut self.net.start_due) && self.net_playgame() {
                     self.net_launch_sync();
@@ -915,13 +912,13 @@ impl ApplicationHandler for App {
                 }
                 self.pace_frame();
                 let now = Instant::now();
-                self.frame_dt = (now - self.last_frame).as_secs_f32();
+                self.frame_dt = (now - self.pace.last_frame).as_secs_f32();
                 // the replay pause freezes the frame as the pause menu does: `[0x606A98]` makes
                 // `RaceFrame` render only (0x415C69) and pauses the audio (0x4AB150 / 0x4AB200,
                 // 0x41581A…0x415849)
                 // diagnostic `NFS_HUD_KEYS=tick:pause`: the pause menu's continue after 64 pause ticks
                 // (or, `tick:pauserestart`, its restart instead — `replay.md` §18.12)
-                if self.scripted_hud.pause && self.pause_ticks >= 64.0 {
+                if self.hud_state.scripted_hud.pause && self.pause_ticks >= 64.0 {
                     self.end_scripted_pause(event_loop);
                 }
                 let halted = self.paused || self.replay.frozen;
@@ -950,13 +947,13 @@ impl ApplicationHandler for App {
                 // SFX loops.)*
                 self.sync_audio_pause();
                 self.billboard_key_frame();
-                self.accumulator += now - self.last_frame;
-                self.last_frame = now;
-                if self.accumulator > Duration::from_millis(250) {
-                    self.accumulator = Duration::from_millis(250);
+                self.pace.accumulator += now - self.pace.last_frame;
+                self.pace.last_frame = now;
+                if self.pace.accumulator > Duration::from_millis(250) {
+                    self.pace.accumulator = Duration::from_millis(250);
                 }
                 if halted {
-                    self.accumulator = Duration::ZERO;
+                    self.pace.accumulator = Duration::ZERO;
                     self.ff_stop_all();
                 }
                 // **An input-exchange race's frame driver** (0x415455…0x415495, 0x415BD4): the ticks that
@@ -969,18 +966,18 @@ impl ApplicationHandler for App {
                     let _ = self.net_exchange_gate();
                 }
                 let mut ran = 0;
-                while if exchange { !halted && ran < 16 && self.net_exchange_gate() } else { self.accumulator >= GAME_TICK } {
+                while if exchange { !halted && ran < 16 && self.net_exchange_gate() } else { self.pace.accumulator >= GAME_TICK } {
                     ran += 1;
                     // a scripted pause (`NFS_HUD_KEYS`) taken inside a tick ends the frame's ticks,
                     // as the pause key between two frames does
-                    if self.scripted_hud.pause {
-                        self.accumulator = Duration::ZERO;
+                    if self.hud_state.scripted_hud.pause {
+                        self.pace.accumulator = Duration::ZERO;
                         break;
                     }
                     if exchange {
                         self.exchange_tick_at = Instant::now();
                     } else {
-                        self.accumulator -= GAME_TICK;
+                        self.pace.accumulator -= GAME_TICK;
                     }
                     // replay.md §5.1: playback speed is tick *decimation* inside the catch-up
                     // loop — never a `dt` scale. Every iteration still renders.
@@ -994,7 +991,7 @@ impl ApplicationHandler for App {
                     for _ in 0..n {
                         // **TEST GLUE** (not in the original): `--follow` without `--autotest` drives a windowed race itself (the scripted
                         // pursuit steers, the throttle is held), so a live frame-time measurement has a moving car
-                        if self.follow_road && self.autotest.is_none() {
+                        if self.follow_road && self.glue.autotest.is_none() {
                             self.input.press(Action::Throttle);
                         }
                         self.simulate();
@@ -1007,7 +1004,7 @@ impl ApplicationHandler for App {
                 }
                 if exchange {
                     // the render's interpolation runs on the time since the last tick
-                    self.accumulator = now.saturating_duration_since(self.exchange_tick_at).min(GAME_TICK);
+                    self.pace.accumulator = now.saturating_duration_since(self.exchange_tick_at).min(GAME_TICK);
                 }
                 if self.race_frame_epilogue(event_loop) {
                     return;

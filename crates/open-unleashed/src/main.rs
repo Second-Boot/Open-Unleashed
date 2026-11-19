@@ -32,9 +32,7 @@ mod hud_str;
 mod hud_cfg;
 mod intro_run;
 mod loopctl;
-mod netlobby;
 mod netplay;
-mod pad_glyphs;
 mod parts_shop;
 mod power;
 use app::*;
@@ -81,9 +79,97 @@ fn main() {
     }
 }
 
+/// The front end's catalogues at start-up (`FeCatalogues` before any profile): the kind-0 car lists in the original's order, the track lists on
+/// the chronicle's first year, and the launch's laps / traffic / cops / direction — the block of `run` that built the menu, moved out whole.
+fn initial_menu(catalog: &[nfs_formats::fedata::CarCatalogEntry], track_all: Vec<String>, track_looped: Vec<String>, num_laps: u32, fe: &nfs_formats::fetxt::RaceSettings, backwards: bool, records: &Records) -> FeCatalogues {
+    // `GenericCar.Car`'s own list, `[0x6919EC]`, is rebuilt by `0x4F3E40` (kind-0 records only
+    // — `record+0x1F4 == 0`, 0x4F400E…0x4F4087, `nfs-formats/src/fedata.rs`'s own `kind` field,
+    // "only kind 0 may be listed or raced" — plus the `+0x204` dealer-availability admit rule,
+    // [`dealer_flag_admitted`]) and then sorted by **0x4F0F50** with the comparator **0x4F1D40**:
+    // era `+0x1B0` first, then class `+0x1AC`, then first year `+0x1F8` (signed word), all
+    // three ascending, swapping the instant a later record compares less — not a stable sort
+    // (`era_class_year_sort`, above, is the same exchange walk instruction for instruction;
+    // `career.md` §10.9's "Dealer / garage order" cites the same two addresses for the
+    // dealer/garage list, `App::dealer_cars`, which now shares this same routine). *(Until this
+    // pass: `!c.sim.is_empty()` for the filter — 6 of the 93 sim-bearing records are kind-2 cop
+    // cars with a drivable model (`Cop 930`/`930 German`/`Cop 356B`/`356B German`/`Cop 993
+    // Turbo`, `+/German` pairs plus one more), wrongly admitted; and `cars.sort_by_key(|c|
+    // c.year)`, which is not the original's order past row 0. Then, until this pass: no
+    // `+0x204` test at all, so every kind-0 record showed regardless of `Game.GameType` — see
+    // [`dealer_flag_admitted`]'s doc for the two arms and the live original check that settled
+    // them; `Game.GameType` is 0 (QuickRace) at start-up, `controls.md`:9519.)*
+    let cars = generic_car_list(&catalog, 0);
+    // `GenericCar2.Car`'s own list `[0x6919F4]` is a **separate** rebuild, not `cars` again —
+    // see `FeCatalogues::cars2`'s field doc and `FeCatalogues::set_cars2`. Built here for the same chronicle
+    // year `tracks_year` below starts at (`nfs_game::track_list::START_YEAR`).
+    let mut cars2: Vec<_> = catalog.iter().filter(|c| c.kind == 0 && c.year as i32 <= nfs_game::track_list::START_YEAR).cloned().collect();
+    era_class_year_sort(&mut cars2, era_class_year_key);
+    // **`0x4FC730`** ("reset track list") zeroes `zMergedList.Car`'s catalogue-half index —
+    // among the seven `Track<i>` rows, `Knockout.TrackNumber` and `LoopedTrack.Track` it also
+    // resets — and `modes.md` §2 confirms it runs **both** at accessor registration (i.e. from
+    // the very first frame, before any profile) and again on every `SETTYPEQUICKRACE`/
+    // `SETTYPEKNOCKOUT`/`SETTYPEQUICKKNOCKOUT` (`FeCatalogues::reset_track_rows`, ported). So the
+    // catalogue always starts on row 0 — the (flag-filtered, sorted) list's first entry —
+    // unless the player has picked something else.
+    // *(Until 2026-09-29 the no-override default hunted the list for a modern 993 coupe
+    // instead — a leftover convenience from the menu's very first cut, never RE-grounded,
+    // which left every screen reached before a `SETTYPE*` reset — including this port's own
+    // `--fe=QuickRace`/`quickknockout`/`knockout` scripted goldens — opening on a `911
+    // Carrera` where the original opens on the catalogue's first car, `REFERENCE-2026-09-28.md`
+    // "Pass 10", `QuickRace`(a). That fix (`b5f1896e`) landed on the *unfiltered* kind-0 sort's
+    // row 0, `'50 356 1100 Cabriolet` — this pass's `+0x204` filter (see
+    // [`dealer_flag_admitted`]) moves QuickRace's row 0 to `'59 356 A 1600 Super Convertible D`
+    // instead, matching the reference capture's own read of the original's default car, `356 A
+    // Convertible`, which `'50 356 1100 Cabriolet` does not.)*
+    let car_idx = 0;
+    // [`default_paint_colour`]/[`default_paint_row`]: `GenericCar.Colour` does not start on
+    // row 0 of whichever car ends up default — its `FEColourAccessor` ctor (0x4B91F0) reads
+    // `nfs5.car`'s own **record 0** once, at registration, and the row shown for the actual
+    // default car is whichever of *its* rows carries that fixed colour.
+    let default_paint_idx = cars.get(car_idx).map_or(0, |c| default_paint_row(default_paint_colour(&catalog), &c.paint_sets));
+    let mut menu0 = FeCatalogues {
+        mode: nfs_game::config::cfg().nfs_menu_mode
+            .as_str()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        // 0x4FBC10 as the `nfs5.trk` loader's tail 0x4FBA67 runs it: before any profile, on
+        // the chronicle year's initial value `[0x5DB764]` = 0x79E and `Game.GameType` 0
+        tracks: track_all,
+        looped: track_looped,
+        tracks_year: nfs_game::track_list::START_YEAR,
+        cars,
+        cars2,
+        track_idx: 0,
+        car_idx,
+        car_garage: false,
+        merged_at_zero: true,
+        car2_idx: 0,
+        ko: Vec::new(),
+        ko_sel: 0,
+        opponents: 4,
+        ko_opponents: 4,
+        damage: true,
+        difficulty: 1,
+        opp_car: env_opp_car(),
+        paint_idx: default_paint_idx,
+        paint_custom: None,
+        laps: num_laps,
+        traffic: env_traffic().unwrap_or(fe.traffic_density as u32),
+        cops: env_cops().unwrap_or(fe.cops),
+        backwards,
+        mirror: false,
+        circuits: records.circuits(),
+        looped_idx: 0,
+        debug: DebugMenuState { knockout_line: "KNOCKOUT   ENTER STARTS A SERIES".into(), row: 0 },
+        font: None,
+    };
+    menu0.fit_ko();
+    menu0
+}
+
 fn run() -> Result<()> {
-    // PLATFORM GLUE: the start-up crash guard (`guard.rs`): a start after a crashed one asks for a plain GPU device
     let cli = cli::Cli::from_env();
+    // PLATFORM GLUE: the start-up crash guard (`guard.rs`): a start after a crashed one asks for a plain GPU device
     // (a headless re-simulation makes no GPU device: nothing for the guard to protect, and a crash of it must not put the next windowed start in safe mode)
     let headless = cli.headless_resim();
     if !headless {
@@ -247,9 +333,7 @@ fn run() -> Result<()> {
         })
         .unwrap_or_else(|| "default".into());
     let sim = CarAssets::load_sim(&paths, &sim_name)?;
-    let sound_set = catalog
-        .iter()
-        .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
+    let sound_set = catalog_by_sim(&catalog, &sim_name)
         .map(|c| c.sound_set.clone())
         .unwrap_or_else(|| "sd7a".into());
     let paint = replay_setup
@@ -257,9 +341,7 @@ fn run() -> Result<()> {
         .map(|r| r.paint)
         .or_else(|| career_request.as_ref().map(|r| r.paint))
         .or_else(|| {
-            catalog
-                .iter()
-                .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
+            catalog_by_sim(&catalog, &sim_name)
                 .and_then(|c| c.paint_sets.first())
                 .map(|p| p.colours[0])
         })
@@ -279,16 +361,14 @@ fn run() -> Result<()> {
         option >= 1 && !career_request.as_ref().and_then(|r| r.mission.as_ref()).is_some_and(|m| m.index == 0x1D)
     };
     if let Some(r) = &career_request {
-        let family = catalog
-            .iter()
-            .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
+        let family = catalog_by_sim(&catalog, &sim_name)
             .map(|c| c.sim_family.clone())
             .unwrap_or_default();
         let owned = career.as_ref().and_then(|cu| cu.pending.as_ref().and_then(|p| p.garage_idx).and_then(|i| cu.career.garage.get(i)));
         if r.parts.is_empty() && owned.is_none() {
             // no garage record and no parts of its own: a fresh `FECar` (0x4EE9A0 stock parts, 0x4EED2D
             // neutral sliders) — same as `load_career_race`'s
-            let stock_ids: Vec<i16> = catalog.iter().find(|c| c.sim.eq_ignore_ascii_case(&sim_name)).map(|c| c.stock_parts.clone()).unwrap_or_default();
+            let stock_ids: Vec<i16> = catalog_by_sim(&catalog, &sim_name).map(|c| c.stock_parts.clone()).unwrap_or_default();
             let table = nfs_formats::career::parse_parts(&std::fs::read(paths.fe_data().join("Data").join("nfs5.prt")).unwrap_or_default()).unwrap_or_default();
             nfs_game::career::fold_fresh_car(&mut specs, &stock_ids, &table, &family, cli_automatic);
         } else {
@@ -304,13 +384,11 @@ fn run() -> Result<()> {
     } else {
         // no career request: this CLI/replay invocation's car races on its stock parts
         // (`specs.rs:49`, 0x4EE9A0's unconditional fit at `FECar::init`)
-        let stock_ids: &[i16] = catalog
-            .iter()
-            .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
+        let stock_ids: &[i16] = catalog_by_sim(&catalog, &sim_name)
             .map(|c| c.stock_parts.as_slice())
             .unwrap_or_default();
         let parts_table = nfs_formats::career::parse_parts(&std::fs::read(paths.fe_data().join("Data").join("nfs5.prt")).unwrap_or_default()).unwrap_or_default();
-        let family = catalog.iter().find(|c| c.sim.eq_ignore_ascii_case(&sim_name)).map(|c| c.sim_family.clone()).unwrap_or_default();
+        let family = catalog_by_sim(&catalog, &sim_name).map(|c| c.sim_family.clone()).unwrap_or_default();
         // the stock parts (0x4EE9A0) and the constructor's neutral sliders (0x4EED2D) through 0x49CB50;
         // `.TRANSMISSION` is the gearbox option (`cli_automatic` above: `Car.Transmission` index >= 1 = automatic)
         let before = (specs.top_speed, specs.final_drive, specs.grip, specs.transfer_div, specs.roll_gain, specs.front_weight);
@@ -467,8 +545,8 @@ fn run() -> Result<()> {
     };
     tracing::info!(cycle = ?camera_cycle, "camera cycle");
     // diagnostic: `NFS_CAMERA=<index into the cycle>` starts on that view instead of the first
-    let camera_mode = std::env::var("NFS_CAMERA")
-        .ok()
+    let camera_mode = nfs_game::config::cfg().nfs_camera
+        .as_str()
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(0);
     // (a re-simulation runs the frames the record allows: `ticks / 64` seconds of game time, plus a margin)
@@ -520,7 +598,7 @@ fn run() -> Result<()> {
                     .unwrap_or(false)
         }
     };
-    let records_path = std::env::var_os("NFS5_RECORDS_SAVE")
+    let records_path = nfs_game::config::cfg().nfs5_records_save.as_os_str()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(Records::default_save_path);
     let records = Records::load(&paths, &records_path);
@@ -530,96 +608,7 @@ fn run() -> Result<()> {
     ));
     let track_tables = nfs_game::track_list::TrackListTables::load(&paths);
     let (track_all, track_looped) = track_tables.build(nfs_game::track_list::START_YEAR, app::menu::all_tracks_glue(0));
-    let menu = if use_menu {
-        // `GenericCar.Car`'s own list, `[0x6919EC]`, is rebuilt by `0x4F3E40` (kind-0 records only
-        // — `record+0x1F4 == 0`, 0x4F400E…0x4F4087, `nfs-formats/src/fedata.rs`'s own `kind` field,
-        // "only kind 0 may be listed or raced" — plus the `+0x204` dealer-availability admit rule,
-        // [`dealer_flag_admitted`]) and then sorted by **0x4F0F50** with the comparator **0x4F1D40**:
-        // era `+0x1B0` first, then class `+0x1AC`, then first year `+0x1F8` (signed word), all
-        // three ascending, swapping the instant a later record compares less — not a stable sort
-        // (`era_class_year_sort`, above, is the same exchange walk instruction for instruction;
-        // `career.md` §10.9's "Dealer / garage order" cites the same two addresses for the
-        // dealer/garage list, `App::dealer_cars`, which now shares this same routine). *(Until this
-        // pass: `!c.sim.is_empty()` for the filter — 6 of the 93 sim-bearing records are kind-2 cop
-        // cars with a drivable model (`Cop 930`/`930 German`/`Cop 356B`/`356B German`/`Cop 993
-        // Turbo`, `+/German` pairs plus one more), wrongly admitted; and `cars.sort_by_key(|c|
-        // c.year)`, which is not the original's order past row 0. Then, until this pass: no
-        // `+0x204` test at all, so every kind-0 record showed regardless of `Game.GameType` — see
-        // [`dealer_flag_admitted`]'s doc for the two arms and the live original check that settled
-        // them; `Game.GameType` is 0 (QuickRace) at start-up, `controls.md`:9519.)*
-        let cars = generic_car_list(&catalog, 0);
-        // `GenericCar2.Car`'s own list `[0x6919F4]` is a **separate** rebuild, not `cars` again —
-        // see `FeCatalogues::cars2`'s field doc and `FeCatalogues::set_cars2`. Built here for the same chronicle
-        // year `tracks_year` below starts at (`nfs_game::track_list::START_YEAR`).
-        let mut cars2: Vec<_> = catalog.iter().filter(|c| c.kind == 0 && c.year as i32 <= nfs_game::track_list::START_YEAR).cloned().collect();
-        era_class_year_sort(&mut cars2, era_class_year_key);
-        // **`0x4FC730`** ("reset track list") zeroes `zMergedList.Car`'s catalogue-half index —
-        // among the seven `Track<i>` rows, `Knockout.TrackNumber` and `LoopedTrack.Track` it also
-        // resets — and `modes.md` §2 confirms it runs **both** at accessor registration (i.e. from
-        // the very first frame, before any profile) and again on every `SETTYPEQUICKRACE`/
-        // `SETTYPEKNOCKOUT`/`SETTYPEQUICKKNOCKOUT` (`FeCatalogues::reset_track_rows`, ported). So the
-        // catalogue always starts on row 0 — the (flag-filtered, sorted) list's first entry —
-        // unless the player has picked something else.
-        // *(Until 2026-09-29 the no-override default hunted the list for a modern 993 coupe
-        // instead — a leftover convenience from the menu's very first cut, never RE-grounded,
-        // which left every screen reached before a `SETTYPE*` reset — including this port's own
-        // `--fe=QuickRace`/`quickknockout`/`knockout` scripted goldens — opening on a `911
-        // Carrera` where the original opens on the catalogue's first car, `REFERENCE-2026-09-28.md`
-        // "Pass 10", `QuickRace`(a). That fix (`b5f1896e`) landed on the *unfiltered* kind-0 sort's
-        // row 0, `'50 356 1100 Cabriolet` — this pass's `+0x204` filter (see
-        // [`dealer_flag_admitted`]) moves QuickRace's row 0 to `'59 356 A 1600 Super Convertible D`
-        // instead, matching the reference capture's own read of the original's default car, `356 A
-        // Convertible`, which `'50 356 1100 Cabriolet` does not.)*
-        let car_idx = 0;
-        // [`default_paint_colour`]/[`default_paint_row`]: `GenericCar.Colour` does not start on
-        // row 0 of whichever car ends up default — its `FEColourAccessor` ctor (0x4B91F0) reads
-        // `nfs5.car`'s own **record 0** once, at registration, and the row shown for the actual
-        // default car is whichever of *its* rows carries that fixed colour.
-        let default_paint_idx = cars.get(car_idx).map_or(0, |c| default_paint_row(default_paint_colour(&catalog), &c.paint_sets));
-        let mut menu0 = FeCatalogues {
-            mode: std::env::var("NFS_MENU_MODE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            // 0x4FBC10 as the `nfs5.trk` loader's tail 0x4FBA67 runs it: before any profile, on
-            // the chronicle year's initial value `[0x5DB764]` = 0x79E and `Game.GameType` 0
-            tracks: track_all,
-            looped: track_looped,
-            tracks_year: nfs_game::track_list::START_YEAR,
-            cars,
-            cars2,
-            track_idx: 0,
-            car_idx,
-            car_garage: false,
-            merged_at_zero: true,
-            car2_idx: 0,
-            ko: Vec::new(),
-            ko_sel: 0,
-            opponents: 4,
-            ko_opponents: 4,
-            damage: true,
-            difficulty: 1,
-            opp_car: std::env::var("NFS_OPPCAR")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            paint_idx: default_paint_idx,
-            paint_custom: None,
-            laps: num_laps,
-            traffic: env_traffic().unwrap_or(fe.traffic_density as u32),
-            cops: env_cops().unwrap_or(fe.cops),
-            backwards,
-            mirror: false,
-            circuits: records.circuits(),
-            looped_idx: 0,
-            debug: DebugMenuState { knockout_line: "KNOCKOUT   ENTER STARTS A SERIES".into(), row: 0 },
-            font: None,
-        };
-        menu0.fit_ko();
-        Some(menu0)
-    } else {
-        None
-    };
+    let menu = use_menu.then(|| initial_menu(&catalog, track_all, track_looped, num_laps, &fe, backwards, &records));
     if let (Some(m), Some(c)) = (&menu, career.as_mut()) {
         c.set_mode(m.mode);
     }
@@ -742,7 +731,7 @@ fn run() -> Result<()> {
         // (TEST GLUE `NFS_PA_FE0`: an `fe = 0` race reads `fe.txt`'s `damage` key into `DAMAGE` [0x657A2C])
         damage: match replay_setup.as_ref() {
             Some(r) => r.damage,
-            None if std::env::var_os("NFS_PA_FE0").is_some() => nfs_formats::fetxt::Registry::load(&paths.root).u32("damage", 1) != 0,
+            None if nfs_game::config::cfg().nfs_pa_fe0.is_set() => nfs_formats::fetxt::Registry::load(&paths.root).u32("damage", 1) != 0,
             None => true,
         },
         skill: race_skill,

@@ -120,23 +120,39 @@ fn pass_with<'e>(encoder: &'e mut wgpu::CommandEncoder, label: &str, timestamp_w
     })
 }
 
+/// A bind group entry: the texture `view` at `binding`.
+pub(crate) fn bg_view(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) }
+}
+
+/// A bind group entry: the `sampler` at `binding`.
+pub(crate) fn bg_sampler(binding: u32, sampler: &wgpu::Sampler) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::Sampler(sampler) }
+}
+
+/// A bind group entry: the whole of `buf` at `binding`.
+pub(crate) fn bg_buf(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry { binding, resource: buf.as_entire_binding() }
+}
+
+/// A bind group of `layout` over `entries`.
+pub(crate) fn bind_group(device: &wgpu::Device, label: &str, layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupEntry]) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries })
+}
+
 /// A bind group of `layout`'s binding 0 = `view`, binding 1 = `sampler` (the sprite layout's shape).
 pub(crate) fn tex_sampler_bg(device: &wgpu::Device, label: &str, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, sampler: &wgpu::Sampler) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) }],
-    })
+    bind_group(device, label, layout, &[bg_view(0, view), bg_sampler(1, sampler)])
 }
 
 /// A bind group of one texture view at binding 0.
 pub(crate) fn view_bg(device: &wgpu::Device, label: &str, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) }] })
+    bind_group(device, label, layout, &[bg_view(0, view)])
 }
 
 /// A bind group of the whole of `buf` at binding 0.
 pub(crate) fn buffer_bg(device: &wgpu::Device, label: &str, layout: &wgpu::BindGroupLayout, buf: &wgpu::Buffer) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }] })
+    bind_group(device, label, layout, &[bg_buf(0, buf)])
 }
 
 /// A uniform buffer the size of `T`, written with `queue.write_buffer`.
@@ -157,6 +173,26 @@ pub(crate) fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu:
 /// A layout entry: a 2-D texture of `sample_type` seen by the fragment stage.
 pub(crate) fn bgl_tex(binding: u32, sample_type: wgpu::TextureSampleType, multisampled: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type, view_dimension: wgpu::TextureViewDimension::D2, multisampled }, count: None }
+}
+
+/// A layout entry: a float 2-D texture (`filterable` or not, one sample) seen by the fragment stage.
+pub(crate) fn bgl_float(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
+    bgl_tex(binding, wgpu::TextureSampleType::Float { filterable }, false)
+}
+
+/// A layout entry: a float 2-D array texture (`filterable` or not) seen by the fragment stage.
+pub(crate) fn bgl_float_array(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None }
+}
+
+/// A layout entry: a uniform buffer of `size` bytes read at a dynamic offset, seen by the fragment stage.
+pub(crate) fn bgl_uniform_dynamic(binding: u32, size: u64) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(size) }, count: None }
+}
+
+/// A layout entry: a depth 2-D texture (`multisampled` or not) seen by the fragment stage.
+pub(crate) fn bgl_depth(binding: u32, multisampled: bool) -> wgpu::BindGroupLayoutEntry {
+    bgl_tex(binding, wgpu::TextureSampleType::Depth, multisampled)
 }
 
 /// A layout entry: a sampler of `kind` seen by the fragment stage.
@@ -394,6 +430,69 @@ impl PostTarget {
             *slot = Some(PostTarget { size, view });
         }
         slot.as_ref().expect("post target")
+    }
+}
+
+/// The rays image's format of the scene-depth passes that march a ray image at a fraction of the size and add it over the
+/// scene (the light shafts, the haze): the tinted light (no blend, no alpha needed).
+pub(crate) const RAYS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The labels of a [`RaysPipes`] pair's two passes: the name of each pass and of its profiler stage.
+#[derive(Clone, Copy)]
+pub(crate) struct RaysLabels {
+    pub rays_pass: &'static str,
+    pub rays_prof: &'static str,
+    pub comp_pass: &'static str,
+    pub comp_prof: &'static str,
+}
+
+/// The two pipelines of a "rays image, then added over the scene" pass (the light shafts, the haze): pass 1 draws the rays into
+/// an image at a fraction of the size, pass 2 adds it over the scene colour at full size (colour channels only, [`blend::ADD`],
+/// `samples` per pixel). The layouts are the pass's own; the entry points are `fs` and `fs_comp`.
+pub(crate) struct RaysPipes {
+    pub rays: wgpu::RenderPipeline,
+    pub rays_bgl: wgpu::BindGroupLayout,
+    pub comp: wgpu::RenderPipeline,
+    pub comp_bgl: wgpu::BindGroupLayout,
+}
+
+impl RaysPipes {
+    /// The pipelines over `module` (`label` names both: "<label> rays", "<label> composite"), the composite targeting `format`.
+    pub fn build(device: &wgpu::Device, module: &wgpu::ShaderModule, label: &str, rays_bgl: wgpu::BindGroupLayout, comp_bgl: wgpu::BindGroupLayout, format: wgpu::TextureFormat, samples: u32) -> Self {
+        let pipe = |label: &str, fs: &str, bgl: &wgpu::BindGroupLayout, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, samples: u32, mask: wgpu::ColorWrites| {
+            let pl = pipeline_layout(device, label, &[bgl]);
+            Fullscreen::new(label, &pl, module).fs(fs).samples(samples).build(device, &[Some(wgpu::ColorTargetState { format, blend, write_mask: mask })])
+        };
+        let rays = pipe(&format!("{label} rays"), "fs", &rays_bgl, RAYS_FORMAT, None, 1, wgpu::ColorWrites::ALL);
+        let comp = pipe(&format!("{label} composite"), "fs_comp", &comp_bgl, format, Some(blend::ADD), samples, wgpu::ColorWrites::COLOR);
+        Self { rays, rays_bgl, comp, comp_bgl }
+    }
+
+    /// Record both passes: the rays into `rays_view` (cleared) with `bg1`, then the composite over `at.colour` (loaded;
+    /// `at.resolve` when multisampled; stored as [`OverScene::store`] says) with `bg2`.
+    pub fn record(&self, encoder: &mut wgpu::CommandEncoder, names: RaysLabels, rays_view: &wgpu::TextureView, at: &OverScene, bg1: &wgpu::BindGroup, bg2: &wgpu::BindGroup) {
+        fullscreen_pass(encoder, names.rays_pass, names.rays_prof, rays_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &self.rays, &[bg1]);
+        let mut pass = color_pass_resolve(encoder, names.comp_pass, names.comp_prof, at.colour, at.resolve, wgpu::LoadOp::Load, at.store());
+        draw_fullscreen(&mut pass, &self.comp, &[bg2]);
+    }
+}
+
+/// The uniform prefix of the scene-depth passes that march view rays (the haze, the lighthouse beam): the inverse
+/// view-projection, the eye and the view's forward axis, with the near and far plane in the two `w`s. 96 bytes, no padding;
+/// the WGSL `U` of those passes starts with `inv_vp`, `cam`, `fwd` of the same layout (`wgsl::VIEW_DIR` reads them).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct EyeUniform {
+    pub inv_vp: [[f32; 4]; 4],
+    /// xyz the eye, w the near plane
+    pub cam: [f32; 4],
+    /// xyz the view's forward axis, w the far plane
+    pub fwd: [f32; 4],
+}
+
+impl EyeUniform {
+    pub fn new(inv_vp: &glam::Mat4, eye: glam::Vec3, fwd: glam::Vec3, planes: [f32; 2]) -> Self {
+        Self { inv_vp: inv_vp.to_cols_array_2d(), cam: [eye.x, eye.y, eye.z, planes[0]], fwd: [fwd.x, fwd.y, fwd.z, planes[1]] }
     }
 }
 

@@ -30,7 +30,7 @@ pub(super) const SHADOW_SIZE: u32 = 512;
 /// ENHANCEMENT E47: the widest half angle of a lamp's frustum (a car right under a low lamp); beyond it the edge fades to lit.
 const MAX_HALF_DEG: f32 = 72.0;
 /// ENHANCEMENT E47: a car part whose bounding sphere is larger than this (m) is no caster (a wrongly flagged huge item).
-const MAX_CASTER_RADIUS: f32 = 6.0;
+const LAMP_MAX_CASTER_RADIUS: f32 = 6.0;
 /// ENHANCEMENT E47: the frustum's widening beyond the casters' widest cone (a share, and an angle in degrees), so the edge fade (the
 /// outer 15 %) does not touch a caster's silhouette.
 const FRUSTUM_MARGIN: f32 = 1.08;
@@ -39,7 +39,7 @@ const FRUSTUM_MARGIN_DEG: f32 = 1.0;
 const NEAR_SHARE: f32 = 0.9;
 const NEAR_RANGE: (f32, f32) = (0.1, 4.0);
 /// ENHANCEMENT E47: the far plane beyond the lamp's radius (m).
-const FAR_MARGIN: f32 = 1.0;
+const LAMP_FAR_MARGIN: f32 = 1.0;
 /// ENHANCEMENT E47 (LAMP-TUNE): [`lamp_score`]'s eye distance (m) at which a car counts half, its cone's least weight, and the
 /// shader's downward cone (`lamp_light`: `smoothstep(0.1, 0.55, l.y)`, its start and width). APPROXIMATION (the 40 m).
 const SCORE_EYE: f32 = 40.0;
@@ -54,11 +54,6 @@ const SLOT_FULL: f32 = 1.5;
 const MIN_DIST: f32 = 1e-3;
 /// The debug log's scores and strengths in thousandths.
 const LOG_SCALE: f32 = 1000.0;
-
-/// `3 t^2 - 2 t^3` of `t` in 0..1 (the shader's `smoothstep`).
-fn smooth01(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -164,7 +159,7 @@ pub(super) fn fit_frustum(lamp: Vec3, radius: f32, cs: impl Iterator<Item = Cast
     // a little margin so the edge fade (the outer 15 %) does not touch a caster's silhouette
     let half = (half * FRUSTUM_MARGIN + FRUSTUM_MARGIN_DEG.to_radians()).min(max_half);
     let near = (near * NEAR_SHARE).clamp(NEAR_RANGE.0, NEAR_RANGE.1);
-    Some(LampFrustum { dir, tan_half: half.tan(), near, far: radius + FAR_MARGIN })
+    Some(LampFrustum { dir, tan_half: half.tan(), near, far: radius + LAMP_FAR_MARGIN })
 }
 
 /// ENHANCEMENT E47 (LAMP-TUNE): how much a lamp's shadow matters this frame: the largest, over the car parts in its reach, of its
@@ -179,10 +174,10 @@ pub(super) fn lamp_score(lamp: Vec3, radius: f32, color: [f32; 3], eye: Vec3, ca
         let v = c.centre - lamp;
         let d = (v.length() - c.radius).max(0.0);
         let r = (1.0 - d / radius).clamp(0.0, 1.0);
-        let fall = smooth01(r);
+        let fall = nfs_math::smooth01(r);
         // the cone toward the part's lowest point (the lamp lights what is below it)
         let low = c.centre - Vec3::Y * c.radius - lamp;
-        let cone = smooth01(((-low.y / low.length().max(MIN_DIST) - CONE_START) / CONE_WIDTH).clamp(0.0, 1.0));
+        let cone = nfs_math::smooth01(((-low.y / low.length().max(MIN_DIST) - CONE_START) / CONE_WIDTH).clamp(0.0, 1.0));
         let e = c.centre.distance(eye) / SCORE_EYE;
         best = best.max(bright * fall * cone.max(SCORE_MIN_CONE) / (1.0 + e * e));
     }
@@ -197,19 +192,19 @@ pub(super) fn slot_strength(score: f32, cut: f32) -> f32 {
     if cut <= 0.0 {
         return 1.0;
     }
-    smooth01(((score - cut) / ((SLOT_FULL - 1.0) * cut)).clamp(0.0, 1.0))
+    nfs_math::smooth01(((score - cut) / ((SLOT_FULL - 1.0) * cut)).clamp(0.0, 1.0))
 }
 
 impl Core {
     /// Whether this frame has street lamps (E23 on, some lamp, not the rear-view mirror).
     pub(super) fn lamps_on(&self, scene: &Scene) -> bool {
-        self.enhancements.is_on(crate::E23) && !self.no_reflections && scene.lamps.n > 0
+        self.enhancements.is_on(crate::E23) && !self.modes.no_reflections && scene.lamps.n > 0
     }
 
     /// ENHANCEMENT E47: whether this frame draws lamp shadow maps (E47 on, lamps; not the environment faces, which take the lamps'
     /// light without their maps: a pass per lamp per face).
     pub(super) fn lamp_shadows_on(&self, scene: &Scene) -> bool {
-        self.lamps_on(scene) && self.enhancements.is_on(crate::E47) && !self.refl_building
+        self.lamps_on(scene) && self.enhancements.is_on(crate::E47) && !self.env.building
     }
 
     /// Write this frame's uniform; without lamps it is zeroed once if it was on. ENHANCEMENT E47: with E47 on, the maps of the
@@ -235,7 +230,7 @@ impl Core {
         // ENHANCEMENT E49: the environment faces take the lamps' light without their shadow maps (a pass per lamp per face)
         if self.lamp_shadows_on(scene) {
             sc.cars.clear();
-            sc.cars.extend(casters.iter().filter(|c| c.car && c.radius <= MAX_CASTER_RADIUS));
+            sc.cars.extend(casters.iter().filter(|c| c.car && c.radius <= LAMP_MAX_CASTER_RADIUS));
             let mut cut = 0.0;
             if !sc.cars.is_empty() {
                 let cars = &sc.cars;

@@ -143,7 +143,7 @@ impl App {
     pub(crate) fn lens_reset(&mut self) {
         // TEST GLUE (not in the original): `NFS_LENS_FORCE=1` switches the lens flare on for a scripted run (a race
         // without the front end has the setting at 0, so no still ever showed the flare's elements)
-        let enabled = self.choice_index(choice::GRAPHICS_LENS_FLARE).is_some_and(|(i, _)| i != 0) || std::env::var_os("NFS_LENS_FORCE").is_some();
+        let enabled = self.choice_index(choice::GRAPHICS_LENS_FLARE).is_some_and(|(i, _)| i != 0) || nfs_game::config::cfg().nfs_lens_force.is_set();
         let mut positions = DEFAULT_POSITIONS;
         if let Ok(d) = std::fs::read(self.paths.render_dir().join("flarepos.dat")) {
             positions = [0.0; 14];
@@ -151,14 +151,14 @@ impl App {
                 *p = nfs_formats::bytes::read_f32(c, 0);
             }
         }
-        self.lens = LensState { enabled, positions, ..Default::default() };
+        self.ambient.lens = LensState { enabled, positions, ..Default::default() };
     }
 
     /// The read-backs that finished: the stored block (0x460290) or a test (0x460460).
     fn lens_collect(&mut self) {
         let Some(r) = self.renderer.as_mut() else { return };
         for read in r.lens_results() {
-            let l = &mut self.lens;
+            let l = &mut self.ambient.lens;
             if read.reference {
                 l.reference_asked = None;
                 if l.mode == LensMode::Waiting {
@@ -181,7 +181,7 @@ impl App {
     /// overlay items. Called last in the race scene's build, so the ranges the mirror splices by
     /// are not moved.
     pub(crate) fn lens_flare_items(&mut self) {
-        if !self.lens.enabled || self.vehicle.is_none() || self.sky.is_none() {
+        if !self.ambient.lens.enabled || self.vehicle.is_none() || self.sky.is_none() {
             return;
         }
         self.lens_collect();
@@ -203,22 +203,22 @@ impl App {
         let mut probe = nfs_renderer::LensProbe { x: pt.px, y: pt.py, reference: false, test: false };
         let now = Instant::now();
         // 0x460290: the block right after the sun is drawn, once
-        if self.lens.mode == LensMode::Waiting && sun_on_screen && !self.lens.reference_asked.is_some_and(|t| now.duration_since(t) < ASK_LAPSES) {
+        if self.ambient.lens.mode == LensMode::Waiting && sun_on_screen && !self.ambient.lens.reference_asked.is_some_and(|t| now.duration_since(t) < ASK_LAPSES) {
             probe.reference = true;
-            self.lens.reference_asked = Some(now);
+            self.ambient.lens.reference_asked = Some(now);
         }
-        if self.lens.mode != LensMode::Active || !readback {
+        if self.ambient.lens.mode != LensMode::Active || !readback {
             self.scene.lens_probe = (probe.reference).then_some(probe);
             return;
         }
         // 0x4604C4…0x4604D9: every frame (the file's `+0x194 + 200 < now` throttle is NOPed by `nfs5.dll`)
-        if !self.lens.test_asked.is_some_and(|t| now.duration_since(t) < ASK_LAPSES) {
-            self.lens.test_asked = Some(now);
+        if !self.ambient.lens.test_asked.is_some_and(|t| now.duration_since(t) < ASK_LAPSES) {
+            self.ambient.lens.test_asked = Some(now);
             probe.test = true;
         }
         self.scene.lens_probe = (probe.reference || probe.test).then_some(probe);
         // 0x460646…0x460765: the elements
-        let scale = self.lens.scale();
+        let scale = self.ambient.lens.scale();
         let (fwd, right, up) = self.flare_basis(&cam);
         let tan_y = (cam.fov_y_radians * 0.5).tan();
         let tan_x = tan_y * aspect;
@@ -226,17 +226,17 @@ impl App {
         let mut items = Vec::new();
         for (e, id) in ELEMENTS.iter().enumerate() {
             // 0x452260, 0x452100: a record with no texture at all is dropped
-            let Some(def) = self.flare_defs.iter().find(|d| d.id == *id && d.textures.iter().any(|t| t.is_some())) else { continue };
+            let Some(def) = self.ambient.flare_defs.iter().find(|d| d.id == *id && d.textures.iter().any(|t| t.is_some())) else { continue };
             if !def.lit(0, self.tick as u32) {
                 continue;
             }
             // `centre + (sun − centre) · t`, in the window's pixels (0x4606FD…0x460736)
-            let t = self.lens.positions[e + 1];
+            let t = self.ambient.lens.positions[e + 1];
             let (ex, ey) = (320.0 + (pt.px - 320.0) * t, 240.0 + (pt.py - 240.0) * t);
             let (sx, sy) = (ex / 640.0, ey / 480.0);
             let dir = fwd + right * ((sx * 2.0 - 1.0) * tan_x) + up * ((1.0 - sy * 2.0) * tan_y);
             let centre = cam.position + dir * ahead;
-            self.flare_quads(&mut items, &cam, aspect, SUN_VIEW_MAIN, FlareQuad { def, at: (ex, ey), centre, ahead, scale, sprites: &self.lens_sprites, overlay: true });
+            self.flare_quads(&mut items, &cam, aspect, SUN_VIEW_MAIN, FlareQuad { def, at: (ex, ey), centre, ahead, scale, sprites: &self.draws.lens_sprites, overlay: true });
         }
         self.scene.items.extend(items);
     }

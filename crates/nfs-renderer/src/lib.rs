@@ -45,6 +45,8 @@ mod shafts;
 mod sharpen;
 pub use prof::{BenchSample, LiveStats, live_set, live_stats, timestamps_supported};
 mod smaa;
+mod scene_env;
+mod scene_lights;
 mod solid;
 mod soft;
 mod temporal;
@@ -57,31 +59,20 @@ pub use dof::{Dof, F_MAX as DOF_F_MAX, F_MIN as DOF_F_MIN};
 pub use drops::Drops;
 pub use haze::{HAZE_LAMPS, Haze, HazeLamp};
 pub use lbeam::{LBeam, LBeams, MAX_LBEAMS};
+pub use scene_env::*;
+pub use scene_lights::*;
 pub use shafts::Shafts;
 pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E21, E23, E24, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
 pub use front::{EnvFace, Renderer};
 pub use mipgen::MipAlpha;
 /// ENHANCEMENT E41: the E2 mip chain generator (levels 1.. of a base image), for the HD textures' own chains
 pub use mipgen::chain as mip_chain;
+pub use mipgen::ALPHA_TEST_REF;
 pub use gpu::{MaterialId, MeshId, OffscreenSpec, ResourceStats, REFL_FACES, REFL_TAN_HALF, STILL_MAX_PIXELS, TextureId, VIEW_FAR, still_size};
 
 use glam::{Mat4, Vec3};
 
-/// CPU-side vertex layout used for uploads.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Vertex {
-    pub position: [f32; 3],
-    pub normal: [f32; 3],
-    pub uv: [f32; 2],
-    pub color: [f32; 4],
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct MeshData {
-    pub vertices: Vec<Vertex>,
-    pub indices: Vec<u32>,
-}
+pub use nfs_gfxdata::{MeshData, Vertex};
 
 #[derive(Clone, Debug)]
 pub struct TextureData {
@@ -324,7 +315,7 @@ pub struct DrawItem {
     /// material is not drivable ground, an instance prop, a smackable, a breakable's piece) also
     /// casts. Cars are recognised by their own `R3DLightLayer` (a nonzero light direction) and need
     /// no flag; effects, the sky and the front end leave it 0. Read only by the renderer.
-    pub csm: u8,
+    pub csm: u16,
     /// ENHANCEMENT E12: a blended world sprite that fades out where it meets geometry — the
     /// distance in metres over which its alpha (colour, for the multiplying blend) goes from 0 at
     /// the surface behind it to full (`saturate((scene depth − own depth) / soft)`); 0 = a hard
@@ -403,9 +394,6 @@ pub fn motion_piece(b: usize, n: usize) -> u32 {
     if b < 65536 && n < 4096 { MOTION_PIECE | (b as u32) << 12 | n as u32 } else { 0 }
 }
 
-/// [`DrawItem::csm`]: the item is road (surface type 1, tarmac), which the rain (E26) wets.
-pub const CSM_ROAD: u8 = 4;
-
 /// [`DrawItem::particle`]: a spark streak, drawn far above white so the bloom makes it glow.
 pub const PARTICLE_SPARK: u8 = 1;
 /// [`DrawItem::particle`]: a billboard of smoke / dust / spray, lit by the sun's side and the sun's shadow at its centre
@@ -415,27 +403,36 @@ pub const PARTICLE_LIT: u8 = 2;
 pub const PARTICLE_LIT_WORLD: u8 = 3;
 
 /// [`DrawItem::csm`]: the item's colour is darkened where a sun shadow falls on it.
-pub const CSM_RECEIVE: u8 = 1;
+pub const CSM_RECEIVE: u16 = 1;
 /// [`DrawItem::csm`]: the item casts a sun shadow.
-pub const CSM_CAST: u8 = 2;
+pub const CSM_CAST: u16 = 2;
+/// [`DrawItem::csm`]: the item is road (surface type 1, tarmac), which the rain (E26) wets.
+pub const CSM_ROAD: u16 = 4;
 /// [`DrawItem::csm`] ENHANCEMENT ENH-FE3D: a front-end room's own piece (floor, walls, platform). It receives the car's
 /// shadow like the track does and never casts one (its own `R3DLightLayer` would otherwise make it a car).
-pub const CSM_ROOM: u8 = 8;
+pub const CSM_ROOM: u16 = 8;
 /// [`DrawItem::csm`] ENHANCEMENT E9: the car's own `SHAD` ground patch (0x43B820). Where the sun's shadow map draws the
 /// car's shadow (a frame with cascades, in the open) it fades out with the cover gate, as the `sh80` blob does —
 /// otherwise the car has two shadows (2026-10-03). Inert without E9.
-pub const CSM_CAR_BLOB: u8 = 16;
+pub const CSM_CAR_BLOB: u16 = 16;
 /// [`DrawItem::csm`] ENHANCEMENT ENH-DBLSH: a track's `sh80` ground-shadow decal (`S_Normal` / `S_UVAnimate`, depth
 /// biased) with a sun-shadow caster standing over it. Where the sun's shadow map draws that object's shadow the
 /// decal fades out with the cover gate (as the car's `sh80` blob does); otherwise two shadows lie on the ground.
-pub const CSM_DECAL: u8 = 32;
+pub const CSM_DECAL: u16 = 32;
 /// [`DrawItem::csm`] ENHANCEMENT E26: a skid-mark strip (`SKDP`) on a track with a wet stretch; `wet` is its wetness. On wet
 /// tarmac the rubber shows lighter and glossy (the tyre wiped the water film). Read only with E26 on and `Scene::rain` set.
-pub const CSM_SKID: u8 = 64;
+pub const CSM_SKID: u16 = 64;
+
+impl Default for DrawItem {
+    /// The plain opaque item `new` starts from (mesh and material 0, the identity transform).
+    fn default() -> Self {
+        Self { mesh: MeshId::default(), material: MaterialId::default(), transform: Mat4::IDENTITY, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false, mirrored: false, csm: 0, soft: 0.0, hdr_boost: 1.0, water: false, particle: 0, wet: 0.0, shadow_only: false, motion_id: 0, cover: 0.0, near_env: false }
+    }
+}
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false, mirrored: false, csm: 0, soft: 0.0, hdr_boost: 1.0, water: false, particle: 0, wet: 0.0, shadow_only: false, motion_id: 0, cover: 0.0, near_env: false }
+        Self { mesh, material, transform, ..Self::default() }
     }
 
     /// A car's part: its `R3DLightLayer` has a direction (the shadow maps' "car" caster / receiver; the track's lit items have
@@ -834,507 +831,6 @@ pub enum NearSky {
     Hue,
 }
 
-/// ENHANCEMENT E9 (ENH-TUNPOOL): how far under a covered slice's road its box reaches (m; the shader's `cover_at` has the same)
-pub const COVER_FLOOR: f32 = -2.0;
-/// ENHANCEMENT E9 (FOREST-E9PERF): the least determinant of a covered box's axes for its corners to be solved (else it is kept)
-const COVER_MIN_DET: f32 = 1e-6;
-
-/// ENHANCEMENT E9 (ENH-TUNPOOL): one road slice's covered volume: a box round the slice (its own axes), `half_len` along the
-/// road (`half_len`: the tested extent, a little more than the slice's own share so the boxes of a bend overlap), `half_wid`
-/// across it, from just under the road to `ceil` over it. `w_back` / `w_front` are the cover weights at the faces of the slice's
-/// own share of the road (`half_nom` either side of the centre), NOT clamped: above 1 inside a covered run, ramping through 0..1
-/// over the first metres of a run's ends, so the portal has no seam; the shader interpolates (and extrapolates) them along the
-/// box and clamps.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CoverBox {
-    pub centre: Vec3,
-    pub forward: Vec3,
-    pub lateral: Vec3,
-    pub up: Vec3,
-    pub half_len: f32,
-    pub half_nom: f32,
-    pub half_wid: f32,
-    pub ceil: f32,
-    pub w_back: f32,
-    pub w_front: f32,
-}
-
-impl CoverBox {
-    /// ENHANCEMENT E9 (FOREST-E9PERF): the eight corners of the volume `weight` tests (the parallelepiped of its three tests,
-    /// `|r . forward| <= half_len`, `|r . lateral| <= half_wid`, `COVER_FLOOR <= r . up <= ceil`, solved for `r`), or `None` when
-    /// the axes have no inverse.
-    pub fn corners(&self) -> Option<[Vec3; 8]> {
-        let m = glam::Mat3::from_cols(self.forward, self.lateral, self.up).transpose();
-        if m.determinant().abs() < COVER_MIN_DET {
-            return None;
-        }
-        let inv = m.inverse();
-        Some(std::array::from_fn(|c| {
-            let b = Vec3::new(
-                if c & 1 == 0 { -self.half_len } else { self.half_len },
-                if c & 2 == 0 { -self.half_wid } else { self.half_wid },
-                if c & 4 == 0 { COVER_FLOOR } else { self.ceil },
-            );
-            self.centre + inv * b
-        }))
-    }
-
-    /// ENHANCEMENT E9 (FOREST-E9PERF): whether any point this box covers (`weight` above 0) can lie within `slack` metres of the
-    /// view volume of `vp` (its four sides and its near plane; `0 <= z`, `-w <= x, y <= w`). False only when the box's weight is
-    /// 0 everywhere or its whole volume ([`Self::corners`]) lies farther than `slack` outside one of those planes, so no point the
-    /// view shades can fall in it (`slack` holds a particle's centre, which E9 reads for the whole sprite, off the screen's edge).
-    /// A degenerate box is kept.
-    pub fn may_cover_view(&self, vp: Mat4, slack: f32) -> bool {
-        // the weight at the box's two ends (it is linear along `l`, then clamped: 0 at both = 0 everywhere; a NaN keeps the box)
-        let at = |l: f32| self.w_back + (self.w_front - self.w_back) * ((l + self.half_nom) / (2.0 * self.half_nom));
-        if at(-self.half_len) <= 0.0 && at(self.half_len) <= 0.0 {
-            return false;
-        }
-        let Some(corners) = self.corners() else { return true };
-        // the view volume's planes from the rows of `vp` (w + x, w - x, w + y, w - y, z), as world distances (inside > 0)
-        let (rx, ry, rz, rw) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
-        let planes = [rw + rx, rw - rx, rw + ry, rw - ry, rz].map(|p| p / p.truncate().length().max(f32::MIN_POSITIVE));
-        !planes.iter().any(|p| corners.iter().all(|c| p.dot(c.extend(1.0)) < -slack))
-    }
-
-    /// How covered `p` is by this box, 0..1 (0 outside it): the shader's `cover_at` for one box.
-    pub fn weight(&self, p: Vec3) -> f32 {
-        let r = p - self.centre;
-        let l = r.dot(self.forward);
-        if l.abs() > self.half_len || r.dot(self.lateral).abs() > self.half_wid {
-            return 0.0;
-        }
-        let h = r.dot(self.up);
-        if !(COVER_FLOOR..=self.ceil).contains(&h) {
-            return 0.0;
-        }
-        (self.w_back + (self.w_front - self.w_back) * ((l + self.half_nom) / (2.0 * self.half_nom))).clamp(0.0, 1.0)
-    }
-}
-
-/// ENHANCEMENT E9 (SHADOW-REAL): how covered `p` is by the track's covered boxes, 0..1 (the highest of the boxes'; the shader's
-/// `cover_at`, over every box rather than the nearest 64).
-pub fn cover_weight(boxes: &[CoverBox], p: Vec3) -> f32 {
-    let mut w = 0.0f32;
-    for b in boxes {
-        w = w.max(b.weight(p));
-        if w >= 1.0 {
-            break;
-        }
-    }
-    w
-}
-
-/// ENHANCEMENT E26: what the wet road reflects and the lights it shows streaks of.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RainEnv {
-    /// The sky straight up (the sky pass's clear colour) and at the horizon.
-    pub zenith: [f32; 3],
-    pub horizon: [f32; 3],
-    /// The wetness at the camera (0..1), drives the splashes' density; the road parts carry their own ([`DrawItem::wet`]).
-    pub camera_wet: f32,
-    /// Seconds on the race clock (the splash ripples' phase; frozen while the race is paused).
-    pub time: f32,
-    /// Lights near the camera that reflect in the road as vertical streaks (at most [`RAIN_LAMPS`]): position,
-    /// linear colour x intensity and (AUTOBAHN-LAMPS) the light's reach in metres, the distance from the lamp at which
-    /// its streak is down to half (`1 / (1 + d² / reach²)`); 0 = [`RAIN_LAMP_REACH`], the street lamps' reach.
-    pub lamps: [(Vec3, [f32; 3], f32); RAIN_LAMPS],
-    /// How many of `lamps` are used.
-    pub n_lamps: usize,
-    /// The nearest wetness edges (where the original's field 5 steps between slices), at most [`RAIN_EDGES`]: the road
-    /// parts carry one value each, so near an edge the shader takes the wetness from these instead, ramped over the edge's width.
-    pub edges: [RainEdge; RAIN_EDGES],
-    pub n_edges: usize,
-}
-
-/// ENHANCEMENT E26: the most lights the road reflects per frame.
-pub const RAIN_LAMPS: usize = 12;
-
-/// ENHANCEMENT E26: the reach (m) of a light whose [`RainEnv::lamps`] entry gives none: the street and tunnel lamps' streak
-/// falls to half 63 m from the lamp (`d² = 4000`, the first version's constant for every light).
-pub const RAIN_LAMP_REACH: f32 = 63.245_55;
-
-/// ENHANCEMENT E26: the most wetness edges the shader knows per frame.
-pub const RAIN_EDGES: usize = 8;
-
-/// ENHANCEMENT E26: a step of the wetness along the track: the plane through `pos` with the normal `dir` (toward the
-/// higher slices), the wetness before it (`before`) and after it (`after`), ramped over `half` metres each side.
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct RainEdge {
-    pub pos: Vec3,
-    pub dir: Vec3,
-    pub before: f32,
-    pub after: f32,
-    pub half: f32,
-}
-
-/// ENHANCEMENT E23: one street lamp as a point light.
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct StreetLamp {
-    pub pos: Vec3,
-    /// the lamp's colour (the flare's), brightness folded in; may be 0 (faded out)
-    pub color: [f32; 3],
-    /// the reach of this lamp, metres
-    pub radius: f32,
-    /// MONACO-TUNNEL: the track's baked colour already holds this lamp's light (a tunnel lamp: a luminaire painted into a lit
-    /// tunnel's texture, or a flare lamp in a covered stretch, round 2): where E47 shadows it, the shadow also takes
-    /// [`BAKED_SHADOW`] of the baked colour, not only the lamp's added term
-    pub baked: bool,
-}
-
-/// ENHANCEMENT E47 (MONACO-TUNNEL): how much of a track point's baked colour a [`StreetLamp::baked`] lamp's shadow takes where the lamp
-/// lights it fully (scaled by the lamp's falloff and cone there; the losses of several lamps add, held to [`BAKED_SHADOW_MAX`]). A
-/// tunnel lit by its bake gets E23's lamps at a small share (the bake already is their light), so a shadow that only removed that
-/// share was invisible; the bake's own share of the lamp is what a car standing in its light really blocks. APPROXIMATION (by the
-/// stills, `RE/notes/ENHANCEMENTS.md` E47 MONACO-TUNNEL).
-pub const BAKED_SHADOW: f32 = 0.65;
-/// ENHANCEMENT E47 (MONACO-TUNNEL): the most a point's baked colour loses to the baked lamps' shadows together (`shader.wgsl`
-/// `lamp_light`, emitted by `classes.rs`). APPROXIMATION (as [`BAKED_SHADOW`]).
-pub const BAKED_SHADOW_MAX: f32 = 0.6;
-
-/// The most street lamps a frame lights.
-pub const MAX_LAMPS: usize = 32;
-
-/// ENHANCEMENT E23: the street lamps of a frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Lamps {
-    pub n: u8,
-    /// the strength of the added light
-    pub gain: f32,
-    pub lamps: [StreetLamp; MAX_LAMPS],
-}
-
-impl Default for Lamps {
-    fn default() -> Self {
-        Self { n: 0, gain: 1.0, lamps: [StreetLamp::default(); MAX_LAMPS] }
-    }
-}
-
-/// ENHANCEMENT E43: the most cars a frame's contact shadow knows.
-pub const MAX_CONTACTS: usize = 16;
-
-/// ENHANCEMENT E43: one car for the contact shadow. The pose is the one the original's blob quad (`shadow_quad`, 0x43B820) is
-/// laid from: the body box `half` (LOD 5's, `car+0x3A8` / `+0x3B0`) round the model origin, which stands on the ground
-/// (`origin`), in the body's axes (right, up, forward).
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct ContactCar {
-    /// the model origin on the road under the car (the box's bottom centre), world
-    pub origin: Vec3,
-    /// the body's right, up and forward axes in the world (unit)
-    pub axes: [Vec3; 3],
-    /// the box's half width (x) and half length (z), metres
-    pub half: [f32; 2],
-    /// the tyres' contact patch centres in the body's (x, z), metres: FL, FR, RL, RR
-    pub wheels: [[f32; 2]; 4],
-    /// the tyre radius, metres
-    pub wheel_r: f32,
-}
-
-/// ENHANCEMENT E43: the cars of a frame (the nearest to the camera first, at most [`MAX_CONTACTS`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Contacts {
-    pub n: u8,
-    pub cars: [ContactCar; MAX_CONTACTS],
-}
-
-impl Default for Contacts {
-    fn default() -> Self {
-        Self { n: 0, cars: [ContactCar::default(); MAX_CONTACTS] }
-    }
-}
-
-impl Contacts {
-    /// Append a car (ignored past [`MAX_CONTACTS`]).
-    pub fn push(&mut self, c: ContactCar) {
-        if (self.n as usize) < MAX_CONTACTS {
-            self.cars[self.n as usize] = c;
-            self.n += 1;
-        }
-    }
-}
-
-/// ENHANCEMENT E51 (CARSH-FADE): one car of [`Scene::sun_cars`]: its pose (the contact shadow's, [`ContactCar`]) and a key that
-/// stays the car's from frame to frame (the renderer eases each car's share of the sun over time under it, `gpu/carsun.rs`).
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct SunCar {
-    /// below [`SUN_CAR_KEYS`]: the player 0, the opponents 1 + seat, the police 64 + index, the traffic 128 + index (mod 128)
-    pub key: u16,
-    pub pose: ContactCar,
-}
-
-/// ENHANCEMENT E51 (CARSH-FADE): how many keys a [`SunCar`] may have.
-pub const SUN_CAR_KEYS: usize = 256;
-
-/// ENHANCEMENT E51 (CARSH-FADE): the key ranges of [`SunCar::key`] (first key, count): the player, the opponents, the police, the
-/// traffic.
-const SUN_KEYS_PLAYER: u16 = 0;
-const SUN_KEYS_OPPONENTS: (u16, usize) = (1, 63);
-const SUN_KEYS_POLICE: (u16, usize) = (64, 64);
-const SUN_KEYS_TRAFFIC: (u16, usize) = (128, 128);
-
-impl SunCar {
-    fn keyed((first, count): (u16, usize), i: usize, pose: ContactCar) -> Self {
-        Self { key: first + (i % count) as u16, pose }
-    }
-
-    /// The player's car.
-    pub fn player(pose: ContactCar) -> Self {
-        Self { key: SUN_KEYS_PLAYER, pose }
-    }
-
-    /// Opponent `seat` (its index in the race's opponents).
-    pub fn opponent(seat: usize, pose: ContactCar) -> Self {
-        Self::keyed(SUN_KEYS_OPPONENTS, seat, pose)
-    }
-
-    /// Police car `i`.
-    pub fn police(i: usize, pose: ContactCar) -> Self {
-        Self::keyed(SUN_KEYS_POLICE, i, pose)
-    }
-
-    /// Traffic car `i`.
-    pub fn traffic(i: usize, pose: ContactCar) -> Self {
-        Self::keyed(SUN_KEYS_TRAFFIC, i, pose)
-    }
-}
-
-/// ENHANCEMENT E51 (CARSH-FADE): the cars of a frame whose sun share is measured (the nearest to the camera first, at most
-/// [`MAX_CONTACTS`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SunCars {
-    pub n: u8,
-    pub cars: [SunCar; MAX_CONTACTS],
-    /// the draw clock (s: the game ticks and the frame's fraction of the next over 64 Hz): the ease runs on it, so a paused race
-    /// holds and a scripted still (one frame per tick or fewer) eases by the race time between its frames, not the wall clock's
-    pub clock: f64,
-}
-
-impl Default for SunCars {
-    fn default() -> Self {
-        Self { n: 0, cars: [SunCar::default(); MAX_CONTACTS], clock: 0.0 }
-    }
-}
-
-impl SunCars {
-    /// Append a car (ignored past [`MAX_CONTACTS`]).
-    pub fn push(&mut self, c: SunCar) {
-        if (self.n as usize) < MAX_CONTACTS {
-            self.cars[self.n as usize] = c;
-            self.n += 1;
-        }
-    }
-}
-
-/// ENHANCEMENT E15: one lit headlight as a spotlight.
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct SpotLamp {
-    /// the lamp's centre in the world
-    pub pos: Vec3,
-    /// the way it shines (unit)
-    pub dir: Vec3,
-    /// 0..1: the lamp slot's ramp (`car+0x2D8`) times how dark the place is
-    pub intensity: f32,
-}
-
-/// The most spotlights a frame lights.
-pub const MAX_SPOTS: usize = 8;
-
-/// ENHANCEMENT E15: the spotlights of a frame. The first `shadowed` lamps are the camera's own car's
-/// pair, which share one shadow map (the rest are lights without shadows).
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct Spots {
-    pub n: u8,
-    pub shadowed: u8,
-    pub lamps: [SpotLamp; MAX_SPOTS],
-}
-
-impl Spots {
-    pub fn push(&mut self, l: SpotLamp) -> bool {
-        if (self.n as usize) < MAX_SPOTS {
-            self.lamps[self.n as usize] = l;
-            self.n += 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// ENHANCEMENT E9: the sun of a race scene's shadows.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SunShadow {
-    /// The direction the light travels (from the sun to the ground) — the one the cars' `R3DLightLayer`
-    /// is given (`-SkyBin::sun_position`, 0x43AC8D), so the shadows agree with the car shading.
-    pub direction: Vec3,
-    /// ENHANCEMENT E9 (SHADOWFIX): false = the frame-wide cover gate shuts (the renderer fades the shadows out over half a
-    /// second and back in). SHADOW-REAL: the race keeps it true whenever `Scene::cover` holds the track's covered boxes, so the
-    /// shadow ends at a tunnel's mouth per surface (the shader's `cover_at`); the gate is the fallback of a track without them
-    /// (false while the camera or the player's car is under cover).
-    pub lit: bool,
-    /// ENHANCEMENT ENH-FE3D: the front end's 3-D views fit ONE cascade to a sphere (centre, radius) round the car
-    /// instead of the race's view-depth cascades, and soften the edge (a jittered disc of that many texels); `None` =
-    /// the race's.
-    pub focus: Option<ShadowFocus>,
-}
-
-/// ENHANCEMENT E9: the lights a view's sun-shadow cascades can be drawn for, one field per kind. The renderer draws ONE frame of
-/// cascades a frame, for the first kind in this order that is set and whose switch is on (`gpu/csm.rs`, `ShadowMode::pick`): the
-/// sky's sun (E9; or a front-end car's [`SunShadow::focus`]), the data sun (E51 / SUN-FULL), the moon
-/// (E50). Besides the cascades only [`Self::sun`] is read (the fog glow, the particles' and the water's sun).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ShadowLights {
-    /// ENHANCEMENT E9: the sun the race's main view (or a front-end car) is lit with; `None` on a night or a sunless track. Read
-    /// only with E9 on.
-    pub sun: Option<SunShadow>,
-    /// ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL) / E9 (SUN-FULL): a sunless day track's sun from its data ([`DataSun`]). Read only
-    /// with E9 on, and with E51 on unless it drives E9's full frame.
-    pub data_sun: Option<DataSun>,
-    /// ENHANCEMENT E50: on a night track the moon's light through the same cascades (a faint cold light, soft shadows, a weak cold
-    /// term on the cars). Read only with E9 and E50 on.
-    pub moon: Option<SunShadow>,
-    /// ENHANCEMENT E50 (SHADOW-OVERCAST): the highest E50 level this track's moon is drawn at (`None` = E50's own level): a level
-    /// above it draws at it (Monaco: «средне» draws as «слабо»).
-    pub moon_level_cap: Option<u8>,
-    /// ENHANCEMENT E9 / E51 (SHADOW-OVERCAST, "overcast during precipitation: no direct sun"): how much snow / rain the sky data
-    /// has round the camera, 0 (none) .. 1 (full). The sun's and the data sun's shadows are drawn at `1 - precipitation` of their
-    /// strength (the cover gate scaled by it: the track's darkening, the cars' direct-term shadow, the car's `SHAD` patch and the
-    /// `sh80` decals' give-way all follow); at 1 no frame is drawn. 0 (the `Default`) changes nothing.
-    pub precipitation: f32,
-    /// ENHANCEMENT E9 (GATE-REL): the track's bake light, for [`BakedGate::Relative`] (`None`: that gate is `Absolute`).
-    pub bake: Option<BakeLight>,
-}
-
-impl ShadowLights {
-    /// No shadow light (the `Default`, usable in a `const`).
-    pub const NONE: Self = Self { sun: None, data_sun: None, moon: None, moon_level_cap: None, precipitation: 0.0, bake: None };
-
-    /// Whether a frame of these lights can draw the scenery's shadows (any light but the cars-only data sun): the race then adds
-    /// the casters round the camera (`TrackWorld::shadow_casters`). By the lights set, not by the switches.
-    pub fn casts_scenery(&self) -> bool {
-        self.sun.is_some() || self.moon.is_some() || self.data_sun.is_some_and(|d| d.scenery.is_some())
-    }
-}
-
-/// ENHANCEMENT E9 (SHADOW-UNIFY): which non-ground scenery parts cast the sun's / the moon's shadow (never a level flat sheet).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SceneryCasters {
-    /// every part whatever its size, but the terrain-like ones: broad (bounding radius over 60 m) and neither upright nor built
-    /// (`gpu/csm.rs` `terrain_like`; hills, cliffs, slopes, fields). APPROXIMATION: an enhancement's rule, by the caster audit.
-    Shape,
-    /// TEST GLUE (comparison): the rule before SHADOW-UNIFY, every part up to this bounding radius (m; E9's was 60, SUN-FULL's
-    /// forest row 15)
-    Radius(f32),
-    /// TEST GLUE (CANYON-SMALLSH, comparison): only the small upright parts: bounding radius up to `radius` m and (mesh space) height up
-    /// to `height` m
-    Small { radius: f32, height: f32 },
-}
-
-/// ENHANCEMENT E9 (SHADOW-UNIFY): the casters' rule of a frame that sets none of its own (the sky sun, E50's moon, the front end,
-/// the data sun's full frame without a test glue radius): [`SceneryCasters::Shape`].
-/// TEST GLUE: `NFS_CASTER_RULE=radius[:<m>]` = the radius rule of before (60 m), for comparison stills; it also moves ENH-DBLSH's
-/// decal tagging (`nfs_game` `world.rs`, [`scenery_part_casts`]).
-pub fn scenery_casters() -> SceneryCasters {
-    static RULE: std::sync::OnceLock<SceneryCasters> = std::sync::OnceLock::new();
-    *RULE.get_or_init(|| {
-        let v = std::env::var("NFS_CASTER_RULE").unwrap_or_default();
-        match v.trim().split_once(':').map_or((v.trim(), None), |(a, b)| (a, Some(b))) {
-            ("radius", r) => SceneryCasters::Radius(r.and_then(|r| r.trim().parse().ok()).unwrap_or(60.0)),
-            _ => SceneryCasters::Shape,
-        }
-    })
-}
-
-/// ENHANCEMENT E9 (SHADOW-UNIFY): whether a non-ground scenery part with these vertices (mesh space) placed at `scale` casts under
-/// `rule`, as the renderer's shadow pass decides it (its bounding sphere and shape at upload, `gpu/csm.rs` `mesh_bounds` /
-/// `part_casts`). For ENH-DBLSH's decal tagging: a decal under a caster gives way to its shadow.
-pub fn scenery_part_casts(vertices: &[Vertex], scale: f32, rule: SceneryCasters) -> bool {
-    gpu::part_casts_vertices(vertices, scale, rule)
-}
-
-/// ENHANCEMENT E51 (CORSICA-SUN, SUN-ALL) / E9 (SUN-FULL): the sun of a day track whose sky has none (the sky's sun object overhead
-/// and off; the cars' own light straight down) but whose data gives one: its `sh80` tree-shadow decals were drawn along it
-/// (Corsica, `canyon`) or its bake was lit by it (Schwarzwald, `nfs_game::bake_light`). The cars' shading is left as it is (their
-/// light is the original's straight-down one), and nothing but the cascades reads it (not the fog glow, the cars' glint, water).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DataSun {
-    pub light: SunShadow,
-    /// `None`: E51's cars-only frame (only the cars cast, onto the track; the scenery's shade is already baked / in the decals).
-    /// `Some(rule)` (SUN-FULL): E9's FULL frame (scenery and cars cast, the scenery by `rule`: SHADOW-UNIFY's shape rule as on a
-    /// sky-sun track, which keeps the terrain out: a hillside's shade along a sun the bake never had would cover whole stretches),
-    /// E9's baked-dark gate on the track, E51's cars-only layers on top when E51 is on, as on a sky-sun track.
-    pub scenery: Option<SceneryCasters>,
-    /// FOREST-TREESH (with `scenery`): E9's baked-dark gate on the track for this frame ([`BakedGate`]; SHADOW-UNIFY: `Relative` but
-    /// by test glue; the gate keeps a shadow baked into the colour from being darkened twice).
-    pub baked_gate: BakedGate,
-}
-
-/// ENHANCEMENT E9: how a track receiver's baked colour scales the sun's shadow on it (the "already baked dark" gate: a shade the
-/// bake already has is not darkened twice). APPROXIMATION: an enhancement's look, nothing of the original.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BakedGate {
-    /// by the baked colour's absolute luma (`smoothstep(0.3, 0.7)`, E9's gate since it came)
-    Absolute,
-    /// none: the whole shadow everywhere (FOREST-TREESH, the "full shadows" trial on forest)
-    Off,
-    /// GATE-REL: by the baked luma against the lit level the track's own bake light gives that orientation ([`BakeLight`]): a
-    /// receiver counts as baked in shade when it is well below its own lit level, not when it is merely dark. Without a
-    /// [`BakeLight`] it is `Absolute`.
-    Relative,
-}
-
-/// ENHANCEMENT E9 (GATE-REL): the light a track's vertex colours were baked with, as `nfs_game::bake_light` fits it over the
-/// scenery, `luma = base + gain max(0, n . to_light)`; the drivable ground's lit level is `ground` times that (its bake is lighter
-/// than the scenery's). Read only by [`BakedGate::Relative`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BakeLight {
-    /// toward the bake's light (unit, upward)
-    pub to_light: Vec3,
-    pub base: f32,
-    pub gain: f32,
-    pub ground: f32,
-}
-
-/// ENHANCEMENT ENH-FE3D: a front-end car's shadow volume.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ShadowFocus {
-    pub centre: Vec3,
-    pub radius: f32,
-    /// the soft edge's radius in metres
-    pub blur: f32,
-    /// how strongly the shadow darkens a receiver at full shadow, 0..1
-    pub strength: f32,
-    /// ENHANCEMENT ENH-GARAGE: the contact core's radius in metres (a second, sharper disc; 0 = none): the shadow is
-    /// the darker of the soft penumbra (weighted by `soft`) and the core, so the car sits in a tight dark footprint
-    pub core: f32,
-    /// the penumbra's share of the full strength, 0..1 (the core is always whole)
-    pub soft: f32,
-    /// how much of the original's `FESH` blob under the garage car gives way to this shadow, 0..1
-    pub blob_fade: f32,
-}
-
-impl SunShadow {
-    /// The race's sun (the view-depth cascades).
-    pub const fn race(direction: Vec3) -> Self {
-        Self { direction, lit: true, focus: None }
-    }
-}
-
-/// ENHANCEMENT E17: what the water reflects when there is no environment map (E8 off), and the sun
-/// that glints on it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WaterEnv {
-    /// The sky straight up (the sky pass's clear colour) and at the horizon (the scene's fog colour, else the same).
-    pub zenith: [f32; 3],
-    pub horizon: [f32; 3],
-    /// The unit vector from the ground to the sun (`SkyBin::sun_position`, the sun of E9 and the lens
-    /// flare); zero = no sun (night, overcast tracks): no glint.
-    pub sun: Vec3,
-    /// Reflect the E8 environment map (taken at the car, so only right where the car is close to the water: the
-    /// night harbour) instead of the sky colours alone (the sea seen from a road far above it).
-    pub use_env_map: bool,
-}
-
-/// The game's 640 × 480 screen the lens flare's probe point is given in ([`LensProbe::x`] / `y`).
 pub(crate) const LENS_SCREEN: [f32; 2] = [640.0, 480.0];
 
 /// The sun's lens flare reads a 4 × 4 block of the frame at the sun's screen point
@@ -1390,8 +886,6 @@ pub struct Fog {
 }
 
 impl Scene {
-    /// A copy with the same items and view state but no sprites — what an offscreen 3-D pass
-    /// (`Renderer::render_offscreen`, which draws none) needs, without cloning the 2-D list.
     /// Copy this scene into `dst`, keeping `dst`'s allocations (the render thread's hand-off).
     pub fn copy_into(&self, dst: &mut Scene) {
         let (mut items, mut sprites) = (std::mem::take(&mut dst.items), std::mem::take(&mut dst.sprites));
@@ -1402,6 +896,8 @@ impl Scene {
         *dst = Self { items, sprites, cover: self.cover.clone(), ..*self };
     }
 
+    /// A copy with the same items and view state but no sprites — what an offscreen 3-D pass
+    /// (`Renderer::render_offscreen`, which draws none) needs, without cloning the 2-D list.
     pub fn clone_without_sprites(&self) -> Self {
         Self { items: self.items.clone(), sprites: Vec::new(), cover: self.cover.clone(), ..*self }
     }
@@ -1416,32 +912,5 @@ impl Scene {
 impl Default for Scene {
     fn default() -> Self {
         Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, headlight_gain: 1.0, beacon: None, fog: None, sky_fog: None, lens_probe: None, refl: 0.0, shadows: ShadowLights::NONE, water: None, spots: Spots::default(), lamps: Lamps::default(), shafts: None, ao: false, eye: false, motion: None, rain: None, dof: None, haze: None, drops: None, contacts: Contacts::default(), sun_cars: SunCars::default(), cover: Default::default(), lbeam: None, near_sky: NearSky::Original }
-    }
-}
-
-impl MeshData {
-    /// Simple checker-grid ground plane used by the M1 smoke test.
-    pub fn grid(half: f32, step: f32) -> Self {
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        let n = ((2.0 * half) / step) as i32;
-        for iz in 0..n {
-            for ix in 0..n {
-                let x0 = -half + ix as f32 * step;
-                let z0 = -half + iz as f32 * step;
-                let shade = if (ix + iz) % 2 == 0 { 0.55 } else { 0.35 };
-                let base = vertices.len() as u32;
-                for (dx, dz) in [(0.0, 0.0), (step, 0.0), (step, step), (0.0, step)] {
-                    vertices.push(Vertex {
-                        position: [x0 + dx, 0.0, z0 + dz],
-                        normal: [0.0, 1.0, 0.0],
-                        uv: [dx / step, dz / step],
-                        color: [shade, shade, shade, 1.0],
-                    });
-                }
-                indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
-            }
-        }
-        Self { vertices, indices }
     }
 }

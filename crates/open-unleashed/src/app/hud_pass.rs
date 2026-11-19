@@ -52,7 +52,7 @@ impl App {
             // before the blink counters 0x436F86 — they hold)
             && self.cheat_bits & CHEAT_DERBY == 0;
         if up {
-            let (count, last, visible) = &mut self.wrong_way_blink;
+            let (count, last, visible) = &mut self.hud_state.wrong_way_blink;
             *count += self.tick.saturating_sub(*last);
             if (*visible && *count > 0x40) || (!*visible && *count > 0x20) {
                 *visible = !*visible;
@@ -60,7 +60,7 @@ impl App {
             }
             *last = self.tick;
         }
-        up && self.wrong_way_blink.2
+        up && self.hud_state.wrong_way_blink.2
     }
 
     /// **`HLeader`**'s picture, only in a network race.
@@ -84,7 +84,7 @@ impl App {
         if let Some(h) = &self.hud {
             h.display.set(Hud::display_colour(self.choice_index(choice::DISPLAY_DISP_COLS).map_or(0, |(i, _)| i)));
             // the trays' box: `HudKeys::boxes`, TRANSLUCENCY's at the session's start, F8 flips it
-            h.boxes.set(self.hud_keys.boxes);
+            h.boxes.set(self.hud_state.hud_keys.boxes);
         }
         let opp_list = self.opponent_rows();
         // `REPLAY != 0` (0x418540…0x418547): 2 through a playback's exhausted frames too
@@ -142,7 +142,7 @@ impl App {
                     None => self
                         .race
                         .as_ref()
-                        .filter(|r| r.finished && !self.player_eliminated)
+                        .filter(|r| r.finished && !self.ko.player_eliminated)
                         .map(|r| r.tick.saturating_sub(RACE_START_TICK)),
                 },
             },
@@ -185,21 +185,21 @@ impl App {
         let opp_mode = self.choice_index(choice::DISPLAY_OPP_LIST).map_or(0, |(i, _)| i);
         let playing_back = self.playback_running();
         if opp_mode != 0
-            && self.hud_keys.live
+            && self.hud_state.hud_keys.live
             && !playing_back
             && !self.road.opponents.is_empty()
             && let Some(r) = self.race.as_ref()
         {
             let order = self.live_order();
             let derby = self.cheat_bits & CHEAT_DERBY != 0;
-            let metres = |d: usize| self.hud_metres.get(d).copied().unwrap_or(0);
+            let metres = |d: usize| self.hud_state.hud_metres.get(d).copied().unwrap_or(0);
             let p_speed = v.horizontal_speed();
             let mut rows = Vec::new();
             let mut links: Vec<(usize, Option<LinkBadge>)> = Vec::new();
             let game_tick = self.tick as u32;
             for &d in &order {
                 let (progress, eliminated, name, paint, speed) = if d == 0 {
-                    (r, self.player_eliminated, self.player_name.clone(), self.paint, p_speed)
+                    (r, self.ko.player_eliminated, self.player_name.clone(), self.paint, p_speed)
                 } else {
                     let o = &self.road.opponents[d - 1];
                     let paint = self.road.opponent_paints.get(d - 1).copied().unwrap_or([0x20, 0x40, 0xC0]);
@@ -207,7 +207,7 @@ impl App {
                 };
                 // Quick Knockout (game type 1) drops the knocked-out cars from the list and
                 // closes it up (0x42B04E…0x42B06C, 0x42B1C9…0x42B1E0)
-                if self.quick_knockout && eliminated {
+                if self.ko.quick_knockout && eliminated {
                     continue;
                 }
                 let gap = metres(d) - metres(0);
@@ -299,13 +299,13 @@ impl App {
                 };
                 let over = nfs_game::skill::damage_over_limit(&ms.mission, &v.damage);
                 // `HTime+0xE4` (the count's moves) × `CONEPENALTY` × 64 (0x43176A…0x4317A1)
-                (self.hud_cones.changes as i64 * per * 64, over || self.cone_flash > 0)
+                (self.hud_state.hud_cones.changes as i64 * per * 64, over || self.hud_state.cone_flash > 0)
             }
             (Some(ms), None) => (0, nfs_game::skill::damage_over_limit(&ms.mission, &v.damage)),
             _ => (0, false),
         };
         // 0x4317C9…0x4317E0: the flash counts down once per draw
-        self.cone_flash = self.cone_flash.saturating_sub(1);
+        self.hud_state.cone_flash = self.hud_state.cone_flash.saturating_sub(1);
         penalty
     }
 
@@ -359,11 +359,11 @@ impl App {
         // A transition stamps `[0x606AC8]` (0x434490) and runs 11 ticks (slot 14, 0x4349F0).
         // `[0x60C970]` clear keeps 0x425E20 from opening a tray (0x425E55) and draws only one
         // sliding out (0x425A35…0x425A50: `live || state == 2`) — F5's hide (`hud_key`)
-        let live = self.hud_keys.live;
+        let live = self.hud_state.hud_keys.live;
         let clock = self.hud_clock();
         let slide = {
-            let (st, stamp) = step_slide(self.slides.tray, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, live);
-            self.slides.tray = (st, stamp);
+            let (st, stamp) = step_slide(self.hud_state.slides.tray, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, live);
+            self.hud_state.slides.tray = (st, stamp);
             h.trays_in.set(st == 3);
             let st = if live || st == 2 { st } else { 0 };
             TraySlide { state: st, t: clock.saturating_sub(stamp).min(1 << 20) as i32 }
@@ -379,12 +379,12 @@ impl App {
         let hidden = TraySlide { state: 0, t: 0 };
         let playback = self.playback_running();
         let (tray4, time_slide) = if !playback {
-            self.slides.time = self.slides.tray;
+            self.hud_state.slides.time = self.hud_state.slides.tray;
             (slide, slide)
         } else if self.mission.is_some() {
-            let (st, stamp) = step_slide(self.slides.time, clock, false, false, true);
+            let (st, stamp) = step_slide(self.hud_state.slides.time, clock, false, false, true);
             let t = clock.saturating_sub(stamp).min(1 << 20) as i32;
-            self.slides.time = (st, stamp);
+            self.hud_state.slides.time = (st, stamp);
             // the rule is each tray's own state-3 test (0x43428D); only these two draw one here
             h.trays_in.set(st == 3);
             (hidden, TraySlide { state: st, t })
@@ -460,9 +460,9 @@ impl App {
         // loop's gates (which do not test `REPLAY`). *(The port tested `Playing` only, so a
         // playback run off its stream's end, `Exhausted` = 3, drew the mirror again.)*
         let mirror_slide = {
-            let (st, stamp) = step_slide(self.slides.mirror, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, self.hud_keys.rearview && live && !playback);
-            self.slides.mirror = (st, stamp);
-            let drawn = (live || st == 2) && (self.hud_keys.rearview || matches!(st, 1 | 2));
+            let (st, stamp) = step_slide(self.hud_state.slides.mirror, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, self.hud_state.hud_keys.rearview && live && !playback);
+            self.hud_state.slides.mirror = (st, stamp);
+            let drawn = (live || st == 2) && (self.hud_state.hud_keys.rearview || matches!(st, 1 | 2));
             TraySlide { state: if drawn { st } else { 0 }, t: clock.saturating_sub(stamp).min(1 << 20) as i32 }
         };
         if !playback
@@ -477,8 +477,8 @@ impl App {
                 h.tray(m, hud_aspect, rx, ry, 240.0, 84.0);
             }
             if slide.state == 3
-                && self.rear_mirror.is_some()
-                && let Some(tex) = self.mirror_tex
+                && self.refl.rear_mirror.is_some()
+                && let Some(tex) = self.refl.mirror_tex
             {
                 // The picture is drawn as it came: the left-right reversal of the original's tray is in the mirror
                 // pass's camera (0x46537B…0x4653A8, `Self::render_mirror`), not in the tray quad (PA-MIRROR, `hud.md`
@@ -502,9 +502,9 @@ impl App {
         // tested `Playing` only.)*
         if self.playback_running() {
             // not drawn in state 0 (0x42D28E), faded by the state's per cent otherwise
-            if let Some(pct) = self.replay_bar.pct(clock) {
+            if let Some(pct) = self.hud_state.replay_bar.pct(clock) {
                 let tips: [&str; 7] = std::array::from_fn(|i| self.fe.strings.hud(nfs_game::replay::bar_tooltip(i, self.replay.frozen, self.replay_net.is_some())).unwrap_or_default());
-                h.replay_bar(&mut self.scene.sprites, hud_aspect, crate::hud::ReplayBarDraw { frozen: self.replay.frozen, network: self.replay_net.is_some(), bar: &self.replay_bar, pct, cursor: self.fe.cursor, tips: &tips });
+                h.replay_bar(&mut self.scene.sprites, hud_aspect, crate::hud::ReplayBarDraw { frozen: self.replay.frozen, network: self.replay_net.is_some(), bar: &self.hud_state.replay_bar, pct, cursor: self.fe.cursor, tips: &tips });
             }
         }
     }
@@ -562,9 +562,9 @@ impl App {
         // 0x425E20 only while its slot 10 0x433400 is clear — `MAP != 0 && [0x60C970]`. MAP is
         // the runtime copy F7 / "2" / F5 change (`HudKeys::map`).
         let map_slide = {
-            let (st, stamp) = step_slide(self.slides.map, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, self.hud_keys.map != 0 && live && !playback);
-            self.slides.map = (st, stamp);
-            let drawn = (live || st == 2) && (self.hud_keys.map != 0 || matches!(st, 1 | 2));
+            let (st, stamp) = step_slide(self.hud_state.slides.map, clock, self.tick <= RACE_START_TICK, self.billboard_key != 0, self.hud_state.hud_keys.map != 0 && live && !playback);
+            self.hud_state.slides.map = (st, stamp);
+            let drawn = (live || st == 2) && (self.hud_state.hud_keys.map != 0 || matches!(st, 1 | 2));
             TraySlide { state: if drawn { st } else { 0 }, t: clock.saturating_sub(stamp).min(1 << 20) as i32 }
         };
         if !in_replay && map_slide.state != 0 {
@@ -572,7 +572,7 @@ impl App {
             // 0x432F92: the current lap is `min(car+0xB20 + 1, NUM_LAPS)` — the laps already
             // timed, plus one — and 0x432EA3 suppresses the whole counter on a linear track.
             // This port printed it as "LAP n/N" in the top-right tray.
-            let linear = !self.records.track(&self.track.name).map(|t| t.circuit).unwrap_or(true);
+            let linear = self.track_is_linear();
             let lap_label = self.fe.strings.hud(19).unwrap_or_default();
             let lap = self
                 .race
@@ -590,7 +590,7 @@ impl App {
             // MAP 1 "rotating" and 3 "radar" turn the view (0x4336BF / 0x4336B9 → 0x433440): by
             // the car's heading, or in radar mode by its slice's direction; 2 "static" does not
             // (MAP 0 while it slides out after F7 answers neither test: the static view)
-            let map_mode = self.hud_keys.map;
+            let map_mode = self.hud_state.hud_keys.map;
             let heading = match map_mode {
                 1 => Some((v.forward().x, v.forward().z)),
                 3 => self
@@ -604,7 +604,7 @@ impl App {
             // the zoom 0x41E9C0: base 0 / 0 / 33 / 66 / 100 by MAPSCALE (the session's, which the
             // keypad's − / + step, `HudKeys::mapscale`), then `· 4.15 + 185`, or `· 0.15 + 5` in radar
             // mode; 600 (= 0x41EA40) is the whole-track view
-            let base = [0.0f32, 0.0, 33.0, 66.0, 100.0][self.hud_keys.mapscale.min(4)];
+            let base = [0.0f32, 0.0, 33.0, 66.0, 100.0][self.hud_state.hud_keys.mapscale.min(4)];
             let zoom = if map_mode == 3 { base * 0.15 + 5.0 } else { base * 4.15 + 185.0 };
             let follow = (zoom != 600.0).then_some((v.position.x, v.position.z, zoom));
             if let Some(r) = self.renderer.as_mut() {
@@ -682,7 +682,7 @@ impl App {
             let ordinals: Vec<String> = (18116..18124).map(fe).collect();
             let (esc, space) = (fe(hud_str::HINT_ESC), fe(hud_str::HINT_SPACE));
             let title = fe(Self::summary_title(self.race_fegame_type()));
-            let page = self.result_pages().get(self.pages.page as usize).copied().unwrap_or(ResultPage::Closed);
+            let page = self.result_pages().get(self.hud_state.pages.page as usize).copied().unwrap_or(ResultPage::Closed);
             // the race's own `HCongrats` is the first thing the queue shows (0x426D54), for
             // game types 0…4 (0x426CCD…0x426CEC, and 0x41D080 skips type 5), places 1–3 and in a
             // Quick Knockout only the winner (show 0x41DD40); it closes itself past 0xC0 ticks
@@ -695,7 +695,7 @@ impl App {
                 let t = self.tick.saturating_sub(res.opened);
                 let allowed = self.mission.is_none()
                     && self.career.as_ref().and_then(|c| c.pending.as_ref()).is_none_or(|p| !p.finale)
-                    && if self.quick_knockout { place == 1 } else { (1..=3).contains(&place) };
+                    && if self.ko.quick_knockout { place == 1 } else { (1..=3).contains(&place) };
                 (page == ResultPage::Summary && allowed && res.congrats && t <= 0xC0).then_some((place, t))
             };
             // the billboard opening (`Hud::billboard`): frames since this page first showed,
@@ -706,15 +706,15 @@ impl App {
             self.results_billboard = None;
             let billboard_up = race_congrats.is_none() && !matches!(page, ResultPage::Closed | ResultPage::TournamentPlace(_));
             if billboard_up {
-                if self.pages.seen != Some(self.pages.page) {
-                    self.pages.seen = Some(self.pages.page);
-                    self.pages.frames = 0;
-                    self.pages.open_tick = Some(self.tick);
+                if self.hud_state.pages.seen != Some(self.hud_state.pages.page) {
+                    self.hud_state.pages.seen = Some(self.hud_state.pages.page);
+                    self.hud_state.pages.frames = 0;
+                    self.hud_state.pages.open_tick = Some(self.tick);
                 } else {
-                    self.pages.frames += 1;
+                    self.hud_state.pages.frames += 1;
                 }
-                let mut height = (40.0 + 65.0 * (self.pages.frames as f32 + 1.0)).min(BILLBOARD.3);
-                if let Some(f) = self.pages.closing.as_mut() {
+                let mut height = (40.0 + 65.0 * (self.hud_state.pages.frames as f32 + 1.0)).min(BILLBOARD.3);
+                if let Some(f) = self.hud_state.pages.closing.as_mut() {
                     *f += 1;
                     height = (BILLBOARD.3 - 65.0 * *f as f32).max(40.0);
                     if height <= 40.0 {
@@ -722,14 +722,14 @@ impl App {
                     }
                 }
                 h.billboard_h.set(height);
-                open_now = self.pages.closing.is_none() && height >= BILLBOARD.3;
-                h.billboard_clock.set((self.hud_clock(), self.hud_clock().saturating_sub(self.tick.saturating_sub(self.pages.open_tick.unwrap_or(0)))));
-                self.results_billboard = self.pages.closing.is_none().then_some(self.pages.page as u32);
+                open_now = self.hud_state.pages.closing.is_none() && height >= BILLBOARD.3;
+                h.billboard_clock.set((self.hud_clock(), self.hud_clock().saturating_sub(self.tick.saturating_sub(self.hud_state.pages.open_tick.unwrap_or(0)))));
+                self.results_billboard = self.hud_state.pages.closing.is_none().then_some(self.hud_state.pages.page as u32);
             } else if let ResultPage::TournamentPlace(_) = page
-                && self.pages.seen != Some(self.pages.page)
+                && self.hud_state.pages.seen != Some(self.hud_state.pages.page)
             {
-                self.pages.seen = Some(self.pages.page);
-                self.pages.open_tick = Some(self.tick);
+                self.hud_state.pages.seen = Some(self.hud_state.pages.page);
+                self.hud_state.pages.open_tick = Some(self.tick);
             }
             if page == ResultPage::Closed {
             } else if page == ResultPage::MissionSummary {
@@ -741,15 +741,15 @@ impl App {
                 // its "race again" button's hover (0x41B340), once the box is open
                 let over = h.billboard_h.get() >= BILLBOARD.3 && Hud::over_button(Hud::mission_button(), self.fe.cursor);
                 *hud_hover = Some(over.then_some((2, 0)));
-                h.mission_summary_sprites(&mut table, hud_aspect, &bb, MissionSummary { narrator, name: &name, lines: &lines, race_again: &fe(hud_str::PAUSE_BUTTON_2), typed: Some(self.pages.frames as usize), button: (over, over && self.fe.mouse_down) });
+                h.mission_summary_sprites(&mut table, hud_aspect, &bb, MissionSummary { narrator, name: &name, lines: &lines, race_again: &fe(hud_str::PAUSE_BUTTON_2), typed: Some(self.hud_state.pages.frames as usize), button: (over, over && self.fe.mouse_down) });
                 // PORT-DEVIATION D64: Y is "race again" on a failed mission's summary (D10, PAD-END2)
                 if self.mission_result.is_some_and(|(passed, _)| !passed) && h.billboard_h.get() >= BILLBOARD.3 {
-                    h.pad_glyphs_beside(&mut table, hud_aspect, Hud::mission_button(), &[crate::pad_glyphs::Glyph::Face(2)]);
+                    h.pad_glyphs_beside(&mut table, hud_aspect, Hud::mission_button(), &[crate::app::pad::glyphs::Glyph::Face(2)]);
                 }
             } else if let Some((place, t)) = race_congrats {
                 h.congrats_sprites(&mut table, hud_aspect, place, t, false);
             } else if let ResultPage::TournamentPlace(rank) = page {
-                h.congrats_sprites(&mut table, hud_aspect, rank, self.tick.saturating_sub(self.pages.tick), true);
+                h.congrats_sprites(&mut table, hud_aspect, rank, self.tick.saturating_sub(self.hud_state.pages.tick), true);
             } else if page == ResultPage::Standings
                 && let Some((t, event)) = self.tournament_event()
                 && let Some(c) = self.career.as_ref()
@@ -794,7 +794,7 @@ impl App {
                 let bb = Billboard { left: "", right: &fe(hud_str::TITLE_RACE_INFO), hints: Some((&esc, Some(&space))) };
                 h.notice_sprites(&mut table, hud_aspect, &bb, &fe(id));
             } else if page == ResultPage::Records
-                && let Some(rec) = &self.hud_records
+                && let Some(rec) = &self.hud_state.hud_records
             {
                 // `HTrackRecords` 0x433830: 18133 "Track Records" / 18158 "Lap Records", columns
                 // NAME 18111, CAR 18112, TIME 18114, rows 1st…8th
@@ -851,7 +851,7 @@ impl App {
         let racing = self.race.is_some();
         // the gate 0x41E850: `SPLITTIMES != 0 && [0x60C970]`
         let split_times = self.choice_index(choice::DISPLAY_SPLIT_TIMES).map_or(0, |(i, _)| i);
-        let multi = if !racing || split_times == 0 || !self.hud_keys.live {
+        let multi = if !racing || split_times == 0 || !self.hud_state.hud_keys.live {
             None
         } else if let Some(ms) = &self.mission {
             // game type 9: FE 18172 "goal time" (0x42A22B) over
@@ -925,10 +925,10 @@ impl App {
             && self.vehicle.is_some()
             && self.mission.as_ref().is_some_and(|ms| ms.mission.cone_rule.is_some())
             && !self.playback_running()
-            && self.hud_cones.frame(self.smackables.knocked_count())
+            && self.hud_state.hud_cones.frame(self.smackables.knocked_count())
         {
-            tracing::info!(count = self.hud_cones.last, moves = self.hud_cones.changes, "cone hit");
-            self.cone_flash = 16;
+            tracing::info!(count = self.hud_state.hud_cones.last, moves = self.hud_state.hud_cones.changes, "cone hit");
+            self.hud_state.cone_flash = 16;
             if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                 s.pylon_hit(a);
             }
@@ -987,14 +987,14 @@ impl App {
         let fe = move |id: u32| strings.hud(id).unwrap_or_default();
         // the pointer over a button: its hover look, and the port's keyboard selection moves
         // there so only one button is lit (the original has no keyboard selection)
-        let hover = match self.pause_confirm {
+        let hover = match self.hud_state.pause_confirm {
             None => Hud::pause_buttons().iter().take(pause_items).position(|b| Hud::over_button(*b, self.fe.cursor)).map(|k| (0, k)),
             Some(_) => Hud::yes_no_buttons().iter().position(|b| Hud::over_button(*b, self.fe.cursor)).map(|k| (1, k)),
         };
         *hud_hover = Some(hover);
         match hover {
-            Some((0, k)) => self.pause_sel = k as u8,
-            Some((_, k)) => self.pause_confirm = Some(k as u8),
+            Some((0, k)) => self.hud_state.pause_sel = k as u8,
+            Some((_, k)) => self.hud_state.pause_confirm = Some(k as u8),
             None => {}
         }
         let pressed = hover.is_some() && self.fe.mouse_down;
@@ -1002,7 +1002,7 @@ impl App {
         // `[0x606AC8]` keeps running through the pause (see `pause_ticks`)
         let clock = self.hud_clock();
         let out = &mut self.scene.sprites;
-        match self.pause_confirm {
+        match self.hud_state.pause_confirm {
             None => {
                 // 0x42A477: "" left, 18128 right, no hints
                 let bb = Billboard { left: "", right: fe(hud_str::TITLE_PAUSE), hints: None };
@@ -1011,7 +1011,7 @@ impl App {
                 if let Some(l) = photo_label.as_deref() {
                     labels.push(l);
                 }
-                h.pause_sprites(out, aspect, &bb, &labels, self.pause_sel as usize, pressed);
+                h.pause_sprites(out, aspect, &bb, &labels, self.hud_state.pause_sel as usize, pressed);
             }
             Some(sel) => {
                 let bb = Billboard { left: "", right: fe(hud_str::TITLE_YES_NO), hints: None };
@@ -1036,5 +1036,68 @@ impl App {
         let space = self.net_notice_space.then(|| fe(hud_str::HINT_SPACE));
         let bb = Billboard { left: "", right: fe(hud_str::TITLE_RACE_INFO), hints: Some((fe(hud_str::HINT_ESC), space)) };
         h.notice_sprites(&mut self.scene.sprites, aspect, &bb, fe(id));
+    }
+}
+
+/// The HUD's clock and the render target's geometry (moved from `render_scene.rs`).
+impl App {
+    /// **`[0x606AC8]`**, the HUD clock (64 Hz): what the billboards' strips (0x41A8A1), the trays'
+    /// slide stamps and elapsed (0x434490, 0x434A0F) and the save dialog's caret (0x430D8C) read.
+    /// The frame driver's loop steps it by one a pass until it reaches the timer's clock
+    /// `[0x5E99B8]` (0x415B3F…0x415B52), which a pause does not stop — the port's game tick plus
+    /// the pauses — on from where the session's earlier passes left it (`hud_clock_base`).
+    pub(crate) fn hud_clock(&self) -> u64 {
+        (self.hud_state.hud_clock_base + self.tick as f64 + self.pause_offset + self.pause_ticks).max(0.0) as u64
+    }
+
+    /// The render target's aspect the HUD's 640 × 480 layout is anchored to (`Hud::anchor`, 0x41E480),
+    /// 4:3 while there is no renderer.
+    pub(crate) fn hud_aspect(&self) -> f32 {
+        self.renderer.as_ref().map(|r| r.aspect()).unwrap_or(HUD_REF_W / HUD_REF_H)
+    }
+
+    /// **The port's HiDPI mapping** (a platform stand-in, not a game rule; 2026-10-01):
+    /// the render target `(physical W, physical H, scale)` — the window's framebuffer and winit's
+    /// scale factor, or a still's `NFS_SHOT_SIZE` / `NFS_SHOT_SCALE` ([`shot_geometry`]). The
+    /// original's rules (0x41E480 anchoring, 0x41FB40, native-pixel sizes and fonts, the centred
+    /// loading picture) run on the **logical** resolution `physical / scale` ([`App::hud_logical`]);
+    /// the sprites are fractions of the target, so they land at `× scale` physical pixels. At scale 1
+    /// that is the original to the pixel. A font is the native bitmap font drawn `scale` times
+    /// as large (its glyph quads are simply scaled; for an integer scale that is a nearest-neighbour
+    /// enlargement if the renderer samples nearest, otherwise the sampler's filter — PORT-DEVIATION D30
+    /// for fractional scales, which the original has no analogue for).
+    pub(crate) fn hud_geometry(&self) -> (u32, u32, f32) {
+        if let Some(t) = self.glue.shot_target {
+            return t;
+        }
+        let (w, h) = self.renderer.as_ref().map_or((640, 480), |r| r.size());
+        (w, h, self.window_scale())
+    }
+
+    /// The window's scale factor; while `start_race` has the window taken out of the `App` the last one seen
+    /// (the loading screen of a race start, LOADSEAM: it fell back to 1 and 640x480 and drew the picture
+    /// stretched over the real target with black gaps between the tiles).
+    fn window_scale(&self) -> f32 {
+        if let Some(w) = self.window.as_ref() {
+            self.hud_state.hud_scale.set(w.scale_factor() as f32);
+        }
+        self.hud_state.hud_scale.get().max(1.0)
+    }
+
+    /// [`App::hud_geometry`] for a renderer that is not in `self.renderer` (the one `start_race` holds locally
+    /// through the whole load): that renderer's surface, the window's scale.
+    pub(crate) fn hud_logical_on(&self, r: &Renderer) -> (u32, u32) {
+        let (w, h, s) = self.glue.shot_target.unwrap_or_else(|| {
+            let (w, h) = r.size();
+            (w, h, self.window_scale())
+        });
+        (((w as f32 / s).round() as u32).max(1), ((h as f32 / s).round() as u32).max(1))
+    }
+
+    /// The HUD's logical resolution in pixels, `W = physical W / scale`, `H = physical H / scale`
+    /// (see [`App::hud_geometry`]).
+    pub(crate) fn hud_logical(&self) -> (u32, u32) {
+        let (w, h, s) = self.hud_geometry();
+        (((w as f32 / s).round() as u32).max(1), ((h as f32 / s).round() as u32).max(1))
     }
 }

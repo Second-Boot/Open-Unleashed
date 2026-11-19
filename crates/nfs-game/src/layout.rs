@@ -294,6 +294,27 @@ impl Typing {
 /// The design space every `.lay` is authored in.
 pub const DESIGN: (f32, f32) = (640.0, 480.0);
 
+/// The 4:3 design letterboxed (pillar-boxed) inside a window of `aspect`: `(fw, x0)`, the design's width and left edge in
+/// screen widths (`(1, 0)` at 4:3 and narrower).
+#[inline]
+pub fn design_pillarbox(aspect: f32) -> (f32, f32) {
+    let design_aspect = DESIGN.0 / DESIGN.1;
+    if aspect > design_aspect { (design_aspect / aspect, (1.0 - design_aspect / aspect) * 0.5) } else { (1.0, 0.0) }
+}
+
+/// Map a design-space rectangle into sprite coordinates, pillar-boxing the 4:3 design inside a window of aspect
+/// `aspect`: the position `x` in screen widths, `y` and the size in screen heights.
+pub fn design_place(aspect: f32, x: f32, y: f32, w: f32, h: f32) -> ([f32; 2], [f32; 2]) {
+    let (fw, x0) = design_pillarbox(aspect);
+    ([x0 + x / DESIGN.0 * fw, y / DESIGN.1], [w / DESIGN.1, h / DESIGN.1])
+}
+
+/// The inverse of [`design_place`] for a point: the window's `(u, v)` (0..1 across / down) back to design coordinates.
+pub fn design_unplace(aspect: f32, u: f32, v: f32) -> (f32, f32) {
+    let (fw, x0) = design_pillarbox(aspect);
+    ((u - x0) / fw * DESIGN.0, v * DESIGN.1)
+}
+
 /// One event of the tournament a `NFS5.TrackSmall2dSpline` watches, as the widget needs it.
 ///
 /// `FETrackSmall2dSpline::update` (0x4FCB40) asks its `Tournament.Tournament` accessor which
@@ -961,9 +982,7 @@ fn tint(c: [u8; 4]) -> [f32; 4] {
 }
 
 /// An `0xAARRGGBB` colour word as [`tint`] takes it.
-fn argb(c: u32) -> [f32; 4] {
-    tint([(c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8])
-}
+use crate::colour::argb_rgba as argb;
 
 /// `NFS5.MOVIECIRCLE`'s flash frames and its two run fonts (0x4CDE99, 0x4CDED3).
 const MOVIE_FLASHES: &str = "circles.fsh";
@@ -2849,9 +2868,7 @@ impl LayoutScreen {
     /// Map a design-space rectangle into sprite coordinates, letterboxing the 4:3 design inside a
     /// window of aspect `aspect`.
     fn place(&self, aspect: f32, x: f32, y: f32, w: f32, h: f32) -> ([f32; 2], [f32; 2]) {
-        let design_aspect = DESIGN.0 / DESIGN.1;
-        let (fw, x0) = if aspect > design_aspect { (design_aspect / aspect, (1.0 - design_aspect / aspect) * 0.5) } else { (1.0, 0.0) };
-        ([x0 + x / DESIGN.0 * fw, y / DESIGN.1], [w / DESIGN.1, h / DESIGN.1])
+        design_place(aspect, x, y, w, h)
     }
 
     fn quad(&self, aspect: f32, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> Sprite {
@@ -2887,8 +2904,7 @@ impl LayoutScreen {
     /// This port used to step the quad into a grid of flat cells (up to 8 × 8), since its sprites had
     /// one colour a quad; the renderer's per-corner triangles make that unnecessary.
     fn gouraud(&self, out: &mut Vec<Sprite>, aspect: f32, p: [[f32; 2]; 4], c: [[f32; 4]; 4]) {
-        let design_aspect = DESIGN.0 / DESIGN.1;
-        let (fw, x0) = if aspect > design_aspect { (design_aspect / aspect, (1.0 - design_aspect / aspect) * 0.5) } else { (1.0, 0.0) };
+        let (fw, x0) = design_pillarbox(aspect);
         let at = |k: usize| [x0 + p[k][0] / DESIGN.0 * fw, p[k][1] / DESIGN.1];
         let tri = |a: usize, b: usize, d: usize| Sprite {
             texture: self.white,

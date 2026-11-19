@@ -466,7 +466,7 @@ impl Vehicle {
             // the rear two otherwise (against 100) — and the raw throttle byte `[0xD7C]` divides,
             // floored at 0.3. The port had `100·(1 − throttle) + 100`.
             // the whole `allow` chain stays in the register and is stored once (0x49EB44 `fstp [esp+0x28]`)
-            let d = |x: f32| f64::from(x);
+            let d = crate::x87::wide;
             let drive = (15.0 * a_drive).abs();
             let base = if specs.front_drive > 0.0 {
                 // summed `+0xAB0 + +0x9EC + +0x928 + +0x864`, wheel 3 first (0x49EABE…0x49EAD0)

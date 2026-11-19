@@ -159,7 +159,7 @@ impl App {
 fn studio(d: Vec3) -> [f32; 3] {
     let smooth = |a: f32, b: f32, x: f32| {
         let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
+        nfs_math::smooth01(t)
     };
     // walls: a dark cool grey, lighter toward the ceiling; the floor darker
     let mut c = Vec3::new(0.035, 0.045, 0.05) * (0.7 + 0.6 * (d.y * 0.5 + 0.5));

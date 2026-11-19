@@ -29,7 +29,7 @@ impl SoftDepth {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
         let module = gfx::wgsl_module(device, "soft depth", &source());
         let layout = |multisampled: bool| {
-            gfx::bgl(device, "soft depth", &[gfx::bgl_tex(if multisampled { 0 } else { 1 }, wgpu::TextureSampleType::Depth, multisampled)])
+            gfx::bgl(device, "soft depth", &[gfx::bgl_depth(if multisampled { 0 } else { 1 }, multisampled)])
         };
         let (layout_1, layout_ms) = (layout(false), layout(true));
         let pipe = |label: &str, fs: &str, bgl: &wgpu::BindGroupLayout| {
@@ -48,7 +48,7 @@ impl SoftDepth {
         }
         let (view, bg) = self.images.entry((width, height)).or_insert_with(|| (gfx::texture_2d(device, "soft depth", width, height, SOFT_FORMAT, gfx::RT_USAGE).create_view(&Default::default()), Keyed::default()));
         let (pipe, layout, binding) = if multisampled { (&self.pipe_ms, &self.layout_ms, 0) } else { (&self.pipe_1, &self.layout_1, 1) };
-        let bg = bg.get((depth.clone(), multisampled), || device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("soft depth"), layout, entries: &[wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(depth) }] }));
+        let bg = bg.get((depth.clone(), multisampled), || gfx::bind_group(device, "soft depth", layout, &[gfx::bg_view(binding, depth)]));
         gfx::fullscreen_pass(encoder, "soft depth pass", "soft depth convert", view, wgpu::LoadOp::Clear(wgpu::Color::WHITE), pipe, &[bg]);
         view.clone()
     }

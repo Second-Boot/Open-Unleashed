@@ -69,7 +69,7 @@ pub const CAR_SETUP: u16 = 1;
 pub fn encode(kind: u8, value: Option<i32>, word: Option<u32>, text: Option<&[u8]>) -> Vec<u8> {
     let mut m = vec![kind];
     if let Some(v) = value {
-        m.extend_from_slice(&[(v >> 16) as u8, (v >> 8) as u8, v as u8]);
+        crate::msg::put_u24(&mut m, v as u32);
     }
     if let Some(w) = word {
         m.extend_from_slice(&w.to_be_bytes());
@@ -88,8 +88,7 @@ pub fn encode(kind: u8, value: Option<i32>, word: Option<u32>, text: Option<&[u8
 
 /// The 24-bit head value, sign-extended the way 0x48F32F…0x48F338 does.
 fn head(m: &[u8]) -> Option<i32> {
-    let b = m.get(1..4)?;
-    Some(crate::msg::sign_extend_24(((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32))
+    Some(crate::msg::sign_extend_24(crate::msg::read_u24(m.get(1..)?)?))
 }
 
 /// The C string starting at `at`, without its NUL; everything to the end if there is none.
@@ -161,7 +160,7 @@ pub fn player_in(id: i32, name: &[u8]) -> Vec<u8> {
 /// the room's creation (0x491467 / 0x491A81).
 pub fn description(value: i32, name: &[u8; 32], bytes: [u8; 4], words: [u16; 2], count: u32) -> Vec<u8> {
     let mut m = vec![kind::DESCRIPTION];
-    m.extend_from_slice(&[(value >> 16) as u8, (value >> 8) as u8, value as u8]);
+    crate::msg::put_u24(&mut m, value as u32);
     m.extend_from_slice(&[0u8; 0x14]);
     m.extend_from_slice(name);
     m.extend_from_slice(&bytes);

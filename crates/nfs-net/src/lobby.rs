@@ -148,7 +148,7 @@ impl Game {
         if m.first() != Some(&crate::msg::kind::DESCRIPTION) || m.len() < 0x50 {
             return None;
         }
-        let id = u32::from(m[1]) << 16 | u32::from(m[2]) << 8 | u32::from(m[3]);
+        let id = crate::msg::read_u24(&m[1..])?;
         let (name, version) = crate::comm::desc::split_name(&m[0x18..0x38]);
         let le16 = |at: usize| u16::from_le_bytes([m[at], m[at + 1]]);
         let le32 = |at: usize| u32::from_le_bytes([m[at], m[at + 1], m[at + 2], m[at + 3]]);
@@ -259,7 +259,7 @@ impl Lists {
     /// One incoming message: `0xB8` adds a server or updates the two counts of the one with that id (the text never changes),
     /// `0xB9` removes it (0x490BB0); `0xB4` adds or updates a game, `0xB5` removes it; every `0xB2` empties the games list (0x48F799).
     pub fn apply(&mut self, m: &[u8]) -> Changed {
-        let id24 = |m: &[u8]| m.get(1..4).map(|b| u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]));
+        let id24 = |m: &[u8]| m.get(1..).and_then(crate::msg::read_u24);
         match m.first().copied() {
             Some(kind::SERVER) => {
                 let (Some(id), Some(w)) = (id24(m), m.get(4..8)) else { return Changed::Nothing };
@@ -294,7 +294,7 @@ impl Lists {
                 self.games.retain(|g| g.id != id);
                 Changed::Games
             }
-            Some(0xB2) => {
+            Some(crate::msg::kind::YOUR_ID) => {
                 let had = !self.games.is_empty();
                 self.games.clear();
                 if had { Changed::Games } else { Changed::Nothing }
@@ -346,7 +346,7 @@ pub fn parse_client_build(m: &[u8]) -> Result<ClientBuild, ClientBuildError> {
     if m.len() < 5 {
         return Err(ClientBuildError::Short);
     }
-    let revision = crate::msg::sign_extend_24(u32::from(m[1]) << 16 | u32::from(m[2]) << 8 | u32::from(m[3]));
+    let revision = crate::msg::sign_extend_24(crate::msg::read_u24(&m[1..]).unwrap_or(0));
     if revision != CLIENT_BUILD_REVISION {
         return Err(ClientBuildError::BadRevision);
     }

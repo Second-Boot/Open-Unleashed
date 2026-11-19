@@ -18,7 +18,7 @@ impl App {
     /// Navigate the previewed front-end screen: the buttons carry the name of the screen they lead to.
     pub(crate) fn layout_key(&mut self, key: MenuKey, event_loop: &LoopCtl) {
         // PORT-DEVIATION D54: the arrows, the pad and a pointer-placed Enter run on the virtual pointer
-        // (`pad_menu.rs`); what it leaves is the older Enter on `layout_sel`, which the mouse's release uses
+        // (`pad/menu.rs`); what it leaves is the older Enter on `layout_sel`, which the mouse's release uses
         if self.pad_menu_key(key, event_loop) {
             return;
         }
@@ -272,7 +272,7 @@ impl App {
                     self.fe.comms_game_mode = mode;
                     if mode == 0 {
                         // (`update_check_tick`; set by fields: `l` borrows the screen)
-                        let ticks = netlobby::UPDATE_THREAD_TICKS;
+                        let ticks = crate::app::net::lobby::UPDATE_THREAD_TICKS;
                         if self.fe.update_check.is_none() {
                             self.fe.update_check = Some((ticks, true));
                         }

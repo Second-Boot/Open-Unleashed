@@ -8,3 +8,6 @@ license.workspace = true
 glam.workspace = true
 nfs-math.workspace = true
 nfs-formats.workspace = true
+
+[dev-dependencies]
+nfs-devdata.workspace = true

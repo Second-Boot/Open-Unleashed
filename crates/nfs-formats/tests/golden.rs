@@ -7,7 +7,7 @@
 //! print the current values.
 use nfs_formats::{crp::Crp, fsh::Fsh, refpack};
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use nfs_devdata::need_game;
 
 struct Fnv(u64);
 impl Fnv {
@@ -28,26 +28,6 @@ impl std::fmt::Write for Fnv {
         self.bytes(s.as_bytes());
         Ok(())
     }
-}
-
-fn game_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NFS5_GAME_PATH") {
-        return Some(PathBuf::from(p));
-    }
-    let p = PathBuf::from(std::env::var_os("HOME")?).join("Games/NFS-Porsche-Unleashed/game_info/data");
-    p.join("GameData").is_dir().then_some(p)
-}
-
-macro_rules! need_game {
-    () => {
-        match game_root() {
-            Some(r) => r,
-            None => {
-                eprintln!("skipping: original game data not found");
-                return;
-            }
-        }
-    };
 }
 
 fn check(label: &str, got: u64, expect: u64) {

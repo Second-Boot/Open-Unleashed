@@ -1,0 +1,9 @@
+[package]
+name = "nfs-gfxdata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU-side graphics data shared by the asset crates, the renderer and the tools (vertex layout, mesh, mip chains); no GPU dependency"
+
+[dependencies]
+bytemuck.workspace = true

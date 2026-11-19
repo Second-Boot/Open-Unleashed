@@ -11,27 +11,7 @@ use nfs_formats::{
     sim::CarSim,
 };
 use std::path::PathBuf;
-
-fn game_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NFS5_GAME_PATH") {
-        return Some(PathBuf::from(p));
-    }
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    let p = home.join("Games/NFS-Porsche-Unleashed/game_info/data");
-    p.join("GameData").is_dir().then_some(p)
-}
-
-macro_rules! need_game {
-    () => {
-        match game_root() {
-            Some(r) => r,
-            None => {
-                eprintln!("skipping: original game data not found");
-                return;
-            }
-        }
-    };
-}
+use nfs_devdata::{dev_game_root as game_root, need_game};
 
 #[test]
 fn refpack_roundtrip_sizes() {

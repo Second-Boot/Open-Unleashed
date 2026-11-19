@@ -33,7 +33,7 @@ pub fn no_sound() {
 /// `[0x6B48DA]`, 16-bit stereo, `rate / 64` frames per game tick (`RE/notes/REFERENCE-2026-10-24-PA-AUDIOMIX.md`):
 /// the same samples the original's driver pass hands DirectSound (0x58FBC0), on the game's clock.
 pub(super) fn dump_ticked() -> bool {
-    std::env::var_os("NFS_AUDIO_DUMP_TICKS").is_some_and(|v| !v.is_empty() && v != "0")
+    crate::env_flag("NFS_AUDIO_DUMP_TICKS")
 }
 
 impl Offline {
@@ -164,7 +164,7 @@ impl AudioOutput {
         // runs' marker) unless `NFS_SOUND=1` asks for the device (the audio tasks). No device is opened: the
         // mixer runs offline on the calling thread exactly as under `NFS_AUDIO_DUMP`, only nothing is written,
         // so the game's calls into the mixer are the same as with a device.
-        let var = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0");
+        let var = crate::env_flag;
         if NO_SOUND.load(Ordering::Relaxed) {
             anyhow::bail!("no sound in a re-simulation");
         }

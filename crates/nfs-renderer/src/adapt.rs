@@ -119,7 +119,7 @@ pub(crate) struct EyePass {
 
 impl EyePass {
     pub fn new(device: &wgpu::Device, image_layout: &wgpu::BindGroupLayout) -> Self {
-        let state_layout = gfx::bgl(device, "eye state", &[gfx::bgl_tex(0, wgpu::TextureSampleType::Float { filterable: false }, false), gfx::bgl_uniform(1, wgpu::ShaderStages::FRAGMENT)]);
+        let state_layout = gfx::bgl(device, "eye state", &[gfx::bgl_float(0, false), gfx::bgl_uniform(1, wgpu::ShaderStages::FRAGMENT)]);
         let module = gfx::wgsl_module(device, "eye measure", &measure_source(false));
         let pl = gfx::pipeline_layout(device, "eye measure", &[image_layout, &state_layout]);
         let pipeline = Fullscreen::new("eye measure", &pl, &module).build(device, &[gfx::target(STATE_FORMAT, None)]);
@@ -127,11 +127,7 @@ impl EyePass {
         let make = || {
             let t = gfx::texture_2d(device, "eye state", 1, 1, STATE_FORMAT, gfx::RT_USAGE);
             let v = t.create_view(&Default::default());
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("eye state"),
-                layout: &state_layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&v) }, wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() }],
-            });
+            let bg = gfx::bind_group(device, "eye state", &state_layout, &[gfx::bg_view(0, &v), gfx::bg_buf(1, &params)]);
             (t, v, bg)
         };
         let states = [make(), make()];

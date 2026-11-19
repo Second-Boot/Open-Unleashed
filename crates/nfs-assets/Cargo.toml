@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nfs-devdata.workspace = true
 nfs-formats.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-nfs-renderer.workspace = true
+nfs-gfxdata.workspace = true
 glam.workspace = true
 nfs-physics.workspace = true
 # ENHANCEMENT E41: the HD texture pack's PNGs are read by `hdpack` (the examples write PNGs with it too)

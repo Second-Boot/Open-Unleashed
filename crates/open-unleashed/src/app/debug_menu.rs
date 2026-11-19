@@ -170,7 +170,7 @@ impl App {
                 let Some(car) = m.car().cloned() else { return };
                 // 0x4D52CB: a new series (`Knockout_start` 0x4DDF30) unless one is running
                 // (0x4DDF00), then the round's set-up from the block and the live rows / cars
-                if !self.knockout.as_ref().is_some_and(|k| k.state.active) {
+                if !self.ko.knockout.as_ref().is_some_and(|k| k.state.active) {
                     self.knockout_start();
                 }
                 let Some(track_name) = self.knockout_round() else { return };
@@ -223,7 +223,7 @@ impl App {
             MenuKey::Enter => {
                 let Some(car) = m.car().cloned() else { return };
                 let track_name = m.track().to_string();
-                self.player_grid_override = None;
+                self.ko.player_grid_override = None;
                 let template = m.race_template();
                 self.opp_choice = m.opp_car as u32;
                 self.player_car_id = Some(car.id);

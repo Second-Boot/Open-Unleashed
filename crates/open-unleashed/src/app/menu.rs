@@ -355,5 +355,5 @@ impl KoSlot {
 /// `nfs5.trk` record whatever the chronicle year, so the single-player screens (quick race, ...) offer every track for
 /// testing. Unset = the game type the caller gives, as the original.
 pub(crate) fn all_tracks_glue(game_type: u8) -> u8 {
-    if std::env::var_os("NFS_ALL_TRACKS").is_some_and(|v| v != "0") { nfs_game::track_list::GAME_TYPE_NETWORK } else { game_type }
+    if nfs_game::config::cfg().nfs_all_tracks.is_on() { nfs_game::track_list::GAME_TYPE_NETWORK } else { game_type }
 }

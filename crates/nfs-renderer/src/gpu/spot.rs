@@ -38,11 +38,11 @@ const SHADOW_SIZE: u32 = 1024;
 /// The first two lamps' casters are left out within this distance of the pair's midpoint (the own car).
 const SELF_CLEAR: f32 = 2.8;
 /// A caster whose bounding sphere is larger than this (m) is left out (a hillside would fill the map).
-const MAX_CASTER_RADIUS: f32 = 40.0;
+const SPOT_MAX_CASTER_RADIUS: f32 = 40.0;
 /// A caster within [`SELF_CLEAR`] smaller than this (m) is the own car's part (or at the lamp): left out.
 const SELF_RADIUS: f32 = 4.0;
 /// The shadow frustum's far plane beyond the lamps' reach (m).
-const FAR_MARGIN: f32 = 10.0;
+const SPOT_FAR_MARGIN: f32 = 10.0;
 /// A caster is left out beyond this many of the frustum's half angles off its axis (plus its own angular radius).
 const CONE_SLACK: f32 = 1.45;
 
@@ -99,7 +99,7 @@ impl SpotState {
 
 pub(super) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
     [
-        gfx::bgl_tex(crate::classes::binding::SPOT_MAP, wgpu::TextureSampleType::Depth, false),
+        gfx::bgl_depth(crate::classes::binding::SPOT_MAP, false),
         gfx::bgl_uniform(crate::classes::binding::SPOTS, wgpu::ShaderStages::FRAGMENT),
     ]
 }
@@ -129,7 +129,7 @@ impl Core {
     pub(super) fn spot_frame(&mut self, scene: &Scene) -> Option<SpotFrame> {
         let level = self.enhancements.level(crate::E15);
         let s = &scene.spots;
-        if level == 0 || self.no_reflections || s.n == 0 {
+        if level == 0 || self.modes.no_reflections || s.n == 0 {
             return None;
         }
         let mut u = SpotUniform::zeroed();
@@ -139,7 +139,7 @@ impl Core {
             u.dir[i] = [d.x, d.y, d.z, 0.0];
         }
         u.params = [(s.n as usize).min(crate::MAX_SPOTS) as f32, CONE_OUTER_DEG.to_radians().cos(), CONE_INNER_DEG.to_radians().cos(), RANGE];
-        let far = RANGE + FAR_MARGIN;
+        let far = RANGE + SPOT_FAR_MARGIN;
         let mut shadow = None;
         if level >= 2 && s.shadowed > 0 {
             let (a, b) = (&s.lamps[0], if s.shadowed > 1 { &s.lamps[1] } else { &s.lamps[0] });
@@ -177,13 +177,13 @@ impl Core {
             casters
                 .iter()
                 .filter(|c| {
-                    if c.shape.flat || c.radius > MAX_CASTER_RADIUS {
+                    if c.shape.flat || c.radius > SPOT_MAX_CASTER_RADIUS {
                         return false;
                     }
                     let v = c.centre - origin;
                     let dist = v.length();
                     // the own car (and anything at the lamp) casts nothing; beyond the reach or out of the frustum neither
-                    if dist < SELF_CLEAR && c.radius < SELF_RADIUS || dist - c.radius > RANGE + FAR_MARGIN {
+                    if dist < SELF_CLEAR && c.radius < SELF_RADIUS || dist - c.radius > RANGE + SPOT_FAR_MARGIN {
                         return false;
                     }
                     let along = v.dot(dir);

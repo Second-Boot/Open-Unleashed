@@ -12,6 +12,7 @@ pub mod round;
 pub mod platform;
 pub mod texture;
 pub mod track;
+pub mod track_lights;
 
 pub use paths::GamePaths;
 

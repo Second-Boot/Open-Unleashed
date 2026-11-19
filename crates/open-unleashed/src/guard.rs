@@ -39,8 +39,8 @@ fn enabled() -> bool {
 
 /// The data directory (beside `NFS5_SAVE_DIR` when that is set, as the log is: a test never touches the real one).
 fn dir() -> PathBuf {
-    std::env::var_os("NFS5_SAVE_DIR")
-        .and_then(|d| PathBuf::from(d).parent().map(|p| p.to_path_buf()))
+    nfs_game::config::save_root_override()
+        .and_then(|d| d.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(nfs_assets::platform::data_dir)
 }
 

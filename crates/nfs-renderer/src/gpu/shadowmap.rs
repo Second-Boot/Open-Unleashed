@@ -1,4 +1,4 @@
-//! The pieces every depth-only shadow map shares (SHADOW-REFACTOR): ENHANCEMENT E9's sun / moon cascades (`csm.rs`), E15's
+//! The pieces every depth-only shadow map shares (SHADOW-REFACTOR): ENHANCEMENT E9's sun / moon cascades (`csm/`), E15's
 //! headlight map (`spot.rs`) and E47's lamp maps (`lamps.rs`).
 //!
 //! * [`UniformSlot`]: a light's uniform, zeroed at creation (the shader's "off": every light's count / switch field is 0) and
@@ -197,7 +197,7 @@ impl Core {
             if !self.csm_caster(item) {
                 continue;
             }
-            let mesh = &self.meshes[item.mesh.0 as usize];
+            let mesh = &self.res.meshes[item.mesh.0 as usize];
             if mesh.index_count == 0 || mesh.bounds.1 <= 0.0 {
                 continue;
             }
@@ -215,7 +215,7 @@ impl Core {
         let mut material_bound = false;
         for &idx in casters {
             let item = &scene.items[idx as usize];
-            let mat = &self.materials[item.material.0 as usize];
+            let mat = &self.res.materials[item.material.0 as usize];
             // the alpha test: the cut-out pipeline and the material's texture
             // ENHANCEMENT E9 / E15 / E47 (FOLIAGE-OVERDRAW): not for a draw whose test can never fail (`Core::solid_draws`): `fs_cut`
             // would keep every fragment, so the depth is the opaque pipeline's, which the GPU draws without running a fragment stage
@@ -232,10 +232,9 @@ impl Core {
                 cur_mat = item.material.0;
                 material_bound = true;
             }
-            let mesh = &self.meshes[item.mesh.0 as usize];
+            let mesh = &self.res.meshes[item.mesh.0 as usize];
             if cur_mesh != item.mesh.0 {
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(mesh.vertex_offset..mesh.vertex_offset + mesh.vertex_len.max(4)));
-                pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
+                mesh.bind(pass);
                 cur_mesh = item.mesh.0;
             }
             crate::prof::count_draw(u64::from(mesh.index_count / 3));

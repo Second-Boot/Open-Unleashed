@@ -344,3 +344,21 @@ fn the_widget_class_enum_dispatches_like_the_string_match() {
         assert_eq!(WidgetClass::from_class(c).takes_focus_on_press(), old_press, "press {c:?}");
     }
 }
+
+/// The 4:3 design is whole at 4:3 and pillar-boxed past it; `design_unplace` is the inverse of `design_place` for a point.
+#[test]
+fn the_design_placement_pillar_boxes_and_round_trips() {
+    let (p, s) = design_place(4.0 / 3.0, 320.0, 240.0, 24.0, 24.0);
+    assert!((p[0] - 0.5).abs() < 1e-6 && (p[1] - 0.5).abs() < 1e-6 && (s[1] - 0.05).abs() < 1e-6);
+    let (p, _) = design_place(16.0 / 9.0, 0.0, 0.0, 1.0, 1.0);
+    assert!((p[0] - 0.125).abs() < 1e-6);
+    // narrower than 4:3: the design fills the width
+    assert_eq!(design_pillarbox(1.0), (1.0, 0.0));
+    for aspect in [1.0, 4.0 / 3.0, 16.0 / 9.0, 21.0 / 9.0] {
+        for (x, y) in [(0.0, 0.0), (123.0, 77.0), (640.0, 480.0)] {
+            let (p, _) = design_place(aspect, x, y, 0.0, 0.0);
+            let (rx, ry) = design_unplace(aspect, p[0], p[1]);
+            assert!((rx - x).abs() < 1e-3 && (ry - y).abs() < 1e-3, "{aspect} {x} {y}: {rx} {ry}");
+        }
+    }
+}

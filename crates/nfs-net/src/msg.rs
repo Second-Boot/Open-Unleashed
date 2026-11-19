@@ -160,6 +160,18 @@ pub fn sign_extend_24(v: u32) -> i32 {
     ((v << 8) as i32) >> 8
 }
 
+/// The three big-endian bytes at the start of `b` as an unsigned value (`None` when `b` is shorter): the id / head of a message
+/// (`(b1 << 16) | (b2 << 8) | b3`, 0x48F318…0x48F338). Pass the slice that starts AFTER the type byte.
+pub fn read_u24(b: &[u8]) -> Option<u32> {
+    let b = b.get(..3)?;
+    Some(u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]))
+}
+
+/// Append the low 24 bits of `v` as three big-endian bytes (the way 0x48C899…0x48C8AB writes a head value).
+pub fn put_u24(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&[(v >> 16) as u8, (v >> 8) as u8, v as u8]);
+}
+
 impl<'a> Message<'a> {
     pub fn parse(buf: &'a [u8]) -> Result<Self, MsgError> {
         if buf.len() < 4 {
@@ -169,7 +181,7 @@ impl<'a> Message<'a> {
         if !(FIRST..=LAST).contains(&kind) {
             return Err(MsgError::UnknownType(kind));
         }
-        let v = ((buf[1] as u32) << 16) | ((buf[2] as u32) << 8) | buf[3] as u32;
+        let v = read_u24(&buf[1..]).unwrap_or(0);
         Ok(Self { kind, value: sign_extend_24(v), body: &buf[4..] })
     }
 
@@ -182,9 +194,7 @@ impl<'a> Message<'a> {
     pub fn write_head(kind: u8, value: i32, out: &mut Vec<u8>) {
         let v = (value as u32) & 0x00FF_FFFF;
         out.push(kind);
-        out.push((v >> 16) as u8);
-        out.push((v >> 8) as u8);
-        out.push(v as u8);
+        put_u24(out, v);
     }
 
     /// The body's first four bytes as the big-endian u32 the handlers read (0x48F543…, 0x48F595…).
@@ -197,6 +207,28 @@ impl<'a> Message<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the two helpers against the hand-written expressions they replace, over the whole 24-bit range's edges and a spread of values
+    #[test]
+    fn the_24_bit_helpers_are_the_old_expressions() {
+        let mut vals: Vec<u32> = (0..0x1000).chain(0xFF_F000..=0xFF_FFFF).chain([0x7F_FFFF, 0x80_0000, 0x80_0001, 0x12_3456, 0xFFFF_FFFF, 0x0100_0000]).collect();
+        vals.extend((0..0x100_0000u32).step_by(4099));
+        for v in vals {
+            let bytes = [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+            let mut out = vec![9];
+            put_u24(&mut out, v);
+            assert_eq!(&out[1..], &bytes, "{v:#x}");
+            let old = u32::from(bytes[0]) << 16 | u32::from(bytes[1]) << 8 | u32::from(bytes[2]);
+            assert_eq!(read_u24(&bytes), Some(old));
+            // an i32 head value, as `room::encode` / `description` take it
+            let i = v as i32;
+            let mut a = Vec::new();
+            put_u24(&mut a, i as u32);
+            assert_eq!(a, [(i >> 16) as u8, (i >> 8) as u8, i as u8], "{i}");
+        }
+        assert_eq!(read_u24(&[1, 2]), None);
+        assert_eq!(read_u24(&[1, 2, 3, 4]), Some(0x0001_0203));
+    }
 
     #[test]
     fn the_head_is_a_type_and_a_signed_24_bit_value() {

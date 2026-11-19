@@ -1,5 +1,5 @@
 //! The renderer's resources: the command list's apply, the mesh arena and its uploads, the textures (plain, BC7, generated
-//! mips, deferred level writes), the twins (ENHANCEMENT E41 / E42), release and the counts. Moved out of gpu.rs as it was.
+//! mips, deferred level writes), the twins (ENHANCEMENT E41 / E42), release and the counts.
 
 use crate::gfx;
 use super::kit;
@@ -19,11 +19,11 @@ impl Core {
         let CmdList { cmds, bytes, .. } = list;
         // WIN-STARTUP: a new GPU error while enhancements are on = drop to the original path (queued last: it takes effect this frame)
         let errs = GPU_ERRORS.load(std::sync::atomic::Ordering::Relaxed);
-        if errs != self.gpu_errors_seen {
-            self.gpu_errors_seen = errs;
-            if !self.enh_forced_off {
+        if errs != self.diag.gpu_errors_seen {
+            self.diag.gpu_errors_seen = errs;
+            if !self.diag.enh_forced_off {
                 // (also when none is on yet: the set of the first frame arrives in this very list)
-                self.enh_forced_off = true;
+                self.diag.enh_forced_off = true;
                 tracing::warn!(errors = errs, enhancements = %self.enhancements.describe(), "the GPU reported errors: every enhancement is turned off for this run (the original path)");
                 cmds.push(Cmd::Enhancements(crate::Enhancements::ORIGINAL));
             }
@@ -46,22 +46,22 @@ impl Core {
                 Cmd::Trilinear(on) => self.set_trilinear(on),
                 Cmd::FakeSort(m) => self.set_fakesort_mode(m),
                 Cmd::Gamma(g) => self.set_gamma(g),
-                Cmd::TemporalCut => self.fsr_cut(),
+                Cmd::TemporalCut => self.temporal_cut(),
                 Cmd::PrewarmPipelines => self.prewarm_pipelines(),
-                Cmd::ExactPipelines(on) => self.exact_sets = on,
+                Cmd::ExactPipelines(on) => self.pipes.exact = on,
                 Cmd::Enhancements(e) => {
                     // ENHANCEMENT ENH-UPSCALER: the stored set has both backends' levels; the GPU side works with the chosen one's
-                    let e = if self.enh_forced_off { crate::Enhancements::ORIGINAL } else { e.effective() };
+                    let e = if self.diag.enh_forced_off { crate::Enhancements::ORIGINAL } else { e.effective() };
                     if self.enhancements != e {
                         // ENHANCEMENT ENH-LIVETEX: the resource counts, to see that a flip allocates nothing
-                        tracing::info!(enhancements = %e.describe(), textures = self.textures.len(), meshes = self.meshes.len(), materials = self.materials.len(), "enhancements on the GPU side");
+                        tracing::info!(enhancements = %e.describe(), textures = self.res.textures.len(), meshes = self.res.meshes.len(), materials = self.res.materials.len(), "enhancements on the GPU side");
                     }
                     let (old_e2, new_e2) = (self.enhancements.level(crate::E2), e.level(crate::E2));
                     let (old_hd, new_hd) = (self.enhancements.level(crate::E41) > 0, e.level(crate::E41) > 0);
                     self.enhancements = e;
                     if old_e2 != new_e2 {
                         self.apply_e2(new_e2);
-                    } else if old_hd != new_hd && self.tex_twin.iter().any(|t| t.is_some()) {
+                    } else if old_hd != new_hd && self.res.tex_twin.iter().any(|t| t.is_some()) {
                         // ENHANCEMENT ENH-LIVETEX: E41 went on / off: the materials sample the HD twins / the originals from this frame
                         self.rebuild_material_bind_groups(None);
                     }
@@ -96,24 +96,24 @@ impl Core {
     }
 
     pub(crate) fn white(&self) -> TextureId {
-        self.white
+        self.res.white
     }
 
     pub(crate) fn texture_count(&self) -> u32 {
-        self.textures.len() as u32
+        self.res.textures.len() as u32
     }
 
     /// `(vertex bytes, writes)` per mesh, for the front's mirror.
     pub(crate) fn mesh_infos(&self) -> Vec<(u64, u32)> {
-        self.meshes.iter().map(|m| (m.vertex_len, m.writes)).collect()
+        self.res.meshes.iter().map(|m| (m.vertex_len, m.writes)).collect()
     }
 
     pub(crate) fn mesh_vertex_len(&self, id: MeshId) -> u64 {
-        self.meshes[id.0 as usize].vertex_len
+        self.res.meshes[id.0 as usize].vertex_len
     }
 
     pub(crate) fn material_textures(&self) -> Vec<TextureId> {
-        self.materials.iter().map(|m| m.texture).collect()
+        self.res.materials.iter().map(|m| m.texture).collect()
     }
 
     pub(crate) fn offscreen_sizes(&self) -> std::collections::HashMap<u32, (u32, u32)> {
@@ -133,12 +133,16 @@ impl Core {
             contents: bytemuck::cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let (vertex_len, index_len) = (vertex_buf.size(), index_buf.size());
-        self.arena_bytes += vertex_len + index_len;
-        let serial = self.buffer_serial;
-        self.buffer_serial += 1;
-        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0, bounds: { let (c, r, _) = csm::mesh_bounds(&mesh.vertices); (c, r * DYNAMIC_BOUNDS_SLACK) }, shape: csm::MeshShape::default(), alpha_one: crate::solid::vertex_bytes_alpha_one(bytemuck::cast_slice(&mesh.vertices)), arena: false, cap: (vertex_len, index_len), released: false });
-        MeshId(self.meshes.len() as u32 - 1)
+        self.res.arena_bytes += vertex_buf.size() + index_buf.size();
+        let serial = self.res.buffer_serial;
+        self.res.buffer_serial += 1;
+        let bounds = {
+            let (c, r, _) = csm::mesh_bounds(&mesh.vertices);
+            (c, r * DYNAMIC_BOUNDS_SLACK)
+        };
+        let alpha_one = crate::solid::vertex_bytes_alpha_one(bytemuck::cast_slice(&mesh.vertices));
+        self.res.meshes.push(GpuMesh::dynamic(vertex_buf, index_buf, serial, mesh.indices.len() as u32, bounds, alpha_one));
+        MeshId(self.res.meshes.len() as u32 - 1)
     }
 
     /// Queue a vertex write for the next frame's encoder (`flush_mesh_writes`); empty writes are
@@ -147,22 +151,22 @@ impl Core {
         if bytes.is_empty() {
             return;
         }
-        self.meshes[id.0 as usize].writes = self.meshes[id.0 as usize].writes.wrapping_add(1);
+        self.res.meshes[id.0 as usize].writes = self.res.meshes[id.0 as usize].writes.wrapping_add(1);
         // ENHANCEMENT E1 (FOLIAGE-OVERDRAW): a written vertex below alpha 1 ends the mesh's solid answer
-        self.meshes[id.0 as usize].alpha_one &= crate::solid::vertex_bytes_alpha_one(bytes);
-        self.pending_writes.push(PendingWrite { mesh: id.0, start: self.pending_bytes.len(), len: bytes.len() });
-        self.pending_bytes.extend_from_slice(bytes);
+        self.res.meshes[id.0 as usize].alpha_one &= crate::solid::vertex_bytes_alpha_one(bytes);
+        self.res.pending_writes.push(PendingWrite { mesh: id.0, start: self.res.pending_bytes.len(), len: bytes.len() });
+        self.res.pending_bytes.extend_from_slice(bytes);
     }
 
     /// Record the queued vertex writes into `encoder`, from the staging belt, in call order.
     pub(super) fn flush_mesh_writes(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        for w in &self.pending_writes {
+        for w in &self.res.pending_writes {
             let size = wgpu::BufferSize::new(w.len as u64).expect("non-empty write");
-            let m = &self.meshes[w.mesh as usize];
-            self.belt.write_buffer(encoder, &m.vertex_buf, m.vertex_offset, size).copy_from_slice(&self.pending_bytes[w.start..w.start + w.len]);
+            let m = &self.res.meshes[w.mesh as usize];
+            self.belt.write_buffer(encoder, &m.vertex_buf, m.vertex_offset, size).copy_from_slice(&self.res.pending_bytes[w.start..w.start + w.len]);
         }
-        self.pending_writes.clear();
-        self.pending_bytes.clear();
+        self.res.pending_writes.clear();
+        self.res.pending_bytes.clear();
     }
 
     /// The start of a frame, before its commands are applied: the previous frame's last
@@ -185,7 +189,7 @@ impl Core {
     /// frame (`RE/notes/PERF.md` PERF2).
     /// The passes the command list recorded for the frame (the mirror, the faces) are submitted with them.
     pub(super) fn flush_writes(&mut self) {
-        if self.pending_writes.is_empty() && self.pending_textures.is_empty() && self.frame_cmds.is_empty() {
+        if self.res.pending_writes.is_empty() && self.res.pending_textures.is_empty() && self.frame_cmds.is_empty() {
             return;
         }
         self.seal_arena();
@@ -198,31 +202,31 @@ impl Core {
 
     /// ENHANCEMENT ENH-LIVELEAK: a static mesh's table slot - a recycled one (a released twin's, see [`Self::recycle_released`]) or a new one.
     pub(super) fn add_mesh(&mut self, m: GpuMesh) -> MeshId {
-        if let Some(i) = self.free_mesh.pop() {
-            self.meshes[i as usize] = m;
+        if let Some(i) = self.res.free_mesh.pop() {
+            self.res.meshes[i as usize] = m;
             return MeshId(i);
         }
-        self.meshes.push(m);
-        MeshId(self.meshes.len() as u32 - 1)
+        self.res.meshes.push(m);
+        MeshId(self.res.meshes.len() as u32 - 1)
     }
 
     /// ENHANCEMENT ENH-LIVELEAK: a texture's table slot, as [`Self::add_mesh`].
     pub(super) fn add_texture(&mut self, t: GpuTexture) -> TextureId {
-        if let Some(i) = self.free_tex.pop() {
-            self.textures[i as usize] = t;
-            self.released_textures.remove(&i);
+        if let Some(i) = self.res.free_tex.pop() {
+            self.res.textures[i as usize] = t;
+            self.res.released_textures.remove(&i);
             return TextureId(i);
         }
-        self.textures.push(t);
-        TextureId(self.textures.len() as u32 - 1)
+        self.res.textures.push(t);
+        TextureId(self.res.textures.len() as u32 - 1)
     }
 
     /// ENHANCEMENT ENH-LIVELEAK: the texture / mesh slots released so far may be handed out again. The app calls it when a live pass is
     /// complete: until then a model that has not adopted its new twins yet may still release an id the first one already released, and
     /// that must not hit a new owner of the slot.
     pub(crate) fn recycle_released(&mut self) {
-        self.free_tex.append(&mut self.pending_tex);
-        self.free_mesh.append(&mut self.pending_mesh);
+        self.res.free_tex.append(&mut self.res.pending_tex);
+        self.res.free_mesh.append(&mut self.res.pending_mesh);
     }
 
     pub fn upload_mesh(&mut self, mesh: &MeshData) -> MeshId {
@@ -238,9 +242,9 @@ impl Core {
         let (vreserve, ireserve) = (vlen.next_multiple_of(VERTEX_STRIDE).max(VERTEX_STRIDE), ilen.next_multiple_of(8).max(8));
         // ENHANCEMENT ENH-LIVELEAK: the ranges of a released mesh that this one fits (the smallest such slot) are used again, so a twin
         // replaced by the next level does not grow the arena. A queued write, not a mapped copy: the arena is sealed first.
-        if let Some(k) = (0..self.free_slots.len()).filter(|&k| self.free_slots[k].vertex_cap >= vreserve && self.free_slots[k].index_cap >= ireserve).min_by_key(|&k| self.free_slots[k].vertex_cap + self.free_slots[k].index_cap) {
+        if let Some(k) = (0..self.res.free_slots.len()).filter(|&k| self.res.free_slots[k].vertex_cap >= vreserve && self.res.free_slots[k].index_cap >= ireserve).min_by_key(|&k| self.res.free_slots[k].vertex_cap + self.res.free_slots[k].index_cap) {
             self.seal_arena();
-            let f = self.free_slots.swap_remove(k);
+            let f = self.res.free_slots.swap_remove(k);
             if !vbytes.is_empty() {
                 self.queue.write_buffer(&f.vertex_buf, f.vertex_offset, vbytes);
             }
@@ -248,22 +252,23 @@ impl Core {
                 self.queue.write_buffer(&f.index_buf, f.index_offset, ibytes);
             }
             let (c, r, shape) = csm::mesh_bounds(&mesh.vertices);
-            return self.add_mesh(GpuMesh { vertex_buf: f.vertex_buf, vertex_offset: f.vertex_offset, vertex_len: vlen, index_buf: f.index_buf, index_offset: f.index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: f.serial, ib_serial: f.serial, writes: 0, bounds: (c, r), shape, alpha_one: crate::solid::vertex_bytes_alpha_one(vbytes), arena: true, cap: (f.vertex_cap, f.index_cap), released: false });
+            let (vertex, index) = (BufRange { buf: f.vertex_buf, offset: f.vertex_offset, len: vlen, cap: f.vertex_cap }, BufRange { buf: f.index_buf, offset: f.index_offset, len: ilen, cap: f.index_cap });
+            return self.add_mesh(GpuMesh::in_arena(vertex, index, f.serial, mesh.indices.len() as u32, (c, r), shape, crate::solid::vertex_bytes_alpha_one(vbytes)));
         }
-        let fits = self.arena.as_ref().is_some_and(|a| a.vertex_used + vreserve <= a.vertex_buf.size() && a.index_used + ireserve <= a.index_buf.size());
+        let fits = self.res.arena.as_ref().is_some_and(|a| a.vertex_used + vreserve <= a.vertex_buf.size() && a.index_used + ireserve <= a.index_buf.size());
         if !fits {
             // a full arena goes to the queue now, so the host copies of a whole track's meshes do not pile up
-            if self.arena.as_ref().is_some_and(|a| a.mapped) {
+            if self.res.arena.as_ref().is_some_and(|a| a.mapped) {
                 self.seal_arena();
                 self.queue.submit(std::iter::empty());
             }
             let make = |label: &'static str, usage: wgpu::BufferUsages, need: u64| {
                 self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: ARENA_CHUNK.max(need), usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: true })
             };
-            self.arena_bytes += 2 * ARENA_CHUNK.max(vreserve.max(ireserve));
-            let serial = self.buffer_serial;
-            self.buffer_serial += 1;
-            self.arena = Some(MeshArena {
+            self.res.arena_bytes += 2 * ARENA_CHUNK.max(vreserve.max(ireserve));
+            let serial = self.res.buffer_serial;
+            self.res.buffer_serial += 1;
+            self.res.arena = Some(MeshArena {
                 serial,
                 vertex_buf: make("mesh arena vb", wgpu::BufferUsages::VERTEX, vreserve),
                 vertex_used: 0,
@@ -272,7 +277,7 @@ impl Core {
                 mapped: true,
             });
         }
-        let a = self.arena.as_mut().expect("arena made");
+        let a = self.res.arena.as_mut().expect("arena made");
         let (vertex_offset, index_offset) = (a.vertex_used, a.index_used);
         if a.mapped {
             if !vbytes.is_empty() {
@@ -292,14 +297,15 @@ impl Core {
         a.vertex_used += vreserve;
         a.index_used += ireserve;
         let (centre, radius, shape) = csm::mesh_bounds(&mesh.vertices);
-        let g = GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0, bounds: (centre, radius), shape, alpha_one: crate::solid::vertex_bytes_alpha_one(vbytes), arena: true, cap: (vreserve, ireserve), released: false };
+        let (vertex, index) = (BufRange { buf: a.vertex_buf.clone(), offset: vertex_offset, len: vlen, cap: vreserve }, BufRange { buf: a.index_buf.clone(), offset: index_offset, len: ilen, cap: ireserve });
+        let g = GpuMesh::in_arena(vertex, index, a.serial, mesh.indices.len() as u32, (centre, radius), shape, crate::solid::vertex_bytes_alpha_one(vbytes));
         self.add_mesh(g)
     }
 
     /// Unmap the mesh arena so the GPU can read it: what [`Self::upload_mesh`] copied into the mapped
     /// buffers becomes visible to the next frame. A later mesh that still fits goes in as a queued write.
     pub(super) fn seal_arena(&mut self) {
-        if let Some(a) = self.arena.as_mut().filter(|a| a.mapped) {
+        if let Some(a) = self.res.arena.as_mut().filter(|a| a.mapped) {
             a.vertex_buf.unmap();
             a.index_buf.unmap();
             a.mapped = false;
@@ -360,17 +366,17 @@ impl Core {
 
     /// What a texture is made with (every part `Sync`: the textures of a batch are made on worker threads).
     fn tex_maker(&self) -> TexMaker<'_> {
-        TexMaker { device: &self.device, queue: &self.queue, sprite_layout: &self.sprite_layout, sprite_sampler: &self.sprite_sampler }
+        TexMaker { device: &self.device, queue: &self.queue, sprite_layout: &self.layouts.sprite, sprite_sampler: &self.samplers.sprite }
     }
     /// One mip level of `Renderer::update_texture`: `data` holds `h` rows of `4 · w` bytes (or more; the
     /// rest is ignored; less and the level is skipped).
     pub(crate) fn queue_texture_level(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
-        let Some(gpu) = self.textures.get_mut(id.0 as usize) else {
+        let Some(gpu) = self.res.textures.get_mut(id.0 as usize) else {
             return;
         };
         // ENHANCEMENT E1 (FOLIAGE-OVERDRAW): a written level's alpha lowers the texture's minimum (never raises it)
         gpu.min_alpha = gpu.min_alpha.min(crate::solid::rgba_min_alpha(&data[..data.len().min(4 * w as usize * h as usize)]));
-        let gpu = &self.textures[id.0 as usize];
+        let gpu = &self.res.textures[id.0 as usize];
         // ENHANCEMENT E2: a level-0 rewrite of a texture with a generated chain (the car page's damage
         // decals) regenerates the levels below it, queued the same way
         if level == 0 && let Some(mode) = gpu.generated && gpu.size == (w, h) && data.len() >= (4 * w * h) as usize {
@@ -388,40 +394,40 @@ impl Core {
         if data.len() >= row * h as usize {
             // a queued write of the same whole level is overwritten in place (the last wins, as the
             // later `write_texture` would), so frames that are not rendered do not pile writes up
-            let same = self.pending_textures.iter().find(|q| q.texture == id.0 && q.level == level && q.width == w && q.height == h).map(|q| q.start);
-            let start = same.unwrap_or(self.pending_texture_bytes.len());
+            let same = self.res.pending_textures.iter().find(|q| q.texture == id.0 && q.level == level && q.width == w && q.height == h).map(|q| q.start);
+            let start = same.unwrap_or(self.res.pending_texture_bytes.len());
             if same.is_none() {
-                self.pending_texture_bytes.resize(start + padded * h as usize, 0);
-                self.pending_textures.push(PendingTextureWrite { texture: id.0, level, width: w, height: h, bytes_per_row: padded as u32, start });
+                self.res.pending_texture_bytes.resize(start + padded * h as usize, 0);
+                self.res.pending_textures.push(PendingTextureWrite { texture: id.0, level, width: w, height: h, bytes_per_row: padded as u32, start });
             }
             for y in 0..h as usize {
-                self.pending_texture_bytes[start + y * padded..start + y * padded + row].copy_from_slice(&data[y * row..(y + 1) * row]);
+                self.res.pending_texture_bytes[start + y * padded..start + y * padded + row].copy_from_slice(&data[y * row..(y + 1) * row]);
             }
         }
     }
 
     /// Record the queued texture writes into `encoder`, from the staging belt, in call order.
     pub(super) fn flush_texture_writes(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        for w in &self.pending_textures {
-            let Some(gpu) = self.textures.get(w.texture as usize) else { continue };
+        for w in &self.res.pending_textures {
+            let Some(gpu) = self.res.textures.get(w.texture as usize) else { continue };
             let len = w.bytes_per_row as usize * w.height as usize;
             let size = wgpu::BufferSize::new(len as u64).expect("non-empty write");
             let slice = self.belt.allocate(size, wgpu::BufferSize::new(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64).unwrap());
-            slice.get_mapped_range_mut().expect("belt slice").copy_from_slice(&self.pending_texture_bytes[w.start..w.start + len]);
+            slice.get_mapped_range_mut().expect("belt slice").copy_from_slice(&self.res.pending_texture_bytes[w.start..w.start + len]);
             encoder.copy_buffer_to_texture(
                 wgpu::TexelCopyBufferInfo { buffer: slice.buffer(), layout: wgpu::TexelCopyBufferLayout { offset: slice.offset(), bytes_per_row: Some(w.bytes_per_row), rows_per_image: Some(w.height) } },
-                wgpu::TexelCopyTextureInfo { texture: &gpu._texture, mip_level: w.level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::Extent3d { width: w.width, height: w.height, depth_or_array_layers: 1 },
+                kit::level_copy(&gpu._texture, w.level),
+                kit::extent(w.width, w.height),
             );
         }
-        self.pending_textures.clear();
-        self.pending_texture_bytes.clear();
+        self.res.pending_textures.clear();
+        self.res.pending_texture_bytes.clear();
     }
 
     /// ENHANCEMENT ENH-LIVETEX: the texture a material shows for `t` - `t`'s HD twin while E41 is above 0 and it has one, else `t`.
     pub(super) fn shown_texture(&self, t: TextureId) -> TextureId {
         if self.enhancements.level(crate::E41) > 0
-            && let Some(Some(w)) = self.tex_twin.get(t.0 as usize)
+            && let Some(Some(w)) = self.res.tex_twin.get(t.0 as usize)
         {
             return *w;
         }
@@ -431,13 +437,13 @@ impl Core {
     /// ENHANCEMENT ENH-LIVETEX: register (or clear, `None`) `base`'s HD twin; the materials of `base` sample it at once when E41 is on.
     pub(crate) fn set_texture_twin(&mut self, base: TextureId, twin: Option<TextureId>) {
         let i = base.0 as usize;
-        if self.tex_twin.len() <= i {
-            self.tex_twin.resize(i + 1, None);
+        if self.res.tex_twin.len() <= i {
+            self.res.tex_twin.resize(i + 1, None);
         }
-        if self.tex_twin[i] == twin {
+        if self.res.tex_twin[i] == twin {
             return;
         }
-        self.tex_twin[i] = twin;
+        self.res.tex_twin[i] = twin;
         if self.enhancements.level(crate::E41) > 0 {
             self.rebuild_material_bind_groups(Some(base));
         }
@@ -446,25 +452,25 @@ impl Core {
     /// ENHANCEMENT ENH-LIVETEX: register (or clear) `base`'s refined twin mesh, drawn while E42 is above 0.
     pub(crate) fn set_mesh_twin(&mut self, base: MeshId, twin: Option<MeshId>) {
         let i = base.0 as usize;
-        if self.mesh_twin.len() <= i {
-            self.mesh_twin.resize(i + 1, None);
+        if self.res.mesh_twin.len() <= i {
+            self.res.mesh_twin.resize(i + 1, None);
         }
-        self.mesh_twin[i] = twin;
+        self.res.mesh_twin[i] = twin;
     }
 
     /// ENHANCEMENT ENH-LIVETEX: give a texture's memory back (a replaced HD twin): its slot shares one 1 x 1 white image, the id stays valid.
     /// ENHANCEMENT ENH-LIVELEAK: the stub is one shared image (no allocation per release), the writes still queued for the texture are
     /// dropped, and a second release of the same id does nothing.
     pub(crate) fn release_texture(&mut self, id: TextureId) {
-        if id == self.white || id.0 as usize >= self.textures.len() || self.offscreen.contains_key(&id.0) || !self.released_textures.insert(id.0) {
+        if id == self.res.white || id.0 as usize >= self.res.textures.len() || self.offscreen.contains_key(&id.0) || !self.res.released_textures.insert(id.0) {
             return;
         }
-        if self.stub_texture.is_none() {
-            self.stub_texture = Some(self.tex_maker().rgba(1, 1, &[vec![255; 4]], None));
+        if self.res.stub_texture.is_none() {
+            self.res.stub_texture = Some(self.tex_maker().rgba(1, 1, &[vec![255; 4]], None));
         }
-        self.pending_textures.retain(|w| w.texture != id.0);
-        self.textures[id.0 as usize] = self.stub_texture.clone().expect("stub made");
-        self.pending_tex.push(id.0);
+        self.res.pending_textures.retain(|w| w.texture != id.0);
+        self.res.textures[id.0 as usize] = self.res.stub_texture.clone().expect("stub made");
+        self.res.pending_tex.push(id.0);
     }
 
     /// ENHANCEMENT ENH-LIVELEAK: give a mesh's memory back (a replaced refined twin): a static mesh's arena ranges go to the free list (the
@@ -472,32 +478,32 @@ impl Core {
     /// still drawn: the caller clears the twin entry first. A second release of the same id does nothing.
     pub(crate) fn release_mesh(&mut self, id: MeshId) {
         let i = id.0 as usize;
-        if i >= self.meshes.len() || self.meshes[i].released {
+        if i >= self.res.meshes.len() || self.res.meshes[i].released {
             return;
         }
-        self.pending_writes.retain(|w| w.mesh != id.0);
-        if self.mesh_stub.is_none() {
+        self.res.pending_writes.retain(|w| w.mesh != id.0);
+        if self.res.mesh_stub.is_none() {
             let make = |usage: wgpu::BufferUsages| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("released mesh"), size: 8, usage, mapped_at_creation: false });
             let (vb, ib) = (make(wgpu::BufferUsages::VERTEX), make(wgpu::BufferUsages::INDEX));
-            self.mesh_stub = Some((vb, ib, self.buffer_serial));
-            self.buffer_serial += 1;
+            self.res.mesh_stub = Some((vb, ib, self.res.buffer_serial));
+            self.res.buffer_serial += 1;
         }
-        let (svb, sib, stub_serial) = self.mesh_stub.clone().expect("stub made");
-        self.pending_mesh.push(id.0);
-        let m = &mut self.meshes[i];
-        let old = std::mem::replace(m, GpuMesh { vertex_buf: svb, vertex_offset: 0, vertex_len: 0, index_buf: sib, index_offset: 0, index_len: 0, index_count: 0, vb_serial: stub_serial, ib_serial: stub_serial, writes: 0, bounds: ([0.0; 3], 0.0), shape: csm::MeshShape::default(), alpha_one: true, arena: false, cap: (0, 0), released: true });
+        let (svb, sib, stub_serial) = self.res.mesh_stub.clone().expect("stub made");
+        self.res.pending_mesh.push(id.0);
+        let m = &mut self.res.meshes[i];
+        let old = std::mem::replace(m, GpuMesh::stub(svb, sib, stub_serial));
         if old.arena {
-            self.free_slots.push(FreeMeshSlot { serial: old.vb_serial, vertex_buf: old.vertex_buf, vertex_offset: old.vertex_offset, vertex_cap: old.cap.0, index_buf: old.index_buf, index_offset: old.index_offset, index_cap: old.cap.1 });
+            self.res.free_slots.push(FreeMeshSlot { serial: old.vb_serial, vertex_buf: old.vertex_buf, vertex_offset: old.vertex_offset, vertex_cap: old.cap.0, index_buf: old.index_buf, index_offset: old.index_offset, index_cap: old.cap.1 });
         } else {
-            self.arena_bytes = self.arena_bytes.saturating_sub(old.cap.0 + old.cap.1);
+            self.res.arena_bytes = self.res.arena_bytes.saturating_sub(old.cap.0 + old.cap.1);
         }
     }
 
     /// ENHANCEMENT ENH-LIVELEAK: what is resident now (see [`ResourceStats`]).
     pub(crate) fn resource_stats(&self) -> ResourceStats {
-        let mut st = ResourceStats { textures: self.textures.len(), meshes: self.meshes.len(), materials: self.materials.len(), arena_bytes: self.arena_bytes, ..Default::default() };
-        for (i, t) in self.textures.iter().enumerate() {
-            if self.released_textures.contains(&(i as u32)) {
+        let mut st = ResourceStats { textures: self.res.textures.len(), meshes: self.res.meshes.len(), materials: self.res.materials.len(), arena_bytes: self.res.arena_bytes, ..Default::default() };
+        for (i, t) in self.res.textures.iter().enumerate() {
+            if self.res.released_textures.contains(&(i as u32)) {
                 continue;
             }
             st.textures_live += 1;
@@ -512,7 +518,7 @@ impl Core {
                 h = (h / 2).max(1);
             }
         }
-        for m in self.meshes.iter().filter(|m| !m.released) {
+        for m in self.res.meshes.iter().filter(|m| !m.released) {
             st.meshes_live += 1;
             st.mesh_bytes += m.vertex_len + m.index_len;
         }
@@ -522,9 +528,9 @@ impl Core {
     /// ENHANCEMENT ENH-LIVETEX: the mesh a draw of `id` uses - its refined twin while E42 is above 0.
     #[inline]
     pub(super) fn shown_mesh(&self, id: u32) -> u32 {
-        if !self.mesh_twin.is_empty()
+        if !self.res.mesh_twin.is_empty()
             && self.enhancements.level(crate::E42) > 0
-            && let Some(Some(t)) = self.mesh_twin.get(id as usize)
+            && let Some(Some(t)) = self.res.mesh_twin.get(id as usize)
         {
             return t.0;
         }

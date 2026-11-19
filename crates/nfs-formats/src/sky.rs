@@ -18,7 +18,7 @@ use crate::{u32_le, FormatError};
 
 /// The 2π the sun's turn is multiplied by — the executable's own f64 literal, **not** `TAU`
 /// (`sun_position`).
-const TWO_PI_F64: f64 = 6.28318452835083;
+use nfs_math::portable::TWO_PI_IMAGE as TWO_PI_F64;
 
 /// The `type` keyword. 0x45FD57 onwards compares it against thirteen strings and turns it into a
 /// **bitmask** — `config` 0x01, `basic` 0x02, `multinormal` 0x04, `multiadditive` 0x08,

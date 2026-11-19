@@ -31,7 +31,6 @@ struct Params {
 const BODY_INSET: f32 = 0.8;
 const BODY_HEIGHT: f32 = 0.6;
 const RING_STAGGER: f32 = 0.5;
-const TAU: f32 = 6.2831853;
 // an occluder sample's comparison taps (its corners `consts.z` metres apart)
 const TAPS: f32 = 4.0;
 @group(0) @binding(2) var<uniform> params: Params;

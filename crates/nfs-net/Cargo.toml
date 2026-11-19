@@ -5,6 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "The network protocol of Need for Speed: Porsche Unleashed"
 
+[features]
+# `stub`: the scripted lobby host of the tests (TEST GLUE, `stub.rs`); not part of the shipped library. open-unleashed's
+# dev-dependency switches it on for its lobby tests; the `lobby_stub` example needs it.
+stub = []
+
+[[example]]
+name = "lobby_stub"
+required-features = ["stub"]
+
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true

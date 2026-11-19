@@ -2,6 +2,15 @@
 
 use crate::*;
 
+/// The keys of [`App::tunnel_lamps`]' holders (one covered-stretch value each): the cars use 0 (the player), 1 + i, 0x100 + i and
+/// 0x200 + i (`CarSlot::id`); the camera-side effects take the keys below, outside those ranges.
+pub(crate) mod cover_key {
+    /// E36's haze: the camera's covered value
+    pub(crate) const HAZE: u32 = 0x400;
+    /// E40's drops: the camera's covered value
+    pub(crate) const DROPS: u32 = 0x500;
+}
+
 impl App {
     /// Which lamp slots are lit and how brightly, 0x439360 for a racing car: 0 / 1 the headlights
     /// (`car+0xD87 & 1`, this port's night flag); 2 / 3 the brake lamps by the effective brake
@@ -80,8 +89,23 @@ impl App {
         if !self.enh.is_on(nfs_renderer::E24) || self.track.is_night() {
             return 0.0;
         }
-        let covered = self.world.as_ref().is_some_and(|w| w.in_tunnel(pos));
-        self.tunnel_lamps.borrow_mut().value_held(key, covered, now_ms)
+        self.tunnel_cover(key, pos, now_ms)
+    }
+
+    /// Whether `pos` is inside a covered stretch (`TrackWorld::in_tunnel`, the road's overhead-flags bit 15).
+    pub(crate) fn covered_at(&self, pos: Vec3) -> bool {
+        self.world.as_ref().is_some_and(|w| w.in_tunnel(pos))
+    }
+
+    /// The held-and-ramped covered value (0..1) of the holder `key` ([`cover_key`]) at `pos`, in [`Self::tunnel_lamps`]
+    /// (E24's ramp: the first call of a key snaps to its target).
+    pub(crate) fn tunnel_cover(&self, key: u32, pos: Vec3, now_ms: f64) -> f32 {
+        self.ambient.tunnel_lamps.borrow_mut().value_held(key, self.covered_at(pos), now_ms)
+    }
+
+    /// [`Self::tunnel_cover`] through a smoothstep, so a ramp neither starts nor stops with a jump (the haze, the drops).
+    pub(crate) fn tunnel_cover_smooth(&self, key: u32, pos: Vec3, now_ms: f64) -> f32 {
+        nfs_math::smooth01(self.tunnel_cover(key, pos, now_ms))
     }
 
     /// ENHANCEMENT E24: [`Self::lamp_slots`] with the tunnel's lit value `f` (0..1, [`Self::tunnel_lit`]) laid over: a
@@ -144,7 +168,7 @@ impl App {
     /// `CARG`, `SPIK` and `GLNT` of `Render/common.fsh` for the glares (blend pair 1, additive,
     /// 0x43CF5B), when no race has loaded them yet — the front end draws the same effect pass.
     pub(crate) fn fe_load_lamp_sprites(&mut self) {
-        if self.glare_draw.is_some() {
+        if self.draws.glare_draw.is_some() {
             return;
         }
         let Some(renderer) = self.renderer.as_mut() else { return };
@@ -172,8 +196,8 @@ impl App {
             });
             Some((mesh, material))
         };
-        self.glare_draw = sprite("CARG");
-        self.glare_star = [sprite("SPIK"), sprite("GLNT")];
+        self.draws.glare_draw = sprite("CARG");
+        self.draws.glare_star = [sprite("SPIK"), sprite("GLNT")];
     }
 
     /// The car's effect pass `R3DCarLOD` slot 3, **0x43D800** (vtable 0x5B36AC), which the car draw
@@ -227,24 +251,20 @@ impl App {
     /// the race's weather word, 0x43DA88), and the view's planes are the front end's.
     pub(crate) fn lamp_draws_in(&self, model: &CarModel, (pos, rot): (Vec3, Quat), ground: f32, slots: [(bool, f32); 14], front_end: bool, out: &mut Vec<LampDraw>) {
         out.clear();
-        let Some((mesh, material)) = self.glare_draw else {
+        let Some((mesh, material)) = self.draws.glare_draw else {
             return;
         };
         let view = (self.camera.target - self.camera.position).normalize_or_zero();
         // the reflection's inputs, once per car: the sky manager's track B field 5 at the camera's
         // slice (0x45D000 on `[0x627E48]`, whose `+0x50` is that slice), the camera's row `+0xE8`
         // (its right, 0x451DF9) and `[0x61BCBC]`, the road under the eye (`eye_road_height`)
-        let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
-        let wet = match (self.track.sky_bin.as_ref(), self.cam_slice) {
-            (Some(b), Some(s)) if !front_end => b.sample_track_b(5, s as i32, lap),
-            _ => 0.0,
-        };
+        let wet = if front_end { 0.0 } else { self.camera_wet() };
         let right = view.cross(self.camera.up).normalize_or_zero();
         let eye_ground = self.eye_road_height();
         // ENHANCEMENT E26 (AUTOBAHN-LAMPS): on a wet stretch every car is also a box that can hide another light's streak
         let streaks = wet > 0.05 && self.enh.is_on(nfs_renderer::E26);
         let car = streaks.then(|| {
-            let mut cars = self.rain.cars.borrow_mut();
+            let mut cars = self.ambient.rain.cars.borrow_mut();
             cars.push(super::rain::CarBox { pos, rot, min: model.bbox_min, max: model.bbox_max });
             cars.len() - 1
         });
@@ -289,7 +309,7 @@ impl App {
                 if streaks {
                     let s = b.min(1.0) * 1.3;
                     let reach = if l.night { super::rain::HEADLIGHT_REACH } else { super::rain::TAIL_LIGHT_REACH };
-                    self.rain.lamps.borrow_mut().push(super::rain::RainLight { pos: world, colour: [tint[0] * s, tint[1] * s, tint[2] * s], reach, car });
+                    self.ambient.rain.lamps.borrow_mut().push(super::rain::RainLight { pos: world, colour: [tint[0] * s, tint[1] * s, tint[2] * s], reach, car });
                 }
                 // a billboard: the corners are the lamp's centre plus the camera's two rows `+0xF4` /
                 // `+0xE8` times the 2-D corner offsets (0x43D301…0x43D399), so the quad faces the
@@ -309,7 +329,7 @@ impl App {
                 // `GLNT` for kind 4, `SPIK` for the others, none for the front end's kind 10 — in
                 // `L+0x44`, under the same bias
                 if l.kind != 10
-                    && let Some((m2, mat2)) = self.glare_star[usize::from(l.kind == 4)]
+                    && let Some((m2, mat2)) = self.draws.glare_star[usize::from(l.kind == 4)]
                 {
                     let c = l.colour[1];
                     let tint = [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0];
@@ -821,13 +841,7 @@ impl SkidWritten {
     }
 }
 
-/// A colour byte's full scale.
-const BYTE_MAX: f32 = 255.0;
-
-/// An `ARGB` dword as `[r, g, b, a]` in 0..1 (each byte over 255).
-pub(crate) fn argb_rgba(c: u32) -> [f32; 4] {
-    [((c >> 16) & 0xFF) as f32 / BYTE_MAX, ((c >> 8) & 0xFF) as f32 / BYTE_MAX, (c & 0xFF) as f32 / BYTE_MAX, (c >> 24) as f32 / BYTE_MAX]
-}
+pub(crate) use nfs_game::colour::argb_rgba;
 
 pub(crate) fn lamp_command(bits: u8, code: u8) -> u8 {
     match code {

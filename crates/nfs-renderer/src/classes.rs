@@ -54,7 +54,7 @@ pub(crate) const PART_LIT: f32 = crate::PARTICLE_LIT as f32;
 /// a lit particle per fragment ([`crate::PARTICLE_LIT_WORLD`]).
 pub(crate) const PART_LIT_WORLD: f32 = crate::PARTICLE_LIT_WORLD as f32;
 
-/// `Csm::misc.y` — ENHANCEMENT E9 (SHADOW-REFACTOR): the frame's shadow mode (`gpu/csm.rs` `ShadowMode`): the race's sun (the
+/// `Csm::misc.y` — ENHANCEMENT E9 (SHADOW-REFACTOR): the frame's shadow mode (`gpu/csm/mode.rs` `ShadowMode`): the race's sun (the
 /// sky's, a sunless track's data sun, E51's cars-only frame). 0, so a zeroed uniform reads as no special mode.
 pub(crate) const SHADOW_SUN: f32 = 0.0;
 // 1.0 was E25's overcast light (removed 2026-11-16, SHADOW-OVERCAST); the other values keep theirs
@@ -241,7 +241,7 @@ pub(crate) fn faces_wgsl() -> String {
 }
 
 /// The mesh shader's globals group (group 0): each binding's number, for both sides. `shader.wgsl` declares its bindings with the
-/// `B_*` names ([`wgsl_consts`] emits them); `Core::make_globals_bg` and the passes' layout entries (`gpu/csm.rs`, `spot.rs`,
+/// `B_*` names ([`wgsl_consts`] emits them); `Core::make_globals_bg` and the passes' layout entries (`gpu/csm/`, `spot.rs`,
 /// `lamps.rs`, `contact.rs`) take the same constants.
 pub(crate) mod binding {
     macro_rules! bindings {
@@ -414,7 +414,7 @@ pub(crate) fn mesh_shader_source(feats: u32) -> String {
     }
     assert!(stack.is_empty(), "shader.wgsl: an //@if is not closed");
     // (`ign`: the front-end focus shadow's per-pixel turn, ENH-FE3D; the turns: the Vogel discs, the water's ripple)
-    crate::wgsl::compose(&[&wgsl_consts(), crate::wgsl::IGN, crate::wgsl::ANGLES, crate::wgsl::NDC_UV, crate::wgsl::LINEAR_Z, SH_LUMA, &faces_wgsl(), OBJECT_WGSL, &kept])
+    crate::wgsl::compose(&[&wgsl_consts(), crate::wgsl::IGN, crate::wgsl::ANGLES, crate::wgsl::BYTE, crate::wgsl::NDC_UV, crate::wgsl::LINEAR_Z, SH_LUMA, &faces_wgsl(), OBJECT_WGSL, &kept])
 }
 
 #[cfg(test)]
@@ -457,7 +457,7 @@ pub(crate) mod tests {
                 unmarked.push_str(l);
             }
         }
-        assert!(mesh_shader_source(feat::ALL) == crate::wgsl::compose(&[&wgsl_consts(), crate::wgsl::IGN, crate::wgsl::ANGLES, crate::wgsl::NDC_UV, crate::wgsl::LINEAR_Z, SH_LUMA, &faces_wgsl(), OBJECT_WGSL, &unmarked]), "the full shader is not shader.wgsl");
+        assert!(mesh_shader_source(feat::ALL) == crate::wgsl::compose(&[&wgsl_consts(), crate::wgsl::IGN, crate::wgsl::ANGLES, crate::wgsl::BYTE, crate::wgsl::NDC_UV, crate::wgsl::LINEAR_Z, SH_LUMA, &faces_wgsl(), OBJECT_WGSL, &unmarked]), "the full shader is not shader.wgsl");
         let all = mesh_shader_source(feat::ALL);
         for (name, bit) in feat::NAMES {
             assert!(src.contains(&format!("//@if {name}")) || src.contains(&format!("|{name}")), "{name} not used by shader.wgsl");

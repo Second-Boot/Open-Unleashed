@@ -6,5 +6,9 @@ license.workspace = true
 description = "Parsers for Need for Speed: Porsche Unleashed data formats"
 
 [dependencies]
+nfs-math.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+nfs-devdata.workspace = true

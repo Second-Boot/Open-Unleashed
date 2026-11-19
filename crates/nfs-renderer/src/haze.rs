@@ -15,7 +15,7 @@
 //! upsamples with a four-tap depth-aware (edge-aware) blur so a near silhouette (the own car, a post) does not take the haze
 //! of what lies behind it, and adds over the full-size scene. Additive, `Rgba16Float`.
 
-use crate::gfx::{self, Fullscreen, Keyed, OverScene, PostTarget, UniformBuf, Variants};
+use crate::gfx::{self, Keyed, OverScene, PostTarget, RaysLabels, RaysPipes, UniformBuf, Variants};
 use crate::wgsl::{self, DepthKind};
 use glam::Vec3;
 
@@ -130,11 +130,7 @@ const SUBTLE_TUNNEL: f32 = 0.5;
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniform {
-    inv_vp: [[f32; 4]; 4],
-    /// xyz the eye, w the near plane
-    cam: [f32; 4],
-    /// xyz the view's forward axis, w the far plane
-    fwd: [f32; 4],
+    eye: gfx::EyeUniform,
     /// x the beams' density, y the lamps' density, z the march's end, w the lamp count
     air: [f32; 4],
     /// x the beams' gain, y the lamps' gain
@@ -155,212 +151,18 @@ pub(crate) struct Frame {
     pub haze: Haze,
 }
 
-const WGSL: &str = r#"
-struct U {
-    inv_vp: mat4x4<f32>,
-    cam: vec4<f32>,
-    fwd: vec4<f32>,
-    air: vec4<f32>,
-    gain: vec4<f32>,
-    lamp_pos: array<vec4<f32>, HAZE_LAMPS_N>,
-    lamp_col: array<vec4<f32>, HAZE_LAMPS_N>,
-};
-struct Spots {
-    pos: array<vec4<f32>, MAX_SPOTS_N>,
-    dir: array<vec4<f32>, MAX_SPOTS_N>,
-    params: vec4<f32>,
-    shadow: vec4<f32>,
-    mat: mat4x4<f32>,
-    origin: vec4<f32>,
-};
-@group(0) @binding(2) var<uniform> u: U;
-@group(0) @binding(3) var rays: texture_2d<f32>;
-@group(0) @binding(6) var<uniform> spots: Spots;
-@group(0) @binding(7) var t_spot: texture_depth_2d;
-@group(0) @binding(8) var s_shadow: sampler_comparison;
-
-const STEPS: i32 = STEPS_N;
-const CONE_COLOUR: vec3<f32> = vec3<f32>(1.0, 0.9, 0.7);
-// the sky's distance (m) and the stored depth from which a pixel is sky
-const SKY_DIST: f32 = 1000.0;
-const SKY_DEPTH: f32 = 0.99999;
-// the beams: the nearest a point counts to a lamp (m), the distance scale of the inverse-square falloff (m), the fade-in
-// in front of the lamp (m: no halo on the bonnet), the phase's lobe (Henyey-Greenstein g)
-const LAMP_MIN_DIST: f32 = 0.3;
-const FALLOFF_DIST: f32 = 25.0;
-const FADE_IN: vec2<f32> = vec2<f32>(3.0, 9.0);
-const HG_G: f32 = 0.45;
-// the march's image is 1 / MARCH_DIV of the scene's size; a march texel reads the scene's depth at its block's pixel
-// MARCH_TAP (one of the two middle ones; 0 at half size)
-const MARCH_DIV: f32 = MARCH_DIV_N;
-const MARCH_TAP: f32 = MARCH_DIV / 2.0 - 1.0;
-// the composite: the nearest a pixel takes haze (m: the cockpit's panels and pillars), the distance compare's cap (m), its
-// relative and absolute tolerance (m)
-const NEAR_CUT: f32 = 1.5;
-const MATCH_CAP: f32 = 80.0;
-const MATCH_REL: f32 = 0.15;
-const MATCH_ABS: f32 = 0.3;
-
-// the distance along the view ray to the scene, from the stored depth (the sky: a long way)
-fn scene_dist(d: f32, dir: vec3<f32>) -> f32 {
-    let near = u.cam.w;
-    let far = u.fwd.w;
-    if d >= SKY_DEPTH {
-        return SKY_DIST;
-    }
-    let z = linear_z(d, near, far);
-    return z / max(dot(dir, u.fwd.xyz), 0.05);
-}
-
-// E15's shadow map of the player's lamp pair at a point of the air: the same lookup as the surfaces', the point
-// pushed toward the lamp by a texel at its distance
-fn spot_visibility(world: vec3<f32>) -> f32 {
-    let o = spots.origin.xyz;
-    let to = normalize(o - world);
-    let dist = length(world - o);
-    let texel = spots.shadow.y * dist;
-    let p = spots.mat * vec4<f32>(world + to * texel, 1.0);
-    let near = spots.shadow.z;
-    let far = spots.shadow.w;
-    if p.w <= near {
-        return 1.0;
-    }
-    let ndc = p.xyz / p.w;
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0 {
-        return 1.0;
-    }
-    let bias = (0.05 + 1.5 * texel) * far * near / ((far - near) * p.w * p.w);
-    let depth = ndc.z - bias;
-    let st = spots.origin.w;
-    var sum = 0.0;
-    for (var k = 0; k < 4; k++) {
-        sum += textureSampleCompareLevel(t_spot, s_shadow, uv + vec2<f32>(f32(k & 1) * 2.0 - 1.0, f32(k >> 1) * 2.0 - 1.0) * st, depth);
-    }
-    let edge = max(abs(ndc.x), abs(ndc.y));
-    return mix(sum * 0.25, 1.0, smoothstep(0.85, 1.0, edge));
-}
-
-// the scattering phase of a headlight beam toward the eye: a flat part and a forward-leaning Henyey-Greenstein lobe
-// (g 0.45); `c` is the cosine between the light's travel and the direction to the eye
-fn phase(c: f32) -> f32 {
-    let g = HG_G;
-    let hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * c, 1.5);
-    return 0.5 + 0.5 * hg;
-}
-
-// PERF: the march at 1 / MARCH_DIV size; the alpha keeps the distance to the scene for the composite's depth-aware blur
-@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let dims = vec2<f32>(depth_dims());
-    let fp = min(floor(pos.xy) * MARCH_DIV + MARCH_TAP, dims - 1.0);
-    let uv = (fp + 0.5) / dims;
-    let dir = view_dir(uv);
-    let ts = scene_dist(depth_at(vec2<i32>(fp)), dir);
-    let tmax = min(ts, u.air.z);
-    var sum = vec3<f32>(0.0);
-    if tmax > 0.05 {
-        // a static per-pixel offset hides the banding of the few steps (nothing crawls)
-        let jit = ign(pos.xy);
-        let eye = u.cam.xyz;
-        let n_spots = i32(spots.params.x);
-        let n_lamps = i32(u.air.w);
-        let sig_beam = u.air.x;
-        let sig_lamp = u.air.y;
-        for (var i = 0; i < STEPS; i++) {
-            let s = (f32(i) + jit) / f32(STEPS);
-            let t = tmax * s * s;
-            let dt = tmax * 2.0 * s / f32(STEPS);
-            let p = eye + dir * t;
-            var e = vec3<f32>(0.0);
-            if sig_beam > 0.0 && n_spots > 0 {
-                var vis = -1.0;
-                for (var k = 0; k < n_spots; k++) {
-                    let lv = p - spots.pos[k].xyz;
-                    let d = max(length(lv), LAMP_MIN_DIST);
-                    let l = lv / d;
-                    let cone = smoothstep(spots.params.y, spots.params.z, dot(l, spots.dir[k].xyz));
-                    if cone <= 0.0 {
-                        continue;
-                    }
-                    let r = clamp(1.0 - d / spots.params.w, 0.0, 1.0);
-                    if r <= 0.0 {
-                        continue;
-                    }
-                    let d25 = d / FALLOFF_DIST;
-                    // no halo on the bonnet: the beam's air starts a few metres ahead of the lamp and fades in over 3-9 m
-                    var w = spots.pos[k].w * cone * r * r / (1.0 + d25 * d25) * smoothstep(FADE_IN.x, FADE_IN.y, d);
-                    if f32(k) < spots.shadow.x {
-                        if vis < 0.0 {
-                            vis = spot_visibility(p);
-                        }
-                        w = w * vis;
-                    }
-                    // light travels along l; it reaches the eye along -dir
-                    e += CONE_COLOUR * (w * phase(dot(l, -dir)));
-                }
-                e = e * (sig_beam * u.gain.x * exp(-sig_beam * 0.5 * t));
-            }
-            var g = vec3<f32>(0.0);
-            if sig_lamp > 0.0 {
-                for (var k = 0; k < n_lamps; k++) {
-                    let d = length(p - u.lamp_pos[k].xyz);
-                    let r = clamp(1.0 - d / u.lamp_pos[k].w, 0.0, 1.0);
-                    g += u.lamp_col[k].rgb * (r * r);
-                }
-                g = g * (sig_lamp * u.gain.y);
-            }
-            sum += (e + g) * dt;
-        }
-    }
-    return vec4<f32>(sum, min(ts, SKY_DIST));
-}
-
-// the composite: the four nearest march texels weighted bilinearly and by how well their distance matches this
-// pixel's, over the full-size scene; the cockpit's own panels and pillars (closer than 1.5 m) take none
-@fragment fn fs_comp(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let dims = vec2<f32>(depth_dims());
-    let p = vec2<i32>(pos.xy);
-    let dir = view_dir(pos.xy / dims);
-    let ts = scene_dist(depth_at(p), dir);
-    if ts < NEAR_CUT {
-        return vec4<f32>(0.0);
-    }
-    let march_dims = vec2<i32>(textureDimensions(rays));
-    // this pixel's place in the march's texel space (texel centres at integer + 0.5)
-    let hp = pos.xy / MARCH_DIV - 0.5;
-    let base = vec2<i32>(floor(hp));
-    let f = hp - floor(hp);
-    var acc = vec3<f32>(0.0);
-    var wsum = 0.0;
-    for (var k = 0; k < 4; k++) {
-        let o = vec2<i32>(k & 1, k >> 1);
-        let q = clamp(base + o, vec2<i32>(0), march_dims - 1);
-        let tex = textureLoad(rays, q, 0);
-        let bl = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1);
-        let dd = abs(min(tex.a, MATCH_CAP) - min(ts, MATCH_CAP)) / (MATCH_REL * min(ts, MATCH_CAP) + MATCH_ABS);
-        let w = bl * exp(-dd * dd) + 1e-4;
-        acc += tex.rgb * w;
-        wsum += w;
-    }
-    return vec4<f32>(acc / wsum, 0.0);
-}
-"#;
+const WGSL: &str = include_str!("haze.wgsl");
 
 /// The pass's shader for a depth `kind` and `steps` march steps; the arrays' sizes are the Rust ones ([`HAZE_LAMPS`], E15's
 /// `MAX_SPOTS`), written as the literals they were.
 pub(crate) fn source(kind: DepthKind, steps: u32) -> String {
     let body = WGSL.replace("STEPS_N", &steps.to_string()).replace("HAZE_LAMPS_N", &HAZE_LAMPS.to_string()).replace("MAX_SPOTS_N", &crate::MAX_SPOTS.to_string()).replace("MARCH_DIV_N", &format!("{:?}", MARCH_DIV as f32));
-    wgsl::compose(&[wgsl::FULLSCREEN_VS, wgsl::IGN, kind.wgsl(), wgsl::LINEAR_Z, wgsl::VIEW_DIR, &body])
+    wgsl::compose_scene_depth(kind, &[wgsl::VIEW_DIR, &body])
 }
 
-const RAYS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+type Pipes = RaysPipes;
 
-struct Pipes {
-    rays: wgpu::RenderPipeline,
-    rays_bgl: wgpu::BindGroupLayout,
-    comp: wgpu::RenderPipeline,
-    comp_bgl: wgpu::BindGroupLayout,
-}
+const LABELS: RaysLabels = RaysLabels { rays_pass: "haze (march, quarter size)", rays_prof: "haze march (quarter)", comp_pass: "haze (composite)", comp_prof: "haze composite" };
 
 /// What [`HazePass`]'s bind groups are made of: the pipelines' key, the depth, the rays image, E15's spot uniform and map.
 type HazeBgKey = ((DepthKind, u32, u32), wgpu::TextureView, wgpu::TextureView, wgpu::Buffer, wgpu::TextureView);
@@ -400,37 +202,28 @@ impl HazePass {
         let module = gfx::wgsl_module(device, "haze", &source(kind, steps));
         let depth = kind.layout_entry();
         let uniform = |binding: u32| gfx::bgl_uniform(binding, wgpu::ShaderStages::FRAGMENT);
-        let rays_tex = gfx::bgl_tex(3, wgpu::TextureSampleType::Float { filterable: false }, false);
-        let spot_map = gfx::bgl_tex(7, wgpu::TextureSampleType::Depth, false);
+        let rays_tex = gfx::bgl_float(3, false);
+        let spot_map = gfx::bgl_depth(7, false);
         let shadow_samp = gfx::bgl_sampler(8, wgpu::SamplerBindingType::Comparison);
-        let layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| gfx::bgl(device, label, entries);
-        let rays_bgl = layout("haze rays", &[depth, uniform(2), uniform(6), spot_map, shadow_samp]);
-        let comp_bgl = layout("haze composite", &[depth, uniform(2), rays_tex]);
-        let pipe = |label: &str, fs: &str, bgl: &wgpu::BindGroupLayout, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, samples: u32, mask: wgpu::ColorWrites| {
-            let pl = gfx::pipeline_layout(device, label, &[bgl]);
-            Fullscreen::new(label, &pl, &module).fs(fs).samples(samples).build(device, &[Some(wgpu::ColorTargetState { format, blend, write_mask: mask })])
-        };
-        let rays = pipe("haze rays", "fs", &rays_bgl, RAYS_FORMAT, None, 1, wgpu::ColorWrites::ALL);
-        let comp = pipe("haze composite", "fs_comp", &comp_bgl, format, Some(gfx::blend::ADD), samples, wgpu::ColorWrites::COLOR);
-        Pipes { rays, rays_bgl, comp, comp_bgl }
+        let rays_bgl = gfx::bgl(device, "haze rays", &[depth, uniform(2), uniform(6), spot_map, shadow_samp]);
+        let comp_bgl = gfx::bgl(device, "haze composite", &[depth, uniform(2), rays_tex]);
+        RaysPipes::build(device, &module, "haze", rays_bgl, comp_bgl, format, samples)
     }
 
     /// Record the pass into `encoder`: the march at 1 / [`MARCH_DIV`] size, then added over `colour` (loaded; `resolve` when it is
     /// multisampled; `keep` = store the multisampled samples for a later pass), reading `depth` and E15's spot uniform
     /// and shadow map.
     pub(crate) fn draw(&mut self, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, f: &Frame, at: &OverScene, spot_uniform: &wgpu::Buffer, spot_map: &wgpu::TextureView) {
-        let OverScene { depth, kind, colour, resolve, .. } = *at;
+        let OverScene { depth, kind, .. } = *at;
         let samples = at.samples.max(1);
         let steps = if f.gain > STRONG_GAIN { STEPS_STRONG } else { STEPS_SUBTLE };
         let key = (kind, samples, steps);
         let (device, format) = (&self.device, self.format);
         let pipes = self.pipes.get(key, || Self::build(device, format, kind, samples, steps));
         let size = (depth.texture().width(), depth.texture().height());
-        let rays_view = &PostTarget::ensure(&mut self.image, device, "haze rays", size, MARCH_DIV, RAYS_FORMAT).view;
+        let rays_view = &PostTarget::ensure(&mut self.image, device, "haze rays", size, MARCH_DIV, gfx::RAYS_FORMAT).view;
         let mut u = Uniform {
-            inv_vp: f.inv_vp.to_cols_array_2d(),
-            cam: [f.eye.x, f.eye.y, f.eye.z, f.planes[0]],
-            fwd: [f.fwd.x, f.fwd.y, f.fwd.z, f.planes[1]],
+            eye: gfx::EyeUniform::new(&f.inv_vp, f.eye, f.fwd, f.planes),
             air: [f.beam, f.lamp, MAX_DISTANCE, (f.haze.n as usize).min(HAZE_LAMPS) as f32],
             gain: [f.gain * BEAM_GAIN, f.gain * LAMP_GAIN, 0.0, 0.0],
             lamp_pos: [[0.0; 4]; HAZE_LAMPS],
@@ -443,29 +236,19 @@ impl HazePass {
         self.ubuf.write(belt, encoder, &u);
         let (ubuf_res, shadow_sampler) = (&self.ubuf.buf, &self.shadow_sampler);
         let (bg1, bg2) = self.bgs.get((key, depth.clone(), rays_view.clone(), spot_uniform.clone(), spot_map.clone()), || {
-            let depth_entry = wgpu::BindGroupEntry { binding: kind.binding(), resource: wgpu::BindingResource::TextureView(depth) };
-            let ubuf = wgpu::BindGroupEntry { binding: 2, resource: ubuf_res.as_entire_binding() };
-            let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("haze rays"),
-                layout: &pipes.rays_bgl,
-                entries: &[
+            let depth_entry = gfx::bg_view(kind.binding(), depth);
+            let ubuf = gfx::bg_buf(2, ubuf_res);
+            let bg1 = gfx::bind_group(device, "haze rays", &pipes.rays_bgl, &[
                     depth_entry.clone(),
                     ubuf.clone(),
-                    wgpu::BindGroupEntry { binding: 6, resource: spot_uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(spot_map) },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(shadow_sampler) },
-                ],
-            });
-            let bg2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("haze composite"),
-                layout: &pipes.comp_bgl,
-                entries: &[depth_entry, ubuf, wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(rays_view) }],
-            });
+                    gfx::bg_buf(6, spot_uniform),
+                    gfx::bg_view(7, spot_map),
+                    gfx::bg_sampler(8, shadow_sampler),
+                ]);
+            let bg2 = gfx::bind_group(device, "haze composite", &pipes.comp_bgl, &[depth_entry, ubuf, gfx::bg_view(3, rays_view)]);
             (bg1, bg2)
         });
-        gfx::fullscreen_pass(encoder, "haze (march, quarter size)", "haze march (quarter)", rays_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &pipes.rays, &[bg1]);
-        let mut pass = gfx::color_pass_resolve(encoder, "haze (composite)", "haze composite", colour, resolve, wgpu::LoadOp::Load, at.store());
-        gfx::draw_fullscreen(&mut pass, &pipes.comp, &[bg2]);
+        pipes.record(encoder, LABELS, rays_view, at, bg1, bg2);
     }
 }
 

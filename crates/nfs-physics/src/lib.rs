@@ -15,3 +15,5 @@ pub mod specs;
 pub mod track_tree;
 pub mod vehicle;
 pub mod walls;
+/// The x87 idioms of the physics step (the list is in the module), shared with the AI drive of `nfs-game`.
+pub mod x87;

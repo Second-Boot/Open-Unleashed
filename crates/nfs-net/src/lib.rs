@@ -25,6 +25,7 @@ pub mod session;
 pub mod slots;
 pub mod socket;
 pub mod state;
+#[cfg(any(test, feature = "stub"))]
 pub mod stub;
 pub mod tcp;
 pub mod voice;

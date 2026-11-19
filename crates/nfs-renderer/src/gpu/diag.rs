@@ -37,13 +37,13 @@ impl Core {
         let was_on = self.edr.on;
         let (tex, view, pre2d) = self.edr.targets(&self.device, self.config.format, (w, h));
         let depth = self.depth_for(w, h);
-        let gamma = self.gamma;
-        self.gamma = 1.0;
+        let gamma = self.modes.gamma;
+        self.modes.gamma = 1.0;
         self.edr.pass = true;
         self.edr.gain_used = false;
         self.encode_with_gamma(scene, camera, FrameOut::of(&view, &tex, &depth));
         self.edr.pass = false;
-        self.gamma = gamma;
+        self.modes.gamma = gamma;
         self.edr_probe_stats(&tex, &pre2d, gamma, was_on, prefix);
     }
 
@@ -145,6 +145,6 @@ impl Core {
 
     /// An `Rgba16Float` image read back as f32 RGBA.
     pub(super) fn readback_f16(&self, target: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<f32>> {
-        Ok(self.read_texture(target, width, height, 8)?.chunks_exact(2).map(|h| f16_to_f32(u16::from_le_bytes([h[0], h[1]]))).collect())
+        Ok(self.read_texture(target, width, height, 8)?.as_chunks::<2>().0.iter().map(|h| f16_to_f32(u16::from_le_bytes([h[0], h[1]]))).collect())
     }
 }

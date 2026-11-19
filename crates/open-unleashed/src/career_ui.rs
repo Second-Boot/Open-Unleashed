@@ -252,8 +252,8 @@ impl CareerUi {
     pub fn load_from(paths: &GamePaths, dir: PathBuf, json: Option<&Path>) -> Result<Self, CareerError> {
         let tables = CareerTables::load(paths)?;
         // The profile is the one `player.lst` last selected, as `RebuildUserList` 0x4DEF60 does.
-        let profile = std::env::var("NFS5_PROFILE")
-            .ok()
+        let profile = nfs_game::config::cfg().nfs5_profile
+            .as_str()
             .map(|n| Profile::new(n, nfs_game::save::DEFAULT_PICTURE))
             .or_else(|| nfs_game::save::read_player_lst(&dir).and_then(|s| Profile::from_stem(&s)))
             .or_else(|| nfs_game::save::list_profiles(&dir).into_iter().next())

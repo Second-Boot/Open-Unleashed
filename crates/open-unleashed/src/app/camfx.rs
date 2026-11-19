@@ -130,7 +130,7 @@ fn noise(t: f64, seed: u32) -> f32 {
         x ^= x >> 15;
         (x >> 8) as f32 / 8_388_608.0 - 1.0
     };
-    let u = f * f * (3.0 - 2.0 * f);
+    let u = nfs_math::smooth01(f);
     let (a, b) = (h(i as i64), h(i as i64 + 1));
     a + (b - a) * u
 }

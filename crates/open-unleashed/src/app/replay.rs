@@ -11,7 +11,7 @@ impl App {
             return;
         };
         if matches!(r.mode, Mode::Recording | Mode::Full) {
-            let done = self.race.as_ref().map(|r| r.finished).unwrap_or(false) || self.player_eliminated;
+            let done = self.race.as_ref().map(|r| r.finished).unwrap_or(false) || self.ko.player_eliminated;
             if done && !self.replay.saved {
                 self.save_replay();
             }
@@ -303,7 +303,7 @@ impl App {
     /// not carry (a `.prpl` from before them) falls back and says so: single race (not a lap knockout),
     /// the front end's current `Game.GameType`, the last launch's camera list (PORT-DEVIATION D22).
     pub(crate) fn apply_replay_launch_block(&mut self, setup: &nfs_game::replay::ReplaySetup) {
-        self.quick_knockout = setup.race_type == Some(3);
+        self.ko.quick_knockout = setup.race_type == Some(3);
         self.road.cops_race = setup.race_type == Some(1);
         self.road.cop_count = if setup.fegame_type == Some(9) { 2 } else { 4 };
         match setup.camera.as_ref().filter(|c| !c.is_empty()) {
@@ -364,7 +364,7 @@ impl App {
         if bar_cell_at(&cells, cx.floor() as i32, cy.floor() as i32).is_none() {
             return false;
         }
-        self.bar_press = Some((cx, cy));
+        self.hud_state.bar_press = Some((cx, cy));
         true
     }
 
@@ -427,7 +427,7 @@ impl App {
         if !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)) || self.hud.is_none() {
             return false;
         }
-        self.replay_bar.away = 0;
+        self.hud_state.replay_bar.away = 0;
         self.replay_bar_cell(cell, presses, event_loop)
     }
 
@@ -482,9 +482,9 @@ impl App {
         use nfs_game::replay::{bar_event, BarEvent};
         // `+0x198`, built for `FEGAME_TYPE 3` only (0x424F7B): a network race's replay has the network bar
         for _ in 1..presses {
-            let _ = bar_event(cell, &mut self.replay_bar, self.replay_net.is_some());
+            let _ = bar_event(cell, &mut self.hud_state.replay_bar, self.replay_net.is_some());
         }
-        let Some(ev) = bar_event(cell, &mut self.replay_bar, self.replay_net.is_some()) else { return false };
+        let Some(ev) = bar_event(cell, &mut self.hud_state.replay_bar, self.replay_net.is_some()) else { return false };
         tracing::info!(tick = self.tick, cell, event = ev.code(), "replay bar (0x42D880)");
         match ev {
             BarEvent::Camera => {
@@ -519,7 +519,7 @@ impl App {
             BarEvent::Speed(sp) => self.replay.speed = sp,
             BarEvent::Results => {
                 self.paused = false;
-                self.pause_confirm = None;
+                self.hud_state.pause_confirm = None;
                 self.replay_save.up = false;
                 self.replay_save.overwrite = false;
                 // the gates `[0x657E34]` (aborted — such a race is left, never replayed here),
@@ -530,11 +530,11 @@ impl App {
                 {
                     // `0x426C90(1)`: the queue from its start, no `HCongrats`
                     r.congrats = false;
-                    self.pages.page = 0;
-                    self.pages.tick = self.tick;
-                    self.pages.seen = None;
-                    self.pages.open_tick = None;
-                    self.pages.closing = None;
+                    self.hud_state.pages.page = 0;
+                    self.hud_state.pages.tick = self.tick;
+                    self.hud_state.pages.seen = None;
+                    self.hud_state.pages.open_tick = None;
+                    self.hud_state.pages.closing = None;
                 }
             }
             BarEvent::Save => self.open_replay_save(),
@@ -561,7 +561,7 @@ impl App {
     pub(crate) fn replay_bar_frame(&mut self, event_loop: &LoopCtl) {
         // the mailbox is taken and cleared here whatever the guard below finds — 0x435410 runs
         // unconditionally at the pump's head, before any `REPLAY` test
-        if let Some((cx, cy)) = self.bar_press.take() {
+        if let Some((cx, cy)) = self.hud_state.bar_press.take() {
             self.replay_bar_apply_press(cx, cy, event_loop);
         }
         if !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)) || self.hud.is_none() {
@@ -569,12 +569,12 @@ impl App {
         }
         let (cells, frame) = Hud::bar_geometry();
         let pointer = self.fe.cursor.map(|(x, y)| (x.floor() as i32, y.floor() as i32));
-        self.replay_bar.count(&cells, frame, pointer, self.replay_net.is_some());
+        self.hud_state.replay_bar.count(&cells, frame, pointer, self.replay_net.is_some());
         let clock = self.hud_clock();
-        self.replay_bar.transition(clock);
-        let page_up = self.results.is_some() && usize::from(self.pages.page) < self.result_pages().len();
+        self.hud_state.replay_bar.transition(clock);
+        let page_up = self.results.is_some() && usize::from(self.hud_state.pages.page) < self.result_pages().len();
         let queued = self.paused || self.replay_save.up || self.replay_save.overwrite || page_up;
-        self.replay_bar.pin(queued);
+        self.hud_state.replay_bar.pin(queued);
     }
 
     /// The bar's 0xF, in the pump (0x4264EE…0x42663C): the dialog on top closed (slot 5(0)) and
@@ -584,8 +584,8 @@ impl App {
     /// returned — command 3, the replay paused.
     fn open_replay_save(&mut self) {
         self.paused = false;
-        self.pause_confirm = None;
-        self.pages.page = self.result_pages().len() as u8;
+        self.hud_state.pause_confirm = None;
+        self.hud_state.pages.page = self.result_pages().len() as u8;
         self.replay_save.up = true;
         self.replay_save.overwrite = false;
         self.replay_save.opened = Some(Instant::now());
@@ -705,17 +705,17 @@ impl App {
         }
         tracing::info!(tick = self.tick, "automatic replay (0x4B6EFB): the race again from the recorded stream");
         let results = self.results.take();
-        let hud_records = self.hud_records.take();
+        let hud_records = self.hud_state.hud_records.take();
         let mission_result = self.mission_result.take();
         let replay_saved = self.replay.saved;
         self.stop_race_audio();
         self.paused = false;
         // `[0x606AC8]` runs on through the pass (`hud_clock_base`)
-        self.hud_clock_base += self.tick as f64;
+        self.hud_state.hud_clock_base += self.tick as f64;
         self.tick = 0;
         self.race_pass = true;
         self.start_race(renderer, Some(window), event_loop);
-        self.hud_records = hud_records;
+        self.hud_state.hud_records = hud_records;
         self.mission_result = mission_result;
         self.replay.saved = replay_saved;
         self.results = results.map(|r| RaceResults { opened: self.tick, congrats: pages, ..r });
@@ -723,7 +723,7 @@ impl App {
             self.open_result_pages();
         } else {
             // `[0x60CA10]`: nothing queued (0x426C1C), the flag cleared (0x426C6C)
-            self.pages.page = self.result_pages().len() as u8;
+            self.hud_state.pages.page = self.result_pages().len() as u8;
         }
         tracing::info!(pages = ?self.result_pages(), queued = pages, "result pages over the replay (0x426A80(1))");
     }

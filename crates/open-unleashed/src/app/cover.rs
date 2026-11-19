@@ -36,15 +36,15 @@ pub(crate) fn cover_open_view(boxes: &[CoverBox], eye: Vec3) -> bool {
 impl App {
     /// The track's covered boxes, built once per race (empty until the world and the slices exist).
     pub(crate) fn cover_boxes(&mut self) -> Arc<Vec<CoverBox>> {
-        if self.cover.is_none() {
+        if self.ambient.cover.is_none() {
             let mut out = Vec::new();
             if let (Some(w), Some(t)) = (self.world.as_ref(), self.slices.as_ref()) {
                 out = build(w, &t.slices);
             }
             tracing::info!(boxes = out.len(), "covered stretches (ENHANCEMENT E9 ENH-TUNPOOL)");
-            self.cover = Some(Arc::new(out));
+            self.ambient.cover = Some(Arc::new(out));
         }
-        self.cover.clone().unwrap_or_default()
+        self.ambient.cover.clone().unwrap_or_default()
     }
 }
 

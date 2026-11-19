@@ -65,7 +65,7 @@ struct Globals {
 // ENHANCEMENT E16: the car ambient probe, the SH coefficients (rgb) of the irradiance normalised to a upper-hemisphere-mean luminance of 1
 @group(0) @binding(B_PROBE_SH) var<uniform> probe_sh: array<vec4<f32>, SH_COEFFS>;
 
-// ENHANCEMENT E9: the sun's shadow cascades (`gpu/csm.rs`). `dir.w` is the cascade count, 0 = off (every
+// ENHANCEMENT E9: the sun's shadow cascades (`gpu/csm/`). `dir.w` is the cascade count, 0 = off (every
 // path below is then skipped and the shading is the original's).
 struct Csm {
     mats: array<mat4x4<f32>, 4>,
@@ -86,12 +86,10 @@ struct Csm {
     // per box 5 vec4: (centre, half length), (forward, half width), (lateral, weight at the back face), (up, weight at the front
     // face), (ceiling height over the centre, nominal half length, 0, 0)
     misc: vec4<f32>,
-    // GATE-REL (`csm.rs` `bake_uniform`): xyz toward the track's bake light, w its base luma; then x its gain, y the drivable
-    // ground's factor, zw the relative gate's ramp
+    // GATE-REL (`gpu/csm/mode.rs` `bake_uniform`): xyz toward the track's bake light, w its base luma; then x its gain, y the drivable
+    // ground's factor (zw 0)
     bake: vec4<f32>,
     bake_k: vec4<f32>,
-    // GATE-REL: x the floor (the least share of the shadow), y 1 = the cap mode (the bake's shade counts toward the shadow)
-    bake_f: vec4<f32>,
     // ENHANCEMENT E9 (FOREST-E9PERF): the world box round every covered box (xyz least, xyz most): outside it a point is in none
     cover_lo: vec4<f32>,
     cover_hi: vec4<f32>,
@@ -261,8 +259,7 @@ fn contact_presence(world: vec3<f32>) -> f32 {
     return p;
 }
 
-// a colour channel's top value in bytes: the original's 8-bit colours and the alpha test's reference (`shadow_on.w`) are bytes
-const BYTE: f32 = 255.0;
+// (`BYTE`, a colour channel's top value in bytes: `wgsl::BYTE`)
 
 fn night_byte(i: i32) -> f32 {
     let w = night_map[i / 16][(i / 4) % 4];
@@ -719,7 +716,7 @@ fn pcf_disc(layer: i32, uv: vec2<f32>, depth: f32, count: i32, texels: f32, step
     return sum;
 }
 
-// ENHANCEMENT E9 (SHADOW-REFACTOR): whether this frame's cascades are of mode `m` (`SHADOW_*`, `gpu/csm.rs` `ShadowMode`)
+// ENHANCEMENT E9 (SHADOW-REFACTOR): whether this frame's cascades are of mode `m` (`SHADOW_*`, `gpu/csm/mode.rs` `ShadowMode`)
 fn csm_mode_is(m: f32) -> bool {
     return abs(csm.misc.y - m) < 0.5;
 }
@@ -1133,11 +1130,11 @@ fn base_a255(in: VsOut) -> f32 {
 }
 //@endif
 
-@fragment
-fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
-    object = objects[in.obj];
+// The alpha-tested `shade` of the entries that discard after it (`fs_opaque`, `fs_main` and their temporal twins; `object` is
+// set): the early test on the base alpha (ENHANCEMENT E9, FOREST-E9PERF: `alpha_is_base`; the sample is taken before the
+// condition, in uniform control flow), `shade`, then the test on the final alpha.
+fn shade_tested(in: VsOut) -> vec4<f32> {
     //@if CSM
-    // ENHANCEMENT E9 (FOREST-E9PERF): the test on the base alpha first (`alpha_is_base`)
     let a0 = base_a255(in);
     if alpha_is_base() && a0 < object.shadow_on.w {
         discard;
@@ -1147,6 +1144,13 @@ fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
     if object.shadow_on.w > 0.0 && c.a * BYTE < object.shadow_on.w {
         discard;
     }
+    return c;
+}
+
+@fragment
+fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
+    object = objects[in.obj];
+    let c = shade_tested(in);
     return held(vec4<f32>(fogged(in, c).rgb, 1.0));
 }
 
@@ -1183,17 +1187,7 @@ fn fs_opaque_solid(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     object = objects[in.obj];
-    //@if CSM
-    // ENHANCEMENT E9 (FOREST-E9PERF): the test on the base alpha first (`alpha_is_base`)
-    let a0 = base_a255(in);
-    if alpha_is_base() && a0 < object.shadow_on.w {
-        discard;
-    }
-    //@endif
-    let c = shade(in, false);
-    if object.shadow_on.w > 0.0 && c.a * BYTE < object.shadow_on.w {
-        discard;
-    }
+    let c = shade_tested(in);
     return held(soften(in, particle_fx(in, fogged(in, c))));
 }
 
@@ -1251,20 +1245,22 @@ fn composition(alpha: f32) -> f32 {
     return 0.0;
 }
 
+// the output of a blended entry on the temporal set: the colour `col` and the masks of the item's role (`object.soft.w`)
+fn temporal_out(in: VsOut, col: vec4<f32>) -> FsOutT {
+    var o: FsOutT;
+    o.c = col;
+    let kind = object.soft.w;
+    o.mv = vec4<f32>(velocity(in), 0.0, select(0.0, 1.0, kind > ROLE_SKY - 0.5));
+    let fx = kind > ROLE_OPAQUE + 0.5 && kind < ROLE_EFFECT + 0.5;
+    o.re = vec4<f32>(select(0.0, coverage(col), fx), 0.0, 0.0, 0.0);
+    o.tc = vec4<f32>(select(0.0, composition(col.a), fx), 0.0, 0.0, 0.0);
+    return o;
+}
+
 @fragment
 fn fs_opaque_t(in: VsOut) -> FsOutT {
     object = objects[in.obj];
-    //@if CSM
-    // ENHANCEMENT E9 (FOREST-E9PERF): the test on the base alpha first (`alpha_is_base`)
-    let a0 = base_a255(in);
-    if alpha_is_base() && a0 < object.shadow_on.w {
-        discard;
-    }
-    //@endif
-    let c = shade(in, false);
-    if object.shadow_on.w > 0.0 && c.a * BYTE < object.shadow_on.w {
-        discard;
-    }
+    let c = shade_tested(in);
     var o: FsOutT;
     o.c = held(vec4<f32>(fogged(in, c).rgb, 1.0));
     o.mv = vec4<f32>(velocity(in), 0.0, 1.0);
@@ -1278,41 +1274,15 @@ fn fs_opaque_t(in: VsOut) -> FsOutT {
 @fragment
 fn fs_main_t(in: VsOut) -> FsOutT {
     object = objects[in.obj];
-    //@if CSM
-    // ENHANCEMENT E9 (FOREST-E9PERF): the test on the base alpha first (`alpha_is_base`)
-    let a0 = base_a255(in);
-    if alpha_is_base() && a0 < object.shadow_on.w {
-        discard;
-    }
-    //@endif
-    let c = shade(in, false);
-    if object.shadow_on.w > 0.0 && c.a * BYTE < object.shadow_on.w {
-        discard;
-    }
-    var o: FsOutT;
-    let col = held(soften(in, particle_fx(in, fogged(in, c))));
-    o.c = col;
-    let kind = object.soft.w;
-    o.mv = vec4<f32>(velocity(in), 0.0, select(0.0, 1.0, kind > ROLE_SKY - 0.5));
-    let fx = kind > ROLE_OPAQUE + 0.5 && kind < ROLE_EFFECT + 0.5;
-    o.re = vec4<f32>(select(0.0, coverage(col), fx), 0.0, 0.0, 0.0);
-    o.tc = vec4<f32>(select(0.0, composition(col.a), fx), 0.0, 0.0, 0.0);
-    return o;
+    let c = shade_tested(in);
+    return temporal_out(in, held(soften(in, particle_fx(in, fogged(in, c)))));
 }
 
 // ENHANCEMENT ENH-TEMPORAL: `fs_layers` on the temporal set (the blended pair 0 draws only; the layers' coverage is `col.a`)
 @fragment
 fn fs_layers_t(in: VsOut) -> FsOutT {
     object = objects[in.obj];
-    var o: FsOutT;
-    let col = held(layers_color(in));
-    o.c = col;
-    let kind = object.soft.w;
-    o.mv = vec4<f32>(velocity(in), 0.0, select(0.0, 1.0, kind > ROLE_SKY - 0.5));
-    let fx = kind > ROLE_OPAQUE + 0.5 && kind < ROLE_EFFECT + 0.5;
-    o.re = vec4<f32>(select(0.0, coverage(col), fx), 0.0, 0.0, 0.0);
-    o.tc = vec4<f32>(select(0.0, composition(col.a), fx), 0.0, 0.0, 0.0);
-    return o;
+    return temporal_out(in, held(layers_color(in)));
 }
 
 // ENHANCEMENT E18: particles in the float scene, on top of the original's colours. A spark (`hdr.y` > 0) goes far
@@ -1713,6 +1683,206 @@ fn fs_layers(in: VsOut) -> @location(0) vec4<f32> {
     return held(layers_color(in));
 }
 
+// `shade`'s sections of the enhancements that work on its colour `lit0` and coverage `alpha0` (the premultiplied sum of the
+// layers and its coverage when `layered`): each returns the new `vec4(lit, alpha)`; the call sites in `shade` carry the comments.
+//@if COAT
+fn shade_coat(in: VsOut, layered: bool, n: vec3<f32>, tex: vec4<f32>, dwx: vec3<f32>, dwy: vec3<f32>, lit0: vec3<f32>, alpha0: f32) -> vec4<f32> {
+    var lit = lit0;
+    var alpha = alpha0;
+    if object.refl.x > REFL_PAINT - 0.5 && object.refl.x < REFL_GLASS + 0.5 && globals.refl.x > 0.0 && globals.ambient.z < 0.5 && (object.shadow_on.w <= 0.0 || alpha * BYTE >= object.shadow_on.w) {
+        var v = normalize(globals.cam_pos.xyz - in.world);
+        let nv = clamp(dot(n, v), COAT_MIN_NV, 1.0);
+        let r = reflect(-v, n);
+        var ng = normalize(cross(dwx, dwy));
+        if dot(ng, v) < 0.0 {
+            ng = -ng;
+        }
+        let glass = object.refl.x > REFL_GLASS - 0.5;
+        var alpha_g = globals.refl.w;
+        if glass {
+            alpha_g = COAT_GLASS_ALPHA;
+        }
+        let ab = env_brdf(sqrt(alpha_g), nv);
+        var fc = (COAT_F0 * ab.x + ab.y) * globals.refl.x;
+        // ENHANCEMENT ENH-GRILLE: the coat lies on PAINT. A texel of the page that is (near) black is not paint but an opening or
+        // black plastic (the rear engine grille's slats, 0x00 between grey bars): a 4 % sky over a black texel is ~40 / 255 after the
+        // display gamma, and the dark slats turned into a flat grey plate. The weight rises from 0 at max(rgb) 0.03 to 1 at 0.15
+        // (a dark paint is well above it); glass keeps its own coverage rule.
+        if !glass {
+            fc = fc * smoothstep(COAT_GRILLE.x, COAT_GRILLE.y, max(tex.r, max(tex.g, tex.b)));
+        }
+        var horizon = clamp(1.0 + COAT_HORIZON * dot(r, ng), 0.0, 1.0);
+        horizon = horizon * horizon;
+        // specular occlusion: the lower hemisphere's share, from how far down the surface and the ray face
+        let down = smoothstep(0.0, COAT_OCC_N_END, n.y) * 0.5 + smoothstep(COAT_OCC_R.x, COAT_OCC_R.y, r.y) * COAT_OCC_R_SHARE;
+        let occ = 1.0 - clamp(down, 0.0, COAT_OCC_MAX);
+        //@if !NEAR
+        let env = min(refl_sample_lod(r, coat_lod(alpha_g)), vec3<f32>(COAT_ENV_MAX)) * horizon * occ;
+        //@endif
+        //@if NEAR
+        // ENHANCEMENT E49: from the shading point (the box-projected lookup), the player's own car from the faces with the near cars
+        var env_in = vec3<f32>(0.0);
+        if globals.near.x > 0.0 {
+            env_in = near_env(in.world, r, select(coat_lod(alpha_g), 0.0, globals.near.w > NEAR_DEBUG_SHARP - 0.5), object.refl.w > 0.5);
+        } else {
+            env_in = refl_sample_lod(r, coat_lod(alpha_g));
+        }
+        let env = min(env_in, vec3<f32>(COAT_ENV_MAX)) * horizon * occ;
+        // TEST GLUE (`NFS_NEAR_DEBUG`): the paint shows the reflection alone
+        if globals.near.w > NEAR_DEBUG_REFL - 0.5 && globals.near.w < NEAR_DEBUG_SHARP + 0.5 {
+            fc = 1.0;
+        }
+        //@endif
+        if glass {
+            let k = clamp(fc, 0.0, COAT_GLASS_MAX);
+            let a = alpha + k * (1.0 - alpha);
+            if layered {
+                // premultiplied: the reflection adds `env k` over the part of the target the layers leave through
+                lit = lit + env * k * (1.0 - alpha);
+            } else {
+                lit = (lit * alpha + env * k * (1.0 - alpha)) / a;
+            }
+            alpha = a;
+        } else {
+            var straight = lit;
+            if layered {
+                straight = lit / max(alpha, MIN_DIV);
+            }
+            let lin = pow(max(straight, vec3<f32>(0.0)), vec3<f32>(COAT_GAMMA)) * (1.0 - fc) + pow(env, vec3<f32>(COAT_GAMMA)) * fc;
+            lit = pow(lin, vec3<f32>(1.0 / COAT_GAMMA));
+            if layered {
+                lit = lit * alpha;
+            }
+        }
+    }
+    return vec4<f32>(lit, alpha);
+}
+//@endif
+
+//@if WATER
+fn shade_water(in: VsOut, dwx: vec3<f32>, dwy: vec3<f32>, lit0: vec3<f32>, alpha0: f32) -> vec4<f32> {
+    var lit = lit0;
+    var alpha = alpha0;
+    if object.refl.x > REFL_WATER - 0.5 && globals.water.x > 0.5 && abs(cross(dwx, dwy).y) > WATER_LEVEL * length(cross(dwx, dwy)) {
+        let vv = globals.cam_pos.xyz - in.world;
+        let dist = length(vv);
+        let v = vv / max(dist, MIN_DIST);
+        // the ripple fades out with distance (it would alias to noise) and is the original's still sea up close
+        let amp = 1.0 - smoothstep(WATER_RIPPLE_FADE.x, WATER_RIPPLE_FADE.y, dist);
+        // level 2 («сильнее», `globals.water.w` = 1): a stronger ripple, a higher reflection weight, a brighter glint
+        let wst = globals.water.w;
+        let sl = water_slope(in.world.xz, object.env_mix.w) * amp * (1.0 + WATER_RIPPLE_STRONG * wst);
+        let nw = normalize(vec3<f32>(-sl.x, 1.0, -sl.y));
+        let nv = clamp(dot(nw, v), 0.0, 1.0);
+        // water's F0 is 0.02; the weight is held below 1 so the texture always shows through
+        let fres = WATER_FRESNEL.x + WATER_FRESNEL.y * pow(1.0 - nv, SCHLICK_POW);
+        let k = clamp(fres * (WATER_K_BASE + WATER_K_STRONG * wst) + WATER_K_LIFT * wst, 0.0, WATER_K_MAX + WATER_K_MAX_STRONG * wst);
+        var r = reflect(-v, nw);
+        r.y = max(r.y, WATER_MIN_RAY_Y);
+        var env = vec3<f32>(0.0);
+        if globals.refl.x > 0.0 && globals.water.z > 0.5 {
+            env = refl_sample(r);
+        } else {
+            env = mix(globals.water_horizon.rgb, globals.water_zenith.rgb, smoothstep(0.0, WATER_SKY_RAMP, r.y));
+        }
+        var glint = vec3<f32>(0.0);
+        if globals.water.y > 0.5 {
+            let sd = max(dot(r, globals.water_sun.xyz), 0.0);
+            // a hard core and a wide sheen, both stronger toward grazing views (the sun path on the sea)
+            glint = WATER_GLINT_TINT * (pow(sd, WATER_GLINT_POW.x) * WATER_GLINT_GAIN.x + pow(sd, WATER_GLINT_POW.y) * WATER_GLINT_GAIN.y + pow(sd, WATER_GLINT_POW.z) * WATER_GLINT_GAIN.z * wst) * (WATER_GLINT_GRAZE.x + WATER_GLINT_GRAZE.y * fres) * (1.0 + WATER_GLINT_STRONG * wst);
+        }
+        lit = mix(lit, env, k) + glint;
+        alpha = clamp(alpha + (1.0 - alpha) * min(k + max(glint.r, max(glint.g, glint.b)), 1.0), 0.0, 1.0);
+    }
+    return vec4<f32>(lit, alpha);
+}
+//@endif
+
+//@if RAIN
+fn shade_wet_road(in: VsOut, base_rgb: vec3<f32>, lit0: vec3<f32>, alpha0: f32) -> vec4<f32> {
+    var lit = lit0;
+    var alpha = alpha0;
+    if object.refl.x > REFL_WET_ROAD - 0.5 && globals.rain.x > 0.0 {
+        let skid = object.refl.x > REFL_SKID - 0.5;
+        // the part's own wetness (its centre's slice); near a step of the original's field 5 the fragment takes the
+        // ramp of the nearest edge instead (a part is longer than the step, and the original's step is one slice wide)
+        var wet = clamp(object.refl.w, 0.0, 1.0);
+        var near_edge = RAIN_EDGE_FAR;
+        for (var i = 0u; i < u32(globals.rain.w); i = i + 1u) {
+            let off = in.world - globals.rain_edge_pos[i].xyz;
+            let s = dot(off, globals.rain_edge_dir[i].xyz);
+            if abs(s) < near_edge && dot(off, off) < RAIN_EDGE_REACH2 {
+                near_edge = abs(s);
+                let hw = globals.rain_edge_pos[i].w;
+                wet = mix(globals.rain_edge_dir[i].w, globals.rain_edge_val[i].x, smoothstep(-hw, hw, s));
+            }
+        }
+        if wet > RAIN_MIN_WET {
+        let g = globals.rain.x;
+        let vv = globals.cam_pos.xyz - in.world;
+        let dist = length(vv);
+        let v = vv / max(dist, MIN_DIST);
+        let pn = rain_noise(in.world.xz * RAIN_PUDDLE_FREQ.x) * RAIN_PUDDLE_MIX.x + rain_noise(in.world.xz * RAIN_PUDDLE_FREQ.y + RAIN_PUDDLE_SHIFT) * RAIN_PUDDLE_MIX.y;
+        // puddles grow with the wetness and only form in real rain (a damp 0.5 stretch has few)
+        let pud = smoothstep(RAIN_PUDDLE_RAMP.x - RAIN_PUDDLE_WET_SHIFT * wet, RAIN_PUDDLE_RAMP.y - RAIN_PUDDLE_WET_SHIFT * wet, pn) * smoothstep(RAIN_PUDDLE_WET.x, RAIN_PUDDLE_WET.y, wet);
+        let wetf = clamp(wet * g, 0.0, 1.0);
+        // the albedo darkens less where it is bright (the lane markings stay readable)
+        let luma = dot(base_rgb, LUMA);
+        let keep = smoothstep(RAIN_KEEP_LUMA.x, RAIN_KEEP_LUMA.y, luma);
+        if !skid {
+            lit = lit * mix(1.0, mix(RAIN_DARKEN, 1.0, keep), wetf) * mix(1.0, RAIN_PUDDLE_DARKEN, pud * wetf * (1.0 - keep));
+        }
+        // the splash rings: density by the wetness; they tilt the normal a little and glint
+        let rg = rain_rings(in.world.xz, globals.rain.y, RAIN_RING_DENSITY * wet * g, dist);
+        let nw = normalize(vec3<f32>(rg.x, 1.0, rg.y));
+        let nv = clamp(dot(nw, v), 0.0, 1.0);
+        let fres = RAIN_FRESNEL.x + RAIN_FRESNEL.y * pow(1.0 - nv, SCHLICK_POW);
+        // far, grazing road reflects more; the puddles most
+        var k = clamp(fres * (RAIN_K_BASE + RAIN_K_PUDDLE * pud) * wetf, 0.0, RAIN_K_MAX) * (1.0 - 0.5 * keep);
+        if skid {
+            // the wiped streak is smoother than the road round it: a stronger reflection, whatever the rubber's colour
+            k = clamp(fres * RAIN_SKID_K.x * wetf + RAIN_SKID_K.y * wetf, 0.0, RAIN_SKID_K.z);
+        }
+        let r = reflect(-v, nw);
+        let sky = mix(globals.rain_horizon.rgb, globals.rain_zenith.rgb, smoothstep(0.0, RAIN_SKY_RAMP, max(r.y, 0.0)));
+        lit = mix(lit, sky * RAIN_SKY_GAIN, k) + sky * rg.z * RAIN_RING_GLINT * wetf;
+        // the lamps' streaks: azimuth difference narrow, elevation difference long on the eye's side
+        var streak = vec3<f32>(0.0);
+        let rh = normalize(r.xz + vec2<f32>(RAIN_AZ_NUDGE, 0.0));
+        for (var i = 0u; i < u32(globals.rain.z); i = i + 1u) {
+            let d = globals.rain_lamp_pos[i].xyz - in.world;
+            let dl = length(d);
+            let dh = normalize(d.xz + vec2<f32>(RAIN_AZ_NUDGE, 0.0));
+            if dot(rh, dh) > 0.0 {
+                let az = rh.x * dh.y - rh.y * dh.x;
+                let dv = r.y - d.y / dl;
+                var sv = RAIN_STREAK_BELOW;
+                if dv > 0.0 {
+                    sv = RAIN_STREAK_ABOVE;
+                }
+                let sa = RAIN_STREAK_AZ.x + RAIN_STREAK_AZ.y * pud;
+                let e = exp(-(az / sa) * (az / sa) - (dv / sv) * (dv / sv));
+                // AUTOBAHN-LAMPS: the light's own reach (`w` = reach squared; 0 = the street lamps' 4000): a car's
+                // tail light no longer streaks as far and as bright as a street lamp
+                let r2 = select(RAIN_LAMP_REACH2, globals.rain_lamp_pos[i].w, globals.rain_lamp_pos[i].w > 0.0);
+                streak += globals.rain_lamp_col[i].rgb * (e / (1.0 + dl * dl / r2));
+            }
+        }
+        lit = lit + streak * (RAIN_STREAK_GAIN.x + RAIN_STREAK_GAIN.y * fres) * (RAIN_STREAK_GAIN.z + RAIN_STREAK_GAIN.w * pud) * wetf;
+        if skid {
+            // the opacity falls (the alpha test's reference keeps its texels: it reads this alpha) and the reflection
+            // lifts it again where the streak glints
+            let floor_a = min(alpha, object.shadow_on.w / BYTE + RAIN_SKID_ALPHA_MARGIN);
+            alpha = max(alpha * mix(1.0, RAIN_SKID_FADE, wetf), floor_a);
+            alpha = clamp(alpha + (1.0 - alpha) * k * 0.5 * min(alpha * RAIN_SKID_LIFT_RAMP, 1.0), 0.0, 1.0);
+            lit = lit + sky * RAIN_SKID_SHEEN * wetf;
+        }
+        }
+    }
+    return vec4<f32>(lit, alpha);
+}
+//@endif
+
 fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     // ENHANCEMENT E17: the screen-space slope of the surface, taken where the control flow is uniform
     let dwx = dpdx(in.world);
@@ -1791,29 +1961,21 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
         // the "already baked dark" gate (a shadow baked into the colour is not darkened twice), by the mode
         let luma = dot(in.color.rgb, LUMA);
         var bright = smoothstep(BAKED_DARK_LO, BAKED_DARK_HI, luma);
-        // FOREST-TREESH: a frame whose track is set to take the whole shadow (`params.z`, `csm.rs` GATE_OFF): no gate
-        if csm.params.z > 0.5 && csm.params.z < 1.5 {
-            bright = 1.0;
-        }
-        // GATE-REL (`params.z` 2, `csm.rs` GATE_REL; APPROXIMATION, an enhancement's look): the gate by the baked luma against the lit
+        // GATE-REL (`params.z` > 0, `gpu/csm/mode.rs` GATE_REL; APPROXIMATION, an enhancement's look): the gate by the baked luma against the lit
         // level the track's bake light gives this orientation (`nfs_game::bake_light`: `base + gain max(0, n.L)`, times the ground's
         // factor on drivable ground, `lit_d.w`'s RECV_GROUND_MARK): a face darker than that is baked in shade (no second darkening),
         // a merely dark one lit in the bake (a mossy rock, a dim forest road in a sun patch) takes the whole shadow
-        // `baked` (the cap mode, `bake_f.y` 1): the bake's own shade counts toward the shadow instead: the point is darkened only down
+        // `baked` (the cap mode): the bake's own shade counts toward the shadow: the point is darkened only down
         // to the shadow's level of a lit face, `min(1, keep / baked)` with `baked` = the luma / lit level, at most 1
         var baked = 1.0;
-        if csm.params.z > 1.5 {
+        if csm.params.z > 0.5 {
             var lit = csm.bake.w + csm.bake_k.x * max(dot(n, csm.bake.xyz), 0.0);
             if fract(object.lit_d.w) > RECV_GROUND_MARK * 0.5 {
                 lit = lit * csm.bake_k.y;
             }
             let ratio = luma / max(lit, MIN_BAKE_LIT);
-            if csm.bake_f.y > 0.5 {
-                baked = clamp(ratio, MIN_BAKE_LIT, 1.0);
-                bright = 1.0;
-            } else {
-                bright = max(smoothstep(csm.bake_k.z, csm.bake_k.w, ratio), csm.bake_f.x);
-            }
+            baked = clamp(ratio, MIN_BAKE_LIT, 1.0);
+            bright = 1.0;
         }
         //@if FOCUS
         // ENHANCEMENT ENH-GARAGE (the front end's focus shadow): the room's floor is baked dark, the car's shadow must still read
@@ -2120,71 +2282,10 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     // colour carries the reflection. Radiance is not clamped here (the sun above 1: a glint; `held` clamps an 8-bit target at
     // the end). Not in the rear-view mirror's pass (`ambient.z`), not on an alpha-tested-out texel.
     //@if COAT
-    if object.refl.x > REFL_PAINT - 0.5 && object.refl.x < REFL_GLASS + 0.5 && globals.refl.x > 0.0 && globals.ambient.z < 0.5 && (object.shadow_on.w <= 0.0 || alpha * BYTE >= object.shadow_on.w) {
-        var v = normalize(globals.cam_pos.xyz - in.world);
-        let nv = clamp(dot(n, v), COAT_MIN_NV, 1.0);
-        let r = reflect(-v, n);
-        var ng = normalize(cross(dwx, dwy));
-        if dot(ng, v) < 0.0 {
-            ng = -ng;
-        }
-        let glass = object.refl.x > REFL_GLASS - 0.5;
-        var alpha_g = globals.refl.w;
-        if glass {
-            alpha_g = COAT_GLASS_ALPHA;
-        }
-        let ab = env_brdf(sqrt(alpha_g), nv);
-        var fc = (COAT_F0 * ab.x + ab.y) * globals.refl.x;
-        // ENHANCEMENT ENH-GRILLE: the coat lies on PAINT. A texel of the page that is (near) black is not paint but an opening or
-        // black plastic (the rear engine grille's slats, 0x00 between grey bars): a 4 % sky over a black texel is ~40 / 255 after the
-        // display gamma, and the dark slats turned into a flat grey plate. The weight rises from 0 at max(rgb) 0.03 to 1 at 0.15
-        // (a dark paint is well above it); glass keeps its own coverage rule.
-        if !glass {
-            fc = fc * smoothstep(COAT_GRILLE.x, COAT_GRILLE.y, max(tex.r, max(tex.g, tex.b)));
-        }
-        var horizon = clamp(1.0 + COAT_HORIZON * dot(r, ng), 0.0, 1.0);
-        horizon = horizon * horizon;
-        // specular occlusion: the lower hemisphere's share, from how far down the surface and the ray face
-        let down = smoothstep(0.0, COAT_OCC_N_END, n.y) * 0.5 + smoothstep(COAT_OCC_R.x, COAT_OCC_R.y, r.y) * COAT_OCC_R_SHARE;
-        let occ = 1.0 - clamp(down, 0.0, COAT_OCC_MAX);
-        //@if !NEAR
-        let env = min(refl_sample_lod(r, coat_lod(alpha_g)), vec3<f32>(COAT_ENV_MAX)) * horizon * occ;
-        //@endif
-        //@if NEAR
-        // ENHANCEMENT E49: from the shading point (the box-projected lookup), the player's own car from the faces with the near cars
-        var env_in = vec3<f32>(0.0);
-        if globals.near.x > 0.0 {
-            env_in = near_env(in.world, r, select(coat_lod(alpha_g), 0.0, globals.near.w > NEAR_DEBUG_SHARP - 0.5), object.refl.w > 0.5);
-        } else {
-            env_in = refl_sample_lod(r, coat_lod(alpha_g));
-        }
-        let env = min(env_in, vec3<f32>(COAT_ENV_MAX)) * horizon * occ;
-        // TEST GLUE (`NFS_NEAR_DEBUG`): the paint shows the reflection alone
-        if globals.near.w > NEAR_DEBUG_REFL - 0.5 && globals.near.w < NEAR_DEBUG_SHARP + 0.5 {
-            fc = 1.0;
-        }
-        //@endif
-        if glass {
-            let k = clamp(fc, 0.0, COAT_GLASS_MAX);
-            let a = alpha + k * (1.0 - alpha);
-            if layered {
-                // premultiplied: the reflection adds `env k` over the part of the target the layers leave through
-                lit = lit + env * k * (1.0 - alpha);
-            } else {
-                lit = (lit * alpha + env * k * (1.0 - alpha)) / a;
-            }
-            alpha = a;
-        } else {
-            var straight = lit;
-            if layered {
-                straight = lit / max(alpha, MIN_DIV);
-            }
-            let lin = pow(max(straight, vec3<f32>(0.0)), vec3<f32>(COAT_GAMMA)) * (1.0 - fc) + pow(env, vec3<f32>(COAT_GAMMA)) * fc;
-            lit = pow(lin, vec3<f32>(1.0 / COAT_GAMMA));
-            if layered {
-                lit = lit * alpha;
-            }
-        }
+    {
+        let sc = shade_coat(in, layered, n, tex, dwx, dwy, lit, alpha);
+        lit = sc.xyz;
+        alpha = sc.w;
     }
     //@endif
     // ENHANCEMENT E17: water (class 3: a flat water material, `nfs_assets::track::is_water`). The original
@@ -2193,36 +2294,10 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     // target keeps it, E7) and a faint moving ripple that only tilts the reflection. Level surfaces only
     // (a waterfall or a river on a slope is left as the original draws it).
     //@if WATER
-    if object.refl.x > REFL_WATER - 0.5 && globals.water.x > 0.5 && abs(cross(dwx, dwy).y) > WATER_LEVEL * length(cross(dwx, dwy)) {
-        let vv = globals.cam_pos.xyz - in.world;
-        let dist = length(vv);
-        let v = vv / max(dist, MIN_DIST);
-        // the ripple fades out with distance (it would alias to noise) and is the original's still sea up close
-        let amp = 1.0 - smoothstep(WATER_RIPPLE_FADE.x, WATER_RIPPLE_FADE.y, dist);
-        // level 2 («сильнее», `globals.water.w` = 1): a stronger ripple, a higher reflection weight, a brighter glint
-        let wst = globals.water.w;
-        let sl = water_slope(in.world.xz, object.env_mix.w) * amp * (1.0 + WATER_RIPPLE_STRONG * wst);
-        let nw = normalize(vec3<f32>(-sl.x, 1.0, -sl.y));
-        let nv = clamp(dot(nw, v), 0.0, 1.0);
-        // water's F0 is 0.02; the weight is held below 1 so the texture always shows through
-        let fres = WATER_FRESNEL.x + WATER_FRESNEL.y * pow(1.0 - nv, SCHLICK_POW);
-        let k = clamp(fres * (WATER_K_BASE + WATER_K_STRONG * wst) + WATER_K_LIFT * wst, 0.0, WATER_K_MAX + WATER_K_MAX_STRONG * wst);
-        var r = reflect(-v, nw);
-        r.y = max(r.y, WATER_MIN_RAY_Y);
-        var env = vec3<f32>(0.0);
-        if globals.refl.x > 0.0 && globals.water.z > 0.5 {
-            env = refl_sample(r);
-        } else {
-            env = mix(globals.water_horizon.rgb, globals.water_zenith.rgb, smoothstep(0.0, WATER_SKY_RAMP, r.y));
-        }
-        var glint = vec3<f32>(0.0);
-        if globals.water.y > 0.5 {
-            let sd = max(dot(r, globals.water_sun.xyz), 0.0);
-            // a hard core and a wide sheen, both stronger toward grazing views (the sun path on the sea)
-            glint = WATER_GLINT_TINT * (pow(sd, WATER_GLINT_POW.x) * WATER_GLINT_GAIN.x + pow(sd, WATER_GLINT_POW.y) * WATER_GLINT_GAIN.y + pow(sd, WATER_GLINT_POW.z) * WATER_GLINT_GAIN.z * wst) * (WATER_GLINT_GRAZE.x + WATER_GLINT_GRAZE.y * fres) * (1.0 + WATER_GLINT_STRONG * wst);
-        }
-        lit = mix(lit, env, k) + glint;
-        alpha = clamp(alpha + (1.0 - alpha) * min(k + max(glint.r, max(glint.g, glint.b)), 1.0), 0.0, 1.0);
+    {
+        let sc = shade_water(in, dwx, dwy, lit, alpha);
+        lit = sc.xyz;
+        alpha = sc.w;
     }
     //@endif
     //@if RAIN
@@ -2236,82 +2311,10 @@ fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     // ENHANCEMENT E26 (skid marks, class 5 = `object.refl.x` 5): on a wet stretch the rubber of a skid is not black: the
     // tyre wiped the water film off, so the strip darkens much less (~0.4 of its dry opacity at full wetness) and shows
     // the same sky / lamp reflection as the wet road around it (a lighter, glossy streak). Dry: skipped.
-    if object.refl.x > REFL_WET_ROAD - 0.5 && globals.rain.x > 0.0 {
-        let skid = object.refl.x > REFL_SKID - 0.5;
-        // the part's own wetness (its centre's slice); near a step of the original's field 5 the fragment takes the
-        // ramp of the nearest edge instead (a part is longer than the step, and the original's step is one slice wide)
-        var wet = clamp(object.refl.w, 0.0, 1.0);
-        var near_edge = RAIN_EDGE_FAR;
-        for (var i = 0u; i < u32(globals.rain.w); i = i + 1u) {
-            let off = in.world - globals.rain_edge_pos[i].xyz;
-            let s = dot(off, globals.rain_edge_dir[i].xyz);
-            if abs(s) < near_edge && dot(off, off) < RAIN_EDGE_REACH2 {
-                near_edge = abs(s);
-                let hw = globals.rain_edge_pos[i].w;
-                wet = mix(globals.rain_edge_dir[i].w, globals.rain_edge_val[i].x, smoothstep(-hw, hw, s));
-            }
-        }
-        if wet > RAIN_MIN_WET {
-        let g = globals.rain.x;
-        let vv = globals.cam_pos.xyz - in.world;
-        let dist = length(vv);
-        let v = vv / max(dist, MIN_DIST);
-        let pn = rain_noise(in.world.xz * RAIN_PUDDLE_FREQ.x) * RAIN_PUDDLE_MIX.x + rain_noise(in.world.xz * RAIN_PUDDLE_FREQ.y + RAIN_PUDDLE_SHIFT) * RAIN_PUDDLE_MIX.y;
-        // puddles grow with the wetness and only form in real rain (a damp 0.5 stretch has few)
-        let pud = smoothstep(RAIN_PUDDLE_RAMP.x - RAIN_PUDDLE_WET_SHIFT * wet, RAIN_PUDDLE_RAMP.y - RAIN_PUDDLE_WET_SHIFT * wet, pn) * smoothstep(RAIN_PUDDLE_WET.x, RAIN_PUDDLE_WET.y, wet);
-        let wetf = clamp(wet * g, 0.0, 1.0);
-        // the albedo darkens less where it is bright (the lane markings stay readable)
-        let luma = dot(base.rgb, LUMA);
-        let keep = smoothstep(RAIN_KEEP_LUMA.x, RAIN_KEEP_LUMA.y, luma);
-        if !skid {
-            lit = lit * mix(1.0, mix(RAIN_DARKEN, 1.0, keep), wetf) * mix(1.0, RAIN_PUDDLE_DARKEN, pud * wetf * (1.0 - keep));
-        }
-        // the splash rings: density by the wetness; they tilt the normal a little and glint
-        let rg = rain_rings(in.world.xz, globals.rain.y, RAIN_RING_DENSITY * wet * g, dist);
-        let nw = normalize(vec3<f32>(rg.x, 1.0, rg.y));
-        let nv = clamp(dot(nw, v), 0.0, 1.0);
-        let fres = RAIN_FRESNEL.x + RAIN_FRESNEL.y * pow(1.0 - nv, SCHLICK_POW);
-        // far, grazing road reflects more; the puddles most
-        var k = clamp(fres * (RAIN_K_BASE + RAIN_K_PUDDLE * pud) * wetf, 0.0, RAIN_K_MAX) * (1.0 - 0.5 * keep);
-        if skid {
-            // the wiped streak is smoother than the road round it: a stronger reflection, whatever the rubber's colour
-            k = clamp(fres * RAIN_SKID_K.x * wetf + RAIN_SKID_K.y * wetf, 0.0, RAIN_SKID_K.z);
-        }
-        let r = reflect(-v, nw);
-        let sky = mix(globals.rain_horizon.rgb, globals.rain_zenith.rgb, smoothstep(0.0, RAIN_SKY_RAMP, max(r.y, 0.0)));
-        lit = mix(lit, sky * RAIN_SKY_GAIN, k) + sky * rg.z * RAIN_RING_GLINT * wetf;
-        // the lamps' streaks: azimuth difference narrow, elevation difference long on the eye's side
-        var streak = vec3<f32>(0.0);
-        let rh = normalize(r.xz + vec2<f32>(RAIN_AZ_NUDGE, 0.0));
-        for (var i = 0u; i < u32(globals.rain.z); i = i + 1u) {
-            let d = globals.rain_lamp_pos[i].xyz - in.world;
-            let dl = length(d);
-            let dh = normalize(d.xz + vec2<f32>(RAIN_AZ_NUDGE, 0.0));
-            if dot(rh, dh) > 0.0 {
-                let az = rh.x * dh.y - rh.y * dh.x;
-                let dv = r.y - d.y / dl;
-                var sv = RAIN_STREAK_BELOW;
-                if dv > 0.0 {
-                    sv = RAIN_STREAK_ABOVE;
-                }
-                let sa = RAIN_STREAK_AZ.x + RAIN_STREAK_AZ.y * pud;
-                let e = exp(-(az / sa) * (az / sa) - (dv / sv) * (dv / sv));
-                // AUTOBAHN-LAMPS: the light's own reach (`w` = reach squared; 0 = the street lamps' 4000): a car's
-                // tail light no longer streaks as far and as bright as a street lamp
-                let r2 = select(RAIN_LAMP_REACH2, globals.rain_lamp_pos[i].w, globals.rain_lamp_pos[i].w > 0.0);
-                streak += globals.rain_lamp_col[i].rgb * (e / (1.0 + dl * dl / r2));
-            }
-        }
-        lit = lit + streak * (RAIN_STREAK_GAIN.x + RAIN_STREAK_GAIN.y * fres) * (RAIN_STREAK_GAIN.z + RAIN_STREAK_GAIN.w * pud) * wetf;
-        if skid {
-            // the opacity falls (the alpha test's reference keeps its texels: it reads this alpha) and the reflection
-            // lifts it again where the streak glints
-            let floor_a = min(alpha, object.shadow_on.w / BYTE + RAIN_SKID_ALPHA_MARGIN);
-            alpha = max(alpha * mix(1.0, RAIN_SKID_FADE, wetf), floor_a);
-            alpha = clamp(alpha + (1.0 - alpha) * k * 0.5 * min(alpha * RAIN_SKID_LIFT_RAMP, 1.0), 0.0, 1.0);
-            lit = lit + sky * RAIN_SKID_SHEEN * wetf;
-        }
-        }
+    {
+        let sc = shade_wet_road(in, base.rgb, lit, alpha);
+        lit = sc.xyz;
+        alpha = sc.w;
     }
     //@endif
     return vec4<f32>(lit, alpha);

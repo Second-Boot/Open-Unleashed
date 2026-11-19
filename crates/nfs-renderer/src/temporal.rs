@@ -21,12 +21,11 @@
 //! `reproj`) also runs a debug pass over the float scene; `taa` is a minimal TAA resolve (history reprojected by the
 //! vectors, Catmull-Rom, a 3 x 3 neighbourhood clamp) used only to prove the vectors; `reproj` shows the colour
 //! difference between the frame and the previous one reprojected by the vectors (no blending, no clamp).
-//! `NFS_TEMPORAL_NOOBJ=1` leaves the objects' own motion out (the camera's alone) and `NFS_TEMPORAL_NOMV=1` makes the debug pass read
-//! a zero vector: controls, to show what a wrong vector does.
+//! (The controls `NFS_TEMPORAL_NOOBJ` / `NFS_TEMPORAL_NOMV` / `NFS_TEMPORAL_NOID` were removed 2026-11-19, REFACTOR-0119.)
 
 use crate::gfx::{self, Fullscreen, PostCtx};
 use crate::wgsl;
-use crate::camfx::{vp64, vp64_at};
+use crate::camera::{vp64, vp64_at};
 use crate::{Camera, DrawItem};
 use glam::{DMat4, Mat4};
 
@@ -55,17 +54,13 @@ pub(crate) enum View {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Config {
     pub view: View,
-    /// the objects' own motion left out of the vectors (the camera's alone)
-    pub no_obj: bool,
-    /// the debug pass reads a zero vector everywhere (a control: what the history looks like with no reprojection)
-    pub no_mv: bool,
-    /// `NFS_TEMPORAL_NOID=1` (ENH-MOTIONID control): every item's `motion_id` is ignored, the (mesh, material, order)
+    /// (a control of the tests, ENH-MOTIONID): every item's `motion_id` is ignored, the (mesh, material, order)
     /// pairing alone finds the previous transform: what the vectors were before the ids
     pub no_id: bool,
 }
 
 impl Config {
-    /// `NFS_TEMPORAL_DEBUG` (and `NFS_TEMPORAL_NOOBJ`); `None` = the foundation is off.
+    /// `NFS_TEMPORAL_DEBUG`; `None` = the foundation is off.
     pub fn from_env() -> Option<Self> {
         let f = crate::dbg::flags();
         let v = f.temporal_debug.as_deref()?;
@@ -82,7 +77,7 @@ impl Config {
                 View::Plain
             }
         };
-        Some(Self { view, no_obj: f.temporal_noobj, no_mv: f.temporal_nomv, no_id: f.temporal_noid })
+        Some(Self { view, no_id: false })
     }
 }
 
@@ -262,7 +257,7 @@ impl Temporal {
         self.id_keys.sort_unstable();
         tracing::trace!(target: "temporal", items = n, with_id = self.id_keys.len(), pieces = self.id_keys.iter().filter(|k| k.0 & 0xF000_0000 == crate::MOTION_PIECE).count(), movers = self.id_keys.iter().filter(|k| k.0 & 0xF000_0000 != crate::MOTION_CAR).count(), "temporal motion ids");
         let dmat = |m: &[f32; 16]| DMat4::from_cols_array(&m.map(f64::from));
-        let have_prev = self.prev.is_some() && !self.cfg.no_obj;
+        let have_prev = self.prev.is_some();
         // ENHANCEMENT E37: the items with an id: the previous frame's transform of the same id, the same transform =
         // static (the camera's motion alone), else the object's own motion too (a partner further than `PAIR_REACH`
         // is a respawn / a cut of that object: the camera's alone)
@@ -448,11 +443,7 @@ impl Gpu {
         let layout = gfx::bgl(device, "object + motion", &[entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, object_size), entry(1, wgpu::ShaderStages::FRAGMENT, 64)]);
         let pipeline_layout = gfx::pipeline_layout(device, "mesh pipeline layout (temporal)", &[globals, &layout, material, sky]);
         let motion_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("motion matrices"), size: 64 * (max_objects + 2), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let objects_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("objects + motion"),
-            layout: &layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: object_buf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: motion_buf.as_entire_binding() }],
-        });
+        let objects_bg = gfx::bind_group(device, "objects + motion", &layout, &[gfx::bg_buf(0, object_buf), gfx::bg_buf(1, &motion_buf)]);
         Self { pipeline_layout, motion_buf, objects_bg }
     }
 }
@@ -499,7 +490,6 @@ pub(crate) struct Pass {
     imgs: Option<Imgs>,
     flip: usize,
     have_history: bool,
-    no_mv: bool,
 }
 
 /// The history's share of the resolve (the current frame takes the rest): 0.9 is the common TAA feedback.
@@ -628,10 +618,7 @@ fn hsv(h: f32, v: f32) -> vec3<f32> {
             mx = max(mx, c);
         }
     }
-    var mv = textureLoad(t_mv, bp, 0).rg;
-    if p.a.w > 0.5 {
-        mv = vec2<f32>(0.0);
-    }
+    let mv = textureLoad(t_mv, bp, 0).rg;
     let huv = uv + mv * p.size.zw;
     let inside = all(huv > vec2<f32>(0.0)) && all(huv < vec2<f32>(1.0));
     if MODE == 5u {
@@ -655,24 +642,19 @@ fn hsv(h: f32, v: f32) -> vec3<f32> {
 }
 "#;
 
-fn tv(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
-}
-
 impl Pass {
-    pub fn new(device: &wgpu::Device, view: View, no_mv: bool) -> Self {
-        let tex = |binding, filterable| gfx::bgl_tex(binding, wgpu::TextureSampleType::Float { filterable }, false);
+    pub fn new(device: &wgpu::Device, view: View) -> Self {
         let layout = gfx::bgl(
             device,
             "temporal pass",
             &[
                 gfx::bgl_uniform(0, wgpu::ShaderStages::FRAGMENT),
-                tex(1, false),
-                tex(2, true),
-                tex(3, false),
-                gfx::bgl_tex(4, wgpu::TextureSampleType::Depth, false),
-                tex(5, false),
-                tex(6, false),
+                gfx::bgl_float(1, false),
+                gfx::bgl_float(2, true),
+                gfx::bgl_float(3, false),
+                gfx::bgl_depth(4, false),
+                gfx::bgl_float(5, false),
+                gfx::bgl_float(6, false),
                 gfx::bgl_sampler(7, wgpu::SamplerBindingType::Filtering),
             ],
         );
@@ -687,7 +669,7 @@ impl Pass {
         };
         let pipe = Fullscreen::new("temporal pass", &pl, &module).constants(&[("MODE", mode)]).build(device, &[gfx::target(crate::gpu::HDR_FORMAT, None)]);
         let buf = gfx::uniform_buf::<PassUniform>(device, "temporal pass");
-        Self { view, layout, pipe, buf, imgs: None, flip: 0, have_history: false, no_mv }
+        Self { view, layout, pipe, buf, imgs: None, flip: 0, have_history: false }
     }
 
     /// Run the pass over the float scene `cur` and return the image later passes should take as the scene
@@ -716,7 +698,7 @@ impl Pass {
         let reset = t.reset || !self.have_history;
         let u = PassUniform {
             size: [t.size.0 as f32, t.size.1 as f32, 1.0 / t.size.0 as f32, 1.0 / t.size.1 as f32],
-            a: [TAA_FEEDBACK, reset as u32 as f32, t.frame as f32, self.no_mv as u32 as f32],
+            a: [TAA_FEEDBACK, reset as u32 as f32, t.frame as f32, 0.0],
             j: [t.jitter_px[0], t.jitter_px[1], t.phase_count as f32, (t.frame % t.phase_count.max(1) as u32) as f32],
         };
         gfx::belt_write(cx.belt, cx.encoder, &self.buf, bytemuck::bytes_of(&u));
@@ -728,11 +710,7 @@ impl Pass {
             _ => cur_view,
         };
         let target = if self.view == View::Taa { &imgs.view[dest] } else { &imgs.out_view };
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("temporal pass"),
-            layout: &self.layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.buf.as_entire_binding() }, tv(1, cur_view), tv(2, hist), tv(3, &t.mv), tv(4, depth), tv(5, &t.reactive), tv(6, &t.tc), wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(sampler) }],
-        });
+        let bg = gfx::bind_group(device, "temporal pass", &self.layout, &[gfx::bg_buf(0, &self.buf), gfx::bg_view(1, cur_view), gfx::bg_view(2, hist), gfx::bg_view(3, &t.mv), gfx::bg_view(4, depth), gfx::bg_view(5, &t.reactive), gfx::bg_view(6, &t.tc), gfx::bg_sampler(7, sampler)]);
         gfx::fullscreen_pass(encoder, "temporal pass", "temporal pass", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &self.pipe, &[&bg]);
         let extent = wgpu::Extent3d { width: t.size.0, height: t.size.1, depth_or_array_layers: 1 };
         match self.view {
@@ -808,7 +786,7 @@ mod tests {
         let aspect = size.0 as f32 / size.1 as f32;
         let prev_cam = Camera { position: Vec3::new(100.0, 5.0, -50.0), target: Vec3::new(100.0, 4.0, -20.0), ..Camera::default() };
         let cur_cam = Camera { position: Vec3::new(100.0, 5.0, -48.0), target: Vec3::new(100.5, 4.0, -18.0), ..Camera::default() };
-        let mut t = Temporal::new(Config { view: View::Plain, no_obj: false, no_mv: false, no_id: false });
+        let mut t = Temporal::new(Config { view: View::Plain, no_id: false });
         let mut m = Motion::default();
         let prev_car = Mat4::from_translation(Vec3::new(101.0, 0.0, -10.0));
         let cur_car = Mat4::from_translation(Vec3::new(101.0, 0.0, -9.0));
@@ -850,7 +828,7 @@ mod tests {
     fn wheels_of_one_mesh_keep_their_partners_and_a_cut_clears_the_history() {
         let size = (640u32, 400u32);
         let cam = Camera { position: Vec3::new(0.0, 2.0, -10.0), target: Vec3::new(0.0, 1.0, 0.0), ..Camera::default() };
-        let mut t = Temporal::new(Config { view: View::Plain, no_obj: false, no_mv: false, no_id: false });
+        let mut t = Temporal::new(Config { view: View::Plain, no_id: false });
         let mut m = Motion::default();
         // four wheels, one mesh and material, moving forward 1.4 m a frame: the nearest previous wheel of the rear
         // ones is a front wheel (1.0 m away), the draw order pairs them right
@@ -882,7 +860,7 @@ mod tests {
     fn motion_ids_pair_by_identity_not_by_order() {
         let size = (640u32, 400u32);
         let cam = Camera { position: Vec3::new(0.0, 2.0, -10.0), target: Vec3::new(0.0, 1.0, 0.0), ..Camera::default() };
-        let mut t = Temporal::new(Config { view: View::Plain, no_obj: false, no_mv: false, no_id: false });
+        let mut t = Temporal::new(Config { view: View::Plain, no_id: false });
         let mut m = Motion::default();
         let wheels = |z: f32, keep: &[usize]| {
             let mut v: Vec<DrawItem> = [(-0.8, 1.3), (0.8, 1.3), (-0.8, -1.2), (0.8, -1.2)].map(|(x, dz)| item(7, 3, Mat4::from_translation(Vec3::new(x, 0.3, z + dz)))).to_vec();
@@ -937,7 +915,7 @@ mod tests {
     }
 
     /// ENHANCEMENT E37 (ENH-MOTIONID): two identical cones both flying (they cross, so the farthest-first order of the
-    /// draw flips between two frames): with the ids each keeps its own partner; with the ids ignored (`NFS_TEMPORAL_NOID`,
+    /// draw flips between two frames): with the ids each keeps its own partner; with the ids ignored (`Config::no_id`,
     /// the (mesh, material, order) pairing) the flip hands each the other's previous place: the case the ids are for.
     #[test]
     fn two_flying_cones_swap_by_order_but_not_by_id() {
@@ -949,7 +927,7 @@ mod tests {
         let pos_a = |f: f32| Vec3::new(-1.0 + 0.4 * f, 0.0, 4.0);
         let pos_b = |f: f32| Vec3::new(1.0 - 0.4 * f, 0.0, 4.3);
         let errors = |no_id: bool| {
-            let mut t = Temporal::new(Config { view: View::Plain, no_obj: false, no_mv: false, no_id });
+            let mut t = Temporal::new(Config { view: View::Plain, no_id });
             let mut m = Motion::default();
             let mut worst = 0.0f64;
             for frame in 0..11 {
@@ -992,7 +970,7 @@ mod tests {
             let b = cur.inverse() * c;
             b.truncate() / b.w
         };
-        let mut t = Temporal::new(Config { view: View::Plain, no_obj: false, no_mv: false, no_id: false });
+        let mut t = Temporal::new(Config { view: View::Plain, no_id: false });
         let mut m = Motion::default();
         for frame in 0..6 {
             t.begin(&cam, 1.6, false, size, size.0);
@@ -1008,7 +986,7 @@ mod tests {
             t.commit();
         }
         // one of the two is not drawn this frame (culled): the other keeps its own partner
-        let mut t = Temporal::new(Config { view: View::Plain, no_obj: false, no_mv: false, no_id: false });
+        let mut t = Temporal::new(Config { view: View::Plain, no_id: false });
         t.begin(&cam, 1.6, false, size, size.0);
         t.motion(&[cone(10, stand), cone(11, fly(0.0))], &[false; 2], &cam, 1.6, false, &mut m);
         t.commit();

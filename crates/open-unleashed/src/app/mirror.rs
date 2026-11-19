@@ -30,7 +30,7 @@ impl App {
     /// view, from the main update's state — which for the mirror, whose view shows the ring alone
     /// (0x45D470), is the same picture.
     pub(crate) fn mirror_sky_update(&mut self) {
-        let Some(cam) = self.rear_mirror else { return };
+        let Some(cam) = self.refl.rear_mirror else { return };
         let slice = self.mirror_slice(cam.position);
         let (Some(s), Some(r)) = (self.sky.as_mut(), self.renderer.as_mut()) else { return };
         let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
@@ -41,7 +41,7 @@ impl App {
     /// 240 × 84 on the window's scale, cleared to the sky record's group B (0x459A70 under
     /// `[0x627F43] & 0x10`; 0xFF77BBFF, the view's constructor colour, only without a `.bin`).
     pub(crate) fn render_mirror(&mut self) {
-        let Some(cam) = self.rear_mirror else { return };
+        let Some(cam) = self.refl.rear_mirror else { return };
         // **The reflection** (PA-MIRROR): the camera build 0x464F80 ends (0x46537B…0x4653A8) with `al = ([0x65742C] != 0)`,
         // inverted for the view type 1 (`cmp ecx, 1; sete`, 0x46538D…0x465394), and when it holds negates the first row of
         // the camera's 3×3 (`+0xC`, `+0x10`, `+0x14`, 0x46539B…0x4653AB): a reflection of the screen's x, before the
@@ -226,7 +226,7 @@ impl App {
             // or sky-map pass on the cars in it. Its own far plane, 65000 (0x4691D0), scales its
             // depth bias and is the camera's clip
             r.set_mirror_view(true);
-            self.mirror_tex = Some(r.render_offscreen(&scene, &cam, nfs_renderer::OffscreenSpec { width: w, height: h, reuse: self.mirror_tex, clear_colour: Some(sky), depth_far: Some(MIRROR_FAR) }));
+            self.refl.mirror_tex = Some(r.render_offscreen(&scene, &cam, nfs_renderer::OffscreenSpec { width: w, height: h, reuse: self.refl.mirror_tex, clear_colour: Some(sky), depth_far: Some(MIRROR_FAR) }));
             r.set_mirror_view(false);
         }
         self.scratch.mirror_items = scene.items;
@@ -243,8 +243,8 @@ impl App {
     /// The counter `[0x627E10]` it bumps has no reader. Called after the mirror's sky update, as
     /// the pass order has it.
     pub(crate) fn mirror_weather_step(&mut self) {
-        let Some(cam) = self.rear_mirror else { return };
-        if self.weather.is_none() {
+        let Some(cam) = self.refl.rear_mirror else { return };
+        if self.ambient.weather.is_none() {
             return;
         }
         let frozen = self.weather_frozen();
@@ -252,7 +252,7 @@ impl App {
         let (snow, rain) = self.weather_strengths_at(slice);
         let view = nfs_game::weather::View::new(cam.position, (cam.target - cam.position).normalize_or_zero(), cam.up);
         let tick = self.tick as u32;
-        let (Some(w), Some(p)) = (self.weather.as_mut(), self.track_particles.as_mut()) else { return };
+        let (Some(w), Some(p)) = (self.ambient.weather.as_mut(), self.track_particles.as_mut()) else { return };
         w.frame(tick, snow, rain, view, frozen, p.rng_mut(), &mut self.fe_rng);
     }
 }

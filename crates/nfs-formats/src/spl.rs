@@ -268,7 +268,7 @@ mod mix_tests {
         assert_eq!(super::mix_file(false), "game.spl");
         assert_eq!(super::mix_file(true), "replay.spl");
         // the shipped pair differs in slots 0, 6, 7, 9, 10, 12 and 14 (`replay.md` §9)
-        let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Games/NFS-Porsche-Unleashed/game_info/data/GameData/Sounds");
+        let dir = nfs_devdata::dev_game_root().unwrap_or_default().join("GameData/Sounds");
         if dir.join("replay.spl").is_file() {
             let (g, r) = (super::GameSpl::load_mix(&dir, false), super::GameSpl::load_mix(&dir, true));
             assert_eq!((g.music(), r.music()), (52, 68));

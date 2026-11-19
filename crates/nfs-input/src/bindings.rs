@@ -1013,9 +1013,7 @@ mod tests {
             assert!(d[i + 1..].iter().all(|b| !same(a, b)), "row {i}");
         }
         // each pad binding reads its control on a standard pad's record
-        let mut p = crate::gamepad::PadSnapshot::default();
-        p.triggers = [32767, 32767];
-        p.sticks = [32767, 0, -32768, 0];
+        let mut p = crate::gamepad::PadSnapshot { triggers: [32767, 32767], sticks: [32767, 0, -32768, 0], ..Default::default() };
         p.buttons[13] = true;
         let pads = [PadRecord::default(), crate::gamepad::pad_record(&p)];
         let bands = [[0, 127]; 8];

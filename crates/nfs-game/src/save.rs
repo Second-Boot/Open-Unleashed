@@ -41,8 +41,8 @@ pub const TEMPLATE_STEM: &str = "XXDefXX";
 
 /// `SaveData\`, relocated out of the read-only installation (see the module docs).
 pub fn save_dir() -> PathBuf {
-    if let Some(d) = crate::config::cfg().nfs5_save_dir.as_os_str() {
-        return PathBuf::from(d);
+    if let Some(d) = crate::config::save_root_override() {
+        return d;
     }
     nfs_assets::platform::data_dir().join("SaveData")
 }

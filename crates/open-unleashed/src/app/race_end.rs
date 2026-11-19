@@ -33,7 +33,7 @@ impl App {
     /// The block `[0x690410]` as it stands: the series', else the one the profile's `Knockout`
     /// module loaded (0x4DDD60), else the image's zeros.
     fn knockout_block(&self) -> nfs_formats::sav::KnockoutState {
-        self.knockout
+        self.ko.knockout
             .as_ref()
             .map(|k| k.state.clone())
             .or_else(|| self.career.as_ref().and_then(|c| c.side.knockout.as_ref()).map(|k| k.to_state()))
@@ -59,14 +59,14 @@ impl App {
             let drawn = Self::draw_drivers(&self.paths, self.race_skill, n.max(0) as usize, crand);
             (picks, drawn)
         });
-        self.opp_cars = Self::opp_car_saves(&catalog, &picks);
+        self.ko.opp_cars = Self::opp_car_saves(&catalog, &picks);
         let mut state = self.knockout_block();
         nfs_game::career::knockout_start(&mut state, n, &drawn);
         if let Some(c) = self.career.as_mut() {
             c.side.personalities = Some(drawn.iter().map(|p| *p as u16).collect());
         }
         tracing::info!(n, drivers = ?drawn, "knockout series started (0x4DDF30)");
-        self.knockout = Some(KnockoutSeries { state, message: String::new() });
+        self.ko.knockout = Some(KnockoutSeries { state, message: String::new() });
     }
 
     /// **A knockout round's set-up** — 0x4ED5D0 for `Game.GameType` 2: `RACE_TYPE` 2 with the
@@ -78,7 +78,7 @@ impl App {
     /// (0x4DE1E7), the driver `nfs5.per[personalities[i − 1]]` (0x4DE1D4) and
     /// `.STARTINGPOS = start_pos[i]`. Returns the track.
     pub(crate) fn knockout_round(&mut self) -> Option<String> {
-        let k = self.knockout.as_ref().filter(|k| k.state.active)?.state.clone();
+        let k = self.ko.knockout.as_ref().filter(|k| k.state.active)?.state.clone();
         let m = self.fe.menu.as_ref()?;
         let row = m.ko_row(k.race_index.max(0) as usize);
         // `FETrackAccessor`'s out-of-range rule: row 0 of the list (`FeCatalogues::track`)
@@ -91,7 +91,7 @@ impl App {
             if k.alive[car] != 1 {
                 continue;
             }
-            let Some(p) = self.opp_cars.get(car - 1).and_then(|s| Self::pick_of(&catalog, s)) else { continue };
+            let Some(p) = self.ko.opp_cars.get(car - 1).and_then(|s| Self::pick_of(&catalog, s)) else { continue };
             let mut o = Self::opponent_of(&self.fe.strings, &per, &catalog, &p, Some(k.personalities[car - 1] as i16));
             o.grid = Some((k.start_pos[car] - 1).max(0) as u32);
             opponents.push(o);
@@ -99,7 +99,7 @@ impl App {
         tracing::info!(track, race = k.race_index + 1, of = k.opponents, grid = ?k.start_pos, drivers = ?opponents.iter().map(|o| (o.name.as_str(), o.car.display_name.as_str())).collect::<Vec<_>>(), "knockout round (0x4DE150)");
         let rs = RaceSetup::knockout_round(&row, laps, damage, opponents, (k.start_pos[0] - 1).max(0) as u32, self.race_setup());
         self.apply_race_setup(rs);
-        self.knockout_round = true;
+        self.ko.knockout_round = true;
         Some(track)
     }
 
@@ -113,9 +113,9 @@ impl App {
     /// round, 9 for a mission, else 0 — PORT-DEVIATION D23 for those port-only launches: a text-menu career event (the
     /// original's 4) answers 0, which picks the same summary title.
     pub(crate) fn race_fegame_type(&self) -> u8 {
-        self.block_game_type().unwrap_or(if self.quick_knockout {
+        self.block_game_type().unwrap_or(if self.ko.quick_knockout {
             1
-        } else if self.knockout_round {
+        } else if self.ko.knockout_round {
             2
         } else if self.mission.is_some() {
             // a Factory Driver mission is `Game.GameType` 9 (`modes.md` 1): the command line's `--mission`
@@ -141,9 +141,9 @@ impl App {
     /// 0x4ED7D9...), the series 2 (types 2 and 4: 0x4EB515), the skill test 4 (a mission with no
     /// opponent: 0x4EB53A...0x4EB541), the cops race 1 (type 0 with cheat 5: 0x4EB4FD...0x4EB50D), else 0.
     pub(crate) fn launch_race_type(&self) -> u8 {
-        if self.quick_knockout {
+        if self.ko.quick_knockout {
             3
-        } else if self.knockout_round || self.race_fegame_type() == game_type::TOURNAMENT {
+        } else if self.ko.knockout_round || self.race_fegame_type() == game_type::TOURNAMENT {
             2
         } else if self.skill.is_some() {
             4
@@ -170,12 +170,12 @@ impl App {
     }
 
     pub(crate) fn knockout_race_end(&mut self, menu: &mut FeCatalogues) {
-        if !std::mem::take(&mut self.knockout_round) {
+        if !std::mem::take(&mut self.ko.knockout_round) {
             return;
         }
         let (order, _) = self.finishing_order();
         let pos: Vec<i32> = (0..9).map(|d| order.iter().position(|x| *x == d).map_or(99, |p| p as i32 + 1)).collect();
-        let Some(k) = self.knockout.as_mut().filter(|k| k.state.active) else { return };
+        let Some(k) = self.ko.knockout.as_mut().filter(|k| k.state.active) else { return };
         let before = k.state.race_index;
         nfs_game::career::knockout_after_race(&mut k.state, &pos, menu.ko_opponents as i32);
         let s = &k.state;
@@ -232,7 +232,7 @@ impl App {
         self.stop_race_audio();
         let mut menu = menu;
         self.knockout_race_end(&mut menu);
-        self.player_grid_override = None;
+        self.ko.player_grid_override = None;
         self.fe.menu = Some(menu);
         self.sim_shutdown();
         // the race was run to its end: `[0x657E34]` is clear
@@ -351,17 +351,17 @@ impl App {
         self.sync_save_side_state();
         // 0x4D3F0A: an aborted race whose type is not 5…9 cancels the series (0x4DE040 clears
         // `active` only) — a quit test drive or mission leaves it running
-        self.knockout_round = false;
+        self.ko.knockout_round = false;
         let race_type = self.fe.race_game_type.unwrap_or(self.fe.game_type);
         if !playback
             && !(5..=9).contains(&race_type)
-            && let Some(k) = self.knockout.as_mut()
+            && let Some(k) = self.ko.knockout.as_mut()
             && k.state.active
         {
             k.state.active = false;
             k.message = "SERIES CANCELLED".into();
         }
-        self.player_grid_override = None;
+        self.ko.player_grid_override = None;
         self.career_opponents = None;
         self.skill = None;
         self.mission = None;
@@ -452,8 +452,8 @@ impl App {
     /// HUD trays never slid in. Only a restart of the program cleared it. User report, CAM2.)*
     /// Being deleted, not closed, the billboard plays no sound 4 (0x41ADD0 is not called).
     fn hud_teardown(&mut self) {
-        self.hud_hover = None;
-        self.pages.closing = None;
+        self.hud_state.hud_hover = None;
+        self.hud_state.pages.closing = None;
         self.results_billboard = None;
         self.billboard_key = 0;
     }
@@ -529,7 +529,7 @@ impl App {
             replay,
             aborted,
             game_type,
-            knockout_active: self.knockout.as_ref().is_some_and(|k| k.state.active),
+            knockout_active: self.ko.knockout.as_ref().is_some_and(|k| k.state.active),
             net: self.net.session.as_ref().filter(|n| n.established()).map(|n| (self.fe.comms_game_mode, n.first_player_is_us())),
             last_race: flags.last_race,
             end_of_era: flags.end_of_era,
@@ -708,7 +708,7 @@ impl App {
             // a knocked-out car's `car+0xB24` is zeroed (0x416649…0x4166FD); the port also flags
             // it finished, so the knock-out is tested first
             let damage = self.vehicle.as_ref().map_or([0.0; 10], |v| v.damage);
-            cars.push(FinalizeIn::from_progress(r, state(r.finished, self.player_eliminated), 0, damage));
+            cars.push(FinalizeIn::from_progress(r, state(r.finished, self.ko.player_eliminated), 0, damage));
         }
         for (i, o) in self.road.opponents.iter().enumerate() {
             drivers.push(i + 1);
@@ -731,7 +731,7 @@ impl App {
         // 0x502880 sorts on — except a car a lap knockout puts out, which has none (`RACE_TYPE 3`)
         let humans = usize::from(self.race.is_some());
         let tick = self.tick;
-        let mut records = nfs_game::race::race_finalize(&mut cars, humans, &rank, self.num_laps, tick, self.linear_track(), self.quick_knockout);
+        let mut records = nfs_game::race::race_finalize(&mut cars, humans, &rank, self.num_laps, tick, self.linear_track(), self.ko.quick_knockout);
         // by driver index
         let mut by_driver = vec![nfs_game::race::RacerResult::default(); records.len()];
         for (k, r) in records.drain(..).enumerate() {

@@ -100,57 +100,29 @@ pub fn dusk_lamps(night: bool, sun_direction: Vec3, data_sun: Option<&DataSun>) 
 }
 
 /// The full E9 frame's casters' rule and baked-dark gate for `track` along its data sun of `source` ([`full_frame`]: the sky
-/// sun's rule, `nfs_renderer::scenery_casters`, and the relative gate), `None` = cars-only.
-/// TEST GLUE: `NFS_DATA_SUN_FULL=<track>[:<radius>[:gate|nogate|rel]],..` replaces the rule for the tracks it names (`none` = no
-/// track full; a track not named is cars-only; a radius = the radius rule of before, SUN-FULL / FOREST-TREESH, no radius = the
-/// shape rule; `gate` = the absolute gate, `nogate` = none, no gate word / `rel` = GATE-REL's relative gate), for comparison stills.
-fn scenery(track: &str, source: SunSource) -> Option<(SceneryCasters, BakedGate)> {
-    match crate::config::cfg().nfs_data_sun_full.as_str() {
-        Some(list) => list.split(',').find_map(|e| test_glue_row(e, track)),
-        None if full_frame(source) => Some((nfs_renderer::scenery_casters(), BakedGate::Relative)),
-        None => small_parts(source),
-    }
+/// sun's rule, `nfs_renderer::scenery_casters`, and the relative gate), `None` = cars-only. (The comparison switch
+/// `NFS_DATA_SUN_FULL` was removed 2026-11-19, REFACTOR-0119.)
+fn scenery(_track: &str, source: SunSource) -> Option<(SceneryCasters, BakedGate)> {
+    if full_frame(source) { Some((nfs_renderer::scenery_casters(), BakedGate::Relative)) } else { small_parts(source) }
 }
 
 /// CANYON-SMALLSH (2026-11-18): a decals' sun's frame is E51's cars-only frame plus the small upright scenery parts as casters
 /// ([`SMALL_RADIUS`] / [`SMALL_HEIGHT`], `SceneryCasters::Small`). The `sh80` decals are whole draped terrain patches under tree groups,
-/// so the data has no shade of its own for signs, posts, rails, roadside walls or bushes (canyon's audit, `examples/canyon_smallsh.rs`:
+/// so the data has no shade of its own for signs, posts, rails, roadside walls or bushes (canyon's audit, the removed example `canyon_smallsh`, see the history:
 /// of 134 signs, 20 rails, 29 walls and 610 bushes none has a darker bake beside it in the sun's direction and only a few lie in a
 /// decal's patch); the gorge walls and cliffs (broad or tall) still do not cast, the walls' shade being baked / in the decals. The
-/// cars' shadow is the cars-only frame's own (`gpu/csm.rs` `ShadowMode::CarsOnly { small }`). The gate rides along unused (that frame
-/// has no relative gate). TEST GLUE: `NFS_CARS_ONLY_SMALL=off` = the plain cars-only frame, `<radius m>,<height m>` = other limits.
+/// cars' shadow is the cars-only frame's own (`gpu/csm/mode.rs` `ShadowMode::CarsOnly { small }`). The gate rides along unused (that frame
+/// has no relative gate). (The tuning switch `NFS_CARS_ONLY_SMALL` was removed 2026-11-19, REFACTOR-0119.)
 fn small_parts(source: SunSource) -> Option<(SceneryCasters, BakedGate)> {
     if source != SunSource::Decals {
         return None;
     }
-    let (mut radius, mut height) = (SMALL_RADIUS, SMALL_HEIGHT);
-    if let Some(v) = crate::config::cfg().nfs_cars_only_small.as_str() {
-        if v.trim() == "off" {
-            return None;
-        }
-        let mut f = v.split(',').map(|x| x.trim().parse::<f32>());
-        radius = f.next().and_then(Result::ok).unwrap_or(radius);
-        height = f.next().and_then(Result::ok).unwrap_or(height);
-    }
-    Some((SceneryCasters::Small { radius, height }, BakedGate::Relative))
+    Some((SceneryCasters::Small { radius: SMALL_RADIUS, height: SMALL_HEIGHT }, BakedGate::Relative))
 }
 
 /// The small parts' bounding radius (m) and height (m, mesh space) limits (CANYON-SMALLSH).
 pub const SMALL_RADIUS: f32 = 15.0;
 pub const SMALL_HEIGHT: f32 = 8.0;
-
-/// One entry of the `NFS_DATA_SUN_FULL` test glue list, if it names `track`: (casters' rule, gate).
-fn test_glue_row(entry: &str, track: &str) -> Option<(SceneryCasters, BakedGate)> {
-    let mut f = entry.trim().split(':');
-    f.next().filter(|t| t.eq_ignore_ascii_case(track))?;
-    let rule = f.next().and_then(|r| r.parse().ok()).map_or_else(nfs_renderer::scenery_casters, SceneryCasters::Radius);
-    let gate = match f.next() {
-        Some("nogate") => BakedGate::Off,
-        Some("gate") => BakedGate::Absolute,
-        _ => BakedGate::Relative,
-    };
-    Some((rule, gate))
-}
 
 /// TEST GLUE: `NFS_DATA_SUN=<azimuth>,<elevation>` — a hand-set sun for a sunless day track (comparison stills only).
 fn test_glue_data_sun() -> Option<Vec3> {
@@ -183,17 +155,5 @@ mod tests {
         assert!(!dusk_lamps(false, down, Some(&sun)), "forest, canyon");
         assert!(!dusk_lamps(false, Vec3::new(0.4, -0.8, 0.1), None), "a sky sun");
         assert!(!dusk_lamps(true, down, None), "a night track lights them anyway, not by this rule");
-    }
-
-    /// the comparison stills' test glue rows
-    #[test]
-    fn the_test_glue_rows() {
-        let shape = SceneryCasters::Shape;
-        assert_eq!(test_glue_row("forest", "forest"), Some((shape, BakedGate::Relative)));
-        assert_eq!(test_glue_row(" Forest:15", "forest"), Some((SceneryCasters::Radius(15.0), BakedGate::Relative)));
-        assert_eq!(test_glue_row("forest:60:nogate", "forest"), Some((SceneryCasters::Radius(60.0), BakedGate::Off)));
-        assert_eq!(test_glue_row("forest:30:gate", "forest"), Some((SceneryCasters::Radius(30.0), BakedGate::Absolute)));
-        assert_eq!(test_glue_row("forest::rel", "forest"), Some((shape, BakedGate::Relative)));
-        assert_eq!(test_glue_row("canyon:15", "forest"), None);
     }
 }

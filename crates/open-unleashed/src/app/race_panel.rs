@@ -428,7 +428,7 @@ impl App {
     }
 
     fn toast_alive(&self) -> bool {
-        self.panel.toast.as_ref().is_some_and(|(_, t)| self.shot_target.is_some() || t.elapsed() < TOAST)
+        self.panel.toast.as_ref().is_some_and(|(_, t)| self.glue.shot_target.is_some() || t.elapsed() < TOAST)
     }
 
     /// Append the panel and the message to the scene's sprites (after everything else, so photo mode's still cuts them off).

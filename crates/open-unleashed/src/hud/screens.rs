@@ -1,7 +1,8 @@
 //! The HUD's result pages, dialogs, buttons and tables.
 
 use crate::*;
-use crate::pad_glyphs::Glyph;
+use nfs_game::colour::argb_rgba as argb;
+use crate::app::pad::glyphs::Glyph;
 
 /// PORT-DEVIATION D64: the pad icons' side beside the HUD's dialogs, in the 640 x 480 reference rows.
 const PAD_ICON: f32 = 24.0;
@@ -23,7 +24,6 @@ impl Hud {
         let total: f32 = widths.iter().sum();
         let left = (bx + ((bw - total) / 2.0).trunc()).trunc();
         let top = by + ((bh - (n + 1.0) * 20.0) / 2.0).trunc();
-        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
         out.push(self.quad(aspect, left, top, total, 20.0, argb(0xFFFA_B400)));
         out.push(self.quad(aspect, left, top + 20.0, total, n * 20.0, argb(0x40FF_FFFF)));
         if let Some(k) = selected {
@@ -397,7 +397,6 @@ impl Hud {
     pub(crate) fn bevel(&self, out: &mut Vec<Sprite>, aspect: f32, (x, y, w, h): (f32, f32, f32, f32), b: f32, style: u8) {
         let (o0, o1) = ((x - b, y - b), (x + w + b, y + h + b));
         let (i0, i1) = ((x, y), (x + w, y + h));
-        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
         // (outer, inner) per side, top / right / bottom / left
         let tables: [(u32, u32); 4] = match style {
             0 => [(0x05FF_FFFF, 0x4C00_0000), (0x4C00_0000, 0x05FF_FFFF), (0x4C00_0000, 0x05FF_FFFF), (0x05FF_FFFF, 0x4C00_0000)],
@@ -436,7 +435,6 @@ impl Hud {
     /// 0x41B386), which with `hovered` gives the sunken bevel (0x41B4B2…0x41B4D9).
     fn button_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, (x, y): (f32, f32), label: &str, selected: bool, pressed: bool) {
         let (bw, bh) = HUD_BUTTON;
-        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
         let (fill, text) = if selected { (0xFFFA_B400, 0xFF00_0000) } else { (0xFFBC_0000, 0xFFFF_FFFF) };
         out.push(self.quad(aspect, x, y, bw, bh, argb(fill)));
         let edge = argb(0xFF00_0000);
@@ -472,7 +470,7 @@ impl Hud {
     /// PORT-DEVIATION D64 (pad button icons): the pad's keys beside a dialog button (`x`, `y` its top-left in the
     /// 640 x 480 reference), to its right past the button's drop shadow, in the order given. Nothing with no
     /// standard pad connected.
-    pub(crate) fn pad_glyphs_beside(&self, out: &mut Vec<Sprite>, aspect: f32, (x, y): (f32, f32), glyphs: &[crate::pad_glyphs::Glyph]) {
+    pub(crate) fn pad_glyphs_beside(&self, out: &mut Vec<Sprite>, aspect: f32, (x, y): (f32, f32), glyphs: &[crate::app::pad::glyphs::Glyph]) {
         let Some(icons) = self.pad_icons.get() else { return };
         let (bw, bh) = HUD_BUTTON;
         for (n, g) in glyphs.iter().enumerate() {

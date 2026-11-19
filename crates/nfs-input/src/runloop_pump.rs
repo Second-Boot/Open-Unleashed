@@ -41,7 +41,7 @@ thread_local! {
 
 /// TEST GLUE: make every pump run `SDL_hid_enumerate` first, the call a HID device change makes
 /// (`HIDAPI_UpdateDeviceList`), so the front-end return can be reproduced without plugging anything
-/// (also `NFS_SDL_FORCE_ENUM=1` in the environment).
+/// (set by `examples/sdl_reentry_repro.rs`; the `NFS_SDL_FORCE_ENUM` env read was removed 2026-11-19, REFACTOR-0119).
 pub static FORCE_ENUMERATE: AtomicBool = AtomicBool::new(false);
 
 /// Whether [`install`] ran on this thread (then `Gamepads::poll` reads the queue).
@@ -96,8 +96,7 @@ pub(crate) fn pump() {
     if PUMPING.with(|p| p.replace(true)) {
         return;
     }
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if FORCE_ENUMERATE.load(Ordering::Relaxed) || *ENV.get_or_init(|| std::env::var_os("NFS_SDL_FORCE_ENUM").is_some_and(|v| v == "1")) {
+    if FORCE_ENUMERATE.load(Ordering::Relaxed) {
         // SAFETY: plain enumeration; the list is freed at once
         unsafe { sdl3_sys::hidapi::SDL_hid_free_enumeration(sdl3_sys::hidapi::SDL_hid_enumerate(0, 0)) };
     }
@@ -124,10 +123,6 @@ extern "C" fn observer(_o: CFRunLoopObserverRef, _activity: CFRunLoopActivity, _
 /// Returns `false` when it could not be created (the inline pump stays).
 pub fn install() -> bool {
     if installed() {
-        return true;
-    }
-    // TEST GLUE: `NFS_SDL_PUMP=inline` keeps the 0.1.5 behaviour (pump in the frame), for A/B runs
-    if std::env::var_os("NFS_SDL_PUMP").is_some_and(|v| v == "inline") {
         return true;
     }
     let ctx = CFRunLoopObserverContext { version: 0, info: std::ptr::null_mut(), retain: None, release: None, copyDescription: None };

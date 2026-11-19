@@ -266,9 +266,9 @@ impl App {
             cop_count: self.road.cop_count,
             damage: self.road.damage_on,
             skill: self.race_skill,
-            quick_knockout: self.quick_knockout,
+            quick_knockout: self.ko.quick_knockout,
             career_opponents: self.career_opponents.clone(),
-            player_grid: self.player_grid_override,
+            player_grid: self.ko.player_grid_override,
             look: PlayerLook { paint: self.paint, owned_paint: self.owned_paint, owned_decal: self.owned_decal },
         }
     }
@@ -303,9 +303,9 @@ impl App {
         self.road.cop_count = cop_count;
         self.road.damage_on = damage;
         self.race_skill = skill;
-        self.quick_knockout = quick_knockout;
+        self.ko.quick_knockout = quick_knockout;
         self.career_opponents = career_opponents;
-        self.player_grid_override = player_grid;
+        self.ko.player_grid_override = player_grid;
         self.apply_player_look(look);
     }
 

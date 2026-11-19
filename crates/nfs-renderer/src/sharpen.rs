@@ -26,6 +26,23 @@ pub(crate) fn rcas_con(sharpness: f32) -> f32 {
     (-(2.0 - 2.0 * sharpness.clamp(0.0, 1.0))).exp2()
 }
 
+/// What [`Sharpen::run`] writes: the image `view` (`format`), and whether the source is the float scene.
+#[derive(Clone, Copy)]
+pub(crate) struct SharpenDest<'a> {
+    pub view: &'a wgpu::TextureView,
+    pub format: wgpu::TextureFormat,
+    pub hdr: bool,
+}
+
+/// The float image [`Sharpen::run_float`] makes: its `size` and `format`, and the layout / sampler its bind group is made with.
+#[derive(Clone, Copy)]
+pub(crate) struct SharpenImage<'a> {
+    pub layout: &'a wgpu::BindGroupLayout,
+    pub sampler: &'a wgpu::Sampler,
+    pub size: (u32, u32),
+    pub format: wgpu::TextureFormat,
+}
+
 /// The pipelines (one per target format, float flag and strength: E39 has four strengths) and the float output image of the
 /// temporal case, kept while the size holds.
 pub(crate) struct Sharpen {
@@ -51,21 +68,21 @@ impl Sharpen {
 
     /// Sharpen `src` (a bind group of the sprite layout, an image of `dest`'s size) into `dest` (`format`). `hdr`: the source is the
     /// float scene. One full-screen pass into `encoder`, timed as "sharpen".
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, src: &wgpu::BindGroup, dest: &wgpu::TextureView, format: wgpu::TextureFormat, hdr: bool, sharpness: f32) {
+    pub(crate) fn run(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, src: &wgpu::BindGroup, to: SharpenDest, sharpness: f32) {
+        let SharpenDest { view: dest, format, hdr } = to;
         let pipe = self.pipe(device, format, hdr, rcas_con(sharpness));
         gfx::fullscreen_pass(encoder, "sharpen pass", "sharpen", dest, wgpu::LoadOp::Clear(wgpu::Color::BLACK), pipe, &[src]);
     }
 
     /// The temporal case: sharpen the float scene `src` into this module's own float image of `size` and return that image (its bind
     /// group in `layout` and its view), for the post chain to carry on.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_float(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, src: &wgpu::BindGroup, size: (u32, u32), format: wgpu::TextureFormat, sharpness: f32) -> (wgpu::BindGroup, wgpu::TextureView) {
+    pub(crate) fn run_float(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, img: SharpenImage, src: &wgpu::BindGroup, sharpness: f32) -> (wgpu::BindGroup, wgpu::TextureView) {
+        let SharpenImage { layout, sampler, size, format } = img;
         let (bg, view) = {
             let img = RtImage::ensure(&mut self.image, device, "sharpened 3d", layout, sampler, size.0, size.1, format, gfx::RT_USAGE);
             (img.bg.clone(), img.view.clone())
         };
-        self.run(device, encoder, src, &view, format, true, sharpness);
+        self.run(device, encoder, src, SharpenDest { view: &view, format, hdr: true }, sharpness);
         (bg, view)
     }
 }

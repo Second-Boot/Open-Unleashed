@@ -37,7 +37,7 @@
 //!
 //! Render only: nothing reads it but the renderer's shadow frame (`ShadowLights::data_sun`, via `crate::data_sun`), like `decal_sun`'s.
 
-use glam::{Vec2, Vec3};
+use glam::Vec3;
 use nfs_assets::track::TrackGeometry;
 use nfs_formats::crp::Material;
 use std::collections::HashMap;
@@ -52,6 +52,8 @@ const AZ_BIN: f32 = 15.0;
 const NY_BIN: f32 = 0.1;
 /// The fewest faces in a bin.
 const MIN_BIN: usize = 20;
+/// The quantile of the faces' `luma / model` the rule fits on (0.5 = the median; an `APPROXIMATION`, a choice).
+pub const FIT_QUANTILE: f32 = 0.5;
 
 /// What the bake says.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -227,13 +229,13 @@ fn fit_faces(scenery: &[Face], q: f32) -> Option<BakeFit> {
 
 /// The measurement of the module doc.
 pub fn fit(geometry: &TrackGeometry, materials: &[Material]) -> Option<BakeFit> {
-    fit_quantile(geometry, materials, 0.5)
+    fit_quantile(geometry, materials, FIT_QUANTILE)
 }
 
 /// ENHANCEMENT E9 (GATE-REL): the quantile of the drivable ground's `luma / (a + b max(0, n.L))` taken as its lit level (the
 /// ground's bake is lighter than the scenery's: forest's ground faces' ratio has its median at 1.24 and its 90th percentile at
 /// 1.92, where the lit forest road's luma saturates at 1.0; castle 1.17 / 1.34, coastal 0.94 / 1.39, alps 0.90 / 1.35,
-/// farmland 0.93 / 1.14; `examples/bake_gate.rs`). APPROXIMATION: the quantile is a choice.
+/// farmland 0.93 / 1.14; the removed example `bake_gate`, see the history). APPROXIMATION: the quantile is a choice.
 pub const GROUND_LIT_Q: f32 = 0.9;
 
 /// ENHANCEMENT E9 (GATE-REL): the bake's light model for the relative "already baked dark" gate, on every day track (also those
@@ -242,7 +244,7 @@ pub const GROUND_LIT_Q: f32 = 0.9;
 /// Render only.
 pub fn gate_light(geometry: &TrackGeometry, materials: &[Material]) -> Option<nfs_renderer::BakeLight> {
     let (scenery, floor, _) = faces(geometry, materials, false);
-    let f = fit_faces(&scenery, 0.5).filter(|f| f.slope > 0.0)?;
+    let f = fit_faces(&scenery, FIT_QUANTILE).filter(|f| f.slope > 0.0)?;
     let l = -f.direction;
     let mut ratio: Vec<f32> = floor.iter().map(|g| g.luma / (f.intercept + f.slope * g.n.dot(l).max(0.0)).max(0.05)).collect();
     ratio.sort_by(f32::total_cmp);
@@ -250,7 +252,7 @@ pub fn gate_light(geometry: &TrackGeometry, materials: &[Material]) -> Option<nf
     Some(nfs_renderer::BakeLight { to_light: l, base: f.intercept, gain: f.slope, ground })
 }
 
-/// GATE-REL diagnostic (`examples/bake_gate.rs`): per face of the scenery and of the ground, (its baked luma, the fit's luma for
+/// GATE-REL diagnostic (the removed example `bake_gate`, see the history): per face of the scenery and of the ground, (its baked luma, the fit's luma for
 /// its orientation `a + b max(0, n.L)`, `n.L`).
 pub fn face_predictions(geometry: &TrackGeometry, materials: &[Material], fit: &BakeFit) -> (Vec<(f32, f32, f32)>, Vec<(f32, f32, f32)>) {
     let (scenery, floor, _) = faces(geometry, materials, false);
@@ -266,43 +268,10 @@ pub fn face_predictions(geometry: &TrackGeometry, materials: &[Material], fit: &
 /// `stride`-th), those with a track face between them and the light within 150 m against those without - (lit mean luma -
 /// shaded mean luma, lit count, shaded count), per light travel direction given.
 pub fn cast_contrast(geometry: &TrackGeometry, materials: &[Material], lights: &[Vec3], stride: usize) -> Vec<(f32, usize, usize)> {
-    const CELL: f32 = 4.0;
     let (_, floor, tris) = faces(geometry, materials, true);
-    let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
-    for (i, t) in tris.iter().enumerate() {
-        let (lo, hi) = (t[0].min(t[1]).min(t[2]), t[0].max(t[1]).max(t[2]));
-        for x in (lo.x / CELL).floor() as i32..=(hi.x / CELL).floor() as i32 {
-            for z in (lo.z / CELL).floor() as i32..=(hi.z / CELL).floor() as i32 {
-                cells.entry((x, z)).or_default().push(i as u32);
-            }
-        }
-    }
-    let mut stamp = vec![0u32; tris.len()];
-    let mut epoch = 0u32;
-    let mut occluded = |o: Vec3, d: Vec3| -> bool {
-        epoch += 1;
-        let flat = Vec2::new(d.x, d.z).length().max(1e-3);
-        let steps = (150.0 * flat / (CELL * 0.5)).ceil() as i32 + 1;
-        for s in 0..=steps {
-            let p = o + d * (s as f32 * CELL * 0.5 / flat).min(150.0);
-            for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
-                let Some(list) = cells.get(&((p.x / CELL).floor() as i32 + dx, (p.z / CELL).floor() as i32 + dz)) else { continue };
-                for &i in list {
-                    if stamp[i as usize] == epoch {
-                        continue;
-                    }
-                    stamp[i as usize] = epoch;
-                    if ray_hit(o, d, &tris[i as usize]).is_some_and(|h| h > 0.05 && h < 150.0) {
-                        return true;
-                    }
-                }
-            }
-            if p.y > o.y + 40.0 {
-                break;
-            }
-        }
-        false
-    };
+    let occ = crate::gi::Occluders { pos: tris.iter().flatten().copied().collect(), tris: (0..tris.len() as u32).map(|i| [3 * i, 3 * i + 1, 3 * i + 2]).collect(), ..Default::default() };
+    let bvh = crate::gi::Bvh::build(&occ);
+    let occluded = |o: Vec3, d: Vec3| -> bool { bvh.hit(o, d, 0.05, 150.0, &|_| true).is_some() };
     lights
         .iter()
         .map(|t| {
@@ -324,28 +293,6 @@ pub fn cast_contrast(geometry: &TrackGeometry, materials: &[Material], lights: &
             ((mean(sl, nl) - mean(so, no)) as f32, nl, no)
         })
         .collect()
-}
-
-/// Moeller-Trumbore: the ray's distance to the triangle, if it meets it.
-fn ray_hit(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<f32> {
-    let (e1, e2) = (t[1] - t[0], t[2] - t[0]);
-    let p = d.cross(e2);
-    let det = e1.dot(p);
-    if det.abs() < 1e-8 {
-        return None;
-    }
-    let inv = 1.0 / det;
-    let s = o - t[0];
-    let u = s.dot(p) * inv;
-    if !(0.0..=1.0).contains(&u) {
-        return None;
-    }
-    let q = s.cross(e1);
-    let v = d.dot(q) * inv;
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-    Some(e2.dot(q) * inv)
 }
 
 #[cfg(test)]
@@ -377,9 +324,11 @@ mod tests {
     #[test]
     fn a_ray_meets_a_triangle_in_front_only() {
         let t = [Vec3::new(-1.0, 1.0, -1.0), Vec3::new(1.0, 1.0, -1.0), Vec3::new(0.0, 1.0, 1.0)];
-        assert!((ray_hit(Vec3::ZERO, Vec3::Y, &t).unwrap() - 1.0).abs() < 1e-5);
-        assert!(ray_hit(Vec3::ZERO, -Vec3::Y, &t).is_none_or(|h| h < 0.0));
-        assert!(ray_hit(Vec3::new(5.0, 0.0, 0.0), Vec3::Y, &t).is_none());
+        let bvh = crate::gi::Bvh::build(&crate::gi::Occluders { pos: t.to_vec(), tris: vec![[0, 1, 2]], ..Default::default() });
+        let hit = |o: Vec3, d: Vec3| bvh.hit(o, d, 0.05, 150.0, &|_| true);
+        assert!((hit(Vec3::ZERO, Vec3::Y).unwrap().0 - 1.0).abs() < 1e-5);
+        assert!(hit(Vec3::ZERO, -Vec3::Y).is_none());
+        assert!(hit(Vec3::new(5.0, 0.0, 0.0), Vec3::Y).is_none());
     }
 
     /// With the game data: Schwarzwald's bake gives a light (travel azimuth about -162, low), castle's agrees with its sky

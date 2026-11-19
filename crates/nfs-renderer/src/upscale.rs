@@ -20,12 +20,6 @@ use crate::gfx;
 
 mod fsr;
 
-/// ENHANCEMENT E37: `NFS_FSR_NAGA=1` keeps FSR's SPIR-V on naga's front end on Vulkan too (by default Vulkan takes it as it is, the
-/// shader-module passthrough: the SPD image's `Coherent` decoration is kept).
-pub(crate) fn fsr_naga_forced() -> bool {
-    crate::dbg::flags().fsr_naga
-}
-
 #[cfg(target_os = "macos")]
 mod metalfx;
 
@@ -47,16 +41,6 @@ mod metalfx_temporal;
 /// MetalFX guidance: the resolution term alone). See `RE/notes/ENHANCEMENTS.md` (UPSCALE-SOFT) for the stills it was chosen on.
 pub(crate) const TEMPORAL_MIP_EXTRA: f32 = -0.5;
 
-/// TEST GLUE `NFS_UPSCALE_MIP_EXTRA=<f>`: [`TEMPORAL_MIP_EXTRA`] replaced (for A/B stills; read once).
-fn temporal_mip_extra() -> f32 {
-    crate::dbg::flags().upscale_mip_extra.unwrap_or(TEMPORAL_MIP_EXTRA)
-}
-
-/// TEST GLUE `NFS_UPSCALE_MIP=0`: no upscaler LOD bias at all (the frame before UPSCALE-SOFT, for A/B stills; read once).
-fn mip_bias_off() -> bool {
-    crate::dbg::flags().upscale_mip_off
-}
-
 /// ENHANCEMENT UPSCALE-SOFT: the texture LOD bias added to every material's own while the main view is drawn at `render_w` for a
 /// window `display_w` wide by an upscaler (`temporal`: FSR 3.1 / MetalFX temporal; else MetalFX's spatial scaler). The resolution
 /// term `log2(render / display)` picks the mip for the window's pixel, not for the smaller internal one (without it the scene is
@@ -64,11 +48,8 @@ fn mip_bias_off() -> bool {
 /// FSR 1's guide gives the same values for a spatial scaler (-0.58 at 67 %, -1.0 at 50 %). A temporal one adds
 /// [`TEMPORAL_MIP_EXTRA`], at 1:1 too. Never used at level 0 or without an upscaler (nothing is added then).
 pub(crate) fn mip_bias(render_w: u32, display_w: u32, temporal: bool) -> f32 {
-    if mip_bias_off() {
-        return 0.0;
-    }
     let ratio = (render_w.max(1) as f32 / display_w.max(1) as f32).min(1.0);
-    ratio.log2() + if temporal { temporal_mip_extra() } else { 0.0 }
+    ratio.log2() + if temporal { TEMPORAL_MIP_EXTRA } else { 0.0 }
 }
 
 /// The upscaler behind a level.
@@ -133,6 +114,14 @@ pub(crate) fn mark_written(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgp
     queue.submit([enc.finish()]);
 }
 
+/// What [`UpscaleImages::new`] makes: the `surface`'s format of the input image, and the input (internal) and output (window) sizes.
+#[derive(Clone, Copy)]
+pub(crate) struct UpscaleSpec {
+    pub surface: wgpu::TextureFormat,
+    pub input: (u32, u32),
+    pub output: (u32, u32),
+}
+
 /// The images the scaler works between, kept while the sizes hold: the tone-mapped input (internal size,
 /// the surface's format) and the output (window size, the backend's format) with bind groups for the blit.
 pub(crate) struct UpscaleImages {
@@ -145,8 +134,8 @@ pub(crate) struct UpscaleImages {
 }
 
 impl UpscaleImages {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, up: &dyn Upscaler, surface: wgpu::TextureFormat, iw: u32, ih: u32, ow: u32, oh: u32) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, up: &dyn Upscaler, spec: UpscaleSpec) -> Self {
+        let UpscaleSpec { surface, input: (iw, ih), output: (ow, oh) } = spec;
         let make = |label, w, h, format, usage| {
             gfx::texture_2d(device, label, w, h, format, usage)
         };

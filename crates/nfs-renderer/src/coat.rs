@@ -51,6 +51,17 @@ const FACES: u32 = 6;
 /// The filtered mips: 1 .. [`MIPS`].
 const FILTERED: u32 = MIPS - 1;
 
+/// The cube [`CoatFilter::record`] filters: its layer `array` (`format`, `size`²), the faces in `mask`, `tan_inv` and the first layer `base`.
+#[derive(Clone, Copy)]
+pub(crate) struct CoatCube<'a> {
+    pub array: &'a wgpu::Texture,
+    pub format: wgpu::TextureFormat,
+    pub size: u32,
+    pub mask: u8,
+    pub tan_inv: f32,
+    pub base: u32,
+}
+
 pub(crate) struct CoatFilter {
     module: wgpu::ShaderModule,
     layout: wgpu::BindGroupLayout,
@@ -83,35 +94,9 @@ struct LayerSet {
 impl CoatFilter {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
         let module = gfx::wgsl_module(device, "coat prefilter", &source());
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("coat prefilter"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64) },
-                    count: None,
-                },
-            ],
-        });
+        let layout = gfx::bgl(device, "coat prefilter", &[gfx::bgl_float_array(0, true), gfx::bgl_sampler(1, wgpu::SamplerBindingType::Filtering), gfx::bgl_uniform_dynamic(2, std::mem::size_of::<Params>() as u64)]);
         let pipeline_layout = gfx::pipeline_layout(device, "coat prefilter", &[&layout]);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("coat prefilter"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let sampler = gfx::linear_clamp_sampler(device, Some("coat prefilter"));
         let stride = (device.limits().min_uniform_buffer_offset_alignment as u64).max(std::mem::size_of::<Params>() as u64);
         let params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("coat prefilter params"), size: stride * (FILTERED * FACES) as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         Self { module, layout, pipeline_layout, sampler, pipelines: HashMap::new(), params, stride, params_for: None, sets: Vec::new() }
@@ -151,15 +136,11 @@ impl CoatFilter {
         let src = (1..MIPS)
             .map(|m| {
                 let view = array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), base_mip_level: m - 1, mip_level_count: Some(1), base_array_layer: base, array_layer_count: if base == 0 { None } else { Some(FACES) }, ..Default::default() });
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("coat prefilter"),
-                    layout: &self.layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                gfx::bind_group(device, "coat prefilter", &self.layout, &[
+                        gfx::bg_view(0, &view),
+                        gfx::bg_sampler(1, &self.sampler),
                         wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.params, offset: 0, size: wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64) }) },
-                    ],
-                })
+                    ])
             })
             .collect();
         let dst = (1..MIPS)
@@ -173,8 +154,8 @@ impl CoatFilter {
     /// Filter mips 1.. of the faces in `mask` (bit `i` = face `i`) of `array` (`format`, `size`², [`MIPS`] mips, six layers),
     /// reading mip 0 and the mips filtered before; `tan_inv` = `1 / tan(half fov)` of a face. ENHANCEMENT E49: `base` = the first
     /// of the six layers (6: the player's faces of the twelve-layer cube; 0 = E8's cube as ever).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record(&mut self, device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, array: &wgpu::Texture, format: wgpu::TextureFormat, size: u32, mask: u8, tan_inv: f32, base: u32) {
+    pub(crate) fn record(&mut self, device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt, encoder: &mut wgpu::CommandEncoder, cube: CoatCube) {
+        let CoatCube { array, format, size, mask, tan_inv, base } = cube;
         if mask == 0 {
             return;
         }

@@ -8,7 +8,6 @@ license.workspace = true
 nfs-formats.workspace = true
 nfs-assets.workspace = true
 # ENHANCEMENT E41: `hd-export` asks the game which track texture is a shadow projector's map
-nfs-game.workspace = true
 anyhow.workspace = true
 image.workspace = true
 glam.workspace = true

@@ -50,7 +50,7 @@ pub(crate) struct Probe {
 
 /// The probe's compute shader: the mesh shader's SH / luma constants and face table (`classes.rs`), then `probe.wgsl`.
 pub(crate) fn source() -> String {
-    crate::wgsl::compose(&[crate::classes::SH_LUMA, &crate::classes::faces_wgsl(), include_str!("probe.wgsl")])
+    crate::wgsl::compose(&[crate::classes::SH_LUMA, &crate::classes::faces_wgsl(), crate::wgsl::PI, include_str!("probe.wgsl")])
 }
 
 impl Probe {
@@ -117,16 +117,12 @@ impl Probe {
         self.done = true;
         let (layout, partial, state, params) = (&self.layout, &self.partial, &self.state, &self.params);
         let bg = self.bg.get(faces.clone(), || {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("probe"),
-                layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(faces) },
-                    wgpu::BindGroupEntry { binding: 1, resource: partial.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: state.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
-                ],
-            })
+            gfx::bind_group(device, "probe", layout, &[
+                    gfx::bg_view(0, faces),
+                    gfx::bg_buf(1, partial),
+                    gfx::bg_buf(2, state),
+                    gfx::bg_buf(3, params),
+                ])
         });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("probe"), timestamp_writes: crate::prof::cp("E16 probe SH compute") });
