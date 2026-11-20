@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "asset-extractor"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "asset-inspector"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "image",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "car-viewer"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam",
@@ -632,7 +632,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "format-dumper"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "nfs-formats",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "hd-pack"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "image",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "nfs-assets"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "bcdec_rs",
  "glam",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "nfs-audio"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -1182,11 +1182,11 @@ dependencies = [
 
 [[package]]
 name = "nfs-devdata"
-version = "0.1.5"
+version = "0.2.0"
 
 [[package]]
 name = "nfs-formats"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "nfs-devdata",
  "nfs-math",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "nfs-game"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam",
@@ -1216,14 +1216,14 @@ dependencies = [
 
 [[package]]
 name = "nfs-gfxdata"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
 name = "nfs-input"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "core-foundation-sys",
  "nfs-devdata",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "nfs-math"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "glam",
  "libm",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "nfs-net"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "nfs-physics"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "glam",
  "nfs-devdata",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "nfs-renderer"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1698,7 +1698,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "open-unleashed"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -2522,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "track-viewer"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam",

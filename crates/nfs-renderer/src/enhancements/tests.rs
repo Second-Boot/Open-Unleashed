@@ -252,7 +252,10 @@ fn the_real_registry_is_well_formed() {
     assert_eq!((E34.0, E37.0, E38.0, E39.0), (31, 33, 34, 35));
     assert_eq!(REGISTRY[E38.0 as usize].token, "E38");
     assert_eq!(REGISTRY[E39.0 as usize].token, "E39");
-    assert_eq!(E51.0 as usize, REGISTRY.len() - 1); // ENHANCEMENT E51 is the last entry
+    assert_eq!(E52.0 as usize, REGISTRY.len() - 1); // ENHANCEMENT E52 is the last entry
+    assert_eq!(REGISTRY[E52.0 as usize].token, "E52");
+    assert_eq!(REGISTRY[E52.0 as usize].default_level, 1); // the picture wall without seams: on
+    assert_eq!(REGISTRY[E52.0 as usize].levels.len(), 2);
     assert_eq!((E39.0, E40.0, E41.0, E42.0, E43.0, E44.0, E47.0), (35, 36, 37, 38, 39, 40, 41));
     // ENHANCEMENT E48: the steady slope lift of the chase cameras, index 43, on by default, off / on
     assert_eq!(E48.0, 42);

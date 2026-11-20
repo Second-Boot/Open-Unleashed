@@ -237,6 +237,8 @@ switches! {
     E50,
     /// ENHANCEMENT E51 the cars' own sun shadow on dimly baked roads: 0 off, 1 where the sun reaches the car, 2 always (registered after E50; needs E9)
     E51,
+    /// ENHANCEMENT E52 the track room's picture wall without seams: 0 off (the original), 1 on (registered after E51)
+    E52,
 }
 
 /// ENH-LITE: the «лёгкий» (light) preset — the levels a weak (integrated) GPU runs the enhanced game on.
@@ -263,6 +265,7 @@ pub const LITE_PRESET: &[(Switch, u8)] = &[
     (E32, 2), // baked bounce light, medium as the full defaults (baked once per track: no frame cost)
     (E42, 1), // rounded details, soft: load-time CPU (~10 ms a car) and a few thousand triangles, no render pass
     (E43, 1), // contact shadow: stands in for the blob (the light preset has no E9), analytic, a few tenths of a ms
+    (E52, 1), // the picture wall without seams: one matrix scale per panel, free
     (E44, 1), // lighthouse beam: one analytic full-screen pass on coastal only, a few tenths of a ms there
     // no SMAA (E35, +5.6 ms on this GPU)
 ];

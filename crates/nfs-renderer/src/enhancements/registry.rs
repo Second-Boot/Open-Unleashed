@@ -553,4 +553,19 @@ pub const REGISTRY: &[Entry] = &[
         default_level: 1,
         platforms: Platforms::All,
     },
+    // ENHANCEMENT E52: the track room's picture wall without seams (registered after E51; FE-WALLSEAM). The twelve prism panels of
+    // `trackwall.crp` stand 0.0004-0.0011 apart (their pitch is 0.2069-0.2076 and a face is 0.2065 high), so a thin dark line shows
+    // between them when the wall is drawn big; each panel is stretched along its own height by half the gap to its neighbours plus a hair,
+    // so the faces meet. Render only, no data read or written. Off = the original's panels exactly.
+    Entry {
+        token: "E52",
+        name: ["seamless picture wall", "стена с картинками без швов"],
+        help: [
+            "on the track selection screens the big wall of track pictures is built of twelve strips that stand a hair apart, so thin dark lines show between them (more of them the larger the window). With this on each strip is made a hair taller so the neighbours meet and the picture is whole; the photo does not shift or stretch visibly, and the strips still turn over as before. Off is the original's wall with its seams. Only the picture changes",
+            "на экранах выбора трассы большая стена с картинками трасс собрана из двенадцати полос, которые стоят с крошечным зазором, поэтому между ними видны тонкие тёмные линии (чем больше окно, тем их больше). Со включённым улучшением каждая полоса чуть выше, так что соседние смыкаются и картинка цельная; фотография не сдвигается и заметно не растягивается, а полосы переворачиваются, как раньше. Выключено — стена оригинала со швами. Меняется только картинка",
+        ],
+        levels: ON_OFF,
+        default_level: 1,
+        platforms: Platforms::All,
+    },
 ];

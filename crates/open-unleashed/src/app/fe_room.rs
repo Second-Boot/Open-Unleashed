@@ -1108,6 +1108,8 @@ impl App {
         for n in 20..=31u8 {
             self.fe.room[1].1.set_channel_vec(n, [turn, 0.0, 0.0]);
         }
+        // ENHANCEMENT E52 (FE-WALLSEAM): the panels meet; off (also F12 / `NFS_ENH=off`) = the original's panels
+        self.fe.room[1].1.seam_closed = self.renderer.as_ref().is_some_and(|r| r.enhancements().is_on(nfs_renderer::E52));
         use std::f32::consts::TAU;
         let place = |y: f32| Mat4::from_translation(Vec3::new(-pos[0], pos[1], pos[2])) * Mat4::from_rotation_x(xrot * TAU) * Mat4::from_rotation_y(-y * TAU);
         let mut items = self.fe.room[0].1.draw_items_block(nfs_game::world::CarPose::still(place(yrot)), &FRONT_END_PASSES, room_light);

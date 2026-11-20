@@ -204,7 +204,7 @@ fn triangle_bulbs(f: &Fixture, uv: [glam::Vec2; 3], p: [Vec3; 3]) -> Vec<Vec3> {
     out
 }
 
-/// MONACO-TUNNEL round 2 (2026-11-15: "try fewer painted lamps"): along each side of the road, a painted bulb lights only when
+/// MONACO-TUNNEL round 2 (fewer painted lamps): along each side of the road, a painted bulb lights only when
 /// it stands at least this far (m) from the last lit one on that side, walking the slices in order. The luminaires repeat every ~12 m,
 /// so 20 m keeps every second one (~24 m apart on each side): monaco1 99 bulbs -> 51 lamps, the tunnel's frame 17.96 -> 16.4 ms
 /// (with the E47 lookup skip in `lamp_light`). 30 m (35 lamps, 15.75 ms) left the car with one faint shadow or none on some

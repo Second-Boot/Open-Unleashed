@@ -255,10 +255,11 @@ impl Encoder {
             r33 = mac(r33, d[i], d[i + 33]);
         }
         rp[33] = r33;
-        // 0x5973D8…0x597406: the largest positive Rp[5..=32] (strictly greater wins).
+        // 0x5973D8…0x597406: the largest positive Rp[5..=32] (strictly greater wins; `mov ecx, 5` … `cmp ecx, 0x20` / `jle`:
+        // lag 33 is never a candidate, it is only read as Rp[L+1]).
         let mut max = 0.0f64;
         let mut l = 0usize;
-        for (c, &v) in rp.iter().enumerate().skip(5) {
+        for (c, &v) in rp.iter().enumerate().take(33).skip(5) {
             if !(max >= v as f64) {
                 max = v as f64;
                 l = c;
@@ -409,6 +410,24 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A microphone's own hiss (white noise at several levels) never takes the pitch search past the original's last lag 32:
+    /// the search once also tried lag 33 and read Rp[34] (out of bounds) when the noise peaked there, within seconds of capture.
+    #[test]
+    fn white_noise_never_leaves_the_pitch_search() {
+        let mut seed = 0x1234_5678u32;
+        for amp in [1i32, 4, 30, 300, 3000, 30000] {
+            let mut enc = Encoder::new();
+            for _ in 0..400 {
+                let mut pcm = [0i16; FRAME];
+                for s in pcm.iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *s = (((seed >> 16) as i32 % (2 * amp + 1)) - amp) as i16;
+                }
+                let _ = enc.encode(&pcm);
+            }
+        }
+    }
 
     /// FNV-1a 64.
     fn fnv(b: &[u8]) -> u64 {

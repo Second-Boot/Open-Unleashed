@@ -33,7 +33,7 @@ pub(super) const INACTIVE_COLOR: &str = "0xff8a8a8a";
 pub const GROUPS: &[([&str; 2], &[EnhancementSwitch])] = &[
     (["image", "Изображение"], &[E6, E22, E1, E2, E3, E35, E4, E5, E38, E33]),
     (["light and shadows", "Свет и тени"], &[E7, E9, E51, E43, E50, E14, E32, E16, E15, E24, E23, E47]),
-    (["surfaces", "Поверхности"], &[E8, E49, E17, E26, E40, E41, E42]),
+    (["surfaces", "Поверхности"], &[E8, E49, E17, E26, E40, E41, E42, E52]),
     (["atmosphere and effects", "Атмосфера и эффекты"], &[E10, E11, E13, E19, E36, E44, E21, E18, E12]),
     (["camera", "Камера"], &[E27, E28, E29, E48, E31]),
 ];

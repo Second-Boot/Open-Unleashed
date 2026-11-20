@@ -59,6 +59,7 @@ pub(crate) struct Flags {
     /// TEST GLUE `NFS_NEAR_DEBUG=<level>` (ENHANCEMENT E49): the paint shows the reflection alone, 0 = off
     pub near_debug: NearDebug,
     /// ENHANCEMENT E33 diagnostic `NFS_EDR_HEADROOM=<x>`: the display's headroom pretended
+    #[cfg(target_os = "macos")]
     pub edr_headroom: Option<f32>,
     /// ENHANCEMENT E21 TEST GLUE `NFS_EYE_DT=<s>`: the eye adaptation's step fixed (stills independent of the frame rate)
     pub eye_dt: Option<f32>,
@@ -77,6 +78,7 @@ impl Flags {
             fsr_passthrough: std::env::var_os("NFS_FSR_PASSTHROUGH").is_some(),
             temporal_debug: std::env::var("NFS_TEMPORAL_DEBUG").ok(),
             near_debug: NearDebug::from_level(std::env::var("NFS_NEAR_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0)),
+            #[cfg(target_os = "macos")]
             edr_headroom: std::env::var("NFS_EDR_HEADROOM").ok().and_then(|v| v.parse().ok()),
             eye_dt: std::env::var("NFS_EYE_DT").ok().and_then(|v| v.parse().ok()),
         }

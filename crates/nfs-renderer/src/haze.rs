@@ -69,7 +69,7 @@ const LAMP_GAIN: f32 = 4.0;
 /// the stills' luminance: swept 0.1 / 0.2 / 0.35, `RE/notes/ENHANCEMENTS.md` E36).
 pub const DAY_TUNNEL_AIR: f32 = 0.15;
 
-/// ENHANCEMENT E36 (MONACO-TUNNEL, 2026-11-14: "the headlight hot spot is very dense, the road is not visible"): the part of
+/// ENHANCEMENT E36 (MONACO-TUNNEL: the headlight hot spot was very dense and hid the road): the part of
 /// the beams' air density kept inside a covered stretch on a NIGHT track. HAZE-TUNNEL left night tunnels at the whole density
 /// (0.015): monaco1's harbour tunnel showed the same end-on wash over the bonnet as alps' by day (the patch ahead of the car, x 0.4-0.6,
 /// y 0.42-0.58 of a 2560 x 1600 chase still: mean luma 84 with `NFS_ENH=off`, 158 and 21 % clipped by default; in the cockpit view
@@ -85,7 +85,7 @@ const STRONG_GAIN: f32 = 0.8;
 /// How far the march goes at the most, metres (the spot's reach is 70).
 pub const MAX_DISTANCE: f32 = 72.0;
 
-/// PERF (RENDER-AUDIT phase 3, 2026-11-15): the march's image is this fraction of the scene's size in each direction
+/// PERF (RENDER-AUDIT phase 3): the march's image is this fraction of the scene's size in each direction
 /// (it was [`PostTarget::HALF`]): a sixteenth of the pixels march, with the same step count; the composite's depth-aware
 /// upsample keeps the silhouettes. The haze is a smooth glow, so the picture changes only in its fine noise.
 const MARCH_DIV: u32 = PostTarget::QUARTER;

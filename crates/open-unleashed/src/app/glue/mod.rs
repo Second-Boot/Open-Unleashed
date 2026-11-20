@@ -30,4 +30,7 @@ pub(crate) struct Glue {
     /// loop 0x4B6D88 and the front end's round trip), so the second race's `--record` rows can be
     /// compared with a fresh run's. What is left of the session, this race included.
     pub(crate) session_races: u32,
+    /// **TEST GLUE** (SHOT-WINDOW / `NFS_REFL_LIVE`): the scripted run's current tick was drawn as a window frame (E8's faces are
+    /// the frames' own: a still of it does not draw all six afresh)
+    pub(crate) window_frames: bool,
 }

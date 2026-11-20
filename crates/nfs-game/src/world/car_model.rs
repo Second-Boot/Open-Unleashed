@@ -56,6 +56,12 @@ pub struct CarModel {
     /// never moves (`car-model.md`). `R3DCarLOD::draw` picks it at 0x43C98A and turns
     /// `channel_turns[n]` into `Rx·Ry·Rz` about the part's own origin.
     body_channel: Vec<u8>,
+    /// ENHANCEMENT E52 (FE-WALLSEAM): each `body` entry's stretch along its own height (1.0 for none; empty for every model but the
+    /// track room's `trackwall`), from [`wall_seam_stretch`]. Applied by the draw only while [`Self::seam_closed`].
+    seam_stretch: Vec<f32>,
+    /// ENHANCEMENT E52: close the seams between the picture wall's panels (the app sets it each frame from the switch; false = the
+    /// original's panels)
+    pub seam_closed: bool,
     /// The **draw order** of each `body` entry — its article's place in its LOD's part list after
     /// 0x43C1B0's sort. 0x43C1B0 lists a LOD's parts as `{article, lod, Base+70}` in file order and
     /// `std::sort`s them by the byte at `+8`, signed, `a < b` (0x43C35B → 0x43E710 / 0x43E910 /
@@ -492,6 +498,50 @@ impl PartInfo {
     }
 }
 
+/// ENHANCEMENT E52 (FE-WALLSEAM): how much longer each part of the track room's picture wall is drawn so that its panels meet.
+/// The wall's twelve prism panels (`Panel1a…12a`, rotation channels 20…31) sit at `tr` heights 0.2069…0.2076 apart while a face is
+/// 0.2065 high (`examples/wallseam.rs`: gaps 0.0004…0.0011), so the empty strip between two of them shows the dark box behind as a
+/// thin seam, more of them the bigger the window. Each panel gets the stretch (along its own height, about its own origin)
+/// `1 + e / half`, `e` = half the larger gap to its neighbours plus [`SEAM_HAIR`], so neighbours meet and overlap by a hair; the
+/// photo's mapping moves by under half a row of its 16. `body` is the model's parts, `channel` their rotation channels and `half`
+/// the largest `|y|` of each mesh; 1.0 for a part that is no panel.
+fn wall_seam_stretch(body: &[(MeshId, MaterialId, Mat4)], channel: &[u8], half: &[f32]) -> Vec<f32> {
+    let mut out = vec![1.0f32; body.len()];
+    // the panels' distinct heights `(ty, half)`, top first
+    let mut rows: Vec<(f32, f32)> = Vec::new();
+    for (i, part) in body.iter().enumerate() {
+        if !(20..=31).contains(&channel.get(i).copied().unwrap_or(0)) {
+            continue;
+        }
+        let (ty, h) = (part.2.w_axis.y, half.get(i).copied().unwrap_or(0.0));
+        match rows.iter_mut().find(|r| (r.0 - ty).abs() < 1e-4) {
+            Some(r) => r.1 = r.1.max(h),
+            None => rows.push((ty, h)),
+        }
+    }
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (i, part) in body.iter().enumerate() {
+        if !(20..=31).contains(&channel.get(i).copied().unwrap_or(0)) {
+            continue;
+        }
+        let Some(k) = rows.iter().position(|r| (r.0 - part.2.w_axis.y).abs() < 1e-4) else { continue };
+        let (ty, h) = rows[k];
+        if h <= 0.0 {
+            continue;
+        }
+        // the empty strip to the panel above (its bottom to this top) and below (this bottom to its top)
+        let up = if k > 0 { rows[k - 1].0 - rows[k - 1].1 - (ty + h) } else { 0.0 };
+        let down = rows.get(k + 1).map_or(0.0, |n| ty - h - (n.0 + n.1));
+        let e = up.max(down).max(0.0) / 2.0 + SEAM_HAIR;
+        out[i] = 1.0 + e / h;
+    }
+    out
+}
+
+/// ENHANCEMENT E52: how far (model units) a panel reaches past the middle of the gap, so the two neighbours overlap by twice this
+/// (0.0004, about a fifth of a pixel of the biggest wall in a 2560-wide window).
+const SEAM_HAIR: f32 = 0.0002;
+
 /// One `R3DCarLOD::draw` 0x43C830 call of the car draw **0x444E00**: the LOD object (`[R3DCar+0xB0]
 /// [lod − 1]`), the mask its parts' `Base+78` must meet and the flag argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -821,6 +871,8 @@ struct CarParts {
     body: Vec<(MeshId, MaterialId, Mat4)>,
     body_channel: Vec<u8>,
     body_info: Vec<PartInfo>,
+    /// each `body` entry's mesh half height: the largest `|y|` of its vertices (ENHANCEMENT E52, [`wall_seam_stretch`])
+    body_half: Vec<f32>,
     /// each `body` entry's article index, for its place in the LOD list after the loop
     body_art: Vec<usize>,
     wheels: Vec<CarWheelModel>,
@@ -860,6 +912,7 @@ impl CarParts {
         keep_only(&mut self.body, &keep_body);
         keep_only(&mut self.body_channel, &keep_body);
         keep_only(&mut self.body_info, &keep_body);
+        keep_only(&mut self.body_half, &keep_body);
         keep_only(&mut self.body_art, &keep_body);
         keep_only(&mut self.wheels, &keep_wheel);
         keep_only(&mut self.wheel_art, &keep_wheel);
@@ -1346,6 +1399,7 @@ impl CarAccum {
         let crush = damage_geometry.as_ref().and_then(|dg| crush_meshes(car, a, &g, dg, l));
         let mut parts = Vec::new();
         let mut part_channels: Vec<u8> = Vec::new();
+        let mut part_half: Vec<f32> = Vec::new();
         for (k, mm) in article_meshes(&g, l, skipped).into_iter().enumerate() {
             let mut mesh = mm.mesh;
             // the port's own measures (the model box, the tyre radius, the track) come
@@ -1434,6 +1488,7 @@ impl CarAccum {
             }
             parts.push((id, material, local));
             part_channels.push(rot_channel);
+            part_half.push(mesh.vertices.iter().fold(0.0f32, |m, v| m.max(v.position[1].abs())));
         }
         if parts.is_empty() {
             return;
@@ -1450,6 +1505,7 @@ impl CarAccum {
             lists.body_info.extend(std::iter::repeat_n(info, parts.len()));
             lists.body.extend(parts);
             lists.body_channel.extend(part_channels);
+            lists.body_half.extend(part_half);
         }
     }
 }
@@ -1596,6 +1652,7 @@ impl CarModel {
         let CarAccum { mut lists, skipped, min, max, lights, morph, anim_length, wheel_radius, half_track, deform, mut lod_lists, e42, round_static, round_deform, round_stats, .. } = acc;
         let MaterialCache { light: material_light, shadowed, .. } = mats;
         let (body_order, unlisted) = lists.order(&mut lod_lists.list);
+        let seam_stretch = if car.front_end_room && car.model.eq_ignore_ascii_case("trackwall") { wall_seam_stretch(&lists.body, &lists.body_channel, &lists.body_half) } else { Vec::new() };
         let CarParts { body, body_channel, body_info, wheels, .. } = lists;
         if e42 > 0 {
             tracing::info!(level = e42, tris_before = round_stats.0, tris_after = round_stats.1, ms = round_stats.2.as_secs_f32() * 1000.0, "round parts refined (ENHANCEMENT E42)");
@@ -1609,6 +1666,8 @@ impl CarModel {
             front_end: car.front_end_room,
             body,
             body_channel,
+            seam_stretch,
+            seam_closed: false,
             body_order,
             body_info,
             lod_parts: lod_lists.parts,
@@ -2268,6 +2327,12 @@ impl CarModel {
                     // share one model per car type and would otherwise hold the wheel straight.
                     5 => *local * Mat4::from_rotation_z((steer[0] + steer[1]).clamp(-STEERING_WHEEL_LIMIT, STEERING_WHEEL_LIMIT) * std::f32::consts::TAU),
                     n => *local * self.channel_matrix(n),
+                };
+                // ENHANCEMENT E52: the panel stretched along its own height AFTER its turn, in the view's vertical (at each of its three
+                // rest poses the face's ends are at `±half` of that axis); level 0 never takes this branch
+                let m = match self.seam_stretch.get(i).copied() {
+                    Some(s) if self.seam_closed && s != 1.0 => *local * Mat4::from_scale(Vec3::new(1.0, s, 1.0)) * (local.inverse() * m),
+                    _ => m,
                 };
                 items.push((self.body_order.get(i).copied().unwrap_or(u32::MAX), DrawItem::new(*mesh, *material, to_body * m)));
             }

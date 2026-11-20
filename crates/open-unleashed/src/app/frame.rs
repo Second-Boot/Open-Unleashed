@@ -64,13 +64,15 @@ impl App {
         let offscreen = nfs_game::config::cfg().nfs_offscreen_frames.is_set();
         let anim_log = nfs_game::config::cfg().nfs_fe_anim_log.as_str().map(str::to_string);
         let mut frame_px: Option<(u32, u32, Vec<u8>)> = None;
+        // **TEST GLUE** `NFS_WINDOW_SHOT`: this frame is the one to keep (see [`Self::window_shot_due`])
+        let window_shot = if idle { None } else { self.window_shot_due() };
         if !idle
             && let Some(r) = self.renderer.as_mut()
         {
             let drawn = if offscreen {
                 let (w, h) = r.size();
                 r.render_to_image(&self.scene, &render_cam, w, h).map(|px| {
-                    if anim_log.is_some() {
+                    if anim_log.is_some() || window_shot.is_some() {
                         frame_px = Some((w, h, px));
                     }
                 })
@@ -80,6 +82,9 @@ impl App {
             if let Err(e) = drawn {
                 tracing::error!(error = %e, "render failed");
             }
+        }
+        if let Some((out, last)) = window_shot {
+            self.window_shot_write(&out, last, frame_px.take(), &render_cam);
         }
         // **TEST GLUE** `NFS_FE_ANIM_LOG=<dir>[:<ms>[:<every ms>]]`: this frame's animation phases, and the stills at wall-time marks
         if let Some(spec) = anim_log.as_deref() {
@@ -383,6 +388,50 @@ impl App {
                 self.bind_lists();
             self.bind_checks();
             }
+        }
+    }
+}
+
+thread_local! {
+    /// **TEST GLUE** `NFS_WINDOW_SHOT`: how many of its ticks have been written
+    static WINDOW_SHOTS_DONE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl App {
+    /// **TEST GLUE** (not the original's) `NFS_WINDOW_SHOT=<prefix>@<t1>,<t2>,…` (ascending game ticks; with `--follow` and no
+    /// `--autotest`, a windowed race that drives itself): the windowed loop's own frame drawn at the first frame whose game tick
+    /// reached each `t`, written as `<prefix>.w<tick>.png` — the reference a scripted still of the same tick (`--screenshot`,
+    /// `NFS_SHOT_TICKS`) is compared with; the process ends after the last one. With `NFS_OFFSCREEN_FRAMES=1` it is the very
+    /// image the frame drew (a hidden scripted window gives no drawable); without it the frame's scene drawn once more into an
+    /// image of the window's size right after the frame. Not during a replay. `Some((path, last))` when this frame is one.
+    fn window_shot_due(&self) -> Option<(String, bool)> {
+        let spec = nfs_game::config::cfg().nfs_window_shot.as_str()?;
+        let (prefix, ticks) = spec.rsplit_once('@')?;
+        let ticks: Vec<u64> = ticks.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        let replaying = self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
+        if self.vehicle.is_none() || self.race.is_none() || replaying {
+            return None;
+        }
+        let done = WINDOW_SHOTS_DONE.with(std::cell::Cell::get);
+        let due = ticks.get(done).is_some_and(|&t| self.tick >= t);
+        due.then(|| (format!("{prefix}.w{}.png", self.tick), done + 1 >= ticks.len()))
+    }
+
+    /// **TEST GLUE** `NFS_WINDOW_SHOT`: writes this frame's image (`px`, the offscreen frame's own) or, without one, the frame's
+    /// scene drawn again at the window's size; ends the process after the last.
+    fn window_shot_write(&mut self, out: &str, last: bool, px: Option<(u32, u32, Vec<u8>)>, cam: &Camera) {
+        WINDOW_SHOTS_DONE.with(|c| c.set(c.get() + 1));
+        let px = px.or_else(|| {
+            let r = self.renderer.as_mut()?;
+            let (w, h) = r.size();
+            r.render_to_image(&self.scene, cam, w, h).ok().map(|px| (w, h, px))
+        });
+        if let Some((w, h, px)) = px {
+            let _ = image::save_buffer(out, &px, w, h, image::ColorType::Rgba8);
+            tracing::info!(path = out, tick = self.tick, w, h, eye = ?cam.position, target = ?cam.target, "NFS_WINDOW_SHOT: the window's frame written");
+        }
+        if last {
+            std::process::exit(0);
         }
     }
 }

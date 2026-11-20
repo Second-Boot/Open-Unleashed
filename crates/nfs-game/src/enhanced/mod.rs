@@ -18,7 +18,7 @@
 use nfs_assets::paths::GamePaths;
 use nfs_formats::locale::{Strings, typed_char};
 use nfs_renderer::{ENHANCEMENT_REGISTRY, EnhancementStored, EnhancementSwitch, Enhancements, MAX_ENHANCEMENT_LEVELS};
-use nfs_renderer::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E21, E22, E23, E24, E26, E27, E28, E29, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51};
+use nfs_renderer::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E21, E22, E23, E24, E26, E27, E28, E29, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, E52};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::PathBuf;

@@ -32,7 +32,7 @@ pub(super) const GATE_REL: f32 = 2.0;
 /// GATE-REL (APPROXIMATION): the drivable ground's lit level, as a share of `BakeLight::ground` (its 90th percentile). At 1.0 a dim
 /// forest road under the trees counts as baked shade and takes nearly no shadow (the trees before the covered bridge cast none, as
 /// with the absolute gate; by comparing stills of the forest); 0.65 put it near the
-/// ground's median (forest 1.92 x 0.65 = 1.25 against a median of 1.24). SHADOW-UNIFY (2026-11-18, by sheet): 0.80 keeps the
+/// ground's median (forest 1.92 x 0.65 = 1.25 against a median of 1.24). SHADOW-UNIFY (chosen by comparing stills): 0.80 keeps the
 /// forest canopy's dappled stripes and still shades the road under the trees before the covered bridge and at the rock / bush seam.
 pub(super) const GATE_REL_GROUND_SCALE: f32 = 0.80;
 /// ENHANCEMENT ENH-SHPOP: where the last cascade starts to fade out, as a share of its end (was 0.85: a 33 m ramp at 220 m)
@@ -61,7 +61,7 @@ pub(in crate::gpu) enum ShadowMode {
     Sun { casters: crate::SceneryCasters, baked_gate: crate::BakedGate },
     /// ENHANCEMENT E51 (CORSICA-SUN): a sunless track's data sun with the cars alone: the near cascades only, the scenery casts
     /// nothing (its shade is baked / in the decals)
-    /// `small` (CANYON-SMALLSH, 2026-11-18): the small upright scenery parts (signs, posts, rails, walls, bushes: `SceneryCasters::Small`)
+    /// `small` (CANYON-SMALLSH): the small upright scenery parts (signs, posts, rails, walls, bushes: `SceneryCasters::Small`)
     /// that also cast into the same near cascades; everything else of the frame (cascades, strength, gate, floor, the cars' shadow) is
     /// the cars-only frame's own
     CarsOnly { small: Option<crate::SceneryCasters> },
@@ -69,12 +69,12 @@ pub(in crate::gpu) enum ShadowMode {
     Moon { level: u8 },
 }
 
-/// SHADOW-UNIFY (2026-11-18: one shadow mode for every sun track): the sky sun's baked-dark gate is GATE-REL's relative one,
+/// SHADOW-UNIFY (one shadow mode for every sun track): the sky sun's baked-dark gate is GATE-REL's relative one,
 /// as the data sun's ([`ShadowMode::pick`] falls back to the absolute gate when the track has no bake light, a data rule).
 /// (The comparison switch `NFS_SKY_SUN_GATE` was removed 2026-11-19, REFACTOR-0119.)
 const SKY_SUN_GATE: crate::BakedGate = crate::BakedGate::Relative;
 
-/// ENHANCEMENT E9 (SHADOW-FLOOR, 2026-11-18; APPROXIMATION, an enhancement's look): a sun frame's shadow may not darken a
+/// ENHANCEMENT E9 (SHADOW-FLOOR; APPROXIMATION, an enhancement's look): a sun frame's shadow may not darken a
 /// receiver below the bake's own ambient share. The bake light's fit (`luma = a + b max(0, n.L)`, [`crate::BakeLight`] `base` /
 /// `gain`) says a face turned away from the bake's light keeps `a` of a lit face's `a + b`: that is the light a shadow leaves. So
 /// the frame's darkness (`params.x`, [`GROUND_STRENGTH`]: the track receivers and the cars' shadows on them, E51's cars-only frame

@@ -155,6 +155,10 @@ switches! {
     nfs_offscreen_frames = "NFS_OFFSCREEN_FRAMES",
     // TEST GLUE: a windowed front end's per-frame animation phases and wall-time stills (`app/frame.rs` `fe_anim_log`)
     nfs_fe_anim_log = "NFS_FE_ANIM_LOG",
+    // TEST GLUE: the windowed loop's frame at given game ticks of a self-driving race (`app/frame.rs` `window_shot_due`)
+    nfs_window_shot = "NFS_WINDOW_SHOT",
+    // TEST GLUE: a scripted still taken as the window shows its tick (`app/glue/scripted.rs` `shot_window`)
+    nfs_shot_window = "NFS_SHOT_WINDOW",
     // TEST GLUE: a scripted still taken as if that many milliseconds of frames had followed its tick (`app/scripted.rs`)
     nfs_shot_settle = "NFS_SHOT_SETTLE",
     nfs_pa_input = "NFS_PA_INPUT",

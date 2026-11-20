@@ -400,6 +400,33 @@ fn refl_live_from() -> Option<u64> {
     *FROM.get_or_init(|| nfs_game::config::cfg().nfs_refl_live.as_str().and_then(|v| v.trim().parse().ok()))
 }
 
+/// **TEST GLUE** (SHOT-WINDOW, not in the original): how many game ticks of window frames precede a scripted still (3 s): the
+/// HUD's trays slide in over 11 ticks of drawn frames, E51's car-sun ease (0.17 s), E9's cover gate (0.5 s), E16's probe blend and
+/// E21's adaptation settle well within it.
+const SHOT_WINDOW_TICKS: u32 = 192;
+
+/// **TEST GLUE** (SHOT-WINDOW, not in the original): whether a scripted still is taken as the window shows its tick. A scripted run
+/// draws no frames, so everything a window advances once a frame stayed where the race's start left it: the HUD's trays never slid
+/// in (`tray_slides`), the cars' animations kept their first pose (the wing down, `update_damage_decals`), and the renderer's
+/// per-frame state (E51's car-sun ease, E9's cover gate, E16's probe, E21's adaptation, E8's faces) started from its first frame.
+/// With it the run steps the cars' animations every tick and draws the window's frames over the last [`SHOT_WINDOW_TICKS`] before
+/// the still (`NFS_SHOT_TICKS`' ticks too), so the still is the `NFS_WINDOW_SHOT` frame of the same tick (`RE/notes/ENHANCEMENTS.md`
+/// "Stills and the window"). On for a `--screenshot` or `NFS_SHOT_TICKS` run with an enhancement on; `NFS_SHOT_WINDOW=0` turns it
+/// off, `=1` turns it on with `NFS_ENH=off` too (the original's still set stays as it was: byte-identical).
+fn shot_window(screenshot: bool, enhanced: bool) -> bool {
+    let wanted = screenshot || nfs_game::config::cfg().nfs_shot_ticks.is_set();
+    match nfs_game::config::cfg().nfs_shot_window.as_str().map(str::trim) {
+        Some("0") => false,
+        Some("1") => wanted,
+        _ => wanted && enhanced,
+    }
+}
+
+/// **TEST GLUE** (SHOT-WINDOW): the game ticks `NFS_SHOT_TICKS=<prefix>@t1,t2,…` lists.
+fn shot_ticks_listed() -> Vec<u64> {
+    nfs_game::config::cfg().nfs_shot_ticks.as_str().and_then(|s| s.rsplit_once('@')).map_or_else(Vec::new, |(_, t)| t.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+}
+
 /// **TEST GLUE** (not in the original): set by `main` from `--perf-bench <frames>` (0 = off): a `--screenshot` run draws
 /// the still's frame again and again before the still and times it ([`App::run_perf_bench`]).
 pub(crate) static PERF_BENCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -605,6 +632,10 @@ impl App {
         let mut cam_log = cam_log;
         // the game tick of the last drawn frame's animation step (TEST GLUE, below)
         let mut anim_tick = self.tick;
+        // **TEST GLUE** (SHOT-WINDOW): a still of this run is taken as a window shows that tick (see [`shot_window`])
+        let window = shot_window(self.glue.screenshot.is_some(), self.enh.any_on());
+        let shot_ticks: Vec<u64> = if window { shot_ticks_listed() } else { Vec::new() };
+        self.glue.window_frames = false;
         for t in 0..ticks {
             self.net_race_notice();
             // **TEST GLUE** `NFS_NET_LOCKSTEP=<D>`: the remote cars' blocks arrive at fixed receiver ticks (`NetPlay::lockstep_wait`)
@@ -678,7 +709,11 @@ impl App {
             }
             // **TEST GLUE** `NFS_REFL_LIVE=<tick>`: from that game tick on, a frame every tick (see [`refl_live_from`])
             let live = refl_live_from().is_some_and(|from| self.tick >= from);
-            if (smack_frames && t % 2 == 1) || live {
+            // **TEST GLUE** (SHOT-WINDOW): the window's frames of the last [`SHOT_WINDOW_TICKS`] before the `--screenshot` still and
+            // before each `NFS_SHOT_TICKS` tick, one a tick, as `NFS_REFL_LIVE` draws them
+            let warm = window && (ticks - t <= SHOT_WINDOW_TICKS || shot_ticks.iter().any(|&s| s >= self.tick && s - self.tick < u64::from(SHOT_WINDOW_TICKS)));
+            self.glue.window_frames = live || warm;
+            if (smack_frames && t % 2 == 1) || live || warm {
                 // the windowed frame's billboard key first, as `RedrawRequested` takes it
                 self.billboard_key_frame();
                 self.rebuild_scene();
@@ -693,10 +728,18 @@ impl App {
                 let dt = if self.tick >= anim_tick { (ms(self.tick) - ms(anim_tick)) as u32 } else { 16 };
                 anim_tick = self.tick;
                 self.update_damage_decals(dt);
-                if live {
+                if live || warm {
                     self.refl_live_frame();
                 }
                 self.shot_at_tick();
+            } else if window {
+                // **TEST GLUE** (SHOT-WINDOW): the cars' real-time animations a window steps every frame (the wing off the speed
+                // gate, the pop-up lamps, the driver's arms) run through the whole race, so their state at the still is the
+                // window's (the wing stays up from an earlier fast stretch), one step a tick
+                let ms = |k: u64| k * 1000 / 64;
+                let dt = if self.tick >= anim_tick { (ms(self.tick) - ms(anim_tick)) as u32 } else { 16 };
+                anim_tick = self.tick;
+                self.update_damage_decals(dt);
             }
             let phase = t as f32 / ticks as f32;
             if t % 2 == 0 {
@@ -952,7 +995,7 @@ impl App {
             .expect("offscreen render");
         image::save_buffer(&path, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8)
             .expect("write png");
-        tracing::info!(target: "open_unleashed::app::race_start", path, "screenshot written");
+        tracing::info!(target: "open_unleashed::app::race_start", path, tick = self.tick, eye = ?self.camera.position, "screenshot written");
         // **TEST GLUE** (not in the original): `NFS_SHOT_SEQ=<n>` also writes the frames a windowed
         // run draws between this tick and the next — `<shot>.seq<k>.png` at the interpolation
         // fraction k / n (the mirror rebuilt with each, as a frame does), k = 0…n − 1
@@ -1198,7 +1241,7 @@ impl App {
         // **TEST GLUE**: nor the environment faces of E8 (E49) — the still's paint reflected nothing; all six are drawn from the
         // car's place now (a scripted run's frames do not keep them up to date). With `NFS_REFL_LIVE` they are: the still shows
         // the faces as the frames left them (this tick's own faces drawn by its frame, [`Self::refl_live_frame`])
-        if !refl_live_from().is_some_and(|from| self.tick >= from) {
+        if !self.glue.window_frames {
             self.refl.refl_done = 0;
             self.render_reflections();
         }

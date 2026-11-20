@@ -9,8 +9,8 @@ use nfs_game::spatial::ViewCone;
 use nfs_renderer::{Lamps, StreetLamp, MAX_LAMPS};
 
 /// AUTOBAHN-LAMPS / SHADOW-UNIFY: whether `track` lights its open street lamps by day: a day track with no sun from any source
-/// (`nfs_game::data_sun::dusk_lamps`, `TrackWorld::dusk_lamps`: a data rule, APPROXIMATION; it was a per-track choice
-/// for autobahn until SHADOW-UNIFY; the per-track override `NFS_DUSK_TRACKS` was removed 2026-11-19, REFACTOR-0119). No world (the
+/// (`nfs_game::data_sun::dusk_lamps`, `TrackWorld::dusk_lamps`: a data rule, APPROXIMATION; it was a per-track
+/// choice for autobahn until SHADOW-UNIFY; the per-track override `NFS_DUSK_TRACKS` was removed 2026-11-19, REFACTOR-0119). No world (the
 /// front end): none.
 pub(crate) fn dusk_lamps(world: Option<&nfs_game::world::TrackWorld>) -> bool {
     world.is_some_and(|w| w.dusk_lamps)
@@ -122,7 +122,7 @@ impl App {
                 pos: s.pos,
                 color: [s.color[0] * k, s.color[1] * k, s.color[2] * k],
                 radius: s.radius * scale,
-                // MONACO-TUNNEL round 2 (2026-11-15): every tunnel lamp's light is in its tube's bake, so its shadow takes its
+                // MONACO-TUNNEL round 2: every tunnel lamp's light is in its tube's bake, so its shadow takes its
                 // share of the bake too (alps, coastal, castle, canyon, autobahn, the monaco bnut tunnel, industrial's)
                 baked: s.painted || s.tunnel,
             };

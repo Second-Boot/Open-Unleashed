@@ -261,6 +261,7 @@ impl App {
                 screenshot,
                 autotest,
                 session_races: nfs_game::config::cfg().nfs_autotest_races.as_str().and_then(|v| v.trim().parse().ok()).unwrap_or(1),
+                window_frames: false,
                 test_alpha: None,
             },
             registry: nfs_formats::fetxt::Registry::load(&paths.root),

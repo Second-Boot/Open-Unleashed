@@ -10,7 +10,7 @@
 //! last mip added onto the scene with the level's intensity. All of it is plain wgpu / WGSL
 //! (`Rgba16Float` render + blend + filter, which `hdr_ok` already checked for E7).
 //!
-//! PERF (RENDER-AUDIT phase 3, 2026-11-15): that last add is not a pass of its own (a full-size read-modify-write of
+//! PERF (RENDER-AUDIT phase 3): that last add is not a pass of its own (a full-size read-modify-write of
 //! the float scene) but part of the tone map ([`TONE_WGSL`]: the same tent and E28 dirt, summed in f32 where the pass stored
 //! the sum in half floats); E21's eye measure, which used to read the scene after the add, adds the chain's first mip itself
 //! ([`TONE_WGSL`]'s `bloom_coarse`).

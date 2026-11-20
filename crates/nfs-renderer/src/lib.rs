@@ -26,8 +26,7 @@ mod camera;
 mod camfx;
 mod classes;
 mod coat;
-// every diagnostic it holds is macOS-only (EDR)
-#[cfg(target_os = "macos")]
+// the diagnostics and test switches (the EDR ones inside are macOS-only)
 mod dbg;
 mod dof;
 mod drops;
@@ -62,7 +61,7 @@ pub use lbeam::{LBeam, LBeams, MAX_LBEAMS};
 pub use scene_env::*;
 pub use scene_lights::*;
 pub use shafts::Shafts;
-pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E21, E23, E24, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
+pub use enhancements::{E1, E2, E3, E4, E5, E6, E7, E8, E9, E12, E10, E11, E16, E15, E13, E17, E14, E18, E19, E21, E23, E24, E22, E27, E28, E29, E26, E31, E32, E33, E34, E34_TEMPORAL_LEVELS, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E47, E48, E49, E50, E51, E52, UP_OFF, UP_METALFX, UP_FSR, upscaler_choices, MfxMode, mfx_mode, mfx_scale_index, mfx_scale_count, mfx_level, mfx_switch_mode, fsr_scale_index, fsr_sharpness, msaa_samples_wanted, render_scale, fov_bonus_deg, draw_reach, tonemap_mode, shaft_strength, rain_gain, street_lamp_pool, Cond as EnhancementCond, hd_textures_available, set_hd_textures_available, DEPENDS as ENHANCEMENT_DEPENDS, Dependency as EnhancementDependency, Blocked as EnhancementBlocked, Enhancements, GpuClass, classify_gpu, LITE_PRESET, Entry as EnhancementEntry, visible_count as enhancement_visible_count, visible_index as enhancement_visible_index, MAX_LEVELS as MAX_ENHANCEMENT_LEVELS, MAX_SWITCHES as MAX_ENHANCEMENTS, ON_OFF as ENHANCEMENT_ON_OFF, REGISTRY as ENHANCEMENT_REGISTRY, Stored as EnhancementStored, Switch as EnhancementSwitch};
 pub use front::{EnvFace, Renderer};
 pub use mipgen::MipAlpha;
 /// ENHANCEMENT E41: the E2 mip chain generator (levels 1.. of a base image), for the HD textures' own chains

@@ -8,7 +8,7 @@ use crate::*;
 /// APPROXIMATION (enhancement content, chosen by eye on the monaco1 stills: no original counterpart; Industrial, whose sky's sun
 /// object is on at night, has no moon at all since SHADOW-OVERCAST: its sky layers cover it, `TrackWorld::sky_blocks_sun`).
 pub(crate) const MOON_LIGHT: Vec3 = Vec3::new(-0.55, -0.75, 0.35);
-/// ENHANCEMENT E50 (SHADOW-OVERCAST, 2026-11-16): E50's «слабо» level, the highest a capped track's moon is drawn at.
+/// ENHANCEMENT E50 (SHADOW-OVERCAST): E50's «слабо» level, the highest a capped track's moon is drawn at.
 const MOON_WEAK: u8 = 1;
 /// ENHANCEMENT E9 / E51 (SHADOW-OVERCAST): how many slices either side of the camera's the sky data's precipitation is averaged
 /// over (about 120 m each way at the 6 m slices): the data's own snow steps (alps: 0 -> 1 over the four slices 644..648, the 0.3

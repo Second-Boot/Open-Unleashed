@@ -24,7 +24,7 @@ The settings are kept in `enhancements.json` in the saves folder.
 | Light | HDR and tone mapping, glow, a bright sun, eye adaptation, global illumination, corner shading (AO), light from the surroundings on the cars |
 | Shadows | sun shadows (also the cars' own on dimly lit roads; they fade in snowfall and rain), moonlight on the Monaco night tracks, contact shadows under the cars, headlights and street lamps that light the road, the cars' shadows from the street and tunnel lamps, headlights in tunnels |
 | Atmosphere | fog and sky, haze and headlight beams, light shafts, the lighthouse beam, water, wet road and rain, raindrops on the windscreen |
-| Cars | clear coat on the body with reflections of the nearby surroundings, lamps and cars, rounded wheels and details |
+| Cars | clear coat on the body with reflections of the nearby surroundings, lamps and cars, rounded wheels and details, the track-selection picture wall without seams between its strips |
 | Camera | motion blur, depth of field in replays, lens dirt, camera shake, a steady chase camera on slopes |
 | Textures | HD textures (see below) |
 | Display | HDR output on HDR screens (macOS EDR) |
