@@ -235,8 +235,8 @@ pub const REGISTRY: &[Entry] = &[
         token: "E22",
         name: ["frame rate limit", "ограничение FPS"],
         help: [
-            "holds the game to at most this many frames a second (frame pacing only: the simulation keeps its 64 Hz tick); \"display\" is the screen's own refresh rate (with the frame output on «off» the display's sync already does that); \"auto\" is 60 on the battery and \"display\" on mains power (a laptop stays cool and quiet unplugged). The NFS_FPS_CAP variable still wins",
-            "ограничивает игру этим числом кадров в секунду (только темп кадров: симуляция остаётся на своих 64 Гц); «по экрану» - частота обновления самого экрана (при выводе кадров «выкл» это уже делает синхронизация экрана); «авто» - 60 от батареи и «по экрану» от сети (ноутбук без розетки не греется и не шумит). Переменная NFS_FPS_CAP главнее",
+            "holds the game to at most this many frames a second (frame pacing only: the simulation keeps its 64 Hz tick); \"display\" is the screen's own refresh rate (with the frame output on «off» the display's sync already does that); \"auto\" is about 60 on the battery (a whole fraction of the screen's rate: 72 on a 144 Hz screen, so every frame stays up equally long) and \"display\" on mains power (a laptop stays cool and quiet unplugged). The NFS_FPS_CAP variable still wins",
+            "ограничивает игру этим числом кадров в секунду (только темп кадров: симуляция остаётся на своих 64 Гц); «по экрану» - частота обновления самого экрана (при выводе кадров «выкл» это уже делает синхронизация экрана); «авто» - около 60 от батареи (целая доля частоты экрана: на 144 Гц это 72, чтобы кадры держались на экране одинаково) и «по экрану» от сети (ноутбук без розетки не греется и не шумит). Переменная NFS_FPS_CAP главнее",
         ],
         levels: &[["off", "выкл"], ["30", "30"], ["60", "60"], ["120", "120"], ["240", "240"], ["display", "по экрану"], ["auto (60 on battery)", "авто (60 от батареи)"]],
         // 2026-10-04: «auto» (60 on battery, the display rate on power)

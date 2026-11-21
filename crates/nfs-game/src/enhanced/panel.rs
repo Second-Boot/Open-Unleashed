@@ -50,10 +50,13 @@ pub enum VRow {
     MfxScale,
     /// FSR «масштаб»: 1:1 / 1.5x / 1.7x / 2x (E37 levels 1..=4)
     FsrScale,
+    /// ENH-VIEW «графика»: enhanced / as the original — the `0` key's view as a row (the first line of the panel); it shows and
+    /// flips what the screen draws and leaves the stored levels alone
+    View,
 }
 
 impl VRow {
-    pub const ALL: [VRow; 3] = [VRow::MfxMode, VRow::MfxScale, VRow::FsrScale];
+    pub const ALL: [VRow; 4] = [VRow::MfxMode, VRow::MfxScale, VRow::FsrScale, VRow::View];
 
     /// The accessor the row's combo binds (after [`ACCESSOR_PREFIX`]).
     pub fn accessor(self) -> &'static str {
@@ -61,6 +64,7 @@ impl VRow {
             VRow::MfxMode => "Enh.MFXMODE",
             VRow::MfxScale => "Enh.MFXSCALE",
             VRow::FsrScale => "Enh.FSRSCALE",
+            VRow::View => "Enh.VIEW",
         }
     }
 
@@ -86,14 +90,15 @@ impl VRow {
 
 /// The captions of the virtual rows' levels `[English, Russian]`; MfxScale's first entry (1:1) is temporal only, so the simple mode
 /// shows the slice from the second.
-pub const VROW_LEVELS: [(VRow, &[[&str; 2]]); 3] = [
+pub const VROW_LEVELS: [(VRow, &[[&str; 2]]); 4] = [
     (VRow::MfxMode, &[["temporal", "временной"], ["simple", "простой"]]),
     (VRow::MfxScale, &[["1:1 (anti-aliasing only)", "1:1 (только сглаживание)"], ["67 % (quality)", "67 % (качество)"], ["59 % (balanced)", "59 % (баланс)"], ["50 % (performance)", "50 % (производительность)"]]),
     (VRow::FsrScale, &[["1:1 (anti-aliasing only)", "1:1 (только сглаживание)"], ["1.5x (quality)", "1.5x (качество)"], ["1.7x (balanced)", "1.7x (баланс)"], ["2x (performance)", "2x (производительность)"]]),
+    (VRow::View, &[["enhanced", "улучшенная"], ["as in the original", "как в оригинале"]]),
 ];
 
 /// The captions and helps of the virtual rows `[English, Russian]`.
-pub const VROW_TEXTS: [(VRow, [&str; 2], [&str; 2]); 3] = [
+pub const VROW_TEXTS: [(VRow, [&str; 2], [&str; 2]); 4] = [
     (
         VRow::MfxMode,
         ["mode", "режим"],
@@ -118,6 +123,14 @@ pub const VROW_TEXTS: [(VRow, [&str; 2], [&str; 2]); 3] = [
             "во сколько раз размер окна больше размера, в котором рисуется сцена: 1:1 только сглаживает края, 1.5x / 1.7x / 2x рисуют меньше и экономят работу видеокарты. Масштаб рендера не действует, пока включен апскейлер",
         ],
     ),
+    (
+        VRow::View,
+        ["graphics", "графика"],
+        [
+            "enhanced: the rows below are on; as in the original: the original's picture, the rows below are kept for the way back. The same as the 0 key; the choice is remembered for the next start",
+            "улучшенная: действуют строки ниже; как в оригинале: картинка оригинала, строки ниже сохраняются, чтобы к ним вернуться. То же, что клавиша 0; выбор запоминается до следующего запуска",
+        ],
+    ),
 ];
 
 /// One line of the panel.
@@ -134,7 +147,8 @@ pub enum Item {
 /// The lines of every group for a set, header first. The upscaler's settings rows follow E38 and only those of the CHOSEN backend
 /// (MetalFX exists on macOS only); entries the platform has no backend for are not listed.
 pub fn group_items(state: &Enhancements) -> Vec<Vec<Item>> {
-    GROUPS
+    // ENH-VIEW: the «графика» row heads the first page, a group of its own (no header)
+    std::iter::once(vec![Item::Virtual(VRow::View)]).chain(GROUPS
         .iter()
         .enumerate()
         .map(|(g, (_, switches))| {
@@ -155,7 +169,7 @@ pub fn group_items(state: &Enhancements) -> Vec<Vec<Item>> {
                 }
             }
             v
-        })
+        }))
         .collect()
 }
 

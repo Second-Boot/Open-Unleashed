@@ -14,6 +14,12 @@
 *.sim
 *.exe
 *.dll
+*.mad
+*.tpg
+*.qfs
+madtables.bin
+# a game data folder beside the build (packaging / a local run)
+/game/
 
 # Python bytecode
 __pycache__/
@@ -22,3 +28,5 @@ __pycache__/
 # ENHANCEMENT E41: the HD texture pack (big binaries, made from the original textures: never committed, never public)
 /enhanced/hd_textures/
 /remaster/hd_textures/
+/hd_textures
+*.ktx2

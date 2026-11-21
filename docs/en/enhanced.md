@@ -2,7 +2,7 @@
 
 **English** | [Русский](../ru/enhanced.md)
 
-The game is the faithful engine with improvements to the picture, on by default. Each improvement has its own switch;
+The game is the faithful engine with improvements to the picture. They are off on the first start (the original's graphics): the **0** key or the panel's **graphics** row turns them on, and the choice is remembered. Each improvement has its own switch;
 The **0** key shows the original's graphics at once, and with all of them off the game is the original, frame for frame.
 Gameplay, physics, the AI and the network protocol are never changed, so the switches do not stop anyone racing each
 other.
@@ -11,7 +11,9 @@ other.
 
 - **In the game:** Options → Graphics → **Enhancements** — one row per improvement, with a short explanation, and three
   presets: **default**, **light** (for weaker GPUs) and **like the original**.
-- The **0** key switches everything between your settings and the original, live — handy for comparing.
+- The **0** key switches everything between your settings and the original, live — handy for comparing. The panel's
+  first row, **graphics** (enhanced / as in the original), shows which one is on and switches it too. The choice is
+  remembered for the next start, and your settings are kept for the way back.
 - From the command line: `NFS_ENH=off` starts as the original, `NFS_ENH=all` with everything on.
 
 The settings are kept in `enhancements.json` in the saves folder.

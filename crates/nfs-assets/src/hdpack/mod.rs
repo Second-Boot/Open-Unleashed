@@ -194,10 +194,11 @@ impl HdPack {
             return Self::open_in_root(Path::new(&d));
         }
         let exe = std::env::current_exe().ok();
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut c = candidates(exe.as_deref(), &paths.root);
-        if cfg!(debug_assertions) {
-            c.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../enhanced/hd_textures"));
-        }
+        // (`#[cfg]`, not `cfg!`: a release binary must not carry the build machine's path)
+        #[cfg(debug_assertions)]
+        c.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../enhanced/hd_textures"));
         c.into_iter().find_map(|d| Self::open_in_root(&d))
     }
 

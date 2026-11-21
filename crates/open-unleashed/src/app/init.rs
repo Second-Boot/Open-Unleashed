@@ -61,6 +61,8 @@ pub(crate) struct AppInit<'a> {
     // ENHANCEMENT framework: the switches and the mode `run` read at start-up
     pub(crate) enh: nfs_renderer::Enhancements,
     pub(crate) enh_mode: nfs_game::enhanced::Mode,
+    /// ENH-VIEW: the player's set kept behind the original-look view the last run ended in (`None`: no view)
+    pub(crate) enh_stash: Option<nfs_renderer::Enhancements>,
 }
 
 impl App {
@@ -113,6 +115,7 @@ impl App {
             sound_set,
             enh,
             enh_mode,
+            enh_stash,
         } = init;
         App {
             net_launch: Default::default(),
@@ -514,7 +517,7 @@ impl App {
             slot_key_enters: 0,
             enh,
             enh_mode,
-            enh_stash: None,
+            enh_stash,
             enh_panel_dirty: false,
             enh_live_dirty: false,
             enh_live_cache: Default::default(),

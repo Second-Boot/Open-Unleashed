@@ -41,10 +41,18 @@ impl App {
                 // Apple Silicon; or software) gets the light preset, any other the full defaults. Logged once;
                 // nothing is written (the file appears at the first change in the panel), so it is the same
                 // choice every start until the player picks one.
+                // ENH-OPTIN (the enhancements are tried on little hardware so far: the player turns them on knowingly): that set is the
+                // player's to come back to, and the first run shows the original's look (the ENH-VIEW view): the `0` key or the
+                // panel's «графика» row turns the set on, and from then on `enhancements.json` keeps the choice.
                 if nfs_game::enhanced::auto_pending() && self.enh_mode == nfs_game::enhanced::Mode::Normal {
                     let (set, class) = nfs_game::enhanced::auto_set(renderer.gpu_class());
-                    tracing::info!(gpu_class = ?class, enhancements = %set.describe(), "first run: enhancement set chosen by the GPU class (ENH-LITE)");
-                    self.enh = set;
+                    tracing::info!(gpu_class = ?class, enhancements = %set.describe(), "first run: enhancement set chosen by the GPU class (ENH-LITE), shown off until the player turns it on (ENH-OPTIN)");
+                    if set.any_on() && !crate::guard::safe() {
+                        self.enh_stash = Some(set);
+                        self.enh = nfs_renderer::Enhancements::ORIGINAL;
+                    } else {
+                        self.enh = set;
+                    }
                 }
                 renderer.set_enhancements(self.enh);
                 // PERF (PERF-D): a scripted run's frames (a still, an autotest) wait for the pipeline sets their lights want; a live
@@ -53,7 +61,7 @@ impl App {
                     renderer.set_exact_pipelines(true);
                 }
                 // ENHANCEMENT ENH-UPSCALER: the options panel is generated from this set
-                nfs_game::enhanced::set_panel_state(self.enh);
+                nfs_game::enhanced::set_panel_state(self.enh_stash.unwrap_or(self.enh));
                 (window, renderer)
             }
         };

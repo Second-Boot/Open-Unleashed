@@ -67,7 +67,7 @@ impl App {
             Lvl::E22_DISPLAY if own_sync => return Some(self.display_refresh_hz()),
             // ENHANCEMENT E22 «auto»: on the battery 60 frames a second (the GPU is what heats the machine), on mains
             // power as «display»
-            Lvl::E22_AUTO if self.on_battery() => return Some(BATTERY_FPS),
+            Lvl::E22_AUTO if self.on_battery() => return Some(battery_fps(self.display_refresh_hz())),
             Lvl::E22_AUTO if own_sync => return Some(self.display_refresh_hz()),
             _ => {}
         }
@@ -248,6 +248,15 @@ impl App {
     }
 }
 
+/// ENHANCEMENT E22 «auto» on the battery: about [`BATTERY_FPS`], as a whole fraction of the display's refresh rate (the
+/// rate divided by the largest whole number that keeps it at 60 or more), so every frame stays on the screen for the same
+/// number of refreshes: a flat 60 on a 144 Hz screen shows frames for 2 and 3 refreshes in turn and the picture stutters
+/// (seen on a 144 Hz Windows laptop). 144 Hz -> 72, 120 / 60 Hz -> 60, 165 Hz -> 82.5, 90 Hz -> 90; below 60 Hz the display's own.
+pub(crate) fn battery_fps(refresh_hz: f64) -> f64 {
+    let n = (refresh_hz / BATTERY_FPS).floor().max(1.0);
+    refresh_hz / n
+}
+
 /// The frame rate a race presents at most while its window is hidden.
 // PORT-DEVIATION D45 (RE/notes/PORT-DEVIATIONS.md): host-side timing only; the 64 Hz tick loop is not touched.
 pub(crate) const HIDDEN_FPS: f64 = 30.0;
@@ -278,5 +287,10 @@ mod tests {
         assert_eq!(frame_floor(Some(60.0), true), frame_floor(None, true));
         assert_eq!(frame_floor(Some(20.0), true), Some(Duration::from_secs_f64(1.0 / 20.0)));
         assert_eq!(frame_floor(Some(60.0), false), Some(Duration::from_secs_f64(1.0 / 60.0)));
+    }
+
+    #[test]
+    fn the_battery_cap_is_a_whole_fraction_of_the_refresh_rate() {
+        assert_eq!([60.0, 75.0, 90.0, 120.0, 144.0, 165.0, 240.0, 50.0].map(battery_fps), [60.0, 75.0, 90.0, 60.0, 72.0, 82.5, 60.0, 50.0]);
     }
 }

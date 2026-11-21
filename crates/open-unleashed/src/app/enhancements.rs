@@ -38,30 +38,38 @@ impl App {
     /// entry's level captions (`enhanced::level_ids`).
     pub(crate) fn enh_choice(&self, name: &str) -> Option<(usize, &'static [u32])> {
         // ENHANCEMENT ENH-UPSCALER: the settings rows that edit a part of E34's / E37's stored level
+        // ENH-VIEW: in the original-look view the rows show (and edit) the player's own levels, not the all-off set on the screen
+        let p = self.enh_player();
         if let Some(v) = enhanced::VRow::from_accessor(name) {
             let ids = enhanced::vrow_ids(v);
             return Some(match v {
-                enhanced::VRow::MfxMode => (matches!(nfs_renderer::mfx_mode(self.enh.level(nfs_renderer::E34)), nfs_renderer::MfxMode::Simple) as usize, ids),
+                enhanced::VRow::View => (usize::from(!self.enh.any_on()), ids), // what the screen draws
+                enhanced::VRow::MfxMode => (matches!(nfs_renderer::mfx_mode(p.level(nfs_renderer::E34)), nfs_renderer::MfxMode::Simple) as usize, ids),
                 // the simple mode has no 1:1: its list is the same captions from the second
                 enhanced::VRow::MfxScale => {
-                    let l = self.enh.level(nfs_renderer::E34);
+                    let l = p.level(nfs_renderer::E34);
                     let simple = matches!(nfs_renderer::mfx_mode(l), nfs_renderer::MfxMode::Simple);
                     (nfs_renderer::mfx_scale_index(l), if simple { &ids[1..] } else { ids })
                 }
-                enhanced::VRow::FsrScale => (nfs_renderer::fsr_scale_index(self.enh.level(nfs_renderer::E37)), ids),
+                enhanced::VRow::FsrScale => (nfs_renderer::fsr_scale_index(p.level(nfs_renderer::E37)), ids),
             });
         }
         let i = Self::enh_index(name)?;
         let ids = enhanced::level_ids(i);
         // ENHANCEMENT ENH-UPSCALER: the upscaler row lists the backends this platform has
         if i == nfs_renderer::E38.0 as usize {
-            return Some((nfs_renderer::upscaler_choices().iter().position(|&c| c == self.enh.level(nfs_renderer::E38)).unwrap_or(0), ids));
+            return Some((nfs_renderer::upscaler_choices().iter().position(|&c| c == p.level(nfs_renderer::E38)).unwrap_or(0), ids));
         }
         // ENHANCEMENT E33: the row is on / off where the display does EDR, otherwise it only says «недоступно»
         if i == nfs_renderer::E33.0 as usize {
-            return Some(if self.enh_edr_available() { ((self.enh.level(nfs_renderer::E33) as usize).min(1), &ids[..2]) } else { (0, &ids[2..3]) });
+            return Some(if self.enh_edr_available() { ((p.level(nfs_renderer::E33) as usize).min(1), &ids[..2]) } else { (0, &ids[2..3]) });
         }
-        Some((self.enh.shown_level(EnhancementSwitch(i as u8)) as usize, ids))
+        Some((p.shown_level(EnhancementSwitch(i as u8)) as usize, ids))
+    }
+
+    /// ENH-VIEW: the player's own set — the one the original-look view keeps aside, else the one on the screen.
+    pub(crate) fn enh_player(&self) -> Enhancements {
+        self.enh_stash.unwrap_or(self.enh)
     }
 
     /// ENHANCEMENT E33: the display does extended-range output.
@@ -73,8 +81,13 @@ impl App {
     /// like every combo.
     pub(crate) fn enh_step(&mut self, name: &str, delta: i32) -> bool {
         // ENHANCEMENT ENH-UPSCALER: a settings row edits its part of the stored level
+        let p = self.enh_player();
         if let Some(v) = enhanced::VRow::from_accessor(name) {
-            let mut e = self.enh;
+            if v == enhanced::VRow::View {
+                self.enh_toggle_all();
+                return true;
+            }
+            let mut e = p;
             let (e34, e37) = (e.level(nfs_renderer::E34), e.level(nfs_renderer::E37));
             let mode = nfs_renderer::mfx_mode(e34);
             match v {
@@ -87,21 +100,22 @@ impl App {
                     e.set_level(nfs_renderer::E34, nfs_renderer::mfx_level(mode, (nfs_renderer::mfx_scale_index(e34) as i32 + delta).rem_euclid(n) as usize));
                 }
                 enhanced::VRow::FsrScale => e.set_level(nfs_renderer::E37, (nfs_renderer::fsr_scale_index(e37) as i32 + delta).rem_euclid(4) as u8 + 1),
+                enhanced::VRow::View => {}
             }
             self.enh_apply(e);
             return true;
         }
         let Some(i) = Self::enh_index(name) else { return false };
         // ENHANCEMENT ENH-UPSCALER: an inactive row (another setting overrides / disables it, `Enhancements::blocked`) does not change
-        if self.enh.blocked(ENHANCEMENT_REGISTRY[i].token).is_some() {
+        if p.blocked(ENHANCEMENT_REGISTRY[i].token).is_some() {
             return true;
         }
         // ENHANCEMENT ENH-UPSCALER: the choice of the backend; a backend chosen for the first time takes its default scale
         if i == nfs_renderer::E38.0 as usize {
             let choices = nfs_renderer::upscaler_choices();
-            let cur = choices.iter().position(|&c| c == self.enh.level(nfs_renderer::E38)).unwrap_or(0) as i32;
+            let cur = choices.iter().position(|&c| c == p.level(nfs_renderer::E38)).unwrap_or(0) as i32;
             let to = choices[(cur + delta).rem_euclid(choices.len() as i32) as usize];
-            let mut e = self.enh;
+            let mut e = p;
             e.set_level(nfs_renderer::E38, to);
             if to == nfs_renderer::UP_METALFX && e.level(nfs_renderer::E34) == 0 {
                 e.set_level(nfs_renderer::E34, 2);
@@ -121,8 +135,8 @@ impl App {
             }
             n = 2;
         }
-        let mut e = self.enh;
-        e.set_level(s, (self.enh.level(s) as i32 + delta).rem_euclid(n) as u8);
+        let mut e = p;
+        e.set_level(s, (p.level(s) as i32 + delta).rem_euclid(n) as u8);
         self.enh_apply(e);
         true
     }
@@ -149,14 +163,14 @@ impl App {
         self.enh_live_dirty = true;
         // ENHANCEMENT ENH-UPSCALER: the panel is generated from the set (settings rows of the chosen upscaler, inactive rows); when
         // its lines changed it is rebuilt at the start of the next frame (`enh_panel_refresh`), not inside the click that did it
-        if enhanced::set_panel_state(e) {
+        if enhanced::set_panel_state(self.enh_stash.unwrap_or(e)) {
             self.enh_panel_dirty = true;
         }
         if let Some(r) = self.renderer.as_mut() {
             r.set_enhancements(e);
         }
         if save {
-            enhanced::save(&e);
+            enhanced::save(&e, false);
             crate::guard::clear_safe();
         }
         tracing::info!(enhancements = %e.describe(), saved = save, "enhancements changed");
@@ -251,8 +265,9 @@ impl App {
         nfs_renderer::fov_bonus_deg(self.enh.level(nfs_renderer::E4))
     }
 
-    /// The debug A/B key: the player's set <-> every switch off (`enhanced::ab_toggle`). A view only: it never
-    /// writes `enhancements.json`, so the player's levels survive any number of presses (ENH-SAVE).
+    /// The A/B key (and the panel's «графика» row): the player's set <-> every switch off (`enhanced::ab_toggle`). A view: the
+    /// player's levels are never changed by it, so they survive any number of presses (ENH-SAVE); ENH-VIEW: whether the view is on is
+    /// stored beside them, so the next start keeps it (not for an `NFS_ENH` set, nor in safe mode, whose set is not the player's).
     pub(crate) fn enh_toggle_all(&mut self) {
         if self.enh_mode == Mode::HardOriginal {
             return;
@@ -262,6 +277,9 @@ impl App {
         // PORT-DEVIATION D63: the message says what the press left on the screen
         self.panel_toast(show.any_on(), false);
         self.enh_set(show, false);
+        if !enhanced::env_chosen() && !crate::guard::safe() {
+            enhanced::save(&self.enh_player(), self.enh_stash.is_some() && !self.enh.any_on());
+        }
     }
 
     /// A release on a button of the «Улучшения» panel (`callback_at`, the panel is not in `controls()`):

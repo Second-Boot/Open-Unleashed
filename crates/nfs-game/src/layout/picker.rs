@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// What the drop-down hands a car row's painter besides the row (`LayoutScreen::car_row`): the row
+/// box, the text colour and the hover bar.
+pub(super) struct CarRowPaint {
+    pub(super) r: FeRect,
+    pub(super) text: [f32; 4],
+    pub(super) bar: Option<[f32; 4]>,
+}
+
 impl LayoutScreen {
     pub(super) fn drop_down(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, i: usize, x: f32, y: f32, tint: impl Fn([u8; 4]) -> [f32; 4]) {
         let Some((rows, _)) = self.lists.get(&i) else { return };
@@ -129,7 +137,8 @@ impl LayoutScreen {
             acc += row.height();
             // the row's box in a combo is one pixel in on each side (0x4C68B8…0x4C68E5: `w - 2`, `x + 1`)
             let hovered_row = hover_row == Some(n);
-            if hovered_row {
+            // (a car row's painter lays its bar under its own headings, `car_row`)
+            if hovered_row && !matches!(row, ListRow::Car(_)) {
                 out.push(self.quad(aspect, px + 1.0, ry, rect_w - 2.0, row.height(), tint([0xBC, 0x00, 0x00, 0xFF])));
             }
             // No "selected row" bar and no white text here: that arm of the shared row draw
@@ -165,11 +174,64 @@ impl LayoutScreen {
                     let bevel_h = if matches!(row, ListRow::GroupHeading(_)) { 12.0 } else { PART_HEADER_H };
                     self.bevel_heading(out, aspect, FeRect::new(px, bevel_y, rect_w, bevel_h), 2.0);
                 }
+                ListRow::Car(c) => {
+                    let bar = hovered_row.then(|| tint([0xBC, 0x00, 0x00, 0xFF]));
+                    let paint = CarRowPaint { r: FeRect::new(px + 1.0, ry, rect_w - 2.0, row.height()), text: fg, bar };
+                    self.car_row(out, aspect, f, c, paint, &tint);
+                }
                 ListRow::Columns(_) | ListRow::Racer(..) => {}
             }
             ry += row.height();
         }
         self.overlay_mask.set(Some((stencil, inside, out.len())));
+    }
+
+    /// A car accessor's row painter — `FEOwnedCarAccessor` slot 43 **0x4F5D10** /
+    /// `FEGenericCarAccessor` slot 45 **0x4F3510**, with `FEMergedCarListAccessor`'s slot 15
+    /// **0x4F4AD0** band in front ([`CarRow`] has the layout). `r` is the row box the drop-down
+    /// hands slot 15 (`x + 1`, `w − 2`, 0x4C68B8…0x4C68E5); `text` the row's text colour, `bar`
+    /// the hover bar (0 — nothing — on any other row).
+    pub(super) fn car_row(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, c: &CarRow, paint: CarRowPaint, tint: &impl Fn([u8; 4]) -> [f32; 4]) {
+        let CarRowPaint { r, text, bar } = paint;
+        const INSET: f32 = 3.0; // 0x4C688F
+        let FeRect { x, w, .. } = r;
+        let mut y = r.y;
+        let black = tint([0, 0, 0, 0xFF]);
+        let white = tint([0xFF, 0xFF, 0xFF, 0xFF]);
+        // the band and the headings: 0x4D9280(x, y, w, 1.0) and (x, y + 13, w, −1.0) — the
+        // second rule is the pixel row above y + 13 —, the name at (x + w/2, y + 2) centred,
+        // black (0x4D87E0), in the accessor's own font (`%sUnivers7b.ffn`, 0x4F2F5F / 0x4F5AB1;
+        // the merged list's "Univers7b", 0x4F45E2), and 0x521400(x, y + 1, w, 12.0, fade, 2)
+        let hf = self.fonts.get("univers7b.ffn").unwrap_or(f);
+        for t in c.banner.iter().chain(c.headings.iter()) {
+            out.push(self.quad(aspect, x, y, w, 1.0, black));
+            out.push(self.quad(aspect, x, y + CarRow::HEADING_STEP - 1.0, w, 1.0, black));
+            self.text(out, aspect, hf, t, x, y + 2.0, w, 1, black);
+            self.bevel_heading(out, aspect, FeRect::new(x, y + 1.0, w, 12.0), 2.0);
+            y += CarRow::HEADING_STEP;
+        }
+        // the bar, 14 tall (0x4F5F2E / 0x4F372E)
+        if let Some(b) = bar {
+            out.push(self.quad(aspect, x, y, w, LIST_ROW_H, b));
+        }
+        let ty = y + 2.0;
+        // the owned car's swatch: 0x4D9280(x + inset, y + 2, 10, 10, 0x4D87F0(FECar+0x674, fade))
+        // and its black outline 0x4D9200 (0x4F5F57…0x4F5F94)
+        if let CarRowKind::Owned { swatch } = c.kind {
+            let (sx, sw) = (x + INSET, 10.0);
+            out.push(self.quad(aspect, sx, ty, sw, sw, tint(swatch)));
+            for (bx, by, bw, bh) in [(sx, ty, sw, 1.0), (sx, ty + sw - 1.0, sw, 1.0), (sx, ty, 1.0, sw), (sx + sw - 1.0, ty, 1.0, sw)] {
+                out.push(self.quad(aspect, bx, by, bw, bh, black));
+            }
+        }
+        let (year_x, sep_x) = c.columns(INSET);
+        // the year, white (0x4D87D0), left-aligned (0x4DA530, align 0)
+        self.text(out, aspect, f, &c.year, x + year_x, ty, 0.0, 0, white);
+        // the column rule, black: 14 tall, 16 when it joins the next row, 100 past the last
+        let rule_h = if c.rule_tail { 100.0 } else if c.rule_joins { 16.0 } else { LIST_ROW_H };
+        out.push(self.quad(aspect, x + sep_x, y, 1.0, rule_h, black));
+        // the name, past the rule, in the row's text colour
+        self.text(out, aspect, f, &c.name, x + INSET + sep_x, ty, 0.0, 0, text);
     }
 
     /// `FEColourAccessor`'s row draw **0x4B9390**, the part after the row's bar: a colour row is a

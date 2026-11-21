@@ -82,9 +82,8 @@ impl App {
                 }
                 return;
             }
-            // list B: `B.slot11(row − A.count)` (0x4F49F0) — the catalogue index is `row − a`. B is
-            // still flat here (`combo_rows`'s own `zMergedList.Car` arm doc), so no `selectable_index`
-            // conversion. The step is taken from the catalogue's own index `car_idx`, which
+            // list B: `B.slot11(row − A.count)` (0x4F49F0) — the catalogue index is `row − a`:
+            // every row is one car, its headings drawn inside it (`ListRow::Car`). The step is taken from the catalogue's own index `car_idx`, which
             // `set_accessor` moves, not from the merged row `cur`: with a garage row current, `cur`
             // is that row and the difference landed `car_idx` on another car (a click on the
             // catalogue's 911 S gave the 914/4)
@@ -238,39 +237,32 @@ impl App {
             // `record+2` at 0x4F300F, which is the same `display_name`. So the drop-down is the
             // player's garage first, then the whole catalogue. `RE/notes/controls.md` §4.133.
             //
-            // **And its garage half is grouped — correction, its catalogue half likely is too.**
-            // Slot 26 (0x4F4D40) routes the row height to `A->slot26(i)` below `A.count` and
-            // `B->slot26(i − A.count)` above it, and slot 25 (0x4F4D20) is `A->slot25() +
-            // B->slot25()` — the two lists' heights added. List A is `OwnedCars.Car`, whose rows
-            // are 42 / 28 / 14 with era and class headings (§4.144). This paragraph used to say
-            // list B ("stays flat over the catalogue") too, on the strength of nothing more than
-            // B not having its own §4.144 entry yet — **not true**: B is `GenericCar.Car`, a bare
-            // `FEGenericCarAccessor` (§4.137), and cluster 9's own pass (`catalog_rows`'s doc,
-            // 0x4F39E0) found that class's *own* slot 26 is 40/27/14 with the identical
-            // era-then-class heading, not the base's flat 14 — so `B->slot26` is almost certainly
-            // grouped too, the same as the standalone `GenericCar.Car`/`DealerCar.Car`/
-            // `GenericCar2.Car` arms below now are (`catalog_rows`). **Not implemented here**:
-            // grouping this merged list's own B half needs its own row/index bookkeeping (the `a`
-            // boundary below assumes a flat `m.cars.len()`-sized B, and `combo_select`'s
-            // `zMergedList.Car` catalogue-half branch assumes the same) that this pass did not
-            // take on — left an honest, flat B half rather than a half-guessed grouping. §4.148.
+            // **Both halves are grouped, and the list has two bands of its own.** Slot 26
+            // (0x4F4D40) routes the row height to `A->slot26(i)` below `A.count` and
+            // `B->slot26(i − A.count)` above it — the garage's 42 / 28 / 14 (§4.144) and the
+            // catalogue's 40 / 27 / 14 (0x4F39E0), each with its era and class headings — and
+            // adds **13** to row 0 and to row `A.count`; slot 15 (0x4F4AD0) draws a band there,
+            // `FEStrings` 570 `OWNED` over the first garage row (0x4F4B50) and 571 `FACTORY STOCK`
+            // over the first catalogue row (0x4F4C5F), before handing the row to A's painter with
+            // a 0 (0x4F4BCD, slot 43) or B's with a 1 (0x4F4CDB, slot 45). `layouts.md` "The car
+            // drop-downs".
             "zMergedList.Car" => {
-                let short = modifier == "SHORT";
+                let band = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
                 let mut rows: Vec<ListRow> = Vec::new();
-                self.garage_rows(&mut rows, short, usize::MAX);
-                let a = rows.len();
-                rows.extend(m.cars.iter().map(|c| {
-                    ListRow::Text(if short { c.family.to_string() } else { c.display_name.to_string() })
-                }));
                 // **the current row, either half.** `slot10()`'s own field is `car_garage`
                 // (0x4F4DF0, above): below `A.count` it is the garage's own row — `garage_rows`
                 // over the same `select` finds it — otherwise `A.count + car_idx` into the
                 // catalogue (list B).
-                let cur = if m.car_garage {
-                    self.garage_rows(&mut Vec::new(), short, self.career.as_ref().map_or(usize::MAX, |c| c.car_sel))
-                } else {
-                    Some(a + m.car_idx)
-                };
+                let garage_at = self.garage_rows(&mut rows, self.career.as_ref().map_or(usize::MAX, |c| c.car_sel), false);
+                let a = rows.len();
+                let (b, b_at) = self.catalog_rows(m.cars.iter(), Some(m.car_idx), true);
+                rows.extend(b);
+                for (k, id) in [(0, 570), (a, 571)] {
+                    if let Some(ListRow::Car(c)) = rows.get_mut(k) {
+                        c.banner = Some(band(id));
+                    }
+                }
+                let cur = if m.car_garage { garage_at } else { b_at.map(|r| a + r) };
                 Some((rows, cur))
             }
             // the car tables — `(SHORT)` is the family name, the plain form the display name,
@@ -313,7 +305,7 @@ impl App {
             "OwnedCars.Car" => {
                 let c = self.career.as_ref()?;
                 let mut rows: Vec<ListRow> = Vec::new();
-                let at = self.garage_rows(&mut rows, modifier == "SHORT", c.car_sel.min(c.career.garage.len().saturating_sub(1)));
+                let at = self.garage_rows(&mut rows, c.car_sel.min(c.career.garage.len().saturating_sub(1)), true);
                 Some((rows, at))
             }
             // **The catalogue lists are grouped too**, by `FEGenericCarAccessor`'s own slot 26
@@ -322,15 +314,14 @@ impl App {
             // `era_class_year_sort`-ordered, so the same boundary test the height function makes
             // is always a real one.
             "DealerCar.Car" if let Some(v) = self.dealer_cars() => {
-                let short = modifier == "SHORT";
                 let at = self.fe.dealer.car.min(v.len().saturating_sub(1));
-                Some(self.catalog_rows(v.into_iter(), short, Some(at)))
+                Some(self.catalog_rows(v.into_iter(), Some(at), true))
             }
             // one row, the era's prize car (`App::prize_car`)
             "PrizeCars.Car" if let Some(car) = self.prize_car() => {
                 Some((vec![ListRow::Text(if modifier == "SHORT" { car.family.to_string() } else { car.display_name.to_string() })], Some(0)))
             }
-            "GenericCar.Car" => Some(self.catalog_rows(m.cars.iter(), modifier == "SHORT", Some(m.car_idx))),
+            "GenericCar.Car" => Some(self.catalog_rows(m.cars.iter(), Some(m.car_idx), true)),
             "PrizeCars.Car" | "CARSETTINGS.CAR" => {
                 let rows = m
                     .cars
@@ -343,7 +334,7 @@ impl App {
             }
             // `GenericCar2.Car`'s own list `cars2` — `[0x6919F4]`, separate from `cars` above
             // (`FeCatalogues::cars2`'s field doc) — same class, same grouping as `GenericCar.Car`.
-            "GenericCar2.Car" => Some(self.catalog_rows(m.cars2.iter(), modifier == "SHORT", Some(m.car2_idx))),
+            "GenericCar2.Car" => Some(self.catalog_rows(m.cars2.iter(), Some(m.car2_idx), true)),
             // `LoopedTrack.Track` is its own accessor over the circuits `[0x691D08]`, and
             // `Knockout.Track` forwards to the selected row's `Track<n>.Track` (0x4B8580)
             "LoopedTrack.Track" => {

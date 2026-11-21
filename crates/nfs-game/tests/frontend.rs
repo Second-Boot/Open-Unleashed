@@ -2926,6 +2926,34 @@ fn the_garage_lists_grouping_heights() {
     assert_eq!(car.height(), 14.0, "any other row");
 }
 
+/// The car drop-downs' row heights, headings inside the row — `FEOwnedCarAccessor` slot 26
+/// 0x4F60F0 (42 / 28 / 14), `FEGenericCarAccessor` slot 26 0x4F39E0 (40 / 27 / 14), and the
+/// merged list's 13 px band on its first garage and first catalogue row (0x4F4D40).
+#[test]
+fn the_car_rows_carry_their_headings() {
+    use nfs_game::layout::{CarRow, CarRowKind, ListRow};
+    let row = |kind, n: usize, banner: bool| {
+        ListRow::Car(Box::new(CarRow {
+            kind,
+            banner: banner.then(|| "OWNED".to_string()),
+            headings: vec!["H".to_string(); n],
+            year: "'59".into(),
+            name: "356 A".into(),
+            rule_joins: false,
+            rule_tail: false,
+        }))
+    };
+    let owned = CarRowKind::Owned { swatch: [0, 0, 0, 0xFF] };
+    let stock = CarRowKind::Catalogue;
+    assert_eq!([2, 1, 0].map(|n| row(owned, n, false).height()), [42.0, 28.0, 14.0]);
+    assert_eq!([2, 1, 0].map(|n| row(stock, n, false).height()), [40.0, 27.0, 14.0]);
+    assert_eq!(row(owned, 2, true).height(), 55.0, "the OWNED band");
+    assert_eq!(row(stock, 2, true).height(), 53.0, "the FACTORY STOCK band");
+    // the car's own line sits under the band and 13 px per heading (0x4F4B19, 0x4F5D70)
+    let ListRow::Car(c) = row(owned, 2, true) else { unreachable!() };
+    assert_eq!(c.line_y(), 39.0);
+}
+
 /// `nfs5.car + 0x1C0` — the variant index, `controls.md` §4.145.
 #[test]
 fn the_variant_index_orders_one_generation() {

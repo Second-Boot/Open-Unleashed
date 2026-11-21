@@ -173,6 +173,7 @@ switches! {
     // (`NFS_NO_FOCUS`, `NFS_FE_CURSOR` / `NFS_FE_CLOCK` stay raw reads in `main`, which writes them before the snapshot; `NFS_ENH` is the renderer's)
     nfs5_profile = "NFS5_PROFILE",
     nfs5_records_save = "NFS5_RECORDS_SAVE",
+    nfs_all_cars = "NFS_ALL_CARS",
     nfs_all_tracks = "NFS_ALL_TRACKS",
     nfs_autotest_races = "NFS_AUTOTEST_RACES",
     nfs_cam_log = "NFS_CAM_LOG",

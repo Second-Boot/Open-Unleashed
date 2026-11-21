@@ -2649,6 +2649,12 @@ impl LayoutScreen {
                     }
                     self.colour_row(out, aspect, f, row, px, ry, 3.0, &tint);
                 }
+                // a car accessor's row (no shipped list box holds one — every car accessor sits
+                // in a `ComboBoxSlider` — but the row loop calls the same slot 15)
+                ListRow::Car(c) => {
+                    let paint = super::picker::CarRowPaint { r: FeRect::new(px, ry, panel_w, row.height()), text: fg, bar: bar.map(&tint) };
+                    self.car_row(out, aspect, f, c, paint, &tint);
+                }
                 ListRow::GroupHeading(t) => {
                     let black = [0.0, 0.0, 0.0, 1.0];
                     out.push(self.quad(aspect, px, ry, panel_w, 1.0, black));

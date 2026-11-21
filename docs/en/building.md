@@ -64,6 +64,7 @@ and `THIRD-PARTY-LICENSES.txt` — never any file of the original game.
 | `NFS5_SAVE_DIR=<folder>` | the saves folder |
 | `NFS_TRAFFIC=0..3`, `NFS_TRAFFIC_SEED=<n>` | traffic density (none / light / medium / heavy), repeatable spawns |
 | `NFS_NO_CARCOL=1` | no car-to-car collisions |
+| `NFS_ALL_CARS=1` | test glue: every car of the catalogue in the single-player car lists (quick race, the knockouts), as the original's all-cars cheat gives them; the career's lists are unchanged |
 | `NFS_ALL_TRACKS=1` | test glue: every track is open in the single-player track lists (quick race and the rest), as the network game lists them, whatever the career year |
 | `NFS_DEMO=1` | frame rate, GPU, graphics API and system in the window title; the window stays on top (for recordings) |
 | `NFS_AUTOPILOT=1` with `--follow` | a windowed race drives itself (for recordings); `NFS_AUTOPILOT=ai` — the opponents' AI drives the player's car |

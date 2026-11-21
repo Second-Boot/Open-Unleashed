@@ -36,8 +36,34 @@ pub fn load() -> (Enhancements, Mode) {
     if !env_chosen && file.is_none() {
         AUTO_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // ENH-VIEW: the original-look view kept from the last run, only for the player's own stored set (an `NFS_ENH` list is a
+    // scripted / command-line choice: it neither reads nor writes the view)
+    STORED_VIEW.store(!env_chosen && file.as_deref().is_some_and(parse_view), std::sync::atomic::Ordering::Relaxed);
+    ENV_CHOSEN.store(env_chosen, std::sync::atomic::Ordering::Relaxed);
     r
 }
+
+static STORED_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ENV_CHOSEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// ENH-VIEW: `enhancements.json` said the last run ended in the original-look view (the `0` key / the panel's «графика» row):
+/// this one starts in it, the stored levels kept for the way back. Always `false` when `NFS_ENH` chose the set.
+pub fn stored_view() -> bool {
+    STORED_VIEW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// ENH-VIEW: `NFS_ENH` chose this run's set — the view is then not written either.
+pub fn env_chosen() -> bool {
+    ENV_CHOSEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// ENH-VIEW: the file's `"view"`: `"original"` = the original-look view was on; anything else (or none: every older file) = off.
+pub fn parse_view(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text).ok().and_then(|v| v.get("view").and_then(|w| w.as_str()).map(|w| w == VIEW_ORIGINAL)).unwrap_or(false)
+}
+
+/// ENH-VIEW: the stored word of the original-look view.
+pub const VIEW_ORIGINAL: &str = "original";
 
 static AUTO_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -131,25 +157,36 @@ pub fn parse_file(text: &str) -> Enhancements {
 /// The stored form: `{"version": 7, "levels": {"E1": 2, …}}` (3: E34's levels renumbered; 4: the upscaler choice E38, see `parse_file`;
 /// 5: E8's levels are the clear coat's; 6: E41's levels were original / x2 / x4; 7: E41 is off / on).
 pub fn file_text(e: &Enhancements) -> String {
+    file_text_view(e, false)
+}
+
+/// [`file_text`] with ENH-VIEW's `"view": "original"` when the original-look view is on (an extra key: an older build reads the
+/// levels and ignores it, so no version step).
+pub fn file_text_view(e: &Enhancements, original_view: bool) -> String {
     let levels: serde_json::Map<String, serde_json::Value> = e.pairs_in(ENHANCEMENT_REGISTRY).into_iter().map(|(k, l)| (k.to_string(), l.into())).collect();
-    let v = serde_json::json!({ "version": 7, "levels": levels });
+    let v = if original_view {
+        serde_json::json!({ "version": 7, "view": VIEW_ORIGINAL, "levels": levels })
+    } else {
+        serde_json::json!({ "version": 7, "levels": levels })
+    };
     serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
 }
 
-/// Save on change. Best effort: a read-only data dir loses the setting, not the game.
-pub fn save(e: &Enhancements) {
+/// Save on change: the player's own levels and (ENH-VIEW) whether the original-look view is on. Best effort: a read-only data
+/// dir loses the setting, not the game.
+pub fn save(e: &Enhancements, original_view: bool) {
     let path = settings_path();
-    if let Err(err) = save_to(&path, e) {
+    if let Err(err) = save_to(&path, e, original_view) {
         tracing::warn!(path = %path.display(), error = %err, "enhancements.json not saved");
     }
 }
 
 /// [`save`] at a given path (the directory is created).
-pub fn save_to(path: &std::path::Path, e: &Enhancements) -> std::io::Result<()> {
+pub fn save_to(path: &std::path::Path, e: &Enhancements, original_view: bool) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, file_text(e))
+    std::fs::write(path, file_text_view(e, original_view))
 }
 
 /// The A/B key (`0`, the window handler's `App::enh_key`): the player's set <-> every switch off (or, with the player's own set already all
@@ -166,7 +203,7 @@ pub fn ab_toggle(current: Enhancements, stash: Option<Enhancements>) -> (Enhance
 
 /// Where the port-own layouts live: `$NFS5_REMASTER_DIR`, `enhanced/layouts` in the game root
 /// (the packaged data, `packaging/stage_data.sh`), beside the executable / in a macOS bundle's Resources,
-/// then — a development build — the repository's own `enhanced/layouts`. `remaster/` (the folder's
+/// then — a build run from the repository — its own `enhanced/layouts`. `remaster/` (the folder's
 /// earlier name) is accepted after `enhanced/` at every place.
 pub fn layouts_dir(paths: &GamePaths) -> Option<PathBuf> {
     let mut c: Vec<PathBuf> = Vec::new();
@@ -180,6 +217,12 @@ pub fn layouts_dir(paths: &GamePaths) -> Option<PathBuf> {
             c.push(d.join(folder).join("layouts"));
             c.push(d.join("../Resources").join(folder).join("layouts"));
         }
+        // a build run from the repository (`target/<profile>/`): its own folder two levels up
+        if let Some(d) = &exe_dir {
+            c.push(d.join("../..").join(folder).join("layouts"));
+        }
+        // a debug build only: the repository by its compile-time path (a release binary must not carry the build machine's path)
+        #[cfg(debug_assertions)]
         c.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(folder).join("layouts"));
     }
     c.into_iter().find(|d| d.is_dir())

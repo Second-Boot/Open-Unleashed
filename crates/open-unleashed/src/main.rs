@@ -43,7 +43,7 @@ use anyhow::Result;
 use career_ui::{CareerOpponent, CareerUi};
 use glam::{Mat4, Quat, Vec3};
 use nfs_assets::{GamePaths, car::{CarAssets, Paint}, track::TrackAssets};
-use nfs_game::layout::{ListCell, ListRow, TrackMapEvent};
+use nfs_game::layout::{CarRow, CarRowKind, ListCell, ListRow, TrackMapEvent};
 use nfs_game::{
     lanes::{LaneCar, lane_of, lane_span},
     race::{RaceProgress, SliceTable, grid_pose_with_offset},
@@ -524,7 +524,14 @@ fn run() -> Result<()> {
         nfs_renderer::set_hd_textures_available(nfs_assets::hdpack::HdPack::global(&paths).is_some());
     }
     nfs_game::enhanced::init(enh_mode);
-    nfs_game::enhanced::set_panel_state(enh); // ENHANCEMENT ENH-UPSCALER: the options panel's rows follow the set
+    // ENH-VIEW: the last run ended in the original-look view (the `0` key / the panel's «графика» row): start in it, the player's
+    // levels kept for the way back (not in safe mode, which shows the original anyway, and not for an all-off set, which has no view)
+    let enh_stash = (enh_mode == nfs_game::enhanced::Mode::Normal && nfs_game::enhanced::stored_view() && !guard::safe() && enh.any_on()).then_some(enh);
+    if enh_stash.is_some() {
+        enh = nfs_renderer::Enhancements::ORIGINAL;
+        tracing::info!("the original-look view kept from the last run (ENH-VIEW)");
+    }
+    nfs_game::enhanced::set_panel_state(enh_stash.unwrap_or(enh)); // ENHANCEMENT ENH-UPSCALER: the options panel's rows follow the player's set
     tracing::info!(enhancements = %enh.describe(), hard_original = (enh_mode == nfs_game::enhanced::Mode::HardOriginal), "enhanced game");
     let fe_start = if layout_sweep { fe_start.or_else(|| Some("QuickRace".to_string())) } else { fe_start };
     // A plain launch is the original's: main 0x4B6A50 plays the intro movies (0x4DD600, unless
@@ -792,6 +799,7 @@ fn run() -> Result<()> {
         sound_set,
         enh,
         enh_mode,
+        enh_stash,
     });
     // the player's key bindings are `fe.txt`'s `C1_*` lines (`nfs_input::bindings`)
     app.input.bindings = nfs_input::bindings::Bindings::from_registry(|k| app.registry.get(k));

@@ -242,78 +242,77 @@ impl App {
         }
     }
 
-    /// The garage half of a car list, with `FEOwnedCarAccessor`'s headings — §4.144. Pushes a
-    /// `GroupHeading` for the era **and** the class when the era changes, one for the class when
-    /// only the class does, then the car's own row; returns the row index of `select`.
-    pub(crate) fn garage_rows(&self, rows: &mut Vec<ListRow>, short: bool, select: usize) -> Option<usize> {
+    /// The garage's drop-down rows — `FEOwnedCarAccessor`, §4.144 and `layouts.md` "The car
+    /// drop-downs": one [`ListRow::Car`] per garage car, carrying the era heading **and** the class
+    /// heading at an era change (and at row 0), the class heading alone at a class change — the
+    /// row painter 0x4F5D10 draws them in the car's own row (0x4F5D48 compares `object+0x1B4`, the
+    /// era; 0x4F5E33 `+0x1B0`, the class), and slot 26 0x4F60F0 makes the row 42 / 28 / 14. The
+    /// swatch is the car's exterior, `FECar+0x674` (0x4F5F57): its saved custom colour or its
+    /// paint set's colour 0 (`OwnedCar::custom`, `App::colour_state`). `tail` is the painter's
+    /// ninth argument (the column rule runs on past the last row): 1 from the accessor's own slot
+    /// 15 (0x4F5CD4), 0 from the merged list (0x4F4BCD). Returns the row of garage car `select`.
+    pub(crate) fn garage_rows(&self, rows: &mut Vec<ListRow>, select: usize, tail: bool) -> Option<usize> {
+        let c = self.career.as_ref()?;
+        let cars = self.garage_cars();
         let mut at = None;
         let mut prev: Option<(u32, u32)> = None;
-        for (i, e) in self.garage_cars() {
-            let key = (e.era_string_id, e.class_string_id);
-            let heading = |id: u32| ListRow::GroupHeading(self.fe.strings.get(id).unwrap_or_default().to_string());
-            match prev {
-                None => {
-                    rows.push(heading(key.0));
-                    rows.push(heading(key.1));
-                }
-                Some(p) if p.0 != key.0 => {
-                    rows.push(heading(key.0));
-                    rows.push(heading(key.1));
-                }
-                Some(p) if p.1 != key.1 => rows.push(heading(key.1)),
-                _ => {}
-            }
-            prev = Some(key);
-            if i == select {
+        for (n, (i, e)) in cars.iter().enumerate() {
+            let swatch = c.career.garage.get(*i).map_or([0, 0, 0, 0], |o| {
+                colour_rgba(o.custom[0].or_else(|| e.paint_sets.get(o.paint_set as usize).map(|p| p.packed[0])).unwrap_or(0))
+            });
+            if *i == select {
                 at = Some(rows.len());
             }
-            rows.push(ListRow::Text(if short { e.family.to_string() } else { e.display_name.to_string() }));
+            let last = n + 1 == cars.len();
+            rows.push(self.car_list_row(e, &mut prev, CarRowKind::Owned { swatch }, !last, last && tail));
         }
         at
     }
 
-    /// A catalogue car list's own headings — `FEGenericCarAccessor`'s **own** slot 26, **0x4F39E0**
-    /// (the base class §4.137 calls "the full implementation"; `FEOwnedCarAccessor` above
-    /// *overrides* it for the garage). Not read until this pass: the same era-then-class group
-    /// heading as `garage_rows`, drawn inline by the row painter **0x4F3510** (0x4F3548's era
-    /// compare, 0x4F3639's class compare, both against `record+0x1B0`/`+0x1AC` — the identical
-    /// fields `era_class_year_key` already sorts these lists by, so the grouping the height
-    /// function implies always lines up with a real boundary) — but the row height it returns is
-    /// **40 / 27 / 14** (0x4F39F1/0x4F3A17/0x4F3A35: `0x28`/`0x1B`/`0xE`), not the garage's
-    /// 42/28/14, because its heading is **13 px** (`0x5B7734` is the same 13 both classes use for
-    /// the rule spacing, but this one costs one row of `PART_HEADER_H`, not `LIST_ROW_H`, per
-    /// heading — 14+13+13=40, 14+13=27) — the same two-black-rule-plus-bevel shape `ListRow::Header`
-    /// already draws (`layout/widgets.rs`'s plain, non-`parts_glass` arm), reused here rather than
-    /// a second copy of it under `GroupHeading`'s 14 px shape. `GenericCar.Car`, `GenericCar2.Car`
-    /// and `DealerCar.Car` (`career.md` §10.9, `combo_rows` below) are the three shipped lists this
-    /// class serves unmodified, all three already `era_class_year_sort`-ordered so a boundary here
-    /// is always genuine, never a false split from an unsorted run.
-    pub(crate) fn catalog_rows<'a>(&self, cars: impl Iterator<Item = &'a nfs_formats::fedata::CarCatalogEntry>, short: bool, select: Option<usize>) -> (Vec<ListRow>, Option<usize>) {
+    /// A catalogue's drop-down rows — `FEGenericCarAccessor` (`GenericCar.Car`, `GenericCar2.Car`,
+    /// `DealerCar.Car`, and the merged list's second half): one [`ListRow::Car`] per car, the
+    /// same era-then-class headings (painter **0x4F3510**: 0x4F3548 compares `record+0x1B0`, the
+    /// era, 0x4F3639 `+0x1AC`, the class — the fields `era_class_year_key` sorts these lists by,
+    /// so a boundary is always a real one), costing **13** each (slot 26 **0x4F39E0**: 40 / 27 /
+    /// 14), no swatch, the year and the name in two columns. `tail` as for `garage_rows`: 1 from
+    /// the accessor's own slot 15 (0x4F34D4) and from the merged list (0x4F4CDB).
+    pub(crate) fn catalog_rows<'a>(&self, cars: impl ExactSizeIterator<Item = &'a nfs_formats::fedata::CarCatalogEntry>, select: Option<usize>, tail: bool) -> (Vec<ListRow>, Option<usize>) {
+        let count = cars.len();
         let mut rows = Vec::new();
         let mut at = None;
         let mut prev: Option<(u32, u32)> = None;
         for (i, e) in cars.enumerate() {
-            let key = (e.era_string_id, e.class_string_id);
-            let heading = |id: u32| ListRow::Header(self.fe.strings.get(id).unwrap_or_default().to_string(), false);
-            match prev {
-                None => {
-                    rows.push(heading(key.0));
-                    rows.push(heading(key.1));
-                }
-                Some(p) if p.0 != key.0 => {
-                    rows.push(heading(key.0));
-                    rows.push(heading(key.1));
-                }
-                Some(p) if p.1 != key.1 => rows.push(heading(key.1)),
-                _ => {}
-            }
-            prev = Some(key);
             if Some(i) == select {
                 at = Some(rows.len());
             }
-            rows.push(ListRow::Text(if short { e.family.to_string() } else { e.display_name.to_string() }));
+            let last = i + 1 == count;
+            rows.push(self.car_list_row(e, &mut prev, CarRowKind::Catalogue, false, last && tail));
         }
         (rows, at)
+    }
+
+    /// One car's row of either painter: its headings against the car above (`prev`, the
+    /// `(era, class)` string ids), the year — the display name's first three characters, `'59`
+    /// (the 3-byte copy at 0x4F5FAA…0x4F5FC4 / 0x4F3754…0x4F377A) — and the name from its fifth
+    /// (`+4`, 0x4F6022 / 0x4F37DD). The `(SHORT)` modifier plays no part: it is the caption's.
+    fn car_list_row(&self, e: &nfs_formats::fedata::CarCatalogEntry, prev: &mut Option<(u32, u32)>, kind: CarRowKind, rule_joins: bool, rule_tail: bool) -> ListRow {
+        let key = (e.era_string_id, e.class_string_id);
+        let s = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
+        let headings = match *prev {
+            Some(p) if p.0 == key.0 && p.1 == key.1 => vec![],
+            Some(p) if p.0 == key.0 => vec![s(key.1)],
+            _ => vec![s(key.0), s(key.1)],
+        };
+        *prev = Some(key);
+        ListRow::Car(Box::new(CarRow {
+            kind,
+            banner: None,
+            headings,
+            year: e.display_name.chars().take(3).collect(),
+            name: e.display_name.chars().skip(4).collect(),
+            rule_joins,
+            rule_tail,
+        }))
     }
 }
 
@@ -380,7 +379,9 @@ pub(crate) fn era_class_year_sort<T>(v: &mut [T], key: impl Fn(&T) -> (u32, u32,
 /// the *row* delta, whenever headings are present — a click landing inside a heading band belongs
 /// to the row right after it (the same visual block), so `row` is snapped forward to the next
 /// non-heading row before it is counted. A no-op (returns `row` unchanged) on any list with no
-/// headings, which is every list this project had before `catalog_rows`.
+/// headings. The car lists (`garage_rows`, `catalog_rows`) no longer push heading rows at all —
+/// their headings are part of each `ListRow::Car`, the way the painters draw them — so on those
+/// it is the identity too; it stays for any list that still carries `Header`/`GroupHeading` rows.
 pub(crate) fn selectable_index(rows: &[ListRow], row: usize) -> i32 {
     if rows.is_empty() {
         return 0;
@@ -424,13 +425,18 @@ pub(crate) fn selectable_index(rows: &[ListRow], row: usize) -> i32 {
 /// original's own screenshot names. This supersedes that reading; `b5f1896e`'s fix to the *sort
 /// itself* (era/class/year, exchange, not `Vec::sort_by_key(year)`) and to `reset_track_rows`
 /// resetting `car_idx` on every `SETTYPE*` both still stand, unchanged.
-fn dealer_flag_admitted(flag: u16, game_type: u8) -> bool {
+///
+/// `all_cars` stands for the `[0x691A04]` byte: TEST GLUE `NFS_ALL_CARS=1` sets it (the original's only
+/// setter is the `CHEATALLCARS` cheat, which this port has no code entry for), so the quick race, the
+/// knockouts and the rest list every flag-1 car too; flag 3 stays out (0x4F4187, read after the bypass)
+/// and the career arm does not read the byte.
+fn dealer_flag_admitted(flag: u16, game_type: u8, all_cars: bool) -> bool {
     if game_type == game_type::TOURNAMENT {
         flag != 2
     } else {
         match flag {
             0 | 2 => true,
-            1 => game_type == game_type::NETWORK, // Multiplayer, or the un-ported CHEATALLCARS cheat — see above
+            1 => game_type == game_type::NETWORK || all_cars, // Multiplayer, or the `[0x691A04]` byte (0x4F4182 / 0x4F4178)
             _ => false,
         }
     }
@@ -441,7 +447,8 @@ fn dealer_flag_admitted(flag: u16, game_type: u8) -> bool {
 /// `FeCatalogues` construction, which needs the filtered/sorted vector before a `FeCatalogues` exists yet (to
 /// resolve `NFS_FE_CAR`'s starting index).
 pub(crate) fn generic_car_list(catalog: &[nfs_formats::fedata::CarCatalogEntry], game_type: u8) -> Vec<nfs_formats::fedata::CarCatalogEntry> {
-    let mut v: Vec<_> = catalog.iter().filter(|c| c.kind == 0 && dealer_flag_admitted(c.dealer_flag_204, game_type)).cloned().collect();
+    let all_cars = nfs_game::config::cfg().nfs_all_cars.is_on();
+    let mut v: Vec<_> = catalog.iter().filter(|c| c.kind == 0 && dealer_flag_admitted(c.dealer_flag_204, game_type, all_cars)).cloned().collect();
     era_class_year_sort(&mut v, era_class_year_key);
     v
 }
@@ -565,11 +572,16 @@ mod dealer_flag_tests {
     /// duplicates) never passes this arm at all.
     #[test]
     fn the_two_arms_by_flag() {
-        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 4)), [true, true, false, true], "career");
-        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 0)), [true, false, true, false], "quick race");
-        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 1)), [true, false, true, false], "quick knockout");
-        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 2)), [true, false, true, false], "knockout");
-        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 3)), [true, true, true, false], "multiplayer");
+        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 4, false)), [true, true, false, true], "career");
+        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 0, false)), [true, false, true, false], "quick race");
+        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 1, false)), [true, false, true, false], "quick knockout");
+        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 2, false)), [true, false, true, false], "knockout");
+        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 3, false)), [true, true, true, false], "multiplayer");
+        // the `[0x691A04]` byte (TEST GLUE `NFS_ALL_CARS`): flag 1 joins every arm but the career's, flag 3 never
+        for t in 0..=3 {
+            assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, t, true)), [true, true, true, false], "all cars, type {t}");
+        }
+        assert_eq!([0, 1, 2, 3].map(|f| dealer_flag_admitted(f, 4, true)), [true, true, false, true], "all cars, career");
     }
 
     /// Against the shipped `nfs5.car`: QuickRace's filtered, sorted catalogue's row 0 is `'59 356 A

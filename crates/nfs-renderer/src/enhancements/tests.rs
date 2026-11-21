@@ -341,7 +341,9 @@ fn upscaler_choice_and_effective_set() {
     // `describe` parses back with an upscaler on
     let e = Enhancements::parse_override("E37=2", &mut u).unwrap();
     assert_eq!(Enhancements::parse_override(&e.describe(), &mut u), Some(e));
-    assert!(u.is_empty());
+    // E34 (MetalFX) is a macOS-only row: elsewhere its token is reported as unknown, as any unavailable one
+    let expected: &[&str] = if cfg!(target_os = "macos") { &[] } else { &["E34=2"] };
+    assert_eq!(u, expected);
 }
 
 #[test]

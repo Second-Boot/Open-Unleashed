@@ -858,6 +858,11 @@ fn the_legacy_json_is_folded_into_the_sav_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The race goldens' pristine profile (`8DRIVER.sav`, the save dir the scripted runs copy), kept in `tests/data`.
+fn pristine_sav() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/8DRIVER.sav")
+}
+
 /// PORT-DEVIATION D40: a car with an empty stock list `+0x75C` — which the original never writes
 /// (its writers are the constructors 0x4EE404 / 0x4EE63C, 0x4EE9A0 and the loader 0x4EE7F2) — gets
 /// its stock parts on load, and a car with a stock list keeps both lists as written (0x4EE6A0). The
@@ -892,10 +897,8 @@ fn a_sav_car_without_a_stock_list_gets_its_stock_parts() {
     assert_eq!(again.stock.len(), stock.len());
     assert_eq!(again.parts.len(), stock.len() - 1, "a car with its stock list is not refilled");
 
-    // the race goldens' seed, when the fixtures exist
-    let Some(home) = std::env::var_os("HOME") else { return };
-    let path = std::path::Path::new(&home).join("fixtures/fe_save_pristine/8DRIVER.sav");
-    let Ok(data) = std::fs::read(&path) else { return };
+    // the race goldens' seed (a copy is in `tests/data`)
+    let data = std::fs::read(pristine_sav()).unwrap();
     let s = SaveFile::parse(&data).unwrap();
     let raw = &s.player.as_ref().unwrap().cars[0];
     assert!(raw.removed.is_empty() && raw.installed.len() == 1, "the file: removed 0 / installed 1");
@@ -914,19 +917,14 @@ fn a_sav_car_without_a_stock_list_gets_its_stock_parts() {
 /// The port rebuilds the stock list on load (PORT-DEVIATION D40), so the flywheel cancels against
 /// its stock copy and the term is 0. A car the original itself constructs (0x4EE9A0) always
 /// carries its stock list: the port's 11,000 is what the original shows for the same car bought in
-/// the original. Test glue: needs the game data and the fixture.
+/// the original. Test glue: needs the game data.
 #[test]
 fn the_pristine_356_is_worth_11000_rebuilt_and_11123_as_written() {
     let Some(t) = tables() else {
         eprintln!("skipping: no game data");
         return;
     };
-    let Some(home) = std::env::var_os("HOME") else { return };
-    let path = std::path::Path::new(&home).join("fixtures/fe_save_pristine/8DRIVER.sav");
-    let Ok(data) = std::fs::read(&path) else {
-        eprintln!("skipping: no fixture");
-        return;
-    };
+    let data = std::fs::read(pristine_sav()).unwrap();
     let s = SaveFile::parse(&data).unwrap();
     let raw = &s.player.as_ref().unwrap().cars[0];
     assert!(raw.removed.is_empty(), "the file's stock list +0x75C is empty");

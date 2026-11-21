@@ -133,11 +133,11 @@ mod tests {
             }
         }
         for e in [top, zero, mixed] {
-            save_to(&path, &e).unwrap();
+            save_to(&path, &e, false).unwrap();
             let (back, mode) = load_with(None, std::fs::read_to_string(&path).ok().as_deref());
             assert_eq!((back, mode), (e, Mode::Normal));
             // a second save of what was loaded is the same file (no drift to the defaults)
-            save_to(&path, &back).unwrap();
+            save_to(&path, &back, false).unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), file_text(&e));
         }
         // every entry is in the file (none falls back to its default for want of a key)
@@ -426,6 +426,21 @@ mod tests {
         // the lines change with the set (a rebuild is needed) exactly when they differ
         assert_ne!(panel_signature(&Enhancements::all()), panel_signature(&f));
         assert_eq!(panel_signature(&f), panel_signature(&f));
+    }
+
+    /// ENH-VIEW: the original-look view rides in the file beside the levels and never changes them; an older file has none.
+    #[test]
+    fn the_view_is_stored_beside_the_levels() {
+        let mut e = Enhancements::all();
+        e.set_level(nfs_renderer::E1, 0);
+        let on = file_text_view(&e, true);
+        assert!(parse_view(&on) && !parse_view(&file_text_view(&e, false)) && !parse_view(&file_text(&e)));
+        assert_eq!(file_text_view(&e, false), file_text(&e));
+        assert_eq!(parse_file(&on), e, "the view leaves the levels alone");
+        assert_eq!(load_with(None, Some(&on)), (e, Mode::Normal));
+        assert!(!parse_view(r#"{"version": 7, "levels": {"E1": 1}}"#) && !parse_view("not json") && !parse_view(r#"{"view": 1}"#));
+        // the «графика» row heads the first page
+        assert_eq!(panel_pages(&e)[0][0], Item::Virtual(VRow::View));
     }
 
     #[test]

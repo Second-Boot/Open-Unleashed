@@ -863,6 +863,88 @@ pub enum ListRow {
     /// row y)` — `0x4D9280(x + 4, y, 15, 10, 0x4D87F0(colour, alpha))` then the outline
     /// `0x4D9200` of `0x4D87E0(alpha)` (0x4BC0C8…0x4BC116). The swatch is `(anchor, dx, rgba)`.
     Racer(Vec<ListCell>, Option<(String, f32, [u8; 4])>),
+    /// One car of a car accessor's drop-down, drawn whole by the accessor's own row painter —
+    /// its headings included, so a heading is extra height on the car's row and never a row of
+    /// its own (one accessor index per row, as slot 26 counts them). See [`CarRow`].
+    Car(Box<CarRow>),
+}
+
+/// Which car painter a [`ListRow::Car`] is: `FEOwnedCarAccessor`'s slot 43 **0x4F5D10** (the
+/// garage, with the car's paint swatch) or `FEGenericCarAccessor`'s slot 45 **0x4F3510** (the
+/// catalogue). `RE/notes/layouts.md` "The car drop-downs".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CarRowKind {
+    /// The swatch is `FECar+0x674`, the car's exterior colour, as the accessor dword's RGBA.
+    Owned { swatch: [u8; 4] },
+    Catalogue,
+}
+
+/// A car row's content (`ListRow::Car`).
+///
+/// Both painters take the drop-down's `(row, font, x, y, w, inset 3.0, text, bar)` (0x4C687D…
+/// 0x4C68F5) and lay out, from the top:
+///
+/// * `banner` — `FEMergedCarListAccessor`'s own band over its first garage row (`FEStrings` 570
+///   `OWNED`, 0x4F4AFD…0x4F4BB2) and over its first catalogue row (571 `FACTORY STOCK`,
+///   0x4F4C0C…0x4F4CC1), 13 px (slot 26 0x4F4D40 adds 13 to exactly those two rows);
+/// * `headings` — the era (on an era change or at row 0) and the class (on a class change too),
+///   each two black rules 13 apart, the name centred in black in `Univers7b` and the 0x521400
+///   bevel `(x, y + 1, w, 12, fade, 2)`; the painter steps 13 per heading, while the row height
+///   costs `heading_h` each — 14 for the garage (0x4F60F0: 42 / 28 / 14), 13 for the catalogue
+///   (0x4F39E0: 40 / 27 / 14);
+/// * the car's line: the bar `(x, y, w, 14, bar)`, the owned car's 10 × 10 swatch at
+///   `(x + inset, y + 2)` outlined black, the first three characters of the display name (the
+///   model year, `'59`) in white at `year_x`, a black one-pixel column rule at `sep_x`, and the
+///   rest of the name (`display_name + 4`) in the row's text colour at `inset + sep_x`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarRow {
+    pub kind: CarRowKind,
+    pub banner: Option<String>,
+    pub headings: Vec<String>,
+    pub year: String,
+    pub name: String,
+    /// the column rule runs 16 px (into the next row) instead of 14: the garage painter on every
+    /// row but its list's last (0x4F6049…0x4F6070)
+    pub rule_joins: bool,
+    /// the column rule runs 100 px down past the last row: both painters on their list's last
+    /// row when their ninth argument is set — 1 from their own slot 15 (0x4F5CD4, 0x4F34D4) and
+    /// from the merged list's catalogue half (0x4F4CDB), 0 for its garage half (0x4F4BCD)
+    pub rule_tail: bool,
+}
+
+impl CarRow {
+    /// The band over the heading block (0x4F4B19: `y + 13`).
+    pub const BANNER_H: f32 = 13.0;
+    /// The painter's step per heading, `[0x5B7734]` = 13.0.
+    pub const HEADING_STEP: f32 = 13.0;
+
+    /// What one heading costs in row height: 14 in the garage (0x4F60F0), 13 in the catalogue (0x4F39E0).
+    pub fn heading_h(&self) -> f32 {
+        match self.kind {
+            CarRowKind::Owned { .. } => LIST_ROW_H,
+            CarRowKind::Catalogue => Self::HEADING_STEP,
+        }
+    }
+
+    /// The year's x and the column rule's x, from the row's left edge with the 3.0 inset:
+    /// the garage's year at `inset + 12` (`[0x5B240C]`) and rule at 34 (`[0x5B7918]`, 0x4F5FED),
+    /// the catalogue's year at `inset` and rule at 22 (`[0x5B265C]`, 0x4F379E).
+    pub fn columns(&self, inset: f32) -> (f32, f32) {
+        match self.kind {
+            CarRowKind::Owned { .. } => (inset + 12.0, 34.0),
+            CarRowKind::Catalogue => (inset, 22.0),
+        }
+    }
+
+    /// The y of the car's own 14 px line within the row: under the banner and the headings.
+    pub fn line_y(&self) -> f32 {
+        self.banner.as_ref().map_or(0.0, |_| Self::BANNER_H) + self.headings.len() as f32 * Self::HEADING_STEP
+    }
+
+    /// Slot 26: 14, plus each heading's cost, plus the merged list's band.
+    pub fn height(&self) -> f32 {
+        LIST_ROW_H + self.headings.len() as f32 * self.heading_h() + self.banner.as_ref().map_or(0.0, |_| Self::BANNER_H)
+    }
 }
 
 impl ListRow {
@@ -876,6 +958,7 @@ impl ListRow {
             ListRow::GroupHeading(_) => LIST_ROW_H,
             // `FEColourAccessor` keeps the base slot 26, 0x4BC700
             ListRow::Swatch(_) | ListRow::CustomColour(_) => LIST_ROW_H,
+            ListRow::Car(c) => c.height(),
         }
     }
 }

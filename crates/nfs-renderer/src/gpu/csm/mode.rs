@@ -31,7 +31,7 @@ pub(in crate::gpu) const CAR_CASCADES: usize = 2;
 pub(super) const GATE_REL: f32 = 2.0;
 /// GATE-REL (APPROXIMATION): the drivable ground's lit level, as a share of `BakeLight::ground` (its 90th percentile). At 1.0 a dim
 /// forest road under the trees counts as baked shade and takes nearly no shadow (the trees before the covered bridge cast none, as
-/// with the absolute gate; by comparing stills of the forest); 0.65 put it near the
+/// with the absolute gate, by comparing stills of the forest); 0.65 put it near the
 /// ground's median (forest 1.92 x 0.65 = 1.25 against a median of 1.24). SHADOW-UNIFY (chosen by comparing stills): 0.80 keeps the
 /// forest canopy's dappled stripes and still shades the road under the trees before the covered bridge and at the rock / bush seam.
 pub(super) const GATE_REL_GROUND_SCALE: f32 = 0.80;
