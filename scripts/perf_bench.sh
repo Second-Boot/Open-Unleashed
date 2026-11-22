@@ -6,6 +6,8 @@
 # The game logs one `PERF` line (median / p95 GPU busy ms from the stage marks, CPU encode ms, finish / submit ms, the
 # NFS_GPU_TIME-style wall ms) and one `PERFSTAGE` line (each stage's median GPU ms); this script prints them per run with
 # the load average at the start of the run, and runs ONE game process at a time.
+# Each line also names the adapter that drew the run: under Xvfb (an X server without DRI3) no GPU can present to the window and
+# the game gets Mesa's llvmpipe (`device_type=Cpu`), whose times are the CPU's, not the GPU's.
 #
 # Variants (A/B) are interleaved run by run so a changing machine load hits every side alike:
 #   -V 'label=<binary>[;ENV=value;ENV=value...]'   (repeatable; default: one variant "cur" = target/release/open-unleashed)
@@ -26,7 +28,7 @@ while getopts "n:s:r:o:t:V:" opt; do
         o) out=$OPTARG ;;
         t) template=$OPTARG ;;
         V) variants+=("$OPTARG") ;;
-        *) sed -n '2,17p' "$0"; exit 2 ;;
+        *) sed -n '2,19p' "$0"; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -60,7 +62,10 @@ for ((k = 1; k <= runs; k++)); do
                 >"$out/$tag.log" 2>&1 || true
             rm -rf "$save"
             perf=$(grep -o 'PERF size=.*' "$out/$tag.log" | head -1 || true)
-            echo "$sc $label run=$k load=$l ${perf:-PERF missing (see $out/$tag.log)}"
+            # which adapter drew it: a window no GPU can present to (Xvfb: no DRI3) is drawn by a software rasteriser
+            # (device_type=Cpu), and its times say nothing about the machine's GPU
+            adapter=$(grep -o 'gpu adapter adapter=.*device_type=[A-Za-z]*' "$out/$tag.log" | head -1 | sed 's/^gpu adapter //' || true)
+            echo "$sc $label run=$k load=$l ${adapter:-adapter=?} ${perf:-PERF missing (see $out/$tag.log)}"
             grep -o 'PERFSTAGE .*' "$out/$tag.log" | head -1 | sed "s/^/  $label /" || true
         done
     done

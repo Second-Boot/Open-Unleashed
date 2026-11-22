@@ -111,6 +111,23 @@ impl Core {
         let (instance, surface, adapter) = match wgpu::Backends::from_env() {
             Some(chosen) => open(chosen, dxc_path.as_deref())?,
             None => match open(wgpu::Backends::METAL | wgpu::Backends::PRIMARY, dxc_path.as_deref()) {
+                Ok(found) if found.2.get_info().device_type == wgpu::DeviceType::Cpu => {
+                    // PLATFORM GLUE: the only Vulkan adapter that can present to this window is a software one (Mesa's lavapipe /
+                    // llvmpipe: the hardware driver missing or unable to present, e.g. no DRI3), which draws every pixel on the CPU.
+                    // OpenGL may still reach the GPU: take it when it gives a hardware adapter, else keep the software one
+                    let soft = found.2.get_info().name;
+                    drop(found);
+                    match open(wgpu::Backends::GL, dxc_path.as_deref()) {
+                        Ok(gl) if gl.2.get_info().device_type != wgpu::DeviceType::Cpu => {
+                            tracing::warn!(software = %soft, gl = %gl.2.get_info().name, "the Vulkan adapter for the window is a software rasteriser: using the hardware OpenGL adapter instead (WGPU_BACKEND overrides)");
+                            gl
+                        }
+                        _ => {
+                            tracing::info!(software = %soft, "the Vulkan adapter for the window is a software rasteriser and OpenGL has no hardware one either: keeping it");
+                            open(wgpu::Backends::METAL | wgpu::Backends::PRIMARY, dxc_path.as_deref())?
+                        }
+                    }
+                }
                 Ok(found) => found,
                 Err(e) => {
                     tracing::warn!(error = format!("{e:#}"), "no Vulkan / Metal / Direct3D 12 for the window: trying OpenGL");
@@ -120,8 +137,12 @@ impl Core {
         };
         // diagnostics (port-own, `open-unleashed.log`): every adapter the instance sees, the chosen one with
         // its features / limits, so a failure on another machine can be read from the log
+        let mut hardware: Vec<String> = Vec::new();
         for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
             let i = a.get_info();
+            if i.device_type != wgpu::DeviceType::Cpu {
+                hardware.push(format!("{} ({:?})", i.name, i.backend));
+            }
             tracing::info!(name = %i.name, backend = ?i.backend, device_type = ?i.device_type, driver = %i.driver, driver_info = %i.driver_info, vendor = format_args!("{:#06x}", i.vendor), device = format_args!("{:#06x}", i.device), "gpu adapter available");
         }
         tracing::info!(info = ?adapter.get_info(), features = ?adapter.features(), "chosen adapter");
@@ -129,6 +150,13 @@ impl Core {
         let adapter_info = adapter.get_info();
         let gpu_class = crate::classify_gpu(adapter_info.device_type, adapter_info.backend, &adapter_info.name);
         tracing::info!(adapter = ?adapter_info.name, backend = ?adapter_info.backend, device_type = ?adapter_info.device_type, gpu_class = ?gpu_class, "gpu adapter");
+        // PLATFORM GLUE: a software rasteriser (Mesa's llvmpipe, WARP) draws every pixel on the CPU: tens of milliseconds a frame at
+        // 1920x1080 where the machine's own GPU takes a few. It is what the window gets when no hardware adapter can present to it
+        // (an X server without DRI3 - Xvfb, some remote sessions -, a missing Vulkan driver), so the log says it in one line, with
+        // the hardware adapters that were passed over
+        if adapter_info.device_type == wgpu::DeviceType::Cpu {
+            tracing::warn!(adapter = %adapter_info.name, passed_over = ?hardware, "the chosen adapter is a software rasteriser (the CPU draws every frame): expect a low frame rate; no hardware adapter can present to this window");
+        }
         let _ = crate::ADAPTER_LABEL.set(format!("{} · {:?}", adapter_info.name, adapter_info.backend));
         // TEST GLUE `NFS_GPU_PROFILE=minimal` (WIN-STARTUP): a device with no optional feature, the default limits and no multisample
         // count above 1 nor a float scene target — what a weak or old adapter reports — to see the fall-backs act on any machine
